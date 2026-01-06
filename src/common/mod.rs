@@ -1,6 +1,6 @@
-pub mod value;
-pub mod error;
 pub mod encoding;
+pub mod error;
+pub mod value;
 
-pub use value::Value;
 pub use error::{FusionError, Result};
+pub use value::Value;

@@ -838,6 +838,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "fusiondb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-trait",
+ "axum",
+ "bincode",
+ "bytes",
+ "crossbeam-skiplist",
+ "crossbeam-utils",
+ "env_logger",
+ "fastbloom",
+ "futures",
+ "hdrhistogram",
+ "hora",
+ "http",
+ "lazy_static",
+ "moka",
+ "parking_lot 0.12.5",
+ "pgwire",
+ "rand 0.9.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sled",
+ "sqlparser",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+ "tower-http",
+ "uuid",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2878,41 +2913,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "w33dDB"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "axum",
- "bincode",
- "bytes",
- "crossbeam-skiplist",
- "crossbeam-utils",
- "env_logger",
- "fastbloom",
- "futures",
- "hdrhistogram",
- "hora",
- "http",
- "lazy_static",
- "moka",
- "parking_lot 0.12.5",
- "pgwire",
- "rand 0.9.2",
- "reqwest",
- "serde",
- "serde_json",
- "sled",
- "sqlparser",
- "thiserror",
- "tokio",
- "tokio-postgres",
- "tower-http",
- "uuid",
-]
 
 [[package]]
 name = "want"

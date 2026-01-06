@@ -1,7 +1,7 @@
-use w33dDB::server::http_server;
-use w33dDB::storage::memory::MemoryStorage;
-use w33dDB::execution::Executor;
-use w33dDB::parser::parse_sql;
+use fusiondb::execution::Executor;
+use fusiondb::parser::parse_sql;
+use fusiondb::server::http_server;
+use fusiondb::storage::memory::MemoryStorage;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -34,7 +34,7 @@ fn main() {
         let sql = "EXPLAIN SELECT * FROM users WHERE age = 30";
         let stmt = &parse_sql(sql).unwrap()[0];
         let res = executor.execute(stmt).await.unwrap();
-        if let w33dDB::execution::QueryResult::Select { rows, .. } = res {
+        if let fusiondb::execution::QueryResult::Select { rows, .. } = res {
             println!("{}", rows[0][0]);
         }
 
@@ -43,7 +43,7 @@ fn main() {
         let sql = "EXPLAIN SELECT * FROM users WHERE name = 'Alice'";
         let stmt = &parse_sql(sql).unwrap()[0];
         let res = executor.execute(stmt).await.unwrap();
-        if let w33dDB::execution::QueryResult::Select { rows, .. } = res {
+        if let fusiondb::execution::QueryResult::Select { rows, .. } = res {
             println!("{}", rows[0][0]);
         }
 
@@ -52,7 +52,7 @@ fn main() {
         let sql = "EXPLAIN ANALYZE SELECT * FROM users WHERE age = 30";
         let stmt = &parse_sql(sql).unwrap()[0];
         let res = executor.execute(stmt).await.unwrap();
-        if let w33dDB::execution::QueryResult::Select { rows, .. } = res {
+        if let fusiondb::execution::QueryResult::Select { rows, .. } = res {
             println!("{}", rows[0][0]);
         }
         // 7. SHOW TABLES
@@ -60,22 +60,22 @@ fn main() {
         let sql = "SHOW TABLES";
         let stmt = &parse_sql(sql).unwrap()[0];
         let res = executor.execute(stmt).await.unwrap();
-        if let w33dDB::execution::QueryResult::Select { rows, .. } = res {
-             println!("Tables found: {}", rows.len());
-             for row in rows {
-                 println!("- {:?}", row[0]);
-             }
+        if let fusiondb::execution::QueryResult::Select { rows, .. } = res {
+            println!("Tables found: {}", rows.len());
+            for row in rows {
+                println!("- {:?}", row[0]);
+            }
         }
         // 8. DESCRIBE
         println!("\n--- DESCRIBE users ---");
         let sql = "DESCRIBE users";
         let stmt = &parse_sql(sql).unwrap()[0];
         let res = executor.execute(stmt).await.unwrap();
-        if let w33dDB::execution::QueryResult::Select { columns, rows } = res {
-             println!("{:?}", columns);
-             for row in rows {
-                 println!("{:?}", row);
-             }
+        if let fusiondb::execution::QueryResult::Select { columns, rows } = res {
+            println!("{:?}", columns);
+            for row in rows {
+                println!("{:?}", row);
+            }
         }
     });
 }

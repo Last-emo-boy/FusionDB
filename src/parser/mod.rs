@@ -1,7 +1,7 @@
+use crate::common::{FusionError, Result};
+use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use sqlparser::ast::Statement;
-use crate::common::{Result, FusionError};
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let dialect = GenericDialect {};

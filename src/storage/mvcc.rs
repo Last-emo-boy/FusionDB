@@ -1,9 +1,12 @@
-use async_trait::async_trait;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
-use crossbeam_skiplist::SkipMap;
-use crate::common::Result;
+use super::wal::{WalEntry, WalManager};
 use super::{Storage, Transaction};
-use super::wal::{WalManager, WalEntry};
+use crate::common::Result;
+use async_trait::async_trait;
+use crossbeam_skiplist::SkipMap;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 const TS_SIZE: usize = 8;
 
@@ -30,31 +33,35 @@ impl MvccStorage {
         let mut max_ts = 0;
 
         for entry in entries {
-             // In a real MVCC WAL, entries should probably have timestamps.
-             // But for compatibility with existing WAL (which doesn't have TS),
-             // we can assign strictly increasing TS during replay.
-             // Or, if we change WAL format, we can persist TS.
-             // For now, let's just assign new TS for each entry to rebuild state.
-             // This is acceptable for crash recovery as long as order is preserved.
-             
-             max_ts += 1;
-             match entry {
-                 WalEntry::Put(k, v) => {
-                     let key = Self::encode_key(&k, max_ts);
-                     let val = Self::encode_value(true, &v);
-                     data.insert(key, val);
-                 },
-                 WalEntry::Delete(k) => {
-                     let key = Self::encode_key(&k, max_ts);
-                     let val = Self::encode_value(false, &[]);
-                     data.insert(key, val);
-                 },
-             }
+            // In a real MVCC WAL, entries should probably have timestamps.
+            // But for compatibility with existing WAL (which doesn't have TS),
+            // we can assign strictly increasing TS during replay.
+            // Or, if we change WAL format, we can persist TS.
+            // For now, let's just assign new TS for each entry to rebuild state.
+            // This is acceptable for crash recovery as long as order is preserved.
+
+            max_ts += 1;
+            match entry {
+                WalEntry::Put(k, v) => {
+                    let key = Self::encode_key(&k, max_ts);
+                    let val = Self::encode_value(true, &v);
+                    data.insert(key, val);
+                }
+                WalEntry::Delete(k) => {
+                    let key = Self::encode_key(&k, max_ts);
+                    let val = Self::encode_value(false, &[]);
+                    data.insert(key, val);
+                }
+            }
         }
-        
+
         current_ts.store(max_ts, Ordering::SeqCst);
 
-        println!("Recovered {} operations from WAL. Current TS: {}", data.len(), max_ts);
+        println!(
+            "Recovered {} operations from WAL. Current TS: {}",
+            data.len(),
+            max_ts
+        );
 
         Ok(Self {
             data: Arc::new(data),
@@ -103,8 +110,8 @@ impl MvccStorage {
         // So (Key, MAX-V_latest) is the smallest key for this user key.
         // We start scanning from Key (effectively Key + 0000...)
         // We iterate until we find a match or key changes.
-        
-        // Wait, "Key + (MAX - read_ts)"? 
+
+        // Wait, "Key + (MAX - read_ts)"?
         // If we have versions 100, 90, 80.
         // Keys: K+(MAX-100), K+(MAX-90), K+(MAX-80).
         // If read_ts = 95. We want version 90.
@@ -112,13 +119,13 @@ impl MvccStorage {
         // We want the first entry where Version <= read_ts.
         // i.e., (MAX - Version) >= (MAX - read_ts).
         // So we want InternalKey >= Key + (MAX - read_ts).
-        
+
         let search_key = Self::encode_key(key, read_ts);
-        
+
         // SkipMap range is (Bound, Bound).
         // We use range(search_key..)
         let entry = self.data.range(search_key..).next();
-        
+
         if let Some(ent) = entry {
             let (k, _ts) = Self::decode_key(ent.key());
             if k == key {
@@ -132,7 +139,7 @@ impl MvccStorage {
                 // range(K+(MAX-95)..) will skip K+(MAX-100).
                 // It will land on K+(MAX-90).
                 // Version 90 <= 95. Correct.
-                
+
                 let (is_put, val) = Self::decode_value(ent.value());
                 if is_put {
                     return Some(val.to_vec());
@@ -141,7 +148,7 @@ impl MvccStorage {
                 }
             }
         }
-        
+
         None
     }
 }
@@ -181,60 +188,65 @@ impl Transaction for MvccTransaction {
         // Optimization: Stream and filter directly without intermediate HashMap
         // SkipMap is already sorted by Key ASC, Version DESC.
         // So for a given Key, we encounter the newest version first.
-        
+
         let mut storage_res = Vec::new();
         let iter_key = Vec::from(prefix);
-        
+
         let mut last_key: Option<Vec<u8>> = None;
 
         for entry in self.storage.data.range(iter_key..) {
-             let (k, ts) = MvccStorage::decode_key(entry.key());
-             if !k.starts_with(prefix) {
-                 break;
-             }
-             
-             // Check if we already found a visible version for this key
-             if let Some(last) = &last_key {
-                 if last == k {
-                     continue; // Already processed the latest visible version for this key
-                 }
-             }
-             
-             // Check visibility
-             if ts <= self.read_ts {
-                 // Found the latest visible version
-                 let (is_put, val) = MvccStorage::decode_value(entry.value());
-                 if is_put {
-                     storage_res.push((k.to_vec(), val.to_vec()));
-                 }
-                 // If deleted, we effectively "found" it (as deleted), so we shouldn't look for older versions.
-                 // So we update last_key regardless of is_put.
-                 last_key = Some(k.to_vec());
-             }
+            let (k, ts) = MvccStorage::decode_key(entry.key());
+            if !k.starts_with(prefix) {
+                break;
+            }
+
+            // Check if we already found a visible version for this key
+            if let Some(last) = &last_key {
+                if last == k {
+                    continue; // Already processed the latest visible version for this key
+                }
+            }
+
+            // Check visibility
+            if ts <= self.read_ts {
+                // Found the latest visible version
+                let (is_put, val) = MvccStorage::decode_value(entry.value());
+                if is_put {
+                    storage_res.push((k.to_vec(), val.to_vec()));
+                }
+                // If deleted, we effectively "found" it (as deleted), so we shouldn't look for older versions.
+                // So we update last_key regardless of is_put.
+                last_key = Some(k.to_vec());
+            }
         }
-        
+
         // 2. Write Buffer Overlay
         // Since write buffer is usually small in this system (per request), we can just overlay.
         // If write buffer is large, this is O(N*M).
         // For correctness with minimal code change:
         // Put storage results into a Map if write buffer is present, or just update the list.
-        
+
         if self.write_buffer.is_empty() {
             return Ok(storage_res);
         }
 
         // Merge logic
-        let mut result_map: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = storage_res.into_iter().collect();
-        
+        let mut result_map: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            storage_res.into_iter().collect();
+
         for (k, v) in &self.write_buffer {
-             if k.starts_with(prefix) {
-                 match v {
-                     Some(val) => { result_map.insert(k.clone(), val.clone()); },
-                     None => { result_map.remove(k); },
-                 }
-             }
+            if k.starts_with(prefix) {
+                match v {
+                    Some(val) => {
+                        result_map.insert(k.clone(), val.clone());
+                    }
+                    None => {
+                        result_map.remove(k);
+                    }
+                }
+            }
         }
-        
+
         Ok(result_map.into_iter().collect())
     }
 
@@ -288,7 +300,7 @@ impl Storage for MvccStorage {
     }
 
     async fn create_snapshot(&self) -> Result<()> {
-        // MVCC snapshot is implicit. 
+        // MVCC snapshot is implicit.
         // But for persistence checkpointing, we need to iterate all latest keys.
         // Implementation: Scan all keys, pick latest for each, write to snapshot file.
         // TODO for next step.

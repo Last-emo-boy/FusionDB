@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use serde::Serialize;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 lazy_static! {
     pub static ref GLOBAL_METRICS: Metrics = Metrics::default();
@@ -53,100 +53,118 @@ impl Metrics {
     }
 }
 
-pub fn inc_parse() { 
+pub fn inc_parse() {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.sql_parse_count += 1;
         if m.sql_parse_count >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.sql_parse_count.fetch_add(m.sql_parse_count, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .sql_parse_count
+                .fetch_add(m.sql_parse_count, Ordering::Relaxed);
             m.sql_parse_count = 0;
         }
     })
 }
 
-pub fn inc_plan() { 
+pub fn inc_plan() {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.sql_plan_count += 1;
         if m.sql_plan_count >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.sql_plan_count.fetch_add(m.sql_plan_count, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .sql_plan_count
+                .fetch_add(m.sql_plan_count, Ordering::Relaxed);
             m.sql_plan_count = 0;
         }
     })
 }
 
-pub fn inc_row_read() { 
+pub fn inc_row_read() {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.row_read_count += 1;
         if m.row_read_count >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.row_read_count.fetch_add(m.row_read_count, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .row_read_count
+                .fetch_add(m.row_read_count, Ordering::Relaxed);
             m.row_read_count = 0;
         }
     })
 }
 
-pub fn inc_row_cache_hit() { 
+pub fn inc_row_cache_hit() {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.row_cache_hit_count += 1;
         if m.row_cache_hit_count >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.row_cache_hit_count.fetch_add(m.row_cache_hit_count, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .row_cache_hit_count
+                .fetch_add(m.row_cache_hit_count, Ordering::Relaxed);
             m.row_cache_hit_count = 0;
         }
     })
 }
 
-pub fn inc_row_write() { 
+pub fn inc_row_write() {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.row_write_count += 1;
         if m.row_write_count >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.row_write_count.fetch_add(m.row_write_count, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .row_write_count
+                .fetch_add(m.row_write_count, Ordering::Relaxed);
             m.row_write_count = 0;
         }
     })
 }
 
-pub fn inc_fts_search() { 
+pub fn inc_fts_search() {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.fts_search_count += 1;
         if m.fts_search_count >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.fts_search_count.fetch_add(m.fts_search_count, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .fts_search_count
+                .fetch_add(m.fts_search_count, Ordering::Relaxed);
             m.fts_search_count = 0;
         }
     })
 }
 
-pub fn add_fts_hits(n: u64) { 
+pub fn add_fts_hits(n: u64) {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.fts_doc_hits += n;
         if m.fts_doc_hits >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.fts_doc_hits.fetch_add(m.fts_doc_hits, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .fts_doc_hits
+                .fetch_add(m.fts_doc_hits, Ordering::Relaxed);
             m.fts_doc_hits = 0;
         }
     })
 }
 
-pub fn inc_wal_write() { 
+pub fn inc_wal_write() {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.wal_write_count += 1;
         if m.wal_write_count >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.wal_write_count.fetch_add(m.wal_write_count, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .wal_write_count
+                .fetch_add(m.wal_write_count, Ordering::Relaxed);
             m.wal_write_count = 0;
         }
     })
 }
 
-pub fn add_wal_bytes(n: u64) { 
+pub fn add_wal_bytes(n: u64) {
     LOCAL_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.wal_write_bytes += n;
         if m.wal_write_bytes >= FLUSH_THRESHOLD {
-            GLOBAL_METRICS.wal_write_bytes.fetch_add(m.wal_write_bytes, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .wal_write_bytes
+                .fetch_add(m.wal_write_bytes, Ordering::Relaxed);
             m.wal_write_bytes = 0;
         }
     })

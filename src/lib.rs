@@ -1,9 +1,9 @@
-pub mod common;
-pub mod storage;
-pub mod parser;
-pub mod execution;
 pub mod catalog;
-pub mod server;
+pub mod common;
+pub mod execution;
 pub mod monitor;
+pub mod parser;
+pub mod server;
+pub mod storage;
 
 pub type Result<T> = common::Result<T>;

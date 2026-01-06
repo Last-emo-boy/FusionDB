@@ -1,16 +1,16 @@
-use async_trait::async_trait;
 use crate::common::Result;
+use async_trait::async_trait;
 
+pub mod columnar;
+pub mod fusion;
+pub mod inverted_index;
+pub mod lsm;
 pub mod memory;
 pub mod mvcc;
-pub mod lsm;
-pub mod fusion;
-pub mod columnar;
 pub mod sled_store;
 pub mod sstable;
-pub mod inverted_index;
-pub mod wal;
 pub mod vector_index;
+pub mod wal;
 
 #[async_trait]
 pub trait Transaction: Send + Sync {
@@ -39,7 +39,7 @@ use std::any::Any;
 pub trait Storage: Send + Sync + Any {
     /// Begin a new transaction
     async fn begin_transaction(&self) -> Result<Box<dyn Transaction>>;
-    
+
     /// Create a checkpoint (snapshot) of the current state
     async fn create_snapshot(&self) -> Result<()>;
 

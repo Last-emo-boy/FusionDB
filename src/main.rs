@@ -1,8 +1,8 @@
+use fusiondb::execution::Executor;
+use fusiondb::server;
+use fusiondb::storage::memory::MemoryStorage;
+use fusiondb::Result;
 use std::sync::Arc;
-use w33dDB::storage::memory::MemoryStorage;
-use w33dDB::execution::Executor;
-use w33dDB::server;
-use w33dDB::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -1,10 +1,10 @@
+use super::wal::{WalEntry, WalManager};
+use super::{Storage, Transaction};
+use crate::common::Result;
 use async_trait::async_trait;
+use parking_lot::RwLock; // Use parking_lot RwLock
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use parking_lot::RwLock; // Use parking_lot RwLock
-use crate::common::{Result, FusionError};
-use super::{Storage, Transaction};
-use super::wal::{WalManager, WalEntry};
 
 #[derive(Clone)]
 pub struct MemoryStorage {
@@ -21,8 +21,12 @@ impl MemoryStorage {
         let entries = wal.replay()?;
         for entry in entries {
             match entry {
-                WalEntry::Put(k, v) => { data.insert(k, v); },
-                WalEntry::Delete(k) => { data.remove(&k); },
+                WalEntry::Put(k, v) => {
+                    data.insert(k, v);
+                }
+                WalEntry::Delete(k) => {
+                    data.remove(&k);
+                }
             }
         }
         println!("Recovered {} entries from WAL", data.len());
@@ -35,7 +39,8 @@ impl MemoryStorage {
 
     pub fn create_snapshot(&self) -> Result<()> {
         let data = self.data.read();
-        self.wal.create_checkpoint(data.iter().map(|(k, v)| (k.clone(), v.clone())))?;
+        self.wal
+            .create_checkpoint(data.iter().map(|(k, v)| (k.clone(), v.clone())))?;
         Ok(())
     }
 
@@ -79,7 +84,7 @@ impl Transaction for MemoryTransaction {
         if let Some(val) = self.write_buffer.get(key) {
             return Ok(val.clone());
         }
-        
+
         // 2. Check storage
         self.storage.get_internal(key)
     }
@@ -105,15 +110,15 @@ impl Transaction for MemoryTransaction {
         let mut wal_entries = Vec::with_capacity(self.write_buffer.len());
         for (k, v) in &self.write_buffer {
             match v {
-                Some(val) => { 
+                Some(val) => {
                     wal_entries.push(WalEntry::Put(k.clone(), val.clone()));
-                },
-                None => { 
+                }
+                None => {
                     wal_entries.push(WalEntry::Delete(k.clone()));
-                },
+                }
             }
         }
-        
+
         // 2. Write Batch to WAL
         if !wal_entries.is_empty() {
             self.storage.wal.append_batch_async(wal_entries).await?;
@@ -123,8 +128,12 @@ impl Transaction for MemoryTransaction {
         let mut data = self.storage.data.write();
         for (k, v) in self.write_buffer {
             match v {
-                Some(val) => { data.insert(k, val); },
-                None => { data.remove(&k); },
+                Some(val) => {
+                    data.insert(k, val);
+                }
+                None => {
+                    data.remove(&k);
+                }
             }
         }
         Ok(())

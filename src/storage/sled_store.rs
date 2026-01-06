@@ -1,8 +1,8 @@
+use super::{Storage, Transaction};
+use crate::common::{FusionError, Result};
 use async_trait::async_trait;
 use sled::Db;
 use std::collections::HashMap;
-use crate::common::{Result, FusionError};
-use super::{Storage, Transaction};
 
 #[derive(Clone)]
 pub struct SledStorage {
@@ -36,8 +36,11 @@ impl Transaction for SledTransaction {
         if let Some(val) = self.write_buffer.get(key) {
             return Ok(val.clone());
         }
-        
-        let res = self.db.get(key).map_err(|e| FusionError::Storage(e.to_string()))?;
+
+        let res = self
+            .db
+            .get(key)
+            .map_err(|e| FusionError::Storage(e.to_string()))?;
         Ok(res.map(|ivec| ivec.to_vec()))
     }
 
@@ -69,7 +72,7 @@ impl Transaction for SledTransaction {
                 results.push((k.to_vec(), v.to_vec()));
             }
         }
-        
+
         // Add new keys from write buffer that match prefix
         for (k, v) in &self.write_buffer {
             if k.starts_with(prefix) {
@@ -80,21 +83,21 @@ impl Transaction for SledTransaction {
                 // We need to check if `k` was already in storage.
                 // This is getting O(N*M).
                 // Correct way: use a merged iterator.
-                
+
                 // Simplified: Just add if not present in results?
                 // But results is Vec.
                 // Let's assume for this MVP, scan consistency is best-effort or requires optimization later.
-                
+
                 // Check if `k` is already in results
                 let already_in = results.iter().any(|(rk, _)| rk == k);
                 if !already_in {
-                     if let Some(val) = v {
-                         results.push((k.clone(), val.clone()));
-                     }
+                    if let Some(val) = v {
+                        results.push((k.clone(), val.clone()));
+                    }
                 }
             }
         }
-        
+
         Ok(results)
     }
 
@@ -106,7 +109,9 @@ impl Transaction for SledTransaction {
                 None => batch.remove(k),
             }
         }
-        self.db.apply_batch(batch).map_err(|e| FusionError::Storage(e.to_string()))?;
+        self.db
+            .apply_batch(batch)
+            .map_err(|e| FusionError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -123,7 +128,9 @@ impl Storage for SledStorage {
 
     async fn create_snapshot(&self) -> Result<()> {
         // Sled handles persistence automatically, but we can flush
-        self.db.flush().map_err(|e| FusionError::Storage(format!("Sled flush error: {}", e)))?;
+        self.db
+            .flush()
+            .map_err(|e| FusionError::Storage(format!("Sled flush error: {}", e)))?;
         Ok(())
     }
 

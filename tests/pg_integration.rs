@@ -1,9 +1,9 @@
+use fusiondb::execution::Executor;
+use fusiondb::server::pg_server;
+use fusiondb::storage::memory::MemoryStorage;
 use std::sync::Arc;
-use tokio_postgres::NoTls;
-use w33dDB::execution::Executor;
-use w33dDB::storage::memory::MemoryStorage;
-use w33dDB::server::pg_server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_postgres::NoTls;
 
 #[tokio::test]
 #[ignore = "Known issue: pgwire 0.37 runtime dispatch failure. Compilation works but trait methods are ignored at runtime."]
@@ -23,9 +23,10 @@ async fn test_pg_protocol_integration() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Connect Client
-    let (client, connection) = tokio_postgres::connect("host=127.0.0.1 port=9999 user=postgres", NoTls)
-        .await
-        .expect("Failed to connect to server");
+    let (client, connection) =
+        tokio_postgres::connect("host=127.0.0.1 port=9999 user=postgres", NoTls)
+            .await
+            .expect("Failed to connect to server");
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -36,7 +37,10 @@ async fn test_pg_protocol_integration() {
     // Test: Simple Query
     // Should print "MINIMAL QUERY CALLED: ..." in server logs
     // And return empty rows (as per MinimalHandler)
-    let rows = client.simple_query("SELECT 1").await.expect("Failed to query");
+    let rows = client
+        .simple_query("SELECT 1")
+        .await
+        .expect("Failed to query");
     // MinimalHandler returns Ok(vec![]), so client gets CommandComplete? No, it gets nothing?
     // simple_query returns vector of messages.
     // If MinimalHandler returns empty vector of responses, client might hang or finish?
