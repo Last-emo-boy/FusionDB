@@ -1,0 +1,38 @@
+
+    fn compare_for_sort(&self, v1: &Value, v2: &Value) -> Ordering {
+        match (v1, v2) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less, // Nulls first (or last, depending on convention. Here assume Less)
+            (_, Value::Null) => Ordering::Greater,
+            
+            (Value::Integer(i1), Value::Integer(i2)) => i1.cmp(i2),
+            (Value::Float(f1), Value::Float(f2)) => f1.partial_cmp(f2).unwrap_or(Ordering::Equal),
+            (Value::Integer(i1), Value::Float(f2)) => (*i1 as f64).partial_cmp(f2).unwrap_or(Ordering::Equal),
+            (Value::Float(f1), Value::Integer(i2)) => f1.partial_cmp(&(*i2 as f64)).unwrap_or(Ordering::Equal),
+            
+            (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
+            (Value::Boolean(b1), Value::Boolean(b2)) => b1.cmp(b2),
+            
+            // For other types, fallback to partial equality check or strict ordering by type discriminant?
+            // Let's implement a simple type-based ordering for disparate types
+            (v1, v2) => {
+                 // Compare by type discriminant roughly
+                 let t1 = self.get_type_order(v1);
+                 let t2 = self.get_type_order(v2);
+                 t1.cmp(&t2)
+            }
+        }
+    }
+
+    fn get_type_order(&self, v: &Value) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Boolean(_) => 1,
+            Value::Integer(_) | Value::Float(_) => 2,
+            Value::String(_) => 3,
+            Value::Blob(_) => 4,
+            Value::Vector(_) => 5,
+            Value::Array(_) => 6,
+            Value::Object(_) => 7,
+        }
+    }

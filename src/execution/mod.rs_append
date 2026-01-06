@@ -1,0 +1,91 @@
+
+    fn json_value_to_fusion_value(&self, v: &serde_json::Value) -> Value {
+        match v {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(b) => Value::Boolean(*b),
+            serde_json::Value::Number(n) => {
+                if n.is_i64() {
+                    Value::Integer(n.as_i64().unwrap())
+                } else {
+                    Value::Float(n.as_f64().unwrap_or(0.0))
+                }
+            },
+            serde_json::Value::String(s) => Value::String(s.clone()),
+            serde_json::Value::Array(arr) => {
+                Value::Array(arr.iter().map(|x| self.json_value_to_fusion_value(x)).collect())
+            },
+            serde_json::Value::Object(obj) => {
+                let mut map = std::collections::HashMap::new();
+                for (k, v) in obj {
+                    map.insert(k.clone(), self.json_value_to_fusion_value(v));
+                }
+                Value::Object(map)
+            },
+        }
+    }
+
+    fn evaluate_function(&self, func: &Function, row: &[Value], schema: &TableSchema) -> Result<Value> {
+        let name = func.name.to_string().to_uppercase();
+        match name.as_str() {
+            "VECTOR_DISTANCE" => {
+                if func.args.len() != 2 {
+                     return Err(FusionError::Execution("VECTOR_DISTANCE requires 2 arguments".to_string()));
+                }
+                
+                let v1 = self.evaluate_arg(&func.args[0], row, schema)?;
+                let v2 = self.evaluate_arg(&func.args[1], row, schema)?;
+
+                self.compute_vector_distance(&v1, &v2)
+            },
+            _ => Err(FusionError::Execution(format!("Unsupported function: {}", name))),
+        }
+    }
+
+    fn evaluate_arg(&self, arg: &FunctionArg, row: &[Value], schema: &TableSchema) -> Result<Value> {
+        match arg {
+            FunctionArg::Named { arg, .. } => self.evaluate_arg_expr(arg, row, schema),
+            FunctionArg::Unnamed(arg) => self.evaluate_arg_expr(arg, row, schema),
+        }
+    }
+
+    fn evaluate_arg_expr(&self, arg_expr: &FunctionArgExpr, row: &[Value], schema: &TableSchema) -> Result<Value> {
+        match arg_expr {
+            FunctionArgExpr::Expr(expr) => self.evaluate_value(expr, row, schema),
+            _ => Err(FusionError::Execution("Unsupported function argument type".to_string())),
+        }
+    }
+
+    fn compute_vector_distance(&self, v1: &Value, v2: &Value) -> Result<Value> {
+        let vec1 = self.extract_vector(v1)?;
+        let vec2 = self.extract_vector(v2)?;
+
+        if vec1.len() != vec2.len() {
+             return Err(FusionError::Execution("Vector dimensions mismatch".to_string()));
+        }
+
+        let mut sum_sq = 0.0;
+        for (a, b) in vec1.iter().zip(vec2.iter()) {
+            sum_sq += (a - b).powi(2);
+        }
+
+        Ok(Value::Float(sum_sq.sqrt()))
+    }
+
+    fn extract_vector(&self, v: &Value) -> Result<Vec<f64>> {
+        match v {
+            Value::Vector(vec) => Ok(vec.iter().map(|&x| x as f64).collect()),
+            Value::Array(arr) => {
+                let mut res = Vec::new();
+                for item in arr {
+                    match item {
+                        Value::Integer(i) => res.push(*i as f64),
+                        Value::Float(f) => res.push(*f),
+                        _ => return Err(FusionError::Execution("Vector elements must be numbers".to_string())),
+                    }
+                }
+                Ok(res)
+            },
+            _ => Err(FusionError::Execution(format!("Value is not a vector: {:?}", v))),
+        }
+    }
+}

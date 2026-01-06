@@ -1,0 +1,70 @@
+
+    fn evaluate_function(&self, func: &Function, row: &[Value], schema: &TableSchema) -> Result<Value> {
+        let name = func.name.to_string().to_uppercase();
+        match name.as_str() {
+            "VECTOR_DISTANCE" => {
+                // Args: v1, v2
+                // We expect 2 args
+                if func.args.len() != 2 {
+                     return Err(FusionError::Execution("VECTOR_DISTANCE requires 2 arguments".to_string()));
+                }
+                
+                let v1 = self.evaluate_arg(&func.args[0], row, schema)?;
+                let v2 = self.evaluate_arg(&func.args[1], row, schema)?;
+
+                self.compute_vector_distance(&v1, &v2)
+            },
+            _ => Err(FusionError::Execution(format!("Unsupported function: {}", name))),
+        }
+    }
+
+    fn evaluate_arg(&self, arg: &FunctionArg, row: &[Value], schema: &TableSchema) -> Result<Value> {
+        match arg {
+            FunctionArg::Named { arg, .. } => self.evaluate_arg_expr(arg, row, schema),
+            FunctionArg::Unnamed(arg) => self.evaluate_arg_expr(arg, row, schema),
+        }
+    }
+
+    fn evaluate_arg_expr(&self, arg_expr: &FunctionArgExpr, row: &[Value], schema: &TableSchema) -> Result<Value> {
+        match arg_expr {
+            FunctionArgExpr::Expr(expr) => self.evaluate_value(expr, row, schema),
+            _ => Err(FusionError::Execution("Unsupported function argument type".to_string())),
+        }
+    }
+
+    fn compute_vector_distance(&self, v1: &Value, v2: &Value) -> Result<Value> {
+        // Simple Euclidean Distance
+        let vec1 = self.extract_vector(v1)?;
+        let vec2 = self.extract_vector(v2)?;
+
+        if vec1.len() != vec2.len() {
+             return Err(FusionError::Execution("Vector dimensions mismatch".to_string()));
+        }
+
+        let mut sum_sq = 0.0;
+        for (a, b) in vec1.iter().zip(vec2.iter()) {
+            sum_sq += (a - b).powi(2);
+        }
+
+        Ok(Value::Float(sum_sq.sqrt()))
+    }
+
+    fn extract_vector(&self, v: &Value) -> Result<Vec<f64>> {
+        match v {
+            Value::Vector(vec) => Ok(vec.iter().map(|&x| x as f64).collect()),
+            Value::Array(arr) => {
+                let mut res = Vec::new();
+                for item in arr {
+                    match item {
+                        Value::Integer(i) => res.push(*i as f64),
+                        Value::Float(f) => res.push(*f),
+                        _ => return Err(FusionError::Execution("Vector elements must be numbers".to_string())),
+                    }
+                }
+                Ok(res)
+            },
+            // Also handle String if it looks like "[1, 2, 3]"?
+            // For now, assume it's parsed as Array or Vector.
+            _ => Err(FusionError::Execution(format!("Value is not a vector: {:?}", v))),
+        }
+    }
