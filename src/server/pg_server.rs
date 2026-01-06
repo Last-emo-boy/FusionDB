@@ -33,6 +33,7 @@ struct Session {
 }
 
 struct PortalData {
+    #[allow(dead_code)]
     statement_name: String,
     query: String,
     params: Vec<Value>,
@@ -508,7 +509,7 @@ impl ExtendedQueryHandler for PgHandler {
             ))
             .await
             .map_err(|_| {
-                PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "Sink Error"))
+                PgWireError::IoError(std::io::Error::other("Sink Error"))
             })?;
         Ok(())
     }

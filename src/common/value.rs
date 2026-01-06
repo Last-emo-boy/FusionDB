@@ -32,7 +32,7 @@ impl Value {
             }
             serde_json::Value::String(s) => Value::String(s.clone()),
             serde_json::Value::Array(arr) => {
-                Value::Array(arr.iter().map(|x| Value::from_json(x)).collect())
+                Value::Array(arr.iter().map(Value::from_json).collect())
             }
             serde_json::Value::Object(obj) => {
                 let mut map = HashMap::new();

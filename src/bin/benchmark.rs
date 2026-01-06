@@ -1,6 +1,6 @@
+#![allow(dead_code, unused_imports)]
+
 use fusiondb::execution::Executor;
-use fusiondb::server;
-use fusiondb::server::http_server::start_http_server;
 use fusiondb::server::tcp_server::start_tcp_server;
 use fusiondb::storage::fusion::FusionStorage;
 use fusiondb::storage::Storage;
@@ -493,10 +493,8 @@ where
                     if response.status().is_success() {
                         let mut h = hist.lock().unwrap();
                         h.record(elapsed).unwrap();
-                    } else {
-                        if rand::rng().random_bool(0.001) {
-                            eprintln!("Request failed: {}", response.status());
-                        }
+                    } else if rand::rng().random_bool(0.001) {
+                        eprintln!("Request failed: {}", response.status());
                     }
                 } else if let Err(e) = res {
                     if rand::rng().random_bool(0.001) {

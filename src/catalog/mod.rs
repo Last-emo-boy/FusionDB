@@ -1,17 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum IndexType {
+    #[default]
     None,
     BTree,
     FTS,
     HNSW,
-}
-
-impl Default for IndexType {
-    fn default() -> Self {
-        IndexType::None
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

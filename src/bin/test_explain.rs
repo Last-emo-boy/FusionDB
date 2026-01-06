@@ -1,6 +1,5 @@
 use fusiondb::execution::Executor;
 use fusiondb::parser::parse_sql;
-use fusiondb::server::http_server;
 use fusiondb::storage::memory::MemoryStorage;
 use std::sync::Arc;
 use tokio::runtime::Runtime;

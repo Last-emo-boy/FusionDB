@@ -86,11 +86,9 @@ impl AggregateAccumulator {
                 }
                 if min.is_none() {
                     *min = Some(val.clone());
-                } else {
-                    if let Some(current) = min {
-                        if val.compare(current) == Ordering::Less {
-                            *min = Some(val.clone());
-                        }
+                } else if let Some(current) = min {
+                    if val.compare(current) == Ordering::Less {
+                        *min = Some(val.clone());
                     }
                 }
             }
@@ -100,11 +98,9 @@ impl AggregateAccumulator {
                 }
                 if max.is_none() {
                     *max = Some(val.clone());
-                } else {
-                    if let Some(current) = max {
-                        if val.compare(current) == Ordering::Greater {
-                            *max = Some(val.clone());
-                        }
+                } else if let Some(current) = max {
+                    if val.compare(current) == Ordering::Greater {
+                        *max = Some(val.clone());
                     }
                 }
             }
@@ -536,13 +532,11 @@ impl Executor {
 
         let mut index_type = IndexType::BTree;
         for opt in index_options {
-            if let sqlparser::ast::IndexOption::Using(algo) = opt {
-                if let sqlparser::ast::IndexType::Custom(ident) = algo {
-                    if ident.value.eq_ignore_ascii_case("FTS") {
-                        index_type = IndexType::FTS;
-                    } else if ident.value.eq_ignore_ascii_case("HNSW") {
-                        index_type = IndexType::HNSW;
-                    }
+            if let sqlparser::ast::IndexOption::Using(sqlparser::ast::IndexType::Custom(ident)) = opt {
+                if ident.value.eq_ignore_ascii_case("FTS") {
+                    index_type = IndexType::FTS;
+                } else if ident.value.eq_ignore_ascii_case("HNSW") {
+                    index_type = IndexType::HNSW;
                 }
             }
         }
@@ -726,7 +720,7 @@ impl Executor {
                 let mut count = 0;
                 for row in &values.rows {
                     let mut row_values = Vec::new();
-                    for (_i, expr) in row.iter().enumerate() {
+                    for expr in row.iter() {
                         let val = self
                             .evaluate_value(expr, &[], &schema, params)
                             .unwrap_or(Value::Null);
@@ -780,14 +774,12 @@ impl Executor {
                                         vec.clone(),
                                     )?;
                                 }
-                            } else {
-                                if let Some(val_str) = self.value_to_index_string(val) {
-                                    let index_key = format!(
-                                        "index:{}:{}:{}:{}",
-                                        table_name_str, col.name, val_str, row_id
-                                    );
-                                    txn.put(index_key.as_bytes(), &[]).await?;
-                                }
+                            } else if let Some(val_str) = self.value_to_index_string(val) {
+                                let index_key = format!(
+                                    "index:{}:{}:{}:{}",
+                                    table_name_str, col.name, val_str, row_id
+                                );
+                                txn.put(index_key.as_bytes(), &[]).await?;
                             }
                         }
                     }
@@ -2147,8 +2139,8 @@ impl Executor {
         group_key: &[Value],
         group_exprs: &[Expr],
         agg_map: &std::collections::HashMap<Expr, Value>,
-        schema: &TableSchema,
-        params: &[Value],
+        _schema: &TableSchema,
+        _params: &[Value],
     ) -> Result<Value> {
         // 1. Check if it is a pre-calculated aggregate
         if let Some(val) = agg_map.get(expr) {
@@ -2163,17 +2155,17 @@ impl Executor {
         // 3. Recurse / Evaluate
         match expr {
             Expr::BinaryOp { left, op, right } => {
-                let l = self.evaluate_final_group_expr(left, group_key, group_exprs, agg_map, schema, params)?;
-                let r = self.evaluate_final_group_expr(right, group_key, group_exprs, agg_map, schema, params)?;
+                let l = self.evaluate_final_group_expr(left, group_key, group_exprs, agg_map, _schema, _params)?;
+                let r = self.evaluate_final_group_expr(right, group_key, group_exprs, agg_map, _schema, _params)?;
                 self.evaluate_binary_op(l, op, r)
             },
-            Expr::Nested(e) => self.evaluate_final_group_expr(e, group_key, group_exprs, agg_map, schema, params),
+            Expr::Nested(e) => self.evaluate_final_group_expr(e, group_key, group_exprs, agg_map, _schema, _params),
             Expr::Value(v) => Ok(self.sql_value_to_fusion_value(&v.value)),
             Expr::Identifier(ident) => {
                 Err(FusionError::Execution(format!("Column '{}' must appear in the GROUP BY clause or be used in an aggregate function", ident.value)))
             },
             Expr::UnaryOp { op, expr } => {
-                 let val = self.evaluate_final_group_expr(expr, group_key, group_exprs, agg_map, schema, params)?;
+                 let val = self.evaluate_final_group_expr(expr, group_key, group_exprs, agg_map, _schema, _params)?;
                  match op {
                      sqlparser::ast::UnaryOperator::Minus => {
                          match val {
@@ -2723,6 +2715,7 @@ impl Executor {
         v1.compare(v2)
     }
 
+    #[allow(dead_code)]
     fn get_type_order(&self, v: &Value) -> u8 {
         v.get_type_order()
     }

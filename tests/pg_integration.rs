@@ -2,7 +2,7 @@ use fusiondb::execution::Executor;
 use fusiondb::server::pg_server;
 use fusiondb::storage::memory::MemoryStorage;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+// use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::NoTls;
 
 #[tokio::test]

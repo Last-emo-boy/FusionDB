@@ -154,6 +154,7 @@ impl SsTable {
 
 pub struct SsTableIterator {
     file: tokio::fs::File,
+    #[allow(dead_code)]
     index_keys: Vec<Vec<u8>>,
     index_offsets: Vec<u64>,
     current_block_idx: usize,
