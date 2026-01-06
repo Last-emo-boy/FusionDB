@@ -532,7 +532,9 @@ impl Executor {
 
         let mut index_type = IndexType::BTree;
         for opt in index_options {
-            if let sqlparser::ast::IndexOption::Using(sqlparser::ast::IndexType::Custom(ident)) = opt {
+            if let sqlparser::ast::IndexOption::Using(sqlparser::ast::IndexType::Custom(ident)) =
+                opt
+            {
                 if ident.value.eq_ignore_ascii_case("FTS") {
                     index_type = IndexType::FTS;
                 } else if ident.value.eq_ignore_ascii_case("HNSW") {

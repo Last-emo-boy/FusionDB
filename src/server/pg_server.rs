@@ -508,9 +508,7 @@ impl ExtendedQueryHandler for PgHandler {
                 pgwire::messages::response::ReadyForQuery::new(transaction_status),
             ))
             .await
-            .map_err(|_| {
-                PgWireError::IoError(std::io::Error::other("Sink Error"))
-            })?;
+            .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
         Ok(())
     }
 
