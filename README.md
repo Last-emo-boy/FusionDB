@@ -2,8 +2,8 @@
 
 **FusionDB** is a high-performance, multimodal, ACID-compliant database written in Rust. It is designed to be "out-of-the-box" ready (like Redis) while offering powerful SQL capabilities, vector search, and full-text search in a single engine.
 
-![CI Status](https://github.com/last-emo-boy/w33dDB/actions/workflows/ci.yml/badge.svg)
-![Release](https://img.shields.io/github/v/release/last-emo-boy/w33dDB)
+![CI Status](https://github.com/last-emo-boy/FusionDB/actions/workflows/ci.yml/badge.svg)
+![Release](https://img.shields.io/github/v/release/last-emo-boy/FusionDB)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
 ## 🌟 Key Features
