@@ -184,7 +184,7 @@ impl Transaction for MvccTransaction {
         Ok(())
     }
 
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    async fn scan_prefix(&self, prefix: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // Optimization: Stream and filter directly without intermediate HashMap
         // SkipMap is already sorted by Key ASC, Version DESC.
         // So for a given Key, we encounter the newest version first.
@@ -250,6 +250,22 @@ impl Transaction for MvccTransaction {
         Ok(result_map.into_iter().collect())
     }
 
+    async fn scan_range(&self, _start: &[u8], _end: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("MvccTransaction::scan_range")
+    }
+
+    async fn count_prefix(&self, _prefix: &[u8]) -> Result<usize> {
+        unimplemented!("MvccTransaction::count_prefix")
+    }
+
+    async fn first(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("MvccTransaction::first")
+    }
+
+    async fn last(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("MvccTransaction::last")
+    }
+
     async fn commit(self: Box<Self>) -> Result<()> {
         if self.write_buffer.is_empty() {
             return Ok(());
@@ -285,6 +301,10 @@ impl Transaction for MvccTransaction {
 
     async fn rollback(self: Box<Self>) -> Result<()> {
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

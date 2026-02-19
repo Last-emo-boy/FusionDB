@@ -285,7 +285,7 @@ async fn handle_tables(State(state): State<AppState>) -> (StatusCode, Json<Vec<T
     match state.storage.begin_transaction().await {
         Ok(txn) => {
             // Scan for keys starting with "schema:"
-            match txn.scan_prefix(b"schema:").await {
+            match txn.scan_prefix(b"schema:", None).await {
                 Ok(pairs) => {
                     let mut tables = Vec::new();
                     for (_, value) in pairs {

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 // use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
+use moka::sync::Cache;
 
 const MEMTABLE_THRESHOLD: usize = 32 * 1024 * 1024; // 32MB
 
@@ -57,12 +58,14 @@ pub struct LsmStorage {
     wal: Arc<WalManager>,
     next_memtable_id: Arc<AtomicU64>,
     flush_notify: Arc<Notify>,
+    block_cache: Arc<Cache<(u64, u64), Vec<u8>>>,
 }
 
 impl LsmStorage {
     pub fn new(path: &str) -> Result<Self> {
         let wal = WalManager::new(path)?;
         let active = MemTable::new(1);
+        let block_cache = Arc::new(Cache::new(10_000));
 
         // Load existing SSTables
         let mut sstables_vec = Vec::new();
@@ -88,7 +91,7 @@ impl LsmStorage {
                 // But new() is synchronous. We can block on it since it's startup.
                 let rt = tokio::runtime::Handle::current();
                 for (id, path) in files {
-                    if let Ok(sst) = rt.block_on(SsTable::open(path, id)) {
+                    if let Ok(sst) = rt.block_on(SsTable::open(path, id, block_cache.clone())) {
                         sstables_vec.push(Arc::new(sst));
                     }
                 }
@@ -105,6 +108,7 @@ impl LsmStorage {
             wal: Arc::new(wal),
             next_memtable_id: Arc::new(AtomicU64::new(next_id)),
             flush_notify: Arc::new(Notify::new()),
+            block_cache,
         };
 
         // Start background flush thread
@@ -157,14 +161,19 @@ impl LsmStorage {
                     block_count += 1;
 
                     if block_buffer.len() >= 4096 {
-                        builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer);
+                        if let Err(e) = builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer).await {
+                             eprintln!("Failed to flush block: {:?}", e);
+                             break;
+                        }
                         block_buffer.clear();
                         block_count = 0;
                     }
                 }
 
                 if !block_buffer.is_empty() {
-                    builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer);
+                    if let Err(e) = builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer).await {
+                         eprintln!("Failed to flush last block: {:?}", e);
+                    }
                 }
 
                 if let Err(e) = builder.finish().await {
@@ -173,7 +182,7 @@ impl LsmStorage {
                 }
 
                 // Open and Register SSTable
-                match SsTable::open(sst_path, mem.id).await {
+                match SsTable::open(sst_path, mem.id, self.block_cache.clone()).await {
                     Ok(sst) => {
                         let mut sstables = self.sstables.write().unwrap();
                         sstables.push(Arc::new(sst));
@@ -269,7 +278,7 @@ impl Transaction for LsmTransaction {
         Ok(())
     }
 
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    async fn scan_prefix(&self, prefix: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // Simple scan on active memtable for benchmark
         // Merging multiple sources is complex (LSM Merge Iterator).
         // For this step, we just scan active + immutable.
@@ -340,6 +349,22 @@ impl Transaction for LsmTransaction {
         Ok(res)
     }
 
+    async fn scan_range(&self, _start: &[u8], _end: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("LsmTransaction::scan_range")
+    }
+
+    async fn count_prefix(&self, _prefix: &[u8]) -> Result<usize> {
+        unimplemented!("LsmTransaction::count_prefix")
+    }
+
+    async fn first(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("LsmTransaction::first")
+    }
+
+    async fn last(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("LsmTransaction::last")
+    }
+
     async fn commit(self: Box<Self>) -> Result<()> {
         if self.write_buffer.is_empty() {
             return Ok(());
@@ -387,6 +412,10 @@ impl Transaction for LsmTransaction {
 
     async fn rollback(self: Box<Self>) -> Result<()> {
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

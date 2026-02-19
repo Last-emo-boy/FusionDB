@@ -99,10 +99,26 @@ impl Transaction for MemoryTransaction {
         Ok(())
     }
 
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    async fn scan_prefix(&self, prefix: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let results = self.storage.scan_prefix_internal(prefix)?;
         // TODO: Merge write buffer logic if needed (simplified for now)
         Ok(results)
+    }
+
+    async fn scan_range(&self, _start: &[u8], _end: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("MemoryTransaction::scan_range")
+    }
+
+    async fn count_prefix(&self, _prefix: &[u8]) -> Result<usize> {
+        unimplemented!("MemoryTransaction::count_prefix")
+    }
+
+    async fn first(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("MemoryTransaction::first")
+    }
+
+    async fn last(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("MemoryTransaction::last")
     }
 
     async fn commit(self: Box<Self>) -> Result<()> {
@@ -141,6 +157,10 @@ impl Transaction for MemoryTransaction {
 
     async fn rollback(self: Box<Self>) -> Result<()> {
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

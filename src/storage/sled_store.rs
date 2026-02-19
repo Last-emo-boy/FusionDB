@@ -54,7 +54,7 @@ impl Transaction for SledTransaction {
         Ok(())
     }
 
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    async fn scan_prefix(&self, prefix: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // Naive scan merge
         // Note: This does not support "read your own writes" fully if scan logic is complex
         // But for basic atomic transaction, this is acceptable for now.
@@ -101,6 +101,22 @@ impl Transaction for SledTransaction {
         Ok(results)
     }
 
+    async fn scan_range(&self, _start: &[u8], _end: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("SledTransaction::scan_range")
+    }
+
+    async fn count_prefix(&self, _prefix: &[u8]) -> Result<usize> {
+        unimplemented!("SledTransaction::count_prefix")
+    }
+
+    async fn first(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("SledTransaction::first")
+    }
+
+    async fn last(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        unimplemented!("SledTransaction::last")
+    }
+
     async fn commit(self: Box<Self>) -> Result<()> {
         let mut batch = sled::Batch::default();
         for (k, v) in self.write_buffer {
@@ -116,7 +132,13 @@ impl Transaction for SledTransaction {
     }
 
     async fn rollback(self: Box<Self>) -> Result<()> {
+        // Sled Transaction is usually closure-based, but we are adapting it.
+        // Here we just drop the batch.
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

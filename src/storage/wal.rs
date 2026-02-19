@@ -233,54 +233,105 @@ impl WalManager {
     pub fn replay(&self) -> Result<Vec<WalEntry>> {
         // Replay runs before any writes, so it's safe to read the file directly.
         // But we should take the lock just in case.
-        let _guard = self
+        let mut guard = self
             .file
             .lock()
             .map_err(|_| FusionError::Storage("WAL Lock poisoned".to_string()))?;
 
-        let file = File::open(&self.path)
+        let mut file = File::open(&self.path)
             .map_err(|e| FusionError::Storage(format!("Failed to open WAL for replay: {}", e)))?;
+        
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
+        let mut valid_pos = 0;
 
         loop {
+            // Check if we are at EOF before reading
+            // This prevents UnexpectedEof if file ends cleanly
+            // But BufReader doesn't have EOF check easily without fill_buf.
+            // We rely on read_exact returning UnexpectedEof for the first byte.
+
             let mut opcode = [0u8; 1];
-            if let Err(e) = reader.read_exact(&mut opcode) {
-                if e.kind() == io::ErrorKind::UnexpectedEof {
-                    break;
-                }
-                return Err(FusionError::Storage(format!("WAL Replay Error: {}", e)));
+            match reader.read_exact(&mut opcode) {
+                Ok(_) => {},
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(FusionError::Storage(format!("WAL Replay Error reading OpCode: {}", e))),
             }
+
+            // We read OpCode (1 byte). Now try to read the rest.
+            // If any of these fail with UnexpectedEof, it's a partial record.
+            
+            let mut current_record_len = 1; // OpCode
+
+            let read_u32 = |r: &mut BufReader<File>, len_counter: &mut usize| -> Result<u32> {
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf).map_err(|e| {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        FusionError::Storage("Partial Record".to_string())
+                    } else {
+                        FusionError::Storage(format!("WAL Read Error: {}", e))
+                    }
+                })?;
+                *len_counter += 4;
+                Ok(u32::from_le_bytes(buf))
+            };
+
+            let read_vec = |r: &mut BufReader<File>, len: usize, len_counter: &mut usize| -> Result<Vec<u8>> {
+                let mut buf = vec![0u8; len];
+                r.read_exact(&mut buf).map_err(|e| {
+                     if e.kind() == io::ErrorKind::UnexpectedEof {
+                        FusionError::Storage("Partial Record".to_string())
+                    } else {
+                        FusionError::Storage(format!("WAL Read Error: {}", e))
+                    }
+                })?;
+                *len_counter += len;
+                Ok(buf)
+            };
 
             match opcode[0] {
                 1 => {
                     // Put
-                    let mut k_len_buf = [0u8; 4];
-                    reader.read_exact(&mut k_len_buf).map_err(Self::io_err)?;
-                    let k_len = u32::from_le_bytes(k_len_buf) as usize;
+                    let res = (|| -> Result<WalEntry> {
+                        let k_len = read_u32(&mut reader, &mut current_record_len)? as usize;
+                        let k = read_vec(&mut reader, k_len, &mut current_record_len)?;
+                        let v_len = read_u32(&mut reader, &mut current_record_len)? as usize;
+                        let v = read_vec(&mut reader, v_len, &mut current_record_len)?;
+                        Ok(WalEntry::Put(k, v))
+                    })();
 
-                    let mut k = vec![0u8; k_len];
-                    reader.read_exact(&mut k).map_err(Self::io_err)?;
-
-                    let mut v_len_buf = [0u8; 4];
-                    reader.read_exact(&mut v_len_buf).map_err(Self::io_err)?;
-                    let v_len = u32::from_le_bytes(v_len_buf) as usize;
-
-                    let mut v = vec![0u8; v_len];
-                    reader.read_exact(&mut v).map_err(Self::io_err)?;
-
-                    entries.push(WalEntry::Put(k, v));
+                    match res {
+                        Ok(entry) => {
+                            entries.push(entry);
+                            valid_pos += current_record_len as u64;
+                        }
+                        Err(FusionError::Storage(msg)) if msg == "Partial Record" => {
+                            println!("WAL Replay: Found partial record at end. Truncating.");
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 2 => {
                     // Delete
-                    let mut k_len_buf = [0u8; 4];
-                    reader.read_exact(&mut k_len_buf).map_err(Self::io_err)?;
-                    let k_len = u32::from_le_bytes(k_len_buf) as usize;
+                    let res = (|| -> Result<WalEntry> {
+                         let k_len = read_u32(&mut reader, &mut current_record_len)? as usize;
+                         let k = read_vec(&mut reader, k_len, &mut current_record_len)?;
+                         Ok(WalEntry::Delete(k))
+                    })();
 
-                    let mut k = vec![0u8; k_len];
-                    reader.read_exact(&mut k).map_err(Self::io_err)?;
-
-                    entries.push(WalEntry::Delete(k));
+                    match res {
+                        Ok(entry) => {
+                            entries.push(entry);
+                            valid_pos += current_record_len as u64;
+                        }
+                        Err(FusionError::Storage(msg)) if msg == "Partial Record" => {
+                             println!("WAL Replay: Found partial record at end. Truncating.");
+                             break;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 _ => {
                     return Err(FusionError::Storage(format!(
@@ -289,6 +340,34 @@ impl WalManager {
                     )))
                 }
             }
+        }
+        
+        // If we found partial data (valid_pos < file_len), truncate the file
+        if valid_pos < file_len {
+            println!("Truncating WAL from {} to {} bytes", file_len, valid_pos);
+            // We need to re-open or use the file handle?
+            // BufReader took ownership. We can use the file path.
+            // But we hold the lock on `guard` (which is the writer).
+            // We should update the writer too?
+            // The writer is in `self.file`. `guard` is the MutexGuard.
+            // *guard is Option<BufWriter<File>>.
+            
+            // Drop reader to close file handle
+            drop(reader);
+            
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .map_err(|e| FusionError::Storage(format!("Failed to open WAL for truncation: {}", e)))?;
+            file.set_len(valid_pos).map_err(|e| FusionError::Storage(format!("Failed to truncate WAL: {}", e)))?;
+            
+            // Re-initialize the writer in the mutex
+             let file_append = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(|e| FusionError::Storage(format!("Failed to re-open WAL: {}", e)))?;
+            *guard = Some(BufWriter::new(file_append));
         }
 
         Ok(entries)
