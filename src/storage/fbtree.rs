@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -133,7 +132,7 @@ impl FBTree {
                 anchors: Vec::new(),
             };
             
-            for (i, &child_id) in current_level_ids.iter().enumerate() {
+            for (_i, &child_id) in current_level_ids.iter().enumerate() {
                 if current_inner.children.len() >= FANOUT {
                      // Flush inner
                      let mut node = Node::Inner(current_inner);
@@ -315,7 +314,7 @@ impl FBTree {
     }
     
     // Iterator
-    pub fn scan(&self, start_key: &[u8]) -> FBTreeIterator {
+    pub fn scan(&self, start_key: &[u8]) -> FBTreeIterator<'_> {
         let mut curr = self.root;
         // 1. Descent to leaf
         loop {

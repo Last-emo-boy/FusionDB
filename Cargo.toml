@@ -33,6 +33,17 @@ fastbloom = { version = "0.14.0", features = ["serde"] }
 hora = "0.1.1"
 rayon = "1.11.0"
 roaring = { version = "0.11.3", features = ["serde"] }
+openraft = { version = "0.9", features = ["serde"] }
+toml = "0.8"
+crc32fast = "1.4"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+base64 = "0.22"
 
 [[bin]]
 name = "fusiondb"

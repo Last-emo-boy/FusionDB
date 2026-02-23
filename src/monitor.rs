@@ -2,9 +2,15 @@ use lazy_static::lazy_static;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
+
+/// Default slow query threshold: 100ms
+const DEFAULT_SLOW_QUERY_THRESHOLD_MS: u64 = 100;
 
 lazy_static! {
     pub static ref GLOBAL_METRICS: Metrics = Metrics::default();
+    pub static ref SLOW_QUERY_LOG: SlowQueryLog = SlowQueryLog::new(DEFAULT_SLOW_QUERY_THRESHOLD_MS);
 }
 
 #[derive(Default, Serialize)]
@@ -18,6 +24,86 @@ pub struct Metrics {
     pub fts_doc_hits: AtomicU64,
     pub wal_write_count: AtomicU64,
     pub wal_write_bytes: AtomicU64,
+    pub query_count: AtomicU64,
+    pub slow_query_count: AtomicU64,
+    pub query_total_us: AtomicU64,
+}
+
+/// A single slow query log entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowQueryEntry {
+    pub sql: String,
+    pub duration_ms: f64,
+    pub timestamp: String,
+}
+
+/// Ring buffer of recent slow queries.
+pub struct SlowQueryLog {
+    entries: Mutex<Vec<SlowQueryEntry>>,
+    threshold_ms: AtomicU64,
+    max_entries: usize,
+}
+
+impl SlowQueryLog {
+    pub fn new(threshold_ms: u64) -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            threshold_ms: AtomicU64::new(threshold_ms),
+            max_entries: 100,
+        }
+    }
+
+    pub fn set_threshold_ms(&self, ms: u64) {
+        self.threshold_ms.store(ms, Ordering::Relaxed);
+    }
+
+    pub fn threshold_ms(&self) -> u64 {
+        self.threshold_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn record(&self, sql: &str, duration: Duration) {
+        let ms = duration.as_secs_f64() * 1000.0;
+        GLOBAL_METRICS.query_count.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_METRICS.query_total_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+
+        let threshold = self.threshold_ms.load(Ordering::Relaxed) as f64;
+        if ms >= threshold {
+            GLOBAL_METRICS.slow_query_count.fetch_add(1, Ordering::Relaxed);
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let entry = SlowQueryEntry {
+                sql: if sql.len() > 500 { format!("{}...", &sql[..500]) } else { sql.to_string() },
+                duration_ms: ms,
+                timestamp: format!("{:.3}", now.as_secs_f64()),
+            };
+
+            eprintln!("[slow-query] {:.2}ms | {}", ms, &entry.sql);
+
+            if let Ok(mut entries) = self.entries.lock() {
+                if entries.len() >= self.max_entries {
+                    entries.remove(0);
+                }
+                entries.push(entry);
+            }
+        }
+    }
+
+    pub fn recent(&self) -> Vec<SlowQueryEntry> {
+        self.entries.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.clear();
+        }
+    }
+}
+
+/// Record a query execution for monitoring.
+pub fn record_query(sql: &str, duration: Duration) {
+    SLOW_QUERY_LOG.record(sql, duration);
 }
 
 #[derive(Default)]
@@ -50,6 +136,9 @@ impl Metrics {
         self.fts_doc_hits.store(0, Ordering::Relaxed);
         self.wal_write_count.store(0, Ordering::Relaxed);
         self.wal_write_bytes.store(0, Ordering::Relaxed);
+        self.query_count.store(0, Ordering::Relaxed);
+        self.slow_query_count.store(0, Ordering::Relaxed);
+        self.query_total_us.store(0, Ordering::Relaxed);
     }
 }
 

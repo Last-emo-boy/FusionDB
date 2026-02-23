@@ -1,0 +1,963 @@
+use crate::catalog::{Column, IndexType, TableSchema};
+use crate::common::{FusionError, Result, Value};
+use crate::storage::Transaction;
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause,
+    OrderByKind, SelectItem, SetExpr, TableFactor,
+};
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
+use super::{AggregateAccumulator, Executor, QueryResult};
+
+impl Executor {
+    pub(crate) async fn handle_query(
+        &self,
+        query: &sqlparser::ast::Query,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        // Materialize CTEs (WITH ... AS) as temporary tables in the transaction
+        let mut cte_names: Vec<String> = Vec::new();
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                let cte_name = cte.alias.name.value.clone();
+                let result = Box::pin(self.handle_query(&cte.query, txn, params)).await?;
+                if let QueryResult::Select { columns, rows } = result {
+                    use crate::catalog::{Column, IndexType, TableSchema};
+
+                    // Build schema: synthetic _rowid PK + CTE columns
+                    let mut cols = vec![Column {
+                        name: "_rowid".to_string(),
+                        data_type: "INTEGER".to_string(),
+                        is_primary: true,
+                        is_indexed: true,
+                        index_type: IndexType::BTree,
+                        default_value: None,
+                        is_nullable: false,
+                        is_unique: true,
+                        check_expr: None,
+                    }];
+                    cols.extend(columns.iter().map(|c| Column {
+                        name: c.clone(),
+                        data_type: "TEXT".to_string(),
+                        is_primary: false,
+                        is_indexed: false,
+                        index_type: IndexType::None,
+                        default_value: None,
+                        is_nullable: true,
+                        is_unique: false,
+                        check_expr: None,
+                    }));
+                    let schema = TableSchema::new(cte_name.clone(), cols);
+                    let schema_key = format!("schema:{}", cte_name);
+                    let schema_bytes = bincode::serialize(&schema)
+                        .map_err(|e| FusionError::Execution(format!("CTE schema error: {}", e)))?;
+                    txn.put(schema_key.as_bytes(), &schema_bytes).await?;
+
+                    for (i, row) in rows.iter().enumerate() {
+                        // Prepend synthetic _rowid to each row
+                        let mut full_row = vec![Value::Integer(i as i64)];
+                        full_row.extend(row.iter().cloned());
+                        let pk_str = crate::common::encoding::encode_i64_comparable(i as i64);
+                        let key = format!("data:{}:{}", cte_name, pk_str);
+                        let val = crate::common::encoding::RowEncoder::encode(&full_row);
+                        txn.put(key.as_bytes(), &val).await?;
+                    }
+                    cte_names.push(cte_name);
+                }
+            }
+        }
+
+        let result = self.handle_query_inner(query, txn, params).await;
+
+        // Cleanup CTE temporary tables
+        for name in &cte_names {
+            let _ = txn.delete(format!("schema:{}", name).as_bytes()).await;
+            let prefix = format!("data:{}:", name);
+            if let Ok(entries) = txn.scan_prefix(prefix.as_bytes(), None).await {
+                for (k, _) in entries {
+                    let _ = txn.delete(&k).await;
+                }
+            }
+        }
+
+        result
+    }
+
+    async fn handle_query_inner(
+        &self,
+        query: &sqlparser::ast::Query,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        if let SetExpr::Select(select) = &query.body.as_ref() {
+            let is_join = select.from.len() > 1
+                || (!select.from.is_empty() && !select.from[0].joins.is_empty());
+
+            // Extract Limit
+            let (limit, offset) = match &query.limit_clause {
+                Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+                    let limit = if let Some(limit_expr) = limit {
+                        match limit_expr {
+                            Expr::Value(sqlparser::ast::ValueWithSpan {
+                                value: sqlparser::ast::Value::Number(n, _),
+                                ..
+                            }) => Some(n.parse::<usize>().unwrap_or(usize::MAX)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let offset = if let Some(offset_struct) = offset {
+                        match &offset_struct.value {
+                            Expr::Value(sqlparser::ast::ValueWithSpan {
+                                value: sqlparser::ast::Value::Number(n, _),
+                                ..
+                            }) => n.parse::<usize>().unwrap_or(0),
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+
+                    (limit, offset)
+                }
+                _ => (None, 0),
+            };
+
+            // Push down limit only if no ORDER BY and no GROUP BY (simplified)
+            let is_group_by_none = matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty());
+            
+            // Optimization: Aggregates on PK (COUNT(*), MIN(id), MAX(id))
+            if !is_join && select.selection.is_none() && is_group_by_none {
+                 let mut supported = true;
+                 let mut result_row = Vec::new();
+                 let mut col_names = Vec::new();
+
+                 if let Some(table) = select.from.first() {
+                    if let TableFactor::Table { name, .. } = &table.relation {
+                        let table_name_str = name.to_string();
+                        let schema_key = format!("schema:{}", table_name_str);
+                        if let Ok(Some(schema_bytes)) = txn.get(schema_key.as_bytes()).await {
+                            if let Ok(schema) = bincode::deserialize::<TableSchema>(&schema_bytes) {
+                                
+                                for proj_item in &select.projection {
+                                    let expr = match proj_item {
+                                        SelectItem::UnnamedExpr(expr) => Some(expr),
+                                        SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                                        _ => None,
+                                    };
+
+                                    let mut item_handled = false;
+                                    if let Some(Expr::Function(func)) = expr {
+                                        let func_name = func.name.to_string().to_uppercase();
+                                        if func_name == "COUNT" {
+                                             if let FunctionArguments::List(args) = &func.args {
+                                                 if args.args.len() == 1 {
+                                                     if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) = &args.args[0] {
+                                                         let prefix = format!("data:{}:", table_name_str);
+                                                         let count = txn.count_prefix(prefix.as_bytes()).await?;
+                                                         result_row.push(Value::Integer(count as i64));
+                                                         col_names.push("COUNT(*)".to_string());
+                                                         item_handled = true;
+                                                     }
+                                                 }
+                                             }
+                                        } else if func_name == "MAX" || func_name == "MIN" {
+                                             if let FunctionArguments::List(args) = &func.args {
+                                                 if args.args.len() == 1 {
+                                                     if let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) = &args.args[0] {
+                                                         let mut pk_idx = None;
+                                                         for (i, col) in schema.columns.iter().enumerate() {
+                                                             if col.name.eq_ignore_ascii_case(&ident.value) {
+                                                                 if col.is_primary {
+                                                                     pk_idx = Some(i);
+                                                                 }
+                                                                 break;
+                                                             }
+                                                         }
+
+                                                         if let Some(idx) = pk_idx {
+                                                             let prefix = format!("data:{}:", table_name_str);
+                                                             let min_key = prefix.as_bytes().to_vec();
+                                                             let mut max_key = prefix.as_bytes().to_vec();
+                                                             max_key.push(0xFF);
+                                                             
+                                                             let res = if func_name == "MIN" {
+                                                                 txn.first(&min_key, &max_key).await?
+                                                             } else {
+                                                                 txn.last(&min_key, &max_key).await?
+                                                             };
+
+                                                             let val = if let Some((_, v)) = res {
+                                                                 let row: Vec<Value> = crate::common::encoding::RowDecoder::decode_partial(&v, &[idx]).unwrap_or(vec![Value::Null; idx + 1]);
+                                                                 if idx < row.len() {
+                                                                     row[idx].clone()
+                                                                 } else {
+                                                                     Value::Null
+                                                                 }
+                                                             } else {
+                                                                 Value::Null
+                                                             };
+                                                             result_row.push(val);
+                                                             col_names.push(format!("{}({})", func_name, ident.value));
+                                                             item_handled = true;
+                                                         }
+                                                     }
+                                                 }
+                                             }
+                                        }
+                                    }
+                                    
+                                    if !item_handled {
+                                        supported = false;
+                                        break;
+                                    }
+                                }
+                                
+                                if supported && !result_row.is_empty() {
+                                    return Ok(QueryResult::Select {
+                                        columns: col_names,
+                                        rows: vec![result_row],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                 }
+            }
+
+            let push_down_limit = if is_group_by_none {
+                limit.map(|l| l + offset)
+            } else {
+                None
+            };
+
+            let is_wildcard = select
+                .projection
+                .iter()
+                .any(|item| matches!(item, SelectItem::Wildcard(_)));
+
+            // Calculate projection hint for scan pushdown
+            let projection_hint: Option<Vec<String>> = if is_wildcard {
+                None
+            } else {
+                let mut cols = HashSet::new();
+                for item in &select.projection {
+                    match item {
+                         SelectItem::UnnamedExpr(expr) => self.extract_columns_from_expr(expr, &mut cols),
+                         SelectItem::ExprWithAlias { expr, .. } => self.extract_columns_from_expr(expr, &mut cols),
+                         _ => {}
+                    }
+                }
+                if let Some(selection) = &select.selection {
+                    self.extract_columns_from_expr(selection, &mut cols);
+                }
+                if let Some(order_by) = &query.order_by {
+                    if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+                         for expr in exprs {
+                             self.extract_columns_from_expr(&expr.expr, &mut cols);
+                         }
+                    }
+                }
+                if cols.is_empty() {
+                    Some(vec![])
+                } else {
+                    Some(cols.into_iter().collect())
+                }
+            };
+
+            // Pre-materialize subqueries in the WHERE clause
+            let materialized_selection = if let Some(sel) = &select.selection {
+                if Self::contains_subquery(sel) {
+                    Some(self.materialize_subqueries(sel, txn, params).await?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let effective_selection = materialized_selection.as_ref().or(select.selection.as_ref());
+
+            // Recompute projection hint if subqueries were materialized
+            let projection_hint = if materialized_selection.is_some() && !is_wildcard {
+                let mut cols = HashSet::new();
+                for item in &select.projection {
+                    match item {
+                        SelectItem::UnnamedExpr(expr) => self.extract_columns_from_expr(expr, &mut cols),
+                        SelectItem::ExprWithAlias { expr, .. } => self.extract_columns_from_expr(expr, &mut cols),
+                        _ => {}
+                    }
+                }
+                if let Some(sel) = effective_selection {
+                    self.extract_columns_from_expr(sel, &mut cols);
+                }
+                if let Some(order_by) = &query.order_by {
+                    if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+                        for expr in exprs {
+                            self.extract_columns_from_expr(&expr.expr, &mut cols);
+                        }
+                    }
+                }
+                if cols.is_empty() { Some(vec![]) } else { Some(cols.into_iter().collect()) }
+            } else {
+                projection_hint
+            };
+
+            let sel_option = effective_selection.cloned();
+
+            let (mut schema, mut rows) = if is_join {
+                self.execute_join(&select.from, &sel_option, txn, params)
+                    .await?
+            } else if let Some(table) = select.from.first() {
+                self.scan_single_table(
+                    &table.relation,
+                    &sel_option,
+                    &projection_hint,
+                    txn,
+                    params,
+                    push_down_limit,
+                    query.order_by.as_ref(),
+                )
+                .await?
+            } else {
+                // No FROM clause: evaluate expressions directly (e.g., SELECT 1, SELECT 'hello')
+                let empty_schema = TableSchema::new("".to_string(), vec![]);
+                let empty_row: Vec<Value> = vec![];
+                let mut col_names = Vec::new();
+                let mut result_row = Vec::new();
+                for item in &select.projection {
+                    match item {
+                        SelectItem::UnnamedExpr(expr) => {
+                            col_names.push(format!("{}", expr));
+                            result_row.push(self.evaluate_value(expr, &empty_row, &empty_schema, params).unwrap_or(Value::Null));
+                        }
+                        SelectItem::ExprWithAlias { expr, alias } => {
+                            col_names.push(alias.value.clone());
+                            result_row.push(self.evaluate_value(expr, &empty_row, &empty_schema, params).unwrap_or(Value::Null));
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(QueryResult::Select {
+                    columns: col_names,
+                    rows: vec![result_row],
+                });
+            };
+
+            let mut columns = Vec::new();
+            let mut is_count_star = false;
+
+            if is_wildcard {
+                columns = schema.columns.iter().map(|c| c.name.clone()).collect();
+            } else {
+                if select.projection.len() == 1 {
+                    let expr = match &select.projection[0] {
+                        SelectItem::UnnamedExpr(expr) => Some(expr),
+                        SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                        _ => None,
+                    };
+
+                    if let Some(Expr::Function(func)) = expr {
+                        if func.name.to_string().to_uppercase() == "COUNT" {
+                            if let FunctionArguments::List(args) = &func.args {
+                                if args.args.len() == 1 {
+                                    if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) =
+                                        &args.args[0]
+                                    {
+                                        is_count_star = true;
+                                        columns.push("COUNT(*)".to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !is_count_star {
+                    for item in &select.projection {
+                        match item {
+                            SelectItem::UnnamedExpr(expr) => {
+                                if let Expr::Identifier(ident) = expr {
+                                    columns.push(ident.value.clone());
+                                } else {
+                                    columns.push(format!("{}", expr));
+                                }
+                            }
+                            SelectItem::ExprWithAlias { alias, .. } => {
+                                columns.push(alias.value.clone());
+                            }
+                            SelectItem::QualifiedWildcard(_, _) => {
+                                columns = schema.columns.iter().map(|c| c.name.clone()).collect();
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by {
+                if !group_exprs.is_empty() {
+                    let mut aggregates: Vec<(Expr, String)> = Vec::new();
+
+                    for item in &select.projection {
+                        match item {
+                            SelectItem::UnnamedExpr(expr) => {
+                                self.extract_aggregates_from_expr(expr, &mut aggregates)
+                            }
+                            SelectItem::ExprWithAlias { expr, .. } => {
+                                self.extract_aggregates_from_expr(expr, &mut aggregates)
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(having) = &select.having {
+                        self.extract_aggregates_from_expr(having, &mut aggregates);
+                    }
+
+                    let mut groups: std::collections::HashMap<
+                        Vec<Value>,
+                        Vec<AggregateAccumulator>,
+                    > = std::collections::HashMap::new();
+
+                    for row in rows {
+                        let mut group_key = Vec::new();
+                        for expr in group_exprs {
+                            let val = self
+                                .evaluate_value(expr, &row, &schema, params)
+                                .unwrap_or(Value::Null);
+                            group_key.push(val);
+                        }
+
+                        let accs = groups.entry(group_key).or_insert_with(|| {
+                            aggregates
+                                .iter()
+                                .map(|(_, name)| AggregateAccumulator::new(name))
+                                .collect()
+                        });
+
+                        for (i, (expr, _)) in aggregates.iter().enumerate() {
+                            if let Expr::Function(func) = expr {
+                                let arg_val = if let FunctionArguments::List(args) = &func.args {
+                                    if args.args.is_empty() {
+                                        Value::Integer(1)
+                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) =
+                                        &args.args[0]
+                                    {
+                                        Value::Integer(1)
+                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) =
+                                        &args.args[0]
+                                    {
+                                        self.evaluate_value(e, &row, &schema, params)
+                                            .unwrap_or(Value::Null)
+                                    } else {
+                                        Value::Null
+                                    }
+                                } else {
+                                    Value::Null
+                                };
+
+                                accs[i].update(&arg_val);
+                            }
+                        }
+                    }
+
+                    let mut grouped_rows = Vec::new();
+
+                    for (group_key, accs) in groups {
+                        let mut agg_map = std::collections::HashMap::new();
+                        for (i, (expr, _)) in aggregates.iter().enumerate() {
+                            agg_map.insert(expr.clone(), accs[i].finalize());
+                        }
+
+                        if let Some(having) = &select.having {
+                            let val = self.evaluate_final_group_expr(
+                                having,
+                                &group_key,
+                                group_exprs,
+                                &agg_map,
+                                &schema,
+                                params,
+                            )?;
+                            let keep = match val {
+                                Value::Boolean(b) => b,
+                                Value::Null => false,
+                                _ => {
+                                    return Err(FusionError::Execution(
+                                        "HAVING clause must return boolean".to_string(),
+                                    ))
+                                }
+                            };
+                            if !keep {
+                                continue;
+                            }
+                        }
+
+                        let mut new_row = Vec::new();
+
+                        for item in &select.projection {
+                            let val = match item {
+                                SelectItem::UnnamedExpr(expr) => self.evaluate_final_group_expr(
+                                    expr,
+                                    &group_key,
+                                    group_exprs,
+                                    &agg_map,
+                                    &schema,
+                                    params,
+                                )?,
+                                SelectItem::ExprWithAlias { expr, .. } => self
+                                    .evaluate_final_group_expr(
+                                        expr,
+                                        &group_key,
+                                        group_exprs,
+                                        &agg_map,
+                                        &schema,
+                                        params,
+                                    )?,
+                                _ => Value::Null,
+                            };
+                            new_row.push(val);
+                        }
+                        grouped_rows.push(new_row);
+                    }
+                    rows = grouped_rows;
+
+                    let new_cols: Vec<Column> = columns
+                        .iter()
+                        .map(|name| Column {
+                            name: name.clone(),
+                            data_type: "UNKNOWN".to_string(),
+                            is_primary: false,
+                            is_indexed: false,
+                            index_type: IndexType::None,
+                            default_value: None,
+                            is_nullable: true,
+                            is_unique: false,
+                            check_expr: None,
+                        })
+                        .collect();
+                    schema = TableSchema::new("temp_group_by_result".to_string(), new_cols);
+                }
+            }
+
+            if let Some(order_by) = &query.order_by {
+                if let OrderByKind::Expressions(exprs) = &order_by.kind {
+                    rows.sort_by(|a, b| {
+                        for order_expr in exprs {
+                            let val_a = self
+                                .evaluate_value(&order_expr.expr, a, &schema, params)
+                                .unwrap_or(Value::Null);
+                            let val_b = self
+                                .evaluate_value(&order_expr.expr, b, &schema, params)
+                                .unwrap_or(Value::Null);
+
+                            let ordering = self.compare_for_sort(&val_a, &val_b);
+                            if ordering != Ordering::Equal {
+                                return if order_expr.options.asc.unwrap_or(true) {
+                                    ordering
+                                } else {
+                                    ordering.reverse()
+                                };
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                }
+            }
+
+            let rows = rows.into_iter().skip(offset);
+            let rows: Vec<Vec<Value>> = if let Some(limit) = limit {
+                rows.take(limit).collect()
+            } else {
+                rows.collect()
+            };
+
+            if is_count_star {
+                let count = rows.len();
+                return Ok(QueryResult::Select {
+                    columns,
+                    rows: vec![vec![Value::Integer(count as i64)]],
+                });
+            }
+
+            // Detect bare aggregates (e.g. SELECT COUNT(DISTINCT x), SUM(y) FROM t — no GROUP BY)
+            let is_group_by_empty = matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty());
+            if is_group_by_empty && !is_wildcard {
+                let mut bare_aggs: Vec<(Expr, String)> = Vec::new();
+                for item in &select.projection {
+                    match item {
+                        SelectItem::UnnamedExpr(expr) => self.extract_aggregates_from_expr(expr, &mut bare_aggs),
+                        SelectItem::ExprWithAlias { expr, .. } => self.extract_aggregates_from_expr(expr, &mut bare_aggs),
+                        _ => {}
+                    }
+                }
+                if !bare_aggs.is_empty() {
+                    let mut accs: Vec<AggregateAccumulator> = bare_aggs.iter()
+                        .map(|(_, name)| AggregateAccumulator::new(name))
+                        .collect();
+                    for row in &rows {
+                        for (i, (expr, _)) in bare_aggs.iter().enumerate() {
+                            if let Expr::Function(func) = expr {
+                                let arg_val = if let FunctionArguments::List(args) = &func.args {
+                                    if args.args.is_empty() {
+                                        Value::Integer(1)
+                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) = &args.args[0] {
+                                        Value::Integer(1)
+                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = &args.args[0] {
+                                        self.evaluate_value(e, row, &schema, params).unwrap_or(Value::Null)
+                                    } else { Value::Null }
+                                } else { Value::Null };
+                                accs[i].update(&arg_val);
+                            }
+                        }
+                    }
+                    let result_row: Vec<Value> = accs.iter().map(|a| a.finalize()).collect();
+                    return Ok(QueryResult::Select {
+                        columns,
+                        rows: vec![result_row],
+                    });
+                }
+            }
+
+            // Pre-compute window functions for each projection column
+            // window_results[col_idx] = Some(vec_of_values_per_row) if that column is a window fn
+            let window_results: Vec<Option<Vec<Value>>> = if !is_wildcard
+                && matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty())
+            {
+                select.projection.iter().map(|item| {
+                    let expr = match item {
+                        SelectItem::UnnamedExpr(e) => Some(e),
+                        SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+                        _ => None,
+                    };
+                    if let Some(Expr::Function(func)) = expr {
+                        let fname = func.name.to_string().to_uppercase();
+                        if matches!(fname.as_str(), "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "LEAD") {
+                            if let Some(ref over) = func.over {
+                                if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
+                                    return Some(self.compute_window_function(&fname, spec, func, &rows, &schema, params));
+                                }
+                            }
+                        }
+                    }
+                    None
+                }).collect()
+            } else {
+                vec![]
+            };
+
+            let final_rows = if is_wildcard
+                || matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if !exprs.is_empty())
+            {
+                rows
+            } else {
+                let mut projected_rows = Vec::new();
+                for (row_idx, row) in rows.iter().enumerate() {
+                    let mut new_row = Vec::new();
+                    for (col_idx, item) in select.projection.iter().enumerate() {
+                        // Check if this column has pre-computed window function results
+                        if let Some(Some(ref wvals)) = window_results.get(col_idx) {
+                            new_row.push(wvals.get(row_idx).cloned().unwrap_or(Value::Null));
+                            continue;
+                        }
+                        let val = match item {
+                            SelectItem::UnnamedExpr(expr) => self
+                                .evaluate_value(expr, row, &schema, params)
+                                .unwrap_or(Value::Null),
+                            SelectItem::ExprWithAlias { expr, .. } => self
+                                .evaluate_value(expr, row, &schema, params)
+                                .unwrap_or(Value::Null),
+                            _ => Value::Null,
+                        };
+                        new_row.push(val);
+                    }
+                    projected_rows.push(new_row);
+                }
+                projected_rows
+            };
+
+            // Apply DISTINCT
+            let final_rows = if select.distinct.is_some() {
+                let mut seen = HashSet::new();
+                let mut unique_rows = Vec::new();
+                for row in final_rows {
+                    let key = format!("{:?}", row);
+                    if seen.insert(key) {
+                        unique_rows.push(row);
+                    }
+                }
+                unique_rows
+            } else {
+                final_rows
+            };
+
+            return Ok(QueryResult::Select {
+                columns,
+                rows: final_rows,
+            });
+        }
+        // Handle UNION / UNION ALL / INTERSECT / EXCEPT
+        if let SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } = query.body.as_ref()
+        {
+            use sqlparser::ast::{SetOperator, SetQuantifier};
+
+            let make_query = |body: Box<SetExpr>| sqlparser::ast::Query {
+                body,
+                order_by: None,
+                limit_clause: None,
+                with: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            };
+
+            let left_result = Box::pin(self.handle_query(&make_query(left.clone()), txn, params)).await?;
+            let right_result = Box::pin(self.handle_query(&make_query(right.clone()), txn, params)).await?;
+
+            let (left_cols, left_rows) = match left_result {
+                QueryResult::Select { columns, rows } => (columns, rows),
+                _ => return Err(FusionError::Execution("UNION left side must be SELECT".to_string())),
+            };
+            let (_, right_rows) = match right_result {
+                QueryResult::Select { columns, rows } => (columns, rows),
+                _ => return Err(FusionError::Execution("UNION right side must be SELECT".to_string())),
+            };
+
+            let mut combined = match op {
+                SetOperator::Union => {
+                    let mut all_rows = left_rows;
+                    all_rows.extend(right_rows);
+                    all_rows
+                }
+                SetOperator::Intersect => {
+                    let right_set: HashSet<String> = right_rows.iter().map(|r| format!("{:?}", r)).collect();
+                    left_rows.into_iter().filter(|r| right_set.contains(&format!("{:?}", r))).collect()
+                }
+                SetOperator::Except => {
+                    let right_set: HashSet<String> = right_rows.iter().map(|r| format!("{:?}", r)).collect();
+                    left_rows.into_iter().filter(|r| !right_set.contains(&format!("{:?}", r))).collect()
+                }
+                _ => return Err(FusionError::Execution(format!("Unsupported set operator: {:?}", op))),
+            };
+
+            // Deduplicate unless ALL
+            let is_all = matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
+            if !is_all {
+                let mut seen = HashSet::new();
+                combined.retain(|row| seen.insert(format!("{:?}", row)));
+            }
+
+            // Apply ORDER BY from the outer query
+            if let Some(order_by) = &query.order_by {
+                if let OrderByKind::Expressions(order_exprs) = &order_by.kind {
+                    combined.sort_by(|a, b| {
+                        for oe in order_exprs {
+                            let idx = match &oe.expr {
+                                Expr::Value(sqlparser::ast::ValueWithSpan { value: sqlparser::ast::Value::Number(n, _), .. }) => {
+                                    n.parse::<usize>().unwrap_or(1) - 1
+                                }
+                                Expr::Identifier(ident) => {
+                                    left_cols.iter().position(|c| c == &ident.value).unwrap_or(0)
+                                }
+                                _ => 0,
+                            };
+                            let va = a.get(idx).unwrap_or(&Value::Null);
+                            let vb = b.get(idx).unwrap_or(&Value::Null);
+                            let cmp = self.compare_for_sort(va, vb);
+                            if cmp != Ordering::Equal {
+                                return if oe.options.asc.unwrap_or(true) { cmp } else { cmp.reverse() };
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                }
+            }
+
+            // Apply LIMIT/OFFSET from the outer query
+            if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
+                let off = offset.as_ref().and_then(|os| match &os.value {
+                    Expr::Value(sqlparser::ast::ValueWithSpan { value: sqlparser::ast::Value::Number(n, _), .. }) => n.parse::<usize>().ok(),
+                    _ => None,
+                }).unwrap_or(0);
+                let lim = limit.as_ref().and_then(|e| match e {
+                    Expr::Value(sqlparser::ast::ValueWithSpan { value: sqlparser::ast::Value::Number(n, _), .. }) => n.parse::<usize>().ok(),
+                    _ => None,
+                });
+                combined = if let Some(l) = lim {
+                    combined.into_iter().skip(off).take(l).collect()
+                } else {
+                    combined.into_iter().skip(off).collect()
+                };
+            }
+
+            return Ok(QueryResult::Select {
+                columns: left_cols,
+                rows: combined,
+            });
+        }
+
+        Err(FusionError::Execution(
+            "Unsupported SELECT format".to_string(),
+        ))
+    }
+
+    /// Compute window function values for all rows.
+    /// Returns a Vec<Value> with one value per input row.
+    fn compute_window_function(
+        &self,
+        func_name: &str,
+        spec: &sqlparser::ast::WindowSpec,
+        func: &sqlparser::ast::Function,
+        rows: &[Vec<Value>],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Vec<Value> {
+        if rows.is_empty() {
+            return vec![];
+        }
+
+        // Build partition keys for each row
+        let partition_keys: Vec<Vec<Value>> = rows.iter().map(|row| {
+            spec.partition_by.iter().map(|e| {
+                self.evaluate_value(e, row, schema, params).unwrap_or(Value::Null)
+            }).collect()
+        }).collect();
+
+        // Group row indices by partition key
+        let mut partitions: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for (i, pk) in partition_keys.iter().enumerate() {
+            let key = format!("{:?}", pk);
+            partitions.entry(key).or_default().push(i);
+        }
+
+        let mut result = vec![Value::Null; rows.len()];
+
+        for (_pk_key, indices) in &partitions {
+            // Sort indices within partition by ORDER BY
+            let mut sorted_indices: Vec<usize> = indices.clone();
+            if !spec.order_by.is_empty() {
+                sorted_indices.sort_by(|&a, &b| {
+                    for oe in &spec.order_by {
+                        let va = self.evaluate_value(&oe.expr, &rows[a], schema, params).unwrap_or(Value::Null);
+                        let vb = self.evaluate_value(&oe.expr, &rows[b], schema, params).unwrap_or(Value::Null);
+                        let cmp = self.compare_for_sort(&va, &vb);
+                        if cmp != Ordering::Equal {
+                            return if oe.options.asc.unwrap_or(true) { cmp } else { cmp.reverse() };
+                        }
+                    }
+                    Ordering::Equal
+                });
+            }
+
+            match func_name {
+                "ROW_NUMBER" => {
+                    for (rank, &row_idx) in sorted_indices.iter().enumerate() {
+                        result[row_idx] = Value::Integer((rank + 1) as i64);
+                    }
+                }
+                "RANK" => {
+                    let mut rank = 1i64;
+                    let mut i = 0;
+                    while i < sorted_indices.len() {
+                        let current_idx = sorted_indices[i];
+                        // Count ties
+                        let mut tie_count = 1;
+                        while i + tie_count < sorted_indices.len() {
+                            let next_idx = sorted_indices[i + tie_count];
+                            let same = spec.order_by.iter().all(|oe| {
+                                let va = self.evaluate_value(&oe.expr, &rows[current_idx], schema, params).unwrap_or(Value::Null);
+                                let vb = self.evaluate_value(&oe.expr, &rows[next_idx], schema, params).unwrap_or(Value::Null);
+                                va == vb
+                            });
+                            if same { tie_count += 1; } else { break; }
+                        }
+                        for j in 0..tie_count {
+                            result[sorted_indices[i + j]] = Value::Integer(rank);
+                        }
+                        rank += tie_count as i64;
+                        i += tie_count;
+                    }
+                }
+                "DENSE_RANK" => {
+                    let mut rank = 1i64;
+                    let mut i = 0;
+                    while i < sorted_indices.len() {
+                        let current_idx = sorted_indices[i];
+                        let mut tie_count = 1;
+                        while i + tie_count < sorted_indices.len() {
+                            let next_idx = sorted_indices[i + tie_count];
+                            let same = spec.order_by.iter().all(|oe| {
+                                let va = self.evaluate_value(&oe.expr, &rows[current_idx], schema, params).unwrap_or(Value::Null);
+                                let vb = self.evaluate_value(&oe.expr, &rows[next_idx], schema, params).unwrap_or(Value::Null);
+                                va == vb
+                            });
+                            if same { tie_count += 1; } else { break; }
+                        }
+                        for j in 0..tie_count {
+                            result[sorted_indices[i + j]] = Value::Integer(rank);
+                        }
+                        rank += 1; // Dense: always increment by 1
+                        i += tie_count;
+                    }
+                }
+                "LAG" | "LEAD" => {
+                    // Extract offset (default 1) and default value (default NULL)
+                    let (offset, default_val) = if let FunctionArguments::List(args) = &func.args {
+                        let off = if args.args.len() >= 2 {
+                            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = &args.args[1] {
+                                if let Ok(Value::Integer(n)) = self.evaluate_value(e, &rows[0], schema, params) {
+                                    n as usize
+                                } else { 1 }
+                            } else { 1 }
+                        } else { 1 };
+                        let def = if args.args.len() >= 3 {
+                            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = &args.args[2] {
+                                self.evaluate_value(e, &rows[0], schema, params).unwrap_or(Value::Null)
+                            } else { Value::Null }
+                        } else { Value::Null };
+                        (off, def)
+                    } else { (1, Value::Null) };
+
+                    // Get the expression argument (first arg)
+                    let arg_expr = if let FunctionArguments::List(args) = &func.args {
+                        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) = args.args.first() {
+                            Some(e.clone())
+                        } else { None }
+                    } else { None };
+
+                    if let Some(ref arg_e) = arg_expr {
+                        for (pos, &row_idx) in sorted_indices.iter().enumerate() {
+                            let target_pos = if func_name == "LAG" {
+                                if pos >= offset { Some(pos - offset) } else { None }
+                            } else {
+                                // LEAD
+                                if pos + offset < sorted_indices.len() { Some(pos + offset) } else { None }
+                            };
+                            let val = if let Some(tp) = target_pos {
+                                let target_row_idx = sorted_indices[tp];
+                                self.evaluate_value(arg_e, &rows[target_row_idx], schema, params).unwrap_or(default_val.clone())
+                            } else {
+                                default_val.clone()
+                            };
+                            result[row_idx] = val;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+}

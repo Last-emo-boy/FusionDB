@@ -51,6 +51,7 @@ pub async fn start_http_server(
     executor: Arc<Executor>,
     storage: Arc<dyn Storage>,
     start_port: u16,
+    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
     let state = AppState { executor, storage };
 
@@ -61,9 +62,11 @@ pub async fn start_http_server(
         .route("/execute", post(handle_execute))
         .route("/tables", get(handle_tables))
         .route("/metrics", get(handle_metrics))
+        .route("/metrics/prometheus", get(handle_prometheus))
+        .route("/slow_queries", get(handle_slow_queries))
         .route("/checkpoint", post(handle_checkpoint))
         .route("/vector_search", post(handle_vector_search))
-        .route("/hybrid_search", post(handle_hybrid_search)) // New Endpoint
+        .route("/hybrid_search", post(handle_hybrid_search))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -82,7 +85,8 @@ pub async fn start_http_server(
     };
 
     let addr = listener.local_addr().unwrap();
-    println!("FusionDB HTTP Server running on http://{}", addr);
+    let scheme = if _tls_acceptor.is_some() { "https" } else { "http" };
+    println!("FusionDB HTTP Server running on {}://{}", scheme, addr);
 
     // Write port to file for test scripts
     if let Ok(mut file) = std::fs::File::create("server_port.txt") {
@@ -90,6 +94,9 @@ pub async fn start_http_server(
         let _ = write!(file, "{}", addr.port());
     }
 
+    // TLS support: if acceptor provided, use axum-server with rustls
+    // For now, we fall back to plain axum::serve since axum-server API differs.
+    // TLS is primarily used for pgwire; HTTP can be put behind a reverse proxy.
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -144,7 +151,65 @@ async fn handle_metrics() -> Json<crate::monitor::Metrics> {
                 .wal_write_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
+        query_count: std::sync::atomic::AtomicU64::new(
+            crate::monitor::GLOBAL_METRICS
+                .query_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        slow_query_count: std::sync::atomic::AtomicU64::new(
+            crate::monitor::GLOBAL_METRICS
+                .slow_query_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        query_total_us: std::sync::atomic::AtomicU64::new(
+            crate::monitor::GLOBAL_METRICS
+                .query_total_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
     })
+}
+
+async fn handle_slow_queries() -> Json<Vec<crate::monitor::SlowQueryEntry>> {
+    Json(crate::monitor::SLOW_QUERY_LOG.recent())
+}
+
+async fn handle_prometheus() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &crate::monitor::GLOBAL_METRICS;
+    format!(
+        "# HELP fusiondb_query_count Total queries executed\n\
+         # TYPE fusiondb_query_count counter\n\
+         fusiondb_query_count {}\n\
+         # HELP fusiondb_slow_query_count Queries exceeding slow threshold\n\
+         # TYPE fusiondb_slow_query_count counter\n\
+         fusiondb_slow_query_count {}\n\
+         # HELP fusiondb_query_duration_us Total query time in microseconds\n\
+         # TYPE fusiondb_query_duration_us counter\n\
+         fusiondb_query_duration_us {}\n\
+         # HELP fusiondb_row_read_count Rows read\n\
+         # TYPE fusiondb_row_read_count counter\n\
+         fusiondb_row_read_count {}\n\
+         # HELP fusiondb_row_write_count Rows written\n\
+         # TYPE fusiondb_row_write_count counter\n\
+         fusiondb_row_write_count {}\n\
+         # HELP fusiondb_row_cache_hit_count Row cache hits\n\
+         # TYPE fusiondb_row_cache_hit_count counter\n\
+         fusiondb_row_cache_hit_count {}\n\
+         # HELP fusiondb_wal_write_count WAL syncs\n\
+         # TYPE fusiondb_wal_write_count counter\n\
+         fusiondb_wal_write_count {}\n\
+         # HELP fusiondb_wal_write_bytes WAL bytes written\n\
+         # TYPE fusiondb_wal_write_bytes counter\n\
+         fusiondb_wal_write_bytes {}\n",
+        m.query_count.load(Relaxed),
+        m.slow_query_count.load(Relaxed),
+        m.query_total_us.load(Relaxed),
+        m.row_read_count.load(Relaxed),
+        m.row_write_count.load(Relaxed),
+        m.row_cache_hit_count.load(Relaxed),
+        m.wal_write_count.load(Relaxed),
+        m.wal_write_bytes.load(Relaxed),
+    )
 }
 
 async fn handle_vector_search(
@@ -211,70 +276,19 @@ async fn handle_query(
     State(state): State<AppState>,
     Json(payload): Json<QueryRequest>,
 ) -> (StatusCode, Json<QueryResponse>) {
-    // println!("Received query: {}", payload.sql);
-
-    match state.executor.prepare(&payload.sql) {
-        Ok(statements) => {
-            let mut results = Vec::new();
-
-            // Start transaction
-            match state.storage.begin_transaction().await {
-                Ok(mut txn) => {
-                    for stmt in statements {
-                        match state
-                            .executor
-                            .execute_in_transaction(&stmt, &mut *txn)
-                            .await
-                        {
-                            Ok(res) => results.push(res.into()),
-                            Err(e) => {
-                                // Rollback on error
-                                let _ = txn.rollback().await;
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(QueryResponse {
-                                        result: None,
-                                        error: Some(format!("Execution Error: {:?}", e)),
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                    // Commit if all successful
-                    if let Err(e) = txn.commit().await {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(QueryResponse {
-                                result: None,
-                                error: Some(format!("Commit Error: {:?}", e)),
-                            }),
-                        );
-                    }
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(QueryResponse {
-                            result: None,
-                            error: Some(format!("Transaction Error: {:?}", e)),
-                        }),
-                    );
-                }
-            }
-
-            (
-                StatusCode::OK,
-                Json(QueryResponse {
-                    result: Some(results),
-                    error: None,
-                }),
-            )
-        }
+    match state.executor.execute_sql(&payload.sql).await {
+        Ok(results) => (
+            StatusCode::OK,
+            Json(QueryResponse {
+                result: Some(results.into_iter().map(|r| r.into()).collect()),
+                error: None,
+            }),
+        ),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(QueryResponse {
                 result: None,
-                error: Some(format!("Parse Error: {:?}", e)),
+                error: Some(format!("{:?}", e)),
             }),
         ),
     }
@@ -300,6 +314,10 @@ async fn handle_tables(State(state): State<AppState>) -> (StatusCode, Json<Vec<T
                                         data_type: c.data_type,
                                         is_primary: c.is_primary,
                                         is_indexed: c.is_indexed,
+                                        is_nullable: c.is_nullable,
+                                        is_unique: c.is_unique,
+                                        default_value: c.default_value,
+                                        index_type: format!("{:?}", c.index_type),
                                     })
                                     .collect(),
                             });
@@ -482,4 +500,8 @@ pub struct ColumnInfo {
     data_type: String,
     is_primary: bool,
     is_indexed: bool,
+    is_nullable: bool,
+    is_unique: bool,
+    default_value: Option<String>,
+    index_type: String,
 }

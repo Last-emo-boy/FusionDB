@@ -4,7 +4,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex; // Required for client.send
 
-use pgwire::api::auth::StartupHandler;
+use pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
+use pgwire::api::auth::{
+    AuthSource, DefaultServerParameterProvider, LoginInfo, Password,
+};
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response, Tag};
@@ -17,7 +20,6 @@ use pgwire::messages::extendedquery::{
 };
 use pgwire::messages::response::CommandComplete;
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::PgWireFrontendMessage; // Helper struct
 
 use sqlparser::ast::Statement;
 
@@ -61,20 +63,40 @@ impl PgHandler {
     }
 }
 
-impl pgwire::api::PgWireServerHandlers for PgHandler {}
+/// Auth source that validates passwords against a configured credential.
+#[derive(Debug)]
+struct FusionAuthSource {
+    password: String,
+}
 
 #[async_trait::async_trait]
-impl StartupHandler for PgHandler {
-    async fn on_startup<C>(
-        &self,
-        _client: &mut C,
-        _message: PgWireFrontendMessage,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        eprintln!("PG Startup called");
-        Ok(())
+impl AuthSource for FusionAuthSource {
+    async fn get_password(&self, _login: &LoginInfo) -> PgWireResult<Password> {
+        Ok(Password::new(None, self.password.as_bytes().to_vec()))
+    }
+}
+
+type FusionStartupHandler =
+    CleartextPasswordAuthStartupHandler<FusionAuthSource, DefaultServerParameterProvider>;
+
+/// Wrapper that implements PgWireServerHandlers, returning real handlers
+/// instead of the default NoopHandler.
+pub struct PgServerFactory {
+    startup: Arc<FusionStartupHandler>,
+    handler: Arc<PgHandler>,
+}
+
+impl pgwire::api::PgWireServerHandlers for PgServerFactory {
+    fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
+        self.startup.clone()
+    }
+
+    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        self.handler.clone()
+    }
+
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        self.handler.clone()
     }
 }
 
@@ -553,19 +575,37 @@ impl ExtendedQueryHandler for PgHandler {
     }
 }
 
-pub async fn start_pg_server(executor: Arc<Executor>, storage: Arc<dyn Storage>, port: u16) {
+pub async fn start_pg_server(
+    executor: Arc<Executor>,
+    storage: Arc<dyn Storage>,
+    port: u16,
+    password: &str,
+    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+) {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await.unwrap();
     println!("FusionDB Postgres Server running on {}", addr);
+
+    let password = password.to_string();
 
     loop {
         let (stream, _) = listener.accept().await.unwrap();
         let executor = executor.clone();
         let storage = storage.clone();
+        let password = password.clone();
 
         tokio::spawn(async move {
             let handler = Arc::new(PgHandler::new(executor, storage));
-            let _ = pgwire::tokio::process_socket(stream, None, handler).await;
+            let auth_source = FusionAuthSource { password };
+            let startup = Arc::new(CleartextPasswordAuthStartupHandler::new(
+                auth_source,
+                DefaultServerParameterProvider::default(),
+            ));
+            let factory = PgServerFactory { startup, handler };
+
+            // pgwire 0.37 does not natively support TLS negotiation.
+            // TLS for pgwire requires a TLS-terminating proxy (e.g., stunnel, HAProxy).
+            let _ = pgwire::tokio::process_socket(stream, None, factory).await;
         });
     }
 }

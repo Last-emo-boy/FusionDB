@@ -1,12 +1,14 @@
 use crate::common::{FusionError, Result};
 use crate::monitor;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-// use std::time::Duration;
 use tokio::sync::oneshot;
+
+const MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MB per segment
 
 #[derive(Debug)]
 pub enum WalEntry {
@@ -21,57 +23,139 @@ enum WalJob {
     },
 }
 
+/// WAL state shared between main thread and writer thread.
+struct WalState {
+    writer: Option<BufWriter<File>>,
+    segment_id: u64,
+    segment_size: u64,
+    base_path: String,
+}
+
+impl WalState {
+    fn rotate(&mut self) -> std::result::Result<(), FusionError> {
+        // Flush current
+        if let Some(ref mut w) = self.writer {
+            w.flush().map_err(WalManager::io_err)?;
+        }
+        self.segment_id += 1;
+        self.segment_size = 0;
+        let new_path = segment_path(&self.base_path, self.segment_id);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&new_path)
+            .map_err(|e| FusionError::Storage(format!("Failed to open WAL segment {}: {}", new_path, e)))?;
+        self.writer = Some(BufWriter::new(file));
+        Ok(())
+    }
+}
+
+/// Compute the file path for a given segment ID.
+/// Segment 0 = base_path (backward compat), segment N = base_path.seg.N
+fn segment_path(base: &str, id: u64) -> String {
+    if id == 0 {
+        base.to_string()
+    } else {
+        format!("{}.seg.{}", base, id)
+    }
+}
+
+/// Find all existing WAL segment files for a base path, sorted by segment ID.
+fn find_segments(base: &str) -> Vec<(u64, String)> {
+    let mut segments = Vec::new();
+
+    // Check base file (segment 0)
+    if std::path::Path::new(base).exists() {
+        segments.push((0, base.to_string()));
+    }
+
+    // Check segment files: {base}.seg.{N}
+    let parent = std::path::Path::new(base)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let base_name = std::path::Path::new(base)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let prefix = format!("{}.seg.", base_name);
+
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(suffix) = name.strip_prefix(&prefix) {
+                if let Ok(id) = suffix.parse::<u64>() {
+                    segments.push((id, entry.path().to_string_lossy().to_string()));
+                }
+            }
+        }
+    }
+
+    segments.sort_by_key(|(id, _)| *id);
+    segments
+}
+
 pub struct WalManager {
-    file: Arc<Mutex<Option<BufWriter<File>>>>,
+    state: Arc<Mutex<WalState>>,
     tx: mpsc::Sender<WalJob>,
     path: String,
+    segment_id: Arc<AtomicU64>,
 }
 
 impl WalManager {
     pub fn new(path: &str) -> Result<Self> {
+        // Determine which segment to append to
+        let segments = find_segments(path);
+        let (active_id, active_path) = if segments.is_empty() {
+            (0u64, path.to_string())
+        } else {
+            segments.last().unwrap().clone()
+        };
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(&active_path)
             .map_err(|e| FusionError::Storage(format!("Failed to open WAL: {}", e)))?;
 
-        let file_mutex = Arc::new(Mutex::new(Some(BufWriter::new(file))));
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+        let wal_state = WalState {
+            writer: Some(BufWriter::new(file)),
+            segment_id: active_id,
+            segment_size: file_size,
+            base_path: path.to_string(),
+        };
+
+        let state = Arc::new(Mutex::new(wal_state));
         let (tx, rx) = mpsc::channel();
 
-        let writer_file = file_mutex.clone();
+        let writer_state = state.clone();
 
         thread::Builder::new()
             .name("wal-writer".to_string())
             .spawn(move || {
-                Self::wal_writer_loop(rx, writer_file);
+                Self::wal_writer_loop(rx, writer_state);
             })
             .map_err(|e| FusionError::Storage(format!("Failed to spawn WAL thread: {}", e)))?;
 
         Ok(Self {
-            file: file_mutex,
+            state,
             tx,
             path: path.to_string(),
+            segment_id: Arc::new(AtomicU64::new(active_id)),
         })
     }
 
-    fn wal_writer_loop(rx: Receiver<WalJob>, file_mutex: Arc<Mutex<Option<BufWriter<File>>>>) {
+    fn wal_writer_loop(rx: Receiver<WalJob>, state: Arc<Mutex<WalState>>) {
         loop {
-            // Blocking wait for the first job
             let first_job = match rx.recv() {
                 Ok(job) => job,
-                Err(_) => break, // Channel closed, exit
+                Err(_) => break,
             };
 
             let mut batch = vec![first_job];
 
-            // Try to collect more jobs (Group Commit)
-            // Sleep briefly to allow more jobs to accumulate if we have high concurrency but are processing faster than arrival
-            // This is a tradeoff: slightly higher latency for single requests, but much better throughput for many
-            // Given the user report of performance degradation, maybe we are not batching enough.
-            // Let's add a tiny sleep if we got a job, to see if more arrive.
-            // But doing this for *every* job adds latency.
-            // Instead of sleep, just use try_recv loop. If it's empty, we write.
-
+            // Group commit: collect more jobs
             for _ in 0..1000 {
                 match rx.try_recv() {
                     Ok(job) => batch.push(job),
@@ -80,45 +164,55 @@ impl WalManager {
                 }
             }
 
-            // Write Batch
-            // We use a block to scope the lock
             let mut write_result = Ok(());
             {
-                if let Ok(mut writer_guard) = file_mutex.lock() {
-                    if let Some(writer) = writer_guard.as_mut() {
-                        for job in &batch {
-                            let WalJob::Append { entries, .. } = job;
-                            for entry in entries {
-                                if let Err(e) = Self::write_entry(writer, entry) {
-                                    write_result = Err(e);
+                if let Ok(mut ws) = state.lock() {
+                    // Check for segment rotation before writing
+                    if ws.segment_size >= MAX_SEGMENT_SIZE {
+                        if let Err(e) = ws.rotate() {
+                            write_result = Err(e);
+                        }
+                    }
+
+                    if write_result.is_ok() {
+                        if let Some(ref mut writer) = ws.writer {
+                            let mut batch_bytes = 0u64;
+                            for job in &batch {
+                                let WalJob::Append { entries, .. } = job;
+                                for entry in entries {
+                                    match Self::write_entry(writer, entry) {
+                                        Ok(n) => batch_bytes += n as u64,
+                                        Err(e) => {
+                                            write_result = Err(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if write_result.is_err() {
                                     break;
                                 }
                             }
-                            if write_result.is_err() {
-                                break;
-                            }
-                        }
 
-                        if write_result.is_ok() {
-                            if let Err(e) = writer.flush().map_err(Self::io_err) {
-                                write_result = Err(e);
-                            } else {
-                                monitor::inc_wal_write(); // 1 sync for the batch
+                            if write_result.is_ok() {
+                                if let Err(e) = writer.flush().map_err(Self::io_err) {
+                                    write_result = Err(e);
+                                } else {
+                                    ws.segment_size += batch_bytes;
+                                    monitor::inc_wal_write();
+                                }
                             }
+                        } else {
+                            write_result = Err(FusionError::Storage("WAL closed".to_string()));
                         }
-                    } else {
-                        write_result = Err(FusionError::Storage("WAL closed".to_string()));
                     }
                 } else {
                     write_result = Err(FusionError::Storage("WAL Lock poisoned".to_string()));
                 }
             }
 
-            // Notify clients
             for job in batch {
                 match job {
                     WalJob::Append { resp, .. } => {
-                        // Clone the error if there is one
                         let res = match &write_result {
                             Ok(_) => Ok(()),
                             Err(e) => Err(FusionError::Storage(format!("WAL Error: {}", e))),
@@ -130,32 +224,28 @@ impl WalManager {
         }
     }
 
-    fn write_entry(writer: &mut BufWriter<File>, entry: &WalEntry) -> Result<()> {
+    /// Write a single entry. Returns bytes written on success.
+    fn write_entry(writer: &mut BufWriter<File>, entry: &WalEntry) -> Result<usize> {
         match entry {
             WalEntry::Put(k, v) => {
-                writer.write_all(&[1u8]).map_err(Self::io_err)?; // OpCode 1: Put
-
-                let k_len = (k.len() as u32).to_le_bytes();
-                writer.write_all(&k_len).map_err(Self::io_err)?;
+                writer.write_all(&[1u8]).map_err(Self::io_err)?;
+                writer.write_all(&(k.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
                 writer.write_all(k).map_err(Self::io_err)?;
-
-                let v_len = (v.len() as u32).to_le_bytes();
-                writer.write_all(&v_len).map_err(Self::io_err)?;
+                writer.write_all(&(v.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
                 writer.write_all(v).map_err(Self::io_err)?;
-
-                monitor::add_wal_bytes((1 + 4 + k.len() + 4 + v.len()) as u64);
+                let n = 1 + 4 + k.len() + 4 + v.len();
+                monitor::add_wal_bytes(n as u64);
+                Ok(n)
             }
             WalEntry::Delete(k) => {
-                writer.write_all(&[2u8]).map_err(Self::io_err)?; // OpCode 2: Delete
-
-                let k_len = (k.len() as u32).to_le_bytes();
-                writer.write_all(&k_len).map_err(Self::io_err)?;
+                writer.write_all(&[2u8]).map_err(Self::io_err)?;
+                writer.write_all(&(k.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
                 writer.write_all(k).map_err(Self::io_err)?;
-
-                monitor::add_wal_bytes((1 + 4 + k.len()) as u64);
+                let n = 1 + 4 + k.len();
+                monitor::add_wal_bytes(n as u64);
+                Ok(n)
             }
         }
-        Ok(())
     }
 
     pub async fn append_batch_async(&self, entries: Vec<WalEntry>) -> Result<()> {
@@ -230,41 +320,55 @@ impl WalManager {
         Ok(())
     }
 
+    /// Replay all WAL segments in order, returning all entries.
     pub fn replay(&self) -> Result<Vec<WalEntry>> {
-        // Replay runs before any writes, so it's safe to read the file directly.
-        // But we should take the lock just in case.
-        let mut guard = self
-            .file
-            .lock()
+        let _guard = self.state.lock()
             .map_err(|_| FusionError::Storage("WAL Lock poisoned".to_string()))?;
 
-        let mut file = File::open(&self.path)
-            .map_err(|e| FusionError::Storage(format!("Failed to open WAL for replay: {}", e)))?;
-        
-        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let segments = find_segments(&self.path);
+        let mut all_entries = Vec::new();
+
+        for (seg_id, seg_path) in &segments {
+            let file = match File::open(seg_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("WAL Replay: skipping segment {}: {}", seg_path, e);
+                    continue;
+                }
+            };
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if file_len == 0 {
+                continue;
+            }
+            let entries = Self::replay_single_file(seg_path, file_len)?;
+            if !entries.is_empty() {
+                println!("WAL Replay: segment {} ({}) -> {} entries", seg_id, seg_path, entries.len());
+            }
+            all_entries.extend(entries);
+        }
+
+        Ok(all_entries)
+    }
+
+    /// Replay a single WAL file, truncating partial records at the end.
+    fn replay_single_file(path: &str, file_len: u64) -> Result<Vec<WalEntry>> {
+        let file = File::open(path)
+            .map_err(|e| FusionError::Storage(format!("Failed to open WAL segment for replay: {}", e)))?;
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
-        let mut valid_pos = 0;
+        let mut valid_pos = 0u64;
 
         loop {
-            // Check if we are at EOF before reading
-            // This prevents UnexpectedEof if file ends cleanly
-            // But BufReader doesn't have EOF check easily without fill_buf.
-            // We rely on read_exact returning UnexpectedEof for the first byte.
-
             let mut opcode = [0u8; 1];
             match reader.read_exact(&mut opcode) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(FusionError::Storage(format!("WAL Replay Error reading OpCode: {}", e))),
+                Err(e) => return Err(FusionError::Storage(format!("WAL Replay Error: {}", e))),
             }
 
-            // We read OpCode (1 byte). Now try to read the rest.
-            // If any of these fail with UnexpectedEof, it's a partial record.
-            
-            let mut current_record_len = 1; // OpCode
+            let mut record_len = 1usize;
 
-            let read_u32 = |r: &mut BufReader<File>, len_counter: &mut usize| -> Result<u32> {
+            let read_u32 = |r: &mut BufReader<File>, len: &mut usize| -> Result<u32> {
                 let mut buf = [0u8; 4];
                 r.read_exact(&mut buf).map_err(|e| {
                     if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -273,120 +377,88 @@ impl WalManager {
                         FusionError::Storage(format!("WAL Read Error: {}", e))
                     }
                 })?;
-                *len_counter += 4;
+                *len += 4;
                 Ok(u32::from_le_bytes(buf))
             };
 
-            let read_vec = |r: &mut BufReader<File>, len: usize, len_counter: &mut usize| -> Result<Vec<u8>> {
-                let mut buf = vec![0u8; len];
+            let read_vec = |r: &mut BufReader<File>, n: usize, len: &mut usize| -> Result<Vec<u8>> {
+                let mut buf = vec![0u8; n];
                 r.read_exact(&mut buf).map_err(|e| {
-                     if e.kind() == io::ErrorKind::UnexpectedEof {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
                         FusionError::Storage("Partial Record".to_string())
                     } else {
                         FusionError::Storage(format!("WAL Read Error: {}", e))
                     }
                 })?;
-                *len_counter += len;
+                *len += n;
                 Ok(buf)
             };
 
-            match opcode[0] {
-                1 => {
-                    // Put
-                    let res = (|| -> Result<WalEntry> {
-                        let k_len = read_u32(&mut reader, &mut current_record_len)? as usize;
-                        let k = read_vec(&mut reader, k_len, &mut current_record_len)?;
-                        let v_len = read_u32(&mut reader, &mut current_record_len)? as usize;
-                        let v = read_vec(&mut reader, v_len, &mut current_record_len)?;
-                        Ok(WalEntry::Put(k, v))
-                    })();
+            let res = match opcode[0] {
+                1 => (|| -> Result<WalEntry> {
+                    let kl = read_u32(&mut reader, &mut record_len)? as usize;
+                    let k = read_vec(&mut reader, kl, &mut record_len)?;
+                    let vl = read_u32(&mut reader, &mut record_len)? as usize;
+                    let v = read_vec(&mut reader, vl, &mut record_len)?;
+                    Ok(WalEntry::Put(k, v))
+                })(),
+                2 => (|| -> Result<WalEntry> {
+                    let kl = read_u32(&mut reader, &mut record_len)? as usize;
+                    let k = read_vec(&mut reader, kl, &mut record_len)?;
+                    Ok(WalEntry::Delete(k))
+                })(),
+                _ => return Err(FusionError::Storage(format!("Unknown WAL OpCode: {}", opcode[0]))),
+            };
 
-                    match res {
-                        Ok(entry) => {
-                            entries.push(entry);
-                            valid_pos += current_record_len as u64;
-                        }
-                        Err(FusionError::Storage(msg)) if msg == "Partial Record" => {
-                            println!("WAL Replay: Found partial record at end. Truncating.");
-                            break;
-                        }
-                        Err(e) => return Err(e),
-                    }
+            match res {
+                Ok(entry) => {
+                    entries.push(entry);
+                    valid_pos += record_len as u64;
                 }
-                2 => {
-                    // Delete
-                    let res = (|| -> Result<WalEntry> {
-                         let k_len = read_u32(&mut reader, &mut current_record_len)? as usize;
-                         let k = read_vec(&mut reader, k_len, &mut current_record_len)?;
-                         Ok(WalEntry::Delete(k))
-                    })();
-
-                    match res {
-                        Ok(entry) => {
-                            entries.push(entry);
-                            valid_pos += current_record_len as u64;
-                        }
-                        Err(FusionError::Storage(msg)) if msg == "Partial Record" => {
-                             println!("WAL Replay: Found partial record at end. Truncating.");
-                             break;
-                        }
-                        Err(e) => return Err(e),
-                    }
+                Err(FusionError::Storage(msg)) if msg == "Partial Record" => {
+                    println!("WAL Replay: partial record at end of {}. Truncating.", path);
+                    break;
                 }
-                _ => {
-                    return Err(FusionError::Storage(format!(
-                        "Unknown WAL OpCode: {}",
-                        opcode[0]
-                    )))
-                }
+                Err(e) => return Err(e),
             }
         }
-        
-        // If we found partial data (valid_pos < file_len), truncate the file
+
+        // Truncate partial tail if needed
         if valid_pos < file_len {
-            println!("Truncating WAL from {} to {} bytes", file_len, valid_pos);
-            // We need to re-open or use the file handle?
-            // BufReader took ownership. We can use the file path.
-            // But we hold the lock on `guard` (which is the writer).
-            // We should update the writer too?
-            // The writer is in `self.file`. `guard` is the MutexGuard.
-            // *guard is Option<BufWriter<File>>.
-            
-            // Drop reader to close file handle
-            drop(reader);
-            
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&self.path)
-                .map_err(|e| FusionError::Storage(format!("Failed to open WAL for truncation: {}", e)))?;
-            file.set_len(valid_pos).map_err(|e| FusionError::Storage(format!("Failed to truncate WAL: {}", e)))?;
-            
-            // Re-initialize the writer in the mutex
-             let file_append = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .map_err(|e| FusionError::Storage(format!("Failed to re-open WAL: {}", e)))?;
-            *guard = Some(BufWriter::new(file_append));
+            let _ = OpenOptions::new().write(true).open(path)
+                .and_then(|f| f.set_len(valid_pos));
         }
 
         Ok(entries)
     }
 
+    /// Truncate all WAL segments — delete old segments and reset the active segment.
     pub fn truncate(&self) -> Result<()> {
-        let mut writer_guard = self
-            .file
-            .lock()
+        let mut ws = self.state.lock()
             .map_err(|_| FusionError::Storage("WAL Lock poisoned".to_string()))?;
 
-        // Re-open with truncate
+        // Close current writer
+        ws.writer = None;
+
+        // Delete all segment files
+        let segments = find_segments(&self.path);
+        for (_, seg_path) in &segments {
+            let _ = fs::remove_file(seg_path);
+        }
+
+        // Re-create base file and reset state
         let file = OpenOptions::new()
+            .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)
-            .map_err(|e| FusionError::Storage(format!("Failed to truncate WAL: {}", e)))?;
+            .map_err(|e| FusionError::Storage(format!("Failed to recreate WAL: {}", e)))?;
 
-        *writer_guard = Some(BufWriter::new(file));
+        ws.writer = Some(BufWriter::new(file));
+        ws.segment_id = 0;
+        ws.segment_size = 0;
+        self.segment_id.store(0, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -394,59 +466,102 @@ impl WalManager {
     where
         I: Iterator<Item = (Vec<u8>, Vec<u8>)>,
     {
-        // 1. Write to temporary file
         let snap_path = format!("{}.snap", self.path);
         let mut file = BufWriter::new(File::create(&snap_path).map_err(Self::io_err)?);
 
         for (k, v) in iter {
-            // Write as WAL Put entries
-            file.write_all(&[1u8]).map_err(Self::io_err)?; // OpCode 1: Put
-
-            let k_len = (k.len() as u32).to_le_bytes();
-            file.write_all(&k_len).map_err(Self::io_err)?;
+            file.write_all(&[1u8]).map_err(Self::io_err)?;
+            file.write_all(&(k.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
             file.write_all(&k).map_err(Self::io_err)?;
-
-            let v_len = (v.len() as u32).to_le_bytes();
-            file.write_all(&v_len).map_err(Self::io_err)?;
+            file.write_all(&(v.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
             file.write_all(&v).map_err(Self::io_err)?;
         }
         file.flush().map_err(Self::io_err)?;
 
-        // 2. Rename snapshot to WAL (Atomic replace)
         {
-            let mut writer_guard = self
-                .file
-                .lock()
+            let mut ws = self.state.lock()
                 .map_err(|_| FusionError::Storage("WAL Lock poisoned".to_string()))?;
-            // Drop current writer to close the file handle
-            *writer_guard = None;
 
-            // Replace the file on disk
-            if let Err(e) = std::fs::rename(&snap_path, &self.path) {
-                // Try to restore writer if fail?
-                // Re-open old path (might still be there if rename failed)
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)
-                    .map_err(Self::io_err)?;
-                *writer_guard = Some(BufWriter::new(file));
+            // Delete all old segments first
+            let old_segments = find_segments(&self.path);
+            ws.writer = None;
+            for (_, seg_path) in &old_segments {
+                let _ = fs::remove_file(seg_path);
+            }
+
+            // Rename snapshot to base path
+            if let Err(e) = fs::rename(&snap_path, &self.path) {
+                let file = OpenOptions::new().create(true).append(true).open(&self.path).map_err(Self::io_err)?;
+                ws.writer = Some(BufWriter::new(file));
                 return Err(Self::io_err(e));
             }
 
-            // Re-open the file for appending
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .map_err(Self::io_err)?;
-            *writer_guard = Some(BufWriter::new(file));
+            let file = OpenOptions::new().create(true).append(true).open(&self.path).map_err(Self::io_err)?;
+            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            ws.writer = Some(BufWriter::new(file));
+            ws.segment_id = 0;
+            ws.segment_size = size;
         }
 
         Ok(())
     }
 
+    /// Return the number of WAL segment files.
+    #[allow(dead_code)]
+    pub fn segment_count(&self) -> usize {
+        find_segments(&self.path).len()
+    }
+
     fn io_err(e: io::Error) -> FusionError {
         FusionError::Storage(format!("WAL IO Error: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_segment_path() {
+        assert_eq!(segment_path("data/fusion.wal", 0), "data/fusion.wal");
+        assert_eq!(segment_path("data/fusion.wal", 1), "data/fusion.wal.seg.1");
+        assert_eq!(segment_path("data/fusion.wal", 42), "data/fusion.wal.seg.42");
+    }
+
+    #[test]
+    fn test_find_segments_empty() {
+        let segments = find_segments("nonexistent_test_path_xyz.wal");
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_wal_write_and_replay() {
+        let path = format!("test_wal_seg_{}.wal", std::process::id());
+        let wal = WalManager::new(&path).unwrap();
+        wal.append(&WalEntry::Put(b"key1".to_vec(), b"val1".to_vec())).unwrap();
+        wal.append(&WalEntry::Put(b"key2".to_vec(), b"val2".to_vec())).unwrap();
+        wal.append(&WalEntry::Delete(b"key1".to_vec())).unwrap();
+
+        // Re-open and replay
+        let wal2 = WalManager::new(&path).unwrap();
+        let entries = wal2.replay().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        // Cleanup
+        wal2.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_truncate_cleans_segments() {
+        let path = format!("test_wal_trunc_{}.wal", std::process::id());
+        let wal = WalManager::new(&path).unwrap();
+        wal.append(&WalEntry::Put(b"k".to_vec(), b"v".to_vec())).unwrap();
+        wal.truncate().unwrap();
+
+        let entries = wal.replay().unwrap();
+        assert_eq!(entries.len(), 0);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

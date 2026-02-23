@@ -134,7 +134,7 @@ async fn handle_sql_query<W: AsyncWriteExt + Unpin>(
              }
         },
         Statement::Commit { .. } => {
-             if let Some(mut txn) = active_txn.take() {
+             if let Some(txn) = active_txn.take() {
                  txn.commit().await.map_err(|e| std::io::Error::other(e.to_string()))?;
                  Ok(QueryResult::Success { message: "Transaction committed".to_string() })
              } else {
@@ -142,7 +142,7 @@ async fn handle_sql_query<W: AsyncWriteExt + Unpin>(
              }
         },
         Statement::Rollback { .. } => {
-             if let Some(mut txn) = active_txn.take() {
+             if let Some(txn) = active_txn.take() {
                  txn.rollback().await.map_err(|e| std::io::Error::other(e.to_string()))?;
                  Ok(QueryResult::Success { message: "Transaction rolled back".to_string() })
              } else {

@@ -1,31 +1,42 @@
-# Build Stage
-FROM rust:1.83 as builder
+# === Build Stage: Rust ===
+FROM rust:1.83 AS builder
 
 WORKDIR /usr/src/fusiondb
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY tests/ tests/
 
-# Build the release binary
+# Build release binary
 RUN cargo build --release
 
-# Runtime Stage
+# === Build Stage: Dashboard ===
+FROM node:20-slim AS dashboard-builder
+
+WORKDIR /app
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci
+COPY dashboard/ .
+RUN npm run build
+
+# === Runtime Stage ===
 FROM debian:bookworm-slim
 
-# Install OpenSSL/Ca-certificates if needed (depending on dependencies)
-RUN apt-get update && apt-get install -y libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/local/bin
 
-# Copy the binary from builder
+# Copy server binary
 COPY --from=builder /usr/src/fusiondb/target/release/fusiondb .
+
+# Copy dashboard static files
+COPY --from=dashboard-builder /app/dist /usr/local/share/fusiondb/dashboard
 
 # Create data directories
 RUN mkdir -p /data/sstables /data/wal
 WORKDIR /data
 
-# Expose ports
-# 5432: PostgreSQL Protocol
-# 8080: HTTP API (if enabled)
-EXPOSE 5432 8080
+# Expose ports: HTTP API + PostgreSQL Protocol
+EXPOSE 8091 8092
 
 # Run the binary
 CMD ["/usr/local/bin/fusiondb"]

@@ -1,0 +1,17 @@
+[server]
+http_port = 8091
+pg_port = 8092
+bind = "127.0.0.1"
+
+[storage]
+data_dir = "data"
+wal_file = "fusion.wal"
+sstable_dir = "sstables"
+memtable_flush_mb = 32
+row_cache_capacity = 10000
+statement_cache_capacity = 1000
+block_cache_capacity = 25000
+slow_query_threshold_ms = 100
+
+[auth]
+password = "fusiondb"

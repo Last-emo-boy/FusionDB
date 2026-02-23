@@ -50,24 +50,59 @@ mod tests {
     
     #[test]
     fn test_rollback_scenario() {
-        // Reproduce the scenario from external_benchmark
         let row = vec![
             Value::Integer(9999999),
             Value::String("rollback_test".to_string()),
         ];
         
         let encoded = RowEncoder::encode(&row);
-        println!("Encoded: {:?}", encoded);
-        
-        // Manually inspect bytes
-        // Header: 2 bytes count + 8 bytes offsets = 10 bytes
-        // Count: 02 00
-        // Offset 1: 0A 00 00 00 (10)
-        // Data 1 (Integer): 02 00 00 00 (Tag 2) + 8 bytes payload
-        // Len 1 = 12
-        // Offset 2: 16 00 00 00 (22)
-        // Data 2 (String): 03 00 00 00 (Tag 3) + 8 bytes len + 13 bytes data
-        
+        let decoded = RowDecoder::decode(&encoded).expect("Decoding failed");
+        assert_eq!(row, decoded);
+    }
+
+    #[test]
+    fn test_i64_comparable_ordering() {
+        let a = encode_i64_comparable(-100);
+        let b = encode_i64_comparable(0);
+        let c = encode_i64_comparable(100);
+        // Lexicographic ordering should match numeric ordering
+        assert!(a < b);
+        assert!(b < c);
+    }
+
+    #[test]
+    fn test_i64_comparable_roundtrip() {
+        for val in [i64::MIN, -1, 0, 1, i64::MAX] {
+            let encoded = encode_i64_comparable(val);
+            let decoded = decode_i64_comparable(&encoded).unwrap();
+            assert_eq!(val, decoded, "Roundtrip failed for {}", val);
+        }
+    }
+
+    #[test]
+    fn test_encode_key_integer() {
+        let key = encode_key(&Value::Integer(42));
+        assert_eq!(key, encode_i64_comparable(42));
+    }
+
+    #[test]
+    fn test_encode_key_string() {
+        let key = encode_key(&Value::String("hello".to_string()));
+        assert_eq!(key, "hello");
+    }
+
+    #[test]
+    fn test_row_encoding_empty() {
+        let row: Vec<Value> = vec![];
+        let encoded = RowEncoder::encode(&row);
+        let decoded = RowDecoder::decode(&encoded).expect("Decoding failed");
+        assert_eq!(row, decoded);
+    }
+
+    #[test]
+    fn test_row_encoding_single_null() {
+        let row = vec![Value::Null];
+        let encoded = RowEncoder::encode(&row);
         let decoded = RowDecoder::decode(&encoded).expect("Decoding failed");
         assert_eq!(row, decoded);
     }
@@ -91,8 +126,6 @@ pub fn encode_key(v: &Value) -> String {
     }
 }
 
-use std::io::Cursor;
-use std::io::Read;
 
 pub struct RowEncoder;
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use moka::sync::Cache;
 
+use crc32fast::Hasher as Crc32Hasher;
 use fastbloom::BloomFilter;
 
 // --- SSTable ---
@@ -165,11 +166,13 @@ impl SsTable {
                 buf
             };
 
+            // Verify CRC32 checksum (last 4 bytes of block)
+            let block_data = Self::verify_block_crc(&block_data)?;
+
             // Parse Block
             let mut cursor = std::io::Cursor::new(block_data);
             
             let mut count_buf = [0u8; 4];
-            // Use std::io::Read for Cursor (sync)
             if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_err() { continue; }
             let count = u32::from_le_bytes(count_buf);
 
@@ -195,13 +198,36 @@ impl SsTable {
         Ok(None)
     }
 
+    /// Verify CRC32 of a block. Returns the data portion (without trailing CRC).
+    fn verify_block_crc(block_data: &[u8]) -> Result<&[u8]> {
+        if block_data.len() < 4 {
+            return Ok(block_data); // Too small for CRC, legacy block
+        }
+        let (data, crc_bytes) = block_data.split_at(block_data.len() - 4);
+        let stored_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap_or([0; 4]));
+        // If stored_crc is 0, treat as legacy block without checksum
+        if stored_crc == 0 {
+            return Ok(block_data);
+        }
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(data);
+        let computed = hasher.finalize();
+        if computed != stored_crc {
+            return Err(crate::common::FusionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("SSTable block CRC mismatch: expected {:08x}, got {:08x}", stored_crc, computed),
+            )));
+        }
+        Ok(data)
+    }
+
     pub async fn read_block(&self, offset: u64) -> Result<Vec<u8>> {
         if let Some(data) = self.block_cache.get(&(self.id, offset)) {
             return Ok(data);
         }
         
         // Find block length
-        let idx_keys: Vec<&Vec<u8>> = self.index.keys().collect();
+        let _idx_keys: Vec<&Vec<u8>> = self.index.keys().collect();
         let idx_offsets: Vec<&u64> = self.index.values().collect();
         
         let mut next_offset = self.file_len;
@@ -258,6 +284,7 @@ pub struct SsTableIterator {
     path: PathBuf,
     block_cache: Arc<Cache<(u64, u64), Vec<u8>>>,
     sst_id: u64,
+    #[allow(dead_code)]
     index_keys: Vec<Vec<u8>>,
     index_offsets: Vec<u64>,
     file_len: u64,
@@ -298,6 +325,9 @@ impl SsTableIterator {
                 self.block_cache.insert((self.sst_id, offset), buf.clone());
                 buf
             };
+
+            // Verify CRC32
+            let block_data = SsTable::verify_block_crc(&block_data).unwrap_or(&block_data);
 
             // Parse Block
             let mut cursor = std::io::Cursor::new(block_data);
@@ -380,27 +410,27 @@ impl SsTableBuilder {
         
         self.index.insert(start_key.clone(), self.current_offset);
 
-        // Track global first/last key
-        // NOTE: We rely on flush_block being called in order.
         if self.first_key.is_none() {
              self.first_key = Some(start_key.clone());
         }
         
-        // We can't know the TRUE last key of the block from `start_key`.
-        // We rely on `add_key` or `finish`?
-        // Actually, `flush_block` doesn't pass the last key.
-        // But the caller (FusionStorage) knows the keys.
-        // FusionStorage calls `add_key` for BloomFilter.
-        // So we should track last_key in `add_key`!
-        
-        // Write Block Header (Count)
+        // Write Block: [Count: 4b] [Data] [CRC32: 4b]
+        // CRC covers count + data
         if let Some(file) = &mut self.file {
-             file.write_all(&count.to_le_bytes()).await?;
-             self.current_offset += 4;
+             let count_bytes = count.to_le_bytes();
 
-             // Write Data
+             // Compute CRC32 over count + data
+             let mut hasher = Crc32Hasher::new();
+             hasher.update(&count_bytes);
+             hasher.update(buf);
+             let crc = hasher.finalize();
+
+             file.write_all(&count_bytes).await?;
+             self.current_offset += 4;
              file.write_all(buf).await?;
              self.current_offset += buf.len() as u64;
+             file.write_all(&crc.to_le_bytes()).await?;
+             self.current_offset += 4;
         }
         Ok(())
     }

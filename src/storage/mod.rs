@@ -1,14 +1,13 @@
 use crate::common::Result;
 use async_trait::async_trait;
 
+pub mod backend;
 pub mod columnar;
+pub mod columnar_analytics;
 pub mod fbtree;
 pub mod fusion;
 pub mod inverted_index;
-pub mod lsm;
 pub mod memory;
-pub mod mvcc;
-pub mod sled_store;
 pub mod sstable;
 pub mod vector_index;
 pub mod wal;

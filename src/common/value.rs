@@ -209,3 +209,90 @@ impl From<bool> for Value {
         Value::Boolean(v)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compare_integers() {
+        assert_eq!(Value::Integer(1).compare(&Value::Integer(2)), Ordering::Less);
+        assert_eq!(Value::Integer(2).compare(&Value::Integer(2)), Ordering::Equal);
+        assert_eq!(Value::Integer(3).compare(&Value::Integer(2)), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_mixed_numeric() {
+        assert_eq!(Value::Integer(1).compare(&Value::Float(1.5)), Ordering::Less);
+        assert_eq!(Value::Float(2.5).compare(&Value::Integer(2)), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_null_ordering() {
+        assert_eq!(Value::Null.compare(&Value::Integer(1)), Ordering::Less);
+        assert_eq!(Value::Integer(1).compare(&Value::Null), Ordering::Greater);
+        assert_eq!(Value::Null.compare(&Value::Null), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_strings() {
+        assert_eq!(
+            Value::String("abc".into()).compare(&Value::String("def".into())),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_display() {
+        assert_eq!(format!("{}", Value::Null), "NULL");
+        assert_eq!(format!("{}", Value::Integer(42)), "42");
+        assert_eq!(format!("{}", Value::Float(3.14)), "3.14");
+        assert_eq!(format!("{}", Value::Boolean(true)), "true");
+        assert_eq!(format!("{}", Value::String("hello".into())), "'hello'");
+    }
+
+    #[test]
+    fn test_from_conversions() {
+        let v: Value = 42i64.into();
+        assert_eq!(v, Value::Integer(42));
+
+        let v: Value = 3.14f64.into();
+        assert_eq!(v, Value::Float(3.14));
+
+        let v: Value = "hello".into();
+        assert_eq!(v, Value::String("hello".to_string()));
+
+        let v: Value = true.into();
+        assert_eq!(v, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_json_roundtrip() {
+        let original = Value::Integer(42);
+        let json = original.to_json();
+        let restored = Value::from_json(&json);
+        assert_eq!(original, restored);
+
+        let original = Value::String("test".into());
+        let json = original.to_json();
+        let restored = Value::from_json(&json);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn test_hash_equality() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(Value::Integer(1));
+        set.insert(Value::Integer(1));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_type_order() {
+        assert!(Value::Null.get_type_order() < Value::Boolean(true).get_type_order());
+        assert!(Value::Boolean(true).get_type_order() < Value::Integer(0).get_type_order());
+        assert_eq!(Value::Integer(0).get_type_order(), Value::Float(0.0).get_type_order());
+        assert!(Value::Integer(0).get_type_order() < Value::String("".into()).get_type_order());
+    }
+}

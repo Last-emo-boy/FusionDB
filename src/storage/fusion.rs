@@ -4,7 +4,6 @@ use super::{Storage, Transaction};
 use crate::common::Result;
 use async_trait::async_trait;
 use crossbeam_skiplist::SkipMap;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
@@ -532,6 +531,18 @@ impl FusionStorage {
                         eprintln!("Failed to save trigram index: {:?}", e);
                     }
                 }
+
+                // WAL Truncation: if no more immutable memtables remain,
+                // all data is persisted to SSTables, so we can truncate WAL.
+                let remaining = {
+                    let imm = self.immutable_memtables.read().unwrap();
+                    imm.len()
+                };
+                if remaining == 0 {
+                    if let Err(e) = self.wal.truncate() {
+                        eprintln!("Failed to truncate WAL after flush: {:?}", e);
+                    }
+                }
             }
         }
     }
@@ -592,6 +603,8 @@ impl FusionStorage {
             let mut block_buffer = Vec::new();
             let mut block_count = 0;
             let mut first_key = None;
+            let mut last_base_key: Option<Vec<u8>> = None;
+            let mut dedup_count: u64 = 0;
 
             while let Some(item) = heap.pop() {
                 let k = item.key;
@@ -599,7 +612,6 @@ impl FusionStorage {
                 let idx = item.iter_idx;
 
                 if k.len() < TS_SIZE {
-                    // Advance iterator
                     if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
                         heap.push(MergeItem {
                             key: next_k,
@@ -609,6 +621,25 @@ impl FusionStorage {
                     }
                     continue;
                 }
+
+                // Dedup: for the same base key (without timestamp), keep only the latest version.
+                // Keys come out of the min-heap sorted by [base_key][timestamp].
+                // The first occurrence for a base key is the latest version (highest ts).
+                let base_key = k[..k.len() - TS_SIZE].to_vec();
+                let is_dup = last_base_key.as_ref() == Some(&base_key);
+                if is_dup {
+                    dedup_count += 1;
+                    // Skip this older version, but still advance the iterator
+                    if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
+                        heap.push(MergeItem {
+                            key: next_k,
+                            val: next_v,
+                            iter_idx: idx,
+                        });
+                    }
+                    continue;
+                }
+                last_base_key = Some(base_key);
 
                 // Add to Builder
                 if first_key.is_none() {
@@ -639,6 +670,10 @@ impl FusionStorage {
                         iter_idx: idx,
                     });
                 }
+            }
+
+            if dedup_count > 0 {
+                println!("[compaction] Deduplicated {} stale key versions", dedup_count);
             }
 
             if !block_buffer.is_empty() {
@@ -677,6 +712,103 @@ impl FusionStorage {
         }
     }
 
+    /// Graceful shutdown: flush active MemTable to SSTable, save indexes, sync WAL.
+    pub async fn shutdown(&self) {
+        println!("[shutdown] Flushing active MemTable...");
+
+        // 1. Rotate active memtable to immutable
+        self.rotate_memtable().await;
+
+        // 2. Flush all immutable memtables
+        loop {
+            let memtable_to_flush = {
+                let mut imm = self.immutable_memtables.write().unwrap();
+                imm.pop()
+            };
+            match memtable_to_flush {
+                Some(mem) => {
+                    self.flush_memtable_sync(&mem).await;
+                }
+                None => break,
+            }
+        }
+
+        // 3. Save secondary indexes
+        if let Ok(guard) = self.inverted_index.read() {
+            if let Err(e) = guard.save("inverted_index.bin") {
+                eprintln!("[shutdown] Failed to save inverted index: {:?}", e);
+            }
+        }
+        if let Ok(guard) = self.trigram_index.read() {
+            if let Err(e) = guard.save("trigram_index.bin") {
+                eprintln!("[shutdown] Failed to save trigram index: {:?}", e);
+            }
+        }
+
+        // 4. Truncate WAL (all data is now in SSTables)
+        if let Err(e) = self.wal.truncate() {
+            eprintln!("[shutdown] Failed to truncate WAL: {:?}", e);
+        }
+
+        println!("[shutdown] FusionDB shut down cleanly.");
+    }
+
+    /// Flush a single MemTable to SSTable (used during shutdown).
+    async fn flush_memtable_sync(&self, mem: &MemTable) {
+        let sst_path = PathBuf::from(format!("sstables/{}.sst", mem.id));
+        let mut builder = SsTableBuilder::new(sst_path.clone());
+
+        let mut block_count = 0;
+        let mut block_buffer = Vec::new();
+        let mut first_key = None;
+
+        for entry in mem.map.iter() {
+            let key = entry.key();
+            let val = entry.value();
+            if key.len() < TS_SIZE {
+                continue;
+            }
+            if first_key.is_none() {
+                first_key = Some(key.clone());
+            }
+            builder.add_key(key);
+            block_buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            block_buffer.extend_from_slice(key);
+            block_buffer.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            block_buffer.extend_from_slice(val);
+            block_count += 1;
+
+            if block_buffer.len() >= 4096 {
+                if let Err(e) = builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer).await {
+                    eprintln!("[shutdown] flush block error: {:?}", e);
+                    return;
+                }
+                block_buffer.clear();
+                block_count = 0;
+            }
+        }
+
+        if !block_buffer.is_empty() {
+            if let Some(fk) = first_key.take() {
+                let _ = builder.flush_block(fk, block_count, &block_buffer).await;
+            }
+        }
+
+        if let Err(e) = builder.finish().await {
+            eprintln!("[shutdown] SSTable finish error: {:?}", e);
+            return;
+        }
+
+        // Open and register
+        match SsTable::open(sst_path, mem.id, self.block_cache.clone()).await {
+            Ok(sst) => {
+                let mut sstables = self.sstables.write().unwrap();
+                sstables.push(Arc::new(sst));
+            }
+            Err(e) => eprintln!("[shutdown] Failed to open flushed SST: {:?}", e),
+        }
+    }
+
     async fn rotate_memtable(&self) {
         let mut active = self.active_memtable.write().unwrap();
         let mut imm = self.immutable_memtables.write().unwrap();
@@ -706,7 +838,7 @@ impl Transaction for FusionTransaction {
         // 1. Read-Your-Own-Writes
         for (k, v) in self.write_buffer.iter().rev() {
             if k == key {
-                if let Ok(s) = std::str::from_utf8(key) {
+                if let Ok(_s) = std::str::from_utf8(key) {
                      // if s.contains("9999999") {
                      //    eprintln!("DEBUG: FusionTransaction::get HIT WriteBuffer. Key: {}, ValLen: {}, Val: {:?}", s, v.as_ref().map(|x| x.len()).unwrap_or(0), v);
                      // }
@@ -957,13 +1089,10 @@ impl Transaction for FusionTransaction {
         }
         
         // 3. Merge Loop
-        let mut res = Vec::new();
-        // Use last_internal_key to avoid allocating UserKey vector
-        let mut last_internal_key: Option<Vec<u8>> = None;
-        let mut scanned_count = 0;
+        let mut res = Vec::with_capacity(safe_limit.min(4096));
+        let mut last_user_key: Option<Vec<u8>> = None;
         
         while let Some(item) = heap.pop() {
-            scanned_count += 1;
             let k = item.key;
             let v = item.val;
             let idx = item.iter_idx;
@@ -973,31 +1102,12 @@ impl Transaction for FusionTransaction {
                 break;
             }
             
-            // Check if duplicate of last processed key
-            if let Some(last_ik) = &last_internal_key {
-                let (last_uk, _) = FusionStorage::decode_key(last_ik);
-                if last_uk == user_k {
-                    // Already processed this user key (latest version)
-                    // Advance iterator and continue
-                    // Note: We duplicate advance logic here or we can advance after?
-                    // The loop structure requires us to advance.
-                    // Let's refactor: Advance logic is generic.
-                    // But we MUST advance the iterator from which 'item' came.
-                }
-            }
-            
-            
-            // Optimization: Skip duplicates of last_internal_key immediately
-            // But we must Advance Iterator first to keep heap consistent!
-            // Wait, if we 'continue' we skip 'Advance Iterator' block if we put it after?
-            // No, we must Advance Iterator.
-            
-            // Advance Iterator Logic (Same as before)
+            // Advance Iterator (must happen before dedup skip)
             let mut next_item = None;
             
             if idx == 0 {
                 while let Some((nk, nv)) = wb_iter.next() {
-                    let (nuk, nts) = FusionStorage::decode_key(&nk);
+                    let (nuk, _nts) = FusionStorage::decode_key(&nk);
                     if nuk == user_k {
                         if ts <= read_ts { continue; }
                     }
@@ -1010,7 +1120,7 @@ impl Transaction for FusionTransaction {
             } else if idx <= mem_tables.len() {
                 let mem_idx = idx - 1;
                 while let Some((nk, nv)) = mem_iters[mem_idx].next() {
-                     let (nuk, nts) = FusionStorage::decode_key(&nk);
+                     let (nuk, _nts) = FusionStorage::decode_key(&nk);
                      if nuk >= end { next_item = None; break; }
                      if nuk == user_k {
                          if ts <= read_ts { continue; }
@@ -1025,7 +1135,7 @@ impl Transaction for FusionTransaction {
                 let sst_idx = idx - 1 - mem_tables.len();
                 if let Some(it) = &mut sst_iters[sst_idx] {
                     while let Ok(Some((nk, nv))) = it.next().await {
-                         let (nuk, nts) = FusionStorage::decode_key(&nk);
+                         let (nuk, _nts) = FusionStorage::decode_key(&nk);
                          if nuk >= end { next_item = None; break; }
                          if nuk == user_k {
                              if ts <= read_ts { continue; }
@@ -1039,16 +1149,15 @@ impl Transaction for FusionTransaction {
                 }
             }
             
-            // Now check last_internal_key
-            if let Some(last_ik) = &last_internal_key {
-                let (last_uk, _) = FusionStorage::decode_key(last_ik);
-                if last_uk == user_k {
+            // Dedup: skip if same user key as last processed
+            if let Some(ref last_uk) = last_user_key {
+                if last_uk.as_slice() == user_k {
                     continue;
                 }
             }
             
             if ts <= read_ts {
-                last_internal_key = Some(k.clone()); // Store internal key (includes user key)
+                last_user_key = Some(user_k.to_vec());
                 let (is_put, val) = FusionStorage::decode_value(&v);
                 if is_put {
                     res.push((user_k.to_vec(), val.to_vec()));
@@ -1059,107 +1168,22 @@ impl Transaction for FusionTransaction {
             }
         }
         
-        if scanned_count > 100 {
-              // println!("DEBUG: scan_range scanned {} items, returning {}. Start: {:?}, Limit: {:?}", scanned_count, res.len(), String::from_utf8_lossy(start), limit);
-        }
-        
         Ok(res)
     }
 
     async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
-        let iter_key = FusionStorage::encode_key(prefix, u64::MAX);
-        let read_ts = self.read_ts;
-
-        // Collect keys and status (IsValid)
-        // Key -> IsValid
-        // We use BTreeMap to iterate in order if needed, but HashSet/Map is faster for lookup.
-        // But we need to process multiple sources.
-        // Simplest correct way: Merge all sources, track latest version.
-        // We can use a Map<Key, (TS, IsPut)>.
-        // Insert if TS <= read_ts. If key exists, keep the one with higher TS.
-        // Finally count IsPut == true.
+        // Optimized: reuse scan_range merge iterator logic but only count results
+        // This avoids HashMap allocation and is O(n log k) vs O(n) HashMap with high constant
+        let mut end = prefix.to_vec();
+        let mut found = false;
+        while let Some(last) = end.last_mut() {
+            if *last < 255 { *last += 1; found = true; break; }
+            end.pop();
+        }
+        if !found { return Ok(0); }
         
-        let mut key_map: std::collections::HashMap<Vec<u8>, (u64, bool)> = std::collections::HashMap::new();
-
-        let update_map = |k: Vec<u8>, ts: u64, is_put: bool, map: &mut std::collections::HashMap<Vec<u8>, (u64, bool)>| {
-            map.entry(k)
-                .and_modify(|(existing_ts, existing_is_put)| {
-                    if ts > *existing_ts {
-                        *existing_ts = ts;
-                        *existing_is_put = is_put;
-                    }
-                })
-                .or_insert((ts, is_put));
-        };
-
-        // MemTables
-        let scan_mem = |mem: &MemTable, map: &mut std::collections::HashMap<Vec<u8>, (u64, bool)>| {
-            for entry in mem.map.range(iter_key.clone()..) {
-                let (k, ts) = FusionStorage::decode_key(entry.key());
-                if !k.starts_with(prefix) {
-                    break;
-                }
-                if ts <= read_ts {
-                    let (is_put, _) = FusionStorage::decode_value(entry.value());
-                    update_map(k.to_vec(), ts, is_put, map);
-                }
-            }
-        };
-
-        {
-            let active = self.storage.active_memtable.read().unwrap();
-            scan_mem(&active, &mut key_map);
-        }
-
-        {
-            let imm = self.storage.immutable_memtables.read().unwrap();
-            for mem in imm.iter().rev() {
-                scan_mem(mem, &mut key_map);
-            }
-        }
-
-        // Write Buffer (Highest Priority / Latest implicitly? No, WB has no TS in key here?)
-        // In FusionTransaction, WB stores user keys.
-        // We assume they are newer than anything in storage (Read-Your-Own-Writes).
-        // So we can overwrite directly.
-        for (k, v) in &self.write_buffer {
-            if k.starts_with(prefix) {
-                let is_put = v.is_some();
-                // Use MAX TS to ensure it wins
-                update_map(k.clone(), u64::MAX, is_put, &mut key_map);
-            }
-        }
-
-        // SSTables
-        let sstables: Vec<Arc<SsTable>> = {
-            let guard = self.storage.sstables.read().unwrap();
-            guard.clone()
-        };
-
-        for sst in sstables.iter() {
-            // Use seek optimization
-            let mut iter = sst.new_iterator(Some(&iter_key)).await?;
-            
-            while let Ok(Some((k, v))) = iter.next().await {
-                let (user_k, ts) = FusionStorage::decode_key(&k);
-                
-                if !user_k.starts_with(prefix) {
-                    if user_k > prefix {
-                        // Passed the range
-                        break;
-                    }
-                    continue; 
-                }
-                
-                if ts <= read_ts {
-                    let (is_put, _) = FusionStorage::decode_value(&v);
-                    update_map(user_k.to_vec(), ts, is_put, &mut key_map);
-                }
-            }
-        }
-
-        let count = key_map.values().filter(|&&(_, is_put)| is_put).count();
-        Ok(count)
+        let results = self.scan_range(prefix, &end, None).await?;
+        Ok(results.len())
     }
 
     async fn first(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
@@ -1365,6 +1389,55 @@ impl Transaction for FusionTransaction {
     async fn commit(self: Box<Self>) -> Result<()> {
         if self.write_buffer.is_empty() {
             return Ok(());
+        }
+
+        // Write Conflict Detection (OCC):
+        // For each key in write_buffer, check if a newer version (ts > read_ts)
+        // was committed by another transaction since we started.
+        let check_mem_conflict = |mem: &MemTable, search_key: &[u8], user_key: &[u8], read_ts: u64| -> Option<u64> {
+            mem.map.range(search_key.to_vec()..).next().and_then(|entry| {
+                let (k, ts) = FusionStorage::decode_key(entry.key());
+                if k == user_key && ts > read_ts {
+                    Some(ts)
+                } else {
+                    None
+                }
+            })
+        };
+
+        for (user_key, _) in &self.write_buffer {
+            let search_key = FusionStorage::encode_key(user_key, u64::MAX);
+
+            // Check active memtable
+            let conflict_ts = {
+                let active = self.storage.active_memtable.read().unwrap();
+                check_mem_conflict(&active, &search_key, user_key, self.read_ts)
+            };
+            if let Some(ts) = conflict_ts {
+                return Err(crate::common::FusionError::Storage(format!(
+                    "Write conflict: key modified by another transaction (read_ts={}, conflict_ts={})",
+                    self.read_ts, ts
+                )));
+            }
+
+            // Check immutable memtables
+            let conflict_ts = {
+                let imm = self.storage.immutable_memtables.read().unwrap();
+                let mut found = None;
+                for mem in imm.iter().rev() {
+                    if let Some(ts) = check_mem_conflict(mem, &search_key, user_key, self.read_ts) {
+                        found = Some(ts);
+                        break;
+                    }
+                }
+                found
+            };
+            if let Some(ts) = conflict_ts {
+                return Err(crate::common::FusionError::Storage(format!(
+                    "Write conflict: key modified by another transaction (read_ts={}, conflict_ts={})",
+                    self.read_ts, ts
+                )));
+            }
         }
 
         let commit_ts = self.storage.current_ts.fetch_add(1, Ordering::SeqCst) + 1;

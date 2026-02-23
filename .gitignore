@@ -1,3 +1,6 @@
 /target
 /external_benchmark
 /.trae
+benchmark_report_*.json
+server_port.txt
+*.wal
