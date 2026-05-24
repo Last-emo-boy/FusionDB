@@ -2088,29 +2088,51 @@ impl Executor {
                                     selection_fully_applied = true;
                                     let kv_pairs = txn.scan_range(&start, &end, limit).await?;
                                     for (k, v) in kv_pairs {
-                                        let row =
-                                            if key_only_scan {
-                                                let k_str = String::from_utf8_lossy(&k);
-                                                let prefix = format!("data:{}:", table_name);
-                                                if let Some(pk_str) = k_str.strip_prefix(&prefix) {
-                                                    Self::primary_key_row_from_id(
-                                                        &schema, pk_index, pk_str,
-                                                    )
-                                                } else {
-                                                    continue;
-                                                }
-                                            } else {
-                                                Self::decode_row_for_projection(
-                                                    &v,
-                                                    projection_indices.as_deref(),
+                                        let row = if key_only_scan {
+                                            let k_str = String::from_utf8_lossy(&k);
+                                            let prefix = format!("data:{}:", table_name);
+                                            if let Some(pk_str) = k_str.strip_prefix(&prefix) {
+                                                Self::primary_key_row_from_id(
+                                                    &schema, pk_index, pk_str,
                                                 )
-                                                .map_err(|e| {
-                                                    FusionError::Execution(format!(
-                                                        "Data deserialization error: {}",
-                                                        e
-                                                    ))
-                                                })?
-                                            };
+                                            } else {
+                                                continue;
+                                            }
+                                        } else {
+                                            let cache_key = std::str::from_utf8(&k).ok();
+                                            if projection_indices.is_none() {
+                                                if let Some(key_str) = cache_key {
+                                                    if let Some(row) = self.row_cache.get(key_str) {
+                                                        monitor::inc_row_cache_hit();
+                                                        rows.push(row);
+                                                        if let Some(l) = limit {
+                                                            if rows.len() >= l {
+                                                                break;
+                                                            }
+                                                        }
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+
+                                            let row = Self::decode_row_for_projection(
+                                                &v,
+                                                projection_indices.as_deref(),
+                                            )
+                                            .map_err(|e| {
+                                                FusionError::Execution(format!(
+                                                    "Data deserialization error: {}",
+                                                    e
+                                                ))
+                                            })?;
+                                            if projection_indices.is_none() {
+                                                if let Some(key_str) = cache_key {
+                                                    self.row_cache
+                                                        .insert(key_str.to_string(), row.clone());
+                                                }
+                                            }
+                                            row
+                                        };
                                         rows.push(row);
                                         if let Some(l) = limit {
                                             if rows.len() >= l {

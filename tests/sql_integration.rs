@@ -341,6 +341,67 @@ async fn test_commuted_primary_key_range_skips_nonmatching_row_decode() {
 }
 
 #[tokio::test]
+async fn test_primary_key_range_reuses_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE range_cache (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO range_cache VALUES (1, 'Alice'), (2, 'Bob')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM range_cache WHERE id > 0").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::String("Alice".to_string())],
+            vec![Value::Integer(2), Value::String("Bob".to_string())]
+        ]
+    );
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, name) in [(1_i64, "Alice"), (2_i64, "Bob")] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(name.to_string()),
+            ]);
+            let corrupt_col_idx = 1usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+
+            let key = format!(
+                "data:range_cache:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(&executor, "SELECT * FROM range_cache WHERE id > 0").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::String("Alice".to_string())],
+            vec![Value::Integer(2), Value::String("Bob".to_string())]
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_select_with_limit() {
     let (executor, wal) = setup().await;
     exec_ok(&executor, "CREATE TABLE nums (id INTEGER PRIMARY KEY)").await;

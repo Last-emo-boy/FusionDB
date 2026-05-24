@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-035,completed,"Repeated full-row primary-key range scans now avoid redundant row decoding through row_cache reuse.","src/execution/scan.rs;tests/sql_integration.rs",""

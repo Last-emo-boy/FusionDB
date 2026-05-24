@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-035,maestro-plan,"database-core-performance primary-key range row cache",1,completed,"Full-row primary-key range scans can reuse row_cache after invalidation paths were covered by prior tasks.",".workflow/.csv-wave/20260525-plan-pk-range-row-cache/plan.json",""

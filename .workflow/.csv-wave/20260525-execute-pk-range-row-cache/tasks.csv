@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-035,maestro-execute,"database-core-performance primary-key range row cache --method cli",2,completed,"Primary-key range scans now check row_cache for full-row projections and populate cache on decode misses.","src/execution/scan.rs;tests/sql_integration.rs",""

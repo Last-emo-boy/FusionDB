@@ -1,0 +1,39 @@
+{
+  "session_id": "20260525-plan-pk-range-row-cache",
+  "phase": "database-core-performance",
+  "goal": "Reuse row_cache for repeated full-row primary-key range scans while preserving key-only and partial projection behavior.",
+  "scope": {
+    "include": [
+      "src/execution/scan.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-035"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-035",
+      "title": "Primary-key range scan row-cache reuse",
+      "files": [
+        "src/execution/scan.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_primary_key_range_reuses_row_cache -- --nocapture",
+    "cargo test --test sql_integration commuted_primary_key_range -- --nocapture",
+    "cargo check --lib"
+  ]
+}

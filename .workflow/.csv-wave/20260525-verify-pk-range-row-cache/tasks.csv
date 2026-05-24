@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-035,maestro-verify,"database-core-performance primary-key range row cache",3,completed,"Range cache test, commuted range regression, formatting, and library check passed.",".workflow/.csv-wave/20260525-verify-pk-range-row-cache/verification.json",""
