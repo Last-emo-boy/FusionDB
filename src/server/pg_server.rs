@@ -4,22 +4,24 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex; // Required for client.send
 
-use pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
 use pgwire::api::auth::{
-    AuthSource, DefaultServerParameterProvider, LoginInfo, Password,
+    finish_authentication, protocol_negotiation, save_startup_parameters_to_metadata,
+    DefaultServerParameterProvider, LoginInfo, StartupHandler,
 };
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::NoopQueryParser;
-use pgwire::api::{ClientInfo, Type};
+use pgwire::api::{ClientInfo, PgWireConnectionState, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::{ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, Describe, Execute, Parse, ParseComplete, Sync as PgSync,
 };
 use pgwire::messages::response::CommandComplete;
+use pgwire::messages::startup::Authentication;
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::PgWireFrontendMessage;
 
 use sqlparser::ast::Statement;
 
@@ -61,23 +63,109 @@ impl PgHandler {
             })),
         }
     }
-}
 
-/// Auth source that validates passwords against a configured credential.
-#[derive(Debug)]
-struct FusionAuthSource {
-    password: String,
-}
+    fn username_for_client<C: ClientInfo>(client: &C) -> String {
+        LoginInfo::from_client_info(client)
+            .user()
+            .unwrap_or_default()
+            .to_string()
+    }
 
-#[async_trait::async_trait]
-impl AuthSource for FusionAuthSource {
-    async fn get_password(&self, _login: &LoginInfo) -> PgWireResult<Password> {
-        Ok(Password::new(None, self.password.as_bytes().to_vec()))
+    fn auth_error(message: impl Into<String>) -> pgwire::error::ErrorInfo {
+        pgwire::error::ErrorInfo::new("ERROR".to_string(), "42501".to_string(), message.into())
     }
 }
 
-type FusionStartupHandler =
-    CleartextPasswordAuthStartupHandler<FusionAuthSource, DefaultServerParameterProvider>;
+/// Auth source that validates passwords against configured credentials and RBAC records.
+struct FusionAuthSource {
+    password: String,
+    storage: Arc<dyn Storage>,
+}
+
+impl std::fmt::Debug for FusionAuthSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FusionAuthSource")
+            .field("password", &"<redacted>")
+            .field("storage", &"<storage>")
+            .finish()
+    }
+}
+
+impl FusionAuthSource {
+    async fn authenticate(&self, login: &LoginInfo<'_>, password: &str) -> PgWireResult<()> {
+        let username = login.user().unwrap_or_default();
+        if username.is_empty() || username.eq_ignore_ascii_case("postgres") {
+            return if self.password == password {
+                Ok(())
+            } else {
+                Err(PgWireError::InvalidPassword(username.to_string()))
+            };
+        }
+
+        let mut txn = self.storage.begin_transaction().await.map_err(|e| {
+            PgWireError::ApiError(Box::new(std::io::Error::other(format!(
+                "RBAC storage error: {:?}",
+                e
+            ))))
+        })?;
+
+        match crate::auth::get_user(&mut *txn, username)
+            .await
+            .map_err(|e| {
+                PgWireError::ApiError(Box::new(std::io::Error::other(format!(
+                    "RBAC lookup error: {:?}",
+                    e
+                ))))
+            })? {
+            Some(user) if user.verify_password(password) => Ok(()),
+            Some(_) | None => Err(PgWireError::InvalidPassword(username.to_string())),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FusionStartupHandler {
+    auth_source: Arc<FusionAuthSource>,
+    parameter_provider: DefaultServerParameterProvider,
+}
+
+#[async_trait::async_trait]
+impl StartupHandler for FusionStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        match message {
+            PgWireFrontendMessage::Startup(ref startup) => {
+                protocol_negotiation(client, startup).await?;
+                save_startup_parameters_to_metadata(client, startup);
+                client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                client
+                    .send(PgWireBackendMessage::Authentication(
+                        Authentication::CleartextPassword,
+                    ))
+                    .await?;
+            }
+            PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
+                let pwd = pwd.into_password()?;
+                let login_info = LoginInfo::from_client_info(client);
+                let password = pwd.password;
+                self.auth_source
+                    .authenticate(&login_info, &password)
+                    .await?;
+                finish_authentication(client, &self.parameter_provider).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
 
 /// Wrapper that implements PgWireServerHandlers, returning real handlers
 /// instead of the default NoopHandler.
@@ -102,11 +190,19 @@ impl pgwire::api::PgWireServerHandlers for PgServerFactory {
 
 #[async_trait::async_trait]
 impl SimpleQueryHandler for PgHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
         eprintln!("PG Simple Query called: {}", query);
+
+        let username = Self::username_for_client(client);
+        if let Err(e) = self.executor.authorize_sql(&username, query).await {
+            return Ok(vec![Response::Error(Box::new(Self::auth_error(format!(
+                "Authorization Error: {:?}",
+                e
+            ))))]);
+        }
 
         let mut responses = Vec::new();
 
@@ -295,6 +391,17 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
     {
+        let username = Self::username_for_client(client);
+        if let Err(e) = self.executor.authorize_sql(&username, &message.query).await {
+            client
+                .send(PgWireBackendMessage::ErrorResponse(
+                    Self::auth_error(format!("Authorization Error: {:?}", e)).into(),
+                ))
+                .await
+                .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+            return Ok(());
+        }
+
         let mut session = self.session.lock().await;
         let name = message.name.clone().unwrap_or_default();
         session.statements.insert(name, message.query.clone());
@@ -414,6 +521,16 @@ impl ExtendedQueryHandler for PgHandler {
         }
 
         let stmt = &statements[0];
+        let username = Self::username_for_client(client);
+        if let Err(e) = self.executor.authorize_statement(&username, stmt).await {
+            client
+                .send(PgWireBackendMessage::ErrorResponse(
+                    Self::auth_error(format!("Authorization Error: {:?}", e)).into(),
+                ))
+                .await
+                .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+            return Ok(());
+        }
 
         let mut session = self.session.lock().await;
         let result = if let Some(txn) = session.transaction.as_mut() {
@@ -578,11 +695,12 @@ impl ExtendedQueryHandler for PgHandler {
 pub async fn start_pg_server(
     executor: Arc<Executor>,
     storage: Arc<dyn Storage>,
+    bind: &str,
     port: u16,
     password: &str,
     _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).await.unwrap();
     println!("FusionDB Postgres Server running on {}", addr);
 
@@ -595,12 +713,12 @@ pub async fn start_pg_server(
         let password = password.clone();
 
         tokio::spawn(async move {
-            let handler = Arc::new(PgHandler::new(executor, storage));
-            let auth_source = FusionAuthSource { password };
-            let startup = Arc::new(CleartextPasswordAuthStartupHandler::new(
+            let handler = Arc::new(PgHandler::new(executor, storage.clone()));
+            let auth_source = Arc::new(FusionAuthSource { password, storage });
+            let startup = Arc::new(FusionStartupHandler {
                 auth_source,
-                DefaultServerParameterProvider::default(),
-            ));
+                parameter_provider: DefaultServerParameterProvider::default(),
+            });
             let factory = PgServerFactory { startup, handler };
 
             // pgwire 0.37 does not natively support TLS negotiation.

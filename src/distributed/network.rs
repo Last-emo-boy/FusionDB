@@ -1,8 +1,8 @@
 use openraft::error::{InstallSnapshotError, RPCError, RaftError};
 use openraft::network::RaftNetworkFactory;
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, RaftNetwork};
 
@@ -31,11 +31,7 @@ pub struct FusionNetwork {
 impl RaftNetworkFactory<TypeConfig> for FusionNetworkFactory {
     type Network = FusionNetwork;
 
-    async fn new_client(
-        &mut self,
-        target: NodeId,
-        node: &BasicNode,
-    ) -> Self::Network {
+    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
         FusionNetwork {
             target,
             target_addr: node.addr.clone(),
@@ -49,10 +45,7 @@ impl RaftNetwork<TypeConfig> for FusionNetwork {
         &mut self,
         req: AppendEntriesRequest<TypeConfig>,
         _option: openraft::network::RPCOption,
-    ) -> Result<
-        AppendEntriesResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId>>,
-    > {
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let url = format!("http://{}/raft/append", self.target_addr);
         let resp = self
             .client
@@ -97,10 +90,7 @@ impl RaftNetwork<TypeConfig> for FusionNetwork {
         &mut self,
         req: VoteRequest<NodeId>,
         _option: openraft::network::RPCOption,
-    ) -> Result<
-        VoteResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId>>,
-    > {
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let url = format!("http://{}/raft/vote", self.target_addr);
         let resp = self
             .client

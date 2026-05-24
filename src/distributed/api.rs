@@ -5,8 +5,8 @@ use axum::response::Json;
 use axum::routing::post;
 use axum::Router;
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
 use openraft::BasicNode;
 
@@ -98,9 +98,7 @@ async fn raft_add_learner(
     State(state): State<RaftAppState>,
     Json(req): Json<AddLearnerRequest>,
 ) -> Json<WriteResponse> {
-    let node = BasicNode {
-        addr: req.addr,
-    };
+    let node = BasicNode { addr: req.addr };
     match state.raft.add_learner(req.node_id, node, true).await {
         Ok(_) => Json(WriteResponse {
             success: true,
@@ -145,9 +143,7 @@ pub struct MetricsResponse {
     pub last_applied_index: Option<u64>,
 }
 
-async fn raft_metrics(
-    State(state): State<RaftAppState>,
-) -> Json<MetricsResponse> {
+async fn raft_metrics(State(state): State<RaftAppState>) -> Json<MetricsResponse> {
     let m = state.raft.metrics().borrow().clone();
     Json(MetricsResponse {
         id: m.id,

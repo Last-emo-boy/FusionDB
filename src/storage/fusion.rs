@@ -2,12 +2,13 @@ use super::columnar::ColumnarVectorStore;
 use super::wal::{WalEntry, WalManager};
 use super::{Storage, Transaction};
 use crate::common::Result;
+use crate::config::StorageConfig;
 use async_trait::async_trait;
 use crossbeam_skiplist::SkipMap;
+use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
-use moka::sync::Cache;
 
 // Fusion Storage Engine
 // Combines:
@@ -15,7 +16,6 @@ use moka::sync::Cache;
 // 2. LSM-Tree Structure (MemTable -> Flush -> SST)
 // 3. Columnar Vector Store (Integrated for Vector Search)
 
-const MEMTABLE_THRESHOLD: usize = 32 * 1024 * 1024; // 32MB
 const TS_SIZE: usize = 8;
 
 // --- Data Structures ---
@@ -49,15 +49,18 @@ impl MemTable {
         self.map.insert(key, value);
         self.size.fetch_add(len as u64, Ordering::Relaxed);
     }
-    
+
     fn build_fbtree(&self) {
         // Build FBTree from SkipMap
         // This is called when MemTable becomes immutable
         // Use bulk_load if possible, but we need sorted iterator. SkipMap is sorted!
-        
-        let iter = self.map.iter().map(|e| (e.key().clone(), e.value().clone()));
+
+        let iter = self
+            .map
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()));
         let tree = FBTree::bulk_load(iter);
-        
+
         let mut guard = self.fbtree.write().unwrap();
         *guard = Some(Arc::new(tree));
         // println!("Built FBTree for MemTable {}", self.id);
@@ -99,6 +102,13 @@ impl Ord for MergeItem {
 }
 
 #[derive(Clone)]
+struct FusionStoragePaths {
+    sstable_dir: PathBuf,
+    inverted_index_path: PathBuf,
+    trigram_index_path: PathBuf,
+}
+
+#[derive(Clone)]
 pub struct FusionStorage {
     active_memtable: Arc<RwLock<MemTable>>,
     immutable_memtables: Arc<RwLock<Vec<MemTable>>>,
@@ -128,22 +138,43 @@ pub struct FusionStorage {
 
     // Block Cache for SSTables (SST ID, Offset) -> Block Data
     block_cache: Arc<Cache<(u64, u64), Vec<u8>>>,
+    memtable_threshold: usize,
+    paths: Arc<FusionStoragePaths>,
 }
 
 impl FusionStorage {
     pub async fn new(path: &str) -> Result<Self> {
+        let wal_path = Path::new(path);
+        let data_dir = wal_path.parent().unwrap_or_else(|| Path::new("."));
+        let storage_config = StorageConfig {
+            data_dir: data_dir.to_string_lossy().to_string(),
+            wal_file: wal_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "fusion.wal".to_string()),
+            ..StorageConfig::default()
+        };
+        Self::with_config(path, &storage_config).await
+    }
+
+    pub async fn with_config(path: &str, config: &StorageConfig) -> Result<Self> {
         let wal = WalManager::new(path)?;
         let active = MemTable::new(1);
+        let sstable_dir = config.sstable_path();
+        let inverted_index_path = config.inverted_index_path();
+        let trigram_index_path = config.trigram_index_path();
+        std::fs::create_dir_all(&config.data_dir).ok();
+        std::fs::create_dir_all(&sstable_dir).ok();
 
         // Block Cache (e.g. 100MB capacity)
         // Note: moka Cache size is number of entries by default.
         // To limit by bytes, we need weigher.
         // Let's assume average block 4KB. 100MB = 25,000 blocks.
-        let block_cache = Arc::new(Cache::new(25_000));
+        let block_cache = Arc::new(Cache::new(config.block_cache_capacity));
 
         // Load existing SSTables
         let mut sstables_vec = Vec::new();
-        let sst_dir = Path::new("sstables");
+        let sst_dir = sstable_dir.as_path();
         if sst_dir.exists() {
             if let Ok(mut entries) = std::fs::read_dir(sst_dir) {
                 let mut files = Vec::new();
@@ -174,7 +205,13 @@ impl FusionStorage {
         // Replay WAL
         // We need to replay committed transactions into the active memtable.
         let replay_entries = wal.replay().expect("Critical: Failed to replay WAL");
-        
+        let memtable_threshold = config.memtable_flush_threshold_bytes().max(1);
+        let paths = Arc::new(FusionStoragePaths {
+            sstable_dir,
+            inverted_index_path,
+            trigram_index_path,
+        });
+
         let storage = Self {
             active_memtable: Arc::new(RwLock::new(active)),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
@@ -185,18 +222,21 @@ impl FusionStorage {
             flush_notify: Arc::new(Notify::new()),
             columnar_store: Arc::new(RwLock::new(None)),
             inverted_index: Arc::new(RwLock::new(
-                InvertedIndex::load("inverted_index.bin").unwrap_or_else(|_| InvertedIndex::new()),
+                InvertedIndex::load(&paths.inverted_index_path)
+                    .unwrap_or_else(|_| InvertedIndex::new()),
             )),
             vector_index: {
-                 let vi = Arc::new(VectorIndex::new());
-                 vi.create_index("default");
-                 vi
+                let vi = Arc::new(VectorIndex::new());
+                vi.create_index("default");
+                vi
             },
             trigram_index: Arc::new(RwLock::new(
-                crate::storage::trigram::TrigramIndex::load("trigram_index.bin")
+                crate::storage::trigram::TrigramIndex::load(&paths.trigram_index_path)
                     .unwrap_or_else(|_| crate::storage::trigram::TrigramIndex::new()),
             )),
             block_cache,
+            memtable_threshold,
+            paths,
         };
 
         // Apply Replay
@@ -210,7 +250,7 @@ impl FusionStorage {
                     WalEntry::Put(k, v) => {
                         // Strict validation: Skip keys smaller than TS_SIZE
                         if k.len() < TS_SIZE {
-                            continue; 
+                            continue;
                         }
 
                         if k.len() > TS_SIZE {
@@ -219,13 +259,13 @@ impl FusionStorage {
                                 max_ts = ts;
                             }
                         }
-                        
+
                         let needs_rotate = {
                             let active = storage.active_memtable.read().unwrap();
                             active.insert(k, v);
-                            active.size.load(Ordering::Relaxed) > MEMTABLE_THRESHOLD as u64
+                            active.size.load(Ordering::Relaxed) > storage.memtable_threshold as u64
                         };
-                        
+
                         if needs_rotate {
                             storage.rotate_memtable().await;
                         }
@@ -234,9 +274,9 @@ impl FusionStorage {
                         let needs_rotate = {
                             let active = storage.active_memtable.read().unwrap();
                             active.insert(k, Vec::new());
-                            active.size.load(Ordering::Relaxed) > MEMTABLE_THRESHOLD as u64
+                            active.size.load(Ordering::Relaxed) > storage.memtable_threshold as u64
                         };
-                        
+
                         if needs_rotate {
                             storage.rotate_memtable().await;
                         }
@@ -365,6 +405,46 @@ impl FusionStorage {
         (data[0] == 1, &data[1..])
     }
 
+    fn sstable_path_for(&self, id: u64) -> PathBuf {
+        self.paths.sstable_dir.join(format!("{}.sst", id))
+    }
+
+    fn persist_secondary_indexes(&self, log_prefix: &str) {
+        if let Ok(guard) = self.inverted_index.read() {
+            if let Err(e) = guard.save(&self.paths.inverted_index_path) {
+                eprintln!("{} Failed to save inverted index: {:?}", log_prefix, e);
+            }
+        }
+        if let Ok(guard) = self.trigram_index.read() {
+            if let Err(e) = guard.save(&self.paths.trigram_index_path) {
+                eprintln!("{} Failed to save trigram index: {:?}", log_prefix, e);
+            }
+        }
+    }
+
+    async fn flush_all_immutable_memtables(&self) {
+        loop {
+            let memtable_to_flush = {
+                let mut imm = self.immutable_memtables.write().unwrap();
+                imm.pop()
+            };
+            match memtable_to_flush {
+                Some(mem) => {
+                    self.flush_memtable_sync(&mem).await;
+                }
+                None => break,
+            }
+        }
+    }
+
+    pub async fn create_snapshot_now(&self) -> Result<()> {
+        self.rotate_memtable().await;
+        self.flush_all_immutable_memtables().await;
+        self.persist_secondary_indexes("[snapshot]");
+        self.wal.truncate()?;
+        Ok(())
+    }
+
     async fn rebuild_vector_index(&self) {
         println!("Rebuilding Vector Index from Storage...");
         let txn = match self.begin_transaction().await {
@@ -405,7 +485,8 @@ impl FusionStorage {
 
                         // Scan data for this table
                         let data_prefix = format!("data:{}:", table_name);
-                        if let Ok(data_pairs) = txn.scan_prefix(data_prefix.as_bytes(), None).await {
+                        if let Ok(data_pairs) = txn.scan_prefix(data_prefix.as_bytes(), None).await
+                        {
                             for (dk, dv) in data_pairs {
                                 if let Ok(row) = crate::common::encoding::RowDecoder::decode(&dv) {
                                     let parts: Vec<&str> =
@@ -436,7 +517,7 @@ impl FusionStorage {
     }
 
     async fn flush_loop(&self) {
-        let _ = tokio::fs::create_dir_all("sstables").await;
+        let _ = tokio::fs::create_dir_all(&self.paths.sstable_dir).await;
 
         loop {
             self.flush_notify.notified().await;
@@ -447,7 +528,7 @@ impl FusionStorage {
             };
 
             if let Some(mem) = memtable_to_flush {
-                let sst_path = PathBuf::from(format!("sstables/{}.sst", mem.id));
+                let sst_path = self.sstable_path_for(mem.id);
                 let mut builder = SsTableBuilder::new(sst_path.clone());
 
                 // Write memtable to builder
@@ -480,7 +561,10 @@ impl FusionStorage {
                     block_count += 1;
 
                     if block_buffer.len() >= 4096 {
-                        if let Err(e) = builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer).await {
+                        if let Err(e) = builder
+                            .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
+                            .await
+                        {
                             eprintln!("Failed to flush block: {:?}", e);
                             break;
                         }
@@ -490,7 +574,10 @@ impl FusionStorage {
                 }
 
                 if !block_buffer.is_empty() {
-                    if let Err(e) = builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer).await {
+                    if let Err(e) = builder
+                        .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
+                        .await
+                    {
                         eprintln!("Failed to flush last block: {:?}", e);
                     }
                 }
@@ -520,17 +607,7 @@ impl FusionStorage {
                     }
                 }
 
-                // Save Indices
-                if let Ok(guard) = self.inverted_index.read() {
-                    if let Err(e) = guard.save("inverted_index.bin") {
-                        eprintln!("Failed to save inverted index: {:?}", e);
-                    }
-                }
-                if let Ok(guard) = self.trigram_index.read() {
-                    if let Err(e) = guard.save("trigram_index.bin") {
-                        eprintln!("Failed to save trigram index: {:?}", e);
-                    }
-                }
+                self.persist_secondary_indexes("[flush]");
 
                 // WAL Truncation: if no more immutable memtables remain,
                 // all data is persisted to SSTables, so we can truncate WAL.
@@ -547,122 +624,65 @@ impl FusionStorage {
         }
     }
 
-    async fn compaction_loop(&self) {
-        loop {
-            // Check every 1 second
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    fn compaction_candidates(&self) -> Vec<Arc<SsTable>> {
+        let sstables = self.sstables.read().unwrap();
+        if sstables.len() >= 4 {
+            sstables.iter().take(4).cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    }
 
-            let candidates = {
-                let sstables = self.sstables.read().unwrap();
-                if sstables.len() >= 4 {
-                    // Pick oldest 4
-                    sstables.iter().take(4).cloned().collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                }
-            };
+    async fn compact_once(&self) -> Result<bool> {
+        let candidates = self.compaction_candidates();
+        if candidates.is_empty() {
+            return Ok(false);
+        }
 
-            if candidates.is_empty() {
-                continue;
+        // Open iterators
+        let mut iterators = Vec::new();
+        for sst in &candidates {
+            match sst.new_iterator(None).await {
+                Ok(it) => iterators.push(it),
+                Err(e) => eprintln!("Failed to open SST iterator: {:?}", e),
             }
+        }
 
-            // println!("Compacting {} SSTables...", candidates.len());
+        if iterators.is_empty() {
+            return Ok(false);
+        }
 
-            // Open iterators
-            let mut iterators = Vec::new();
-            for sst in &candidates {
-                match sst.new_iterator(None).await {
-                    Ok(it) => iterators.push(it),
-                    Err(e) => eprintln!("Failed to open SST iterator: {:?}", e),
-                }
+        // Output builder
+        let new_id = self.next_memtable_id.fetch_add(1, Ordering::Relaxed);
+        let out_path = self.sstable_path_for(new_id);
+        let mut builder = SsTableBuilder::new(out_path.clone());
+
+        // Merge Logic
+        let mut heap = BinaryHeap::new();
+
+        // Init heap
+        for (idx, it) in iterators.iter_mut().enumerate() {
+            if let Ok(Some((k, v))) = it.next().await {
+                heap.push(MergeItem {
+                    key: k,
+                    val: v,
+                    iter_idx: idx,
+                });
             }
+        }
 
-            if iterators.is_empty() {
-                continue;
-            }
+        let mut block_buffer = Vec::new();
+        let mut block_count = 0;
+        let mut first_key = None;
+        let mut last_base_key: Option<Vec<u8>> = None;
+        let mut dedup_count: u64 = 0;
 
-            // Output builder
-            let new_id = self.next_memtable_id.fetch_add(1, Ordering::Relaxed);
-            let out_path = PathBuf::from(format!("sstables/{}.sst", new_id));
-            let mut builder = SsTableBuilder::new(out_path.clone());
+        while let Some(item) = heap.pop() {
+            let k = item.key;
+            let v = item.val;
+            let idx = item.iter_idx;
 
-            // Merge Logic
-            let mut heap = BinaryHeap::new();
-
-            // Init heap
-            for (idx, it) in iterators.iter_mut().enumerate() {
-                if let Ok(Some((k, v))) = it.next().await {
-                    heap.push(MergeItem {
-                        key: k,
-                        val: v,
-                        iter_idx: idx,
-                    });
-                }
-            }
-
-            let mut block_buffer = Vec::new();
-            let mut block_count = 0;
-            let mut first_key = None;
-            let mut last_base_key: Option<Vec<u8>> = None;
-            let mut dedup_count: u64 = 0;
-
-            while let Some(item) = heap.pop() {
-                let k = item.key;
-                let v = item.val;
-                let idx = item.iter_idx;
-
-                if k.len() < TS_SIZE {
-                    if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
-                        heap.push(MergeItem {
-                            key: next_k,
-                            val: next_v,
-                            iter_idx: idx,
-                        });
-                    }
-                    continue;
-                }
-
-                // Dedup: for the same base key (without timestamp), keep only the latest version.
-                // Keys come out of the min-heap sorted by [base_key][timestamp].
-                // The first occurrence for a base key is the latest version (highest ts).
-                let base_key = k[..k.len() - TS_SIZE].to_vec();
-                let is_dup = last_base_key.as_ref() == Some(&base_key);
-                if is_dup {
-                    dedup_count += 1;
-                    // Skip this older version, but still advance the iterator
-                    if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
-                        heap.push(MergeItem {
-                            key: next_k,
-                            val: next_v,
-                            iter_idx: idx,
-                        });
-                    }
-                    continue;
-                }
-                last_base_key = Some(base_key);
-
-                // Add to Builder
-                if first_key.is_none() {
-                    first_key = Some(k.clone());
-                }
-
-                builder.add_key(&k);
-                block_buffer.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                block_buffer.extend_from_slice(&k);
-                block_buffer.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                block_buffer.extend_from_slice(&v);
-                block_count += 1;
-
-                if block_buffer.len() >= 4096 {
-                    if let Err(e) = builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer).await {
-                        eprintln!("Compaction failed to flush block: {:?}", e);
-                        break;
-                    }
-                    block_buffer.clear();
-                    block_count = 0;
-                }
-
-                // Advance iterator
+            if k.len() < TS_SIZE {
                 if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
                     heap.push(MergeItem {
                         key: next_k,
@@ -670,44 +690,130 @@ impl FusionStorage {
                         iter_idx: idx,
                     });
                 }
-            }
-
-            if dedup_count > 0 {
-                println!("[compaction] Deduplicated {} stale key versions", dedup_count);
-            }
-
-            if !block_buffer.is_empty() {
-                if let Err(e) = builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer).await {
-                    eprintln!("Compaction failed to flush last block: {:?}", e);
-                }
-            }
-
-            if let Err(e) = builder.finish().await {
-                eprintln!("Compaction failed to finish: {:?}", e);
                 continue;
             }
 
-            // Open new SST
-            match SsTable::open(out_path, new_id, self.block_cache.clone()).await {
-                Ok(new_sst) => {
-                    {
-                        let mut sstables = self.sstables.write().unwrap();
-                        // Remove old candidates (by ID)
-                        let old_ids: Vec<u64> = candidates.iter().map(|s| s.id).collect();
-                        sstables.retain(|s| !old_ids.contains(&s.id));
-
-                        // Insert new SST (sorted by ID)
-                        sstables.push(Arc::new(new_sst));
-                        sstables.sort_by_key(|s| s.id);
-                    } // Drop lock
-
-                    // Delete old files
-                    for sst in candidates {
-                        let _ = tokio::fs::remove_file(&sst.path).await;
-                    }
-                    // println!("Compacted {} SSTables into {}", candidates.len(), new_id);
+            // Dedup: for the same base key (without timestamp), keep only the latest version.
+            // Keys come out of the min-heap sorted by [base_key][timestamp].
+            // The first occurrence for a base key is the latest version (highest ts).
+            let base_key = k[..k.len() - TS_SIZE].to_vec();
+            let is_dup = last_base_key.as_ref() == Some(&base_key);
+            if is_dup {
+                dedup_count += 1;
+                // Skip this older version, but still advance the iterator
+                if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
+                    heap.push(MergeItem {
+                        key: next_k,
+                        val: next_v,
+                        iter_idx: idx,
+                    });
                 }
-                Err(e) => eprintln!("Failed to open compacted SST: {:?}", e),
+                continue;
+            }
+            last_base_key = Some(base_key);
+
+            // Add to Builder
+            if first_key.is_none() {
+                first_key = Some(k.clone());
+            }
+
+            builder.add_key(&k);
+            block_buffer.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            block_buffer.extend_from_slice(&k);
+            block_buffer.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            block_buffer.extend_from_slice(&v);
+            block_count += 1;
+
+            if block_buffer.len() >= 4096 {
+                if let Err(e) = builder
+                    .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
+                    .await
+                {
+                    return Err(crate::common::FusionError::Storage(format!(
+                        "Compaction failed to flush block: {:?}",
+                        e
+                    )));
+                }
+                block_buffer.clear();
+                block_count = 0;
+            }
+
+            // Advance iterator
+            if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
+                heap.push(MergeItem {
+                    key: next_k,
+                    val: next_v,
+                    iter_idx: idx,
+                });
+            }
+        }
+
+        if dedup_count > 0 {
+            println!(
+                "[compaction] Deduplicated {} stale key versions",
+                dedup_count
+            );
+        }
+
+        if !block_buffer.is_empty() {
+            if let Err(e) = builder
+                .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
+                .await
+            {
+                return Err(crate::common::FusionError::Storage(format!(
+                    "Compaction failed to flush last block: {:?}",
+                    e
+                )));
+            }
+        }
+
+        if let Err(e) = builder.finish().await {
+            return Err(crate::common::FusionError::Storage(format!(
+                "Compaction failed to finish: {:?}",
+                e
+            )));
+        }
+
+        // Open new SST
+        match SsTable::open(out_path, new_id, self.block_cache.clone()).await {
+            Ok(new_sst) => {
+                {
+                    let mut sstables = self.sstables.write().unwrap();
+                    // Remove old candidates (by ID)
+                    let old_ids: Vec<u64> = candidates.iter().map(|s| s.id).collect();
+                    sstables.retain(|s| !old_ids.contains(&s.id));
+
+                    // Insert new SST (sorted by ID)
+                    sstables.push(Arc::new(new_sst));
+                    sstables.sort_by_key(|s| s.id);
+                } // Drop lock
+
+                // Delete old files
+                for sst in candidates {
+                    let _ = tokio::fs::remove_file(&sst.path).await;
+                }
+
+                Ok(true)
+            }
+            Err(e) => Err(crate::common::FusionError::Storage(format!(
+                "Failed to open compacted SST: {:?}",
+                e
+            ))),
+        }
+    }
+
+    pub async fn compact_now(&self) -> Result<bool> {
+        self.create_snapshot_now().await?;
+        self.compact_once().await
+    }
+
+    async fn compaction_loop(&self) {
+        loop {
+            // Check every 1 second
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            if let Err(e) = self.compact_once().await {
+                eprintln!("Compaction error: {:?}", e);
             }
         }
     }
@@ -720,30 +826,10 @@ impl FusionStorage {
         self.rotate_memtable().await;
 
         // 2. Flush all immutable memtables
-        loop {
-            let memtable_to_flush = {
-                let mut imm = self.immutable_memtables.write().unwrap();
-                imm.pop()
-            };
-            match memtable_to_flush {
-                Some(mem) => {
-                    self.flush_memtable_sync(&mem).await;
-                }
-                None => break,
-            }
-        }
+        self.flush_all_immutable_memtables().await;
 
         // 3. Save secondary indexes
-        if let Ok(guard) = self.inverted_index.read() {
-            if let Err(e) = guard.save("inverted_index.bin") {
-                eprintln!("[shutdown] Failed to save inverted index: {:?}", e);
-            }
-        }
-        if let Ok(guard) = self.trigram_index.read() {
-            if let Err(e) = guard.save("trigram_index.bin") {
-                eprintln!("[shutdown] Failed to save trigram index: {:?}", e);
-            }
-        }
+        self.persist_secondary_indexes("[shutdown]");
 
         // 4. Truncate WAL (all data is now in SSTables)
         if let Err(e) = self.wal.truncate() {
@@ -755,7 +841,7 @@ impl FusionStorage {
 
     /// Flush a single MemTable to SSTable (used during shutdown).
     async fn flush_memtable_sync(&self, mem: &MemTable) {
-        let sst_path = PathBuf::from(format!("sstables/{}.sst", mem.id));
+        let sst_path = self.sstable_path_for(mem.id);
         let mut builder = SsTableBuilder::new(sst_path.clone());
 
         let mut block_count = 0;
@@ -779,7 +865,10 @@ impl FusionStorage {
             block_count += 1;
 
             if block_buffer.len() >= 4096 {
-                if let Err(e) = builder.flush_block(first_key.take().unwrap(), block_count, &block_buffer).await {
+                if let Err(e) = builder
+                    .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
+                    .await
+                {
                     eprintln!("[shutdown] flush block error: {:?}", e);
                     return;
                 }
@@ -817,10 +906,10 @@ impl FusionStorage {
         let new_mem = MemTable::new(new_id);
 
         let old = std::mem::replace(&mut *active, new_mem);
-        
+
         // Build FBTree for the immutable memtable (Read Optimization)
         old.build_fbtree();
-        
+
         imm.push(old);
         self.flush_notify.notify_one();
     }
@@ -839,9 +928,9 @@ impl Transaction for FusionTransaction {
         for (k, v) in self.write_buffer.iter().rev() {
             if k == key {
                 if let Ok(_s) = std::str::from_utf8(key) {
-                     // if s.contains("9999999") {
-                     //    eprintln!("DEBUG: FusionTransaction::get HIT WriteBuffer. Key: {}, ValLen: {}, Val: {:?}", s, v.as_ref().map(|x| x.len()).unwrap_or(0), v);
-                     // }
+                    // if s.contains("9999999") {
+                    //    eprintln!("DEBUG: FusionTransaction::get HIT WriteBuffer. Key: {}, ValLen: {}, Val: {:?}", s, v.as_ref().map(|x| x.len()).unwrap_or(0), v);
+                    // }
                 }
                 return Ok(v.clone());
             }
@@ -922,13 +1011,16 @@ impl Transaction for FusionTransaction {
         Ok(())
     }
 
-
     async fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.write_buffer.push((key.to_vec(), None));
         Ok(())
     }
 
-    async fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    async fn scan_prefix(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut end = prefix.to_vec();
         let mut found = false;
         while let Some(last) = end.last_mut() {
@@ -946,7 +1038,12 @@ impl Transaction for FusionTransaction {
         }
     }
 
-    async fn scan_range(&self, start: &[u8], end: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let safe_limit = limit.unwrap_or(usize::MAX);
         let read_ts = self.read_ts;
         let start_ik = FusionStorage::encode_key(start, u64::MAX);
@@ -963,47 +1060,51 @@ impl Transaction for FusionTransaction {
                 mem_tables.push(mem.clone());
             }
         }
-        
+
         // WriteBuffer
         let mut wb_items = Vec::new();
         for (k, v) in &self.write_buffer {
-             if k.as_slice() >= start && k.as_slice() < end {
-                  let ik = FusionStorage::encode_key(k, u64::MAX);
-                  let iv = match v {
-                      Some(val) => {
-                          let encoded = FusionStorage::encode_value(true, val);
-                          // if let Ok(s) = std::str::from_utf8(k) {
-                          //    if s.contains("800000000098967f") {
-                          //        eprintln!("DEBUG: scan_range WB. Key: {}, OriginalLen: {}, EncodedWithFlagLen: {}, First4: {:?}", s, val.len(), encoded.len(), &encoded[..std::cmp::min(4, encoded.len())]);
-                          //    }
-                          // }
-                          encoded
-                      },
-                      None => FusionStorage::encode_value(false, &[]),
-                  };
-                  wb_items.push((ik, iv));
-             }
+            if k.as_slice() >= start && k.as_slice() < end {
+                let ik = FusionStorage::encode_key(k, u64::MAX);
+                let iv = match v {
+                    Some(val) => {
+                        let encoded = FusionStorage::encode_value(true, val);
+                        // if let Ok(s) = std::str::from_utf8(k) {
+                        //    if s.contains("800000000098967f") {
+                        //        eprintln!("DEBUG: scan_range WB. Key: {}, OriginalLen: {}, EncodedWithFlagLen: {}, First4: {:?}", s, val.len(), encoded.len(), &encoded[..std::cmp::min(4, encoded.len())]);
+                        //    }
+                        // }
+                        encoded
+                    }
+                    None => FusionStorage::encode_value(false, &[]),
+                };
+                wb_items.push((ik, iv));
+            }
         }
         wb_items.sort_by(|a, b| a.0.cmp(&b.0));
         let mut wb_iter = wb_items.into_iter();
 
         // 2. Initialize Heap
         let mut heap = BinaryHeap::new();
-        
+
         if let Some((k, v)) = wb_iter.next() {
-            heap.push(MergeItem { key: k, val: v, iter_idx: 0 });
+            heap.push(MergeItem {
+                key: k,
+                val: v,
+                iter_idx: 0,
+            });
         }
-        
+
         // Helper Type for Iterators
         type BoxedIter<'a> = Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send + 'a>;
 
         // 1. Collect FBTree Arcs first to ensure stability
         // Defined BEFORE mem_iters so it outlives mem_iters (dropped last)
         let mut fbtree_holders: Vec<Option<Arc<FBTree>>> = Vec::with_capacity(mem_tables.len());
-        
+
         for mem in &mem_tables {
-             let guard = mem.fbtree.read().unwrap();
-             fbtree_holders.push(guard.clone());
+            let guard = mem.fbtree.read().unwrap();
+            fbtree_holders.push(guard.clone());
         }
 
         let mut mem_iters: Vec<BoxedIter> = Vec::new();
@@ -1016,7 +1117,7 @@ impl Transaction for FusionTransaction {
                 // Note: tree.scan returns FBTreeIterator which holds reference to tree.
                 // tree is inside fbtree_holders.
                 let iter = Box::new(tree.scan(&start_ik)) as BoxedIter;
-                
+
                 // We need to peek/advance
                 // But we can't easily peek BoxedIter without consuming.
                 // We wrap it in Peekable? No, Peekable is not Iterator of Item=(...).
@@ -1026,43 +1127,56 @@ impl Transaction for FusionTransaction {
                 // We have to consume it, store the item in Heap, and store the REST of iterator.
                 // `BoxedIter` is a Box. `next()` takes `&mut self`.
                 // So we can use it.
-                
+
                 // Rust ownership: `iter` is owned by local var.
                 // We verify first item.
                 let mut iter = iter; // mutable
                 if let Some((k, v)) = iter.next() {
-                     let (user_k, _) = FusionStorage::decode_key(&k);
-                     if user_k < end {
-                         heap.push(MergeItem { key: k, val: v, iter_idx: 1 + i });
-                         mem_iters.push(iter);
-                     } else {
-                         mem_iters.push(iter);
-                     }
+                    let (user_k, _) = FusionStorage::decode_key(&k);
+                    if user_k < end {
+                        heap.push(MergeItem {
+                            key: k,
+                            val: v,
+                            iter_idx: 1 + i,
+                        });
+                        mem_iters.push(iter);
+                    } else {
+                        mem_iters.push(iter);
+                    }
                 } else {
-                     mem_iters.push(iter);
+                    mem_iters.push(iter);
                 }
             } else {
                 // SkipMap Iterator
-                let mut iter = Box::new(mem.map.range(start_ik.clone()..).map(|e| (e.key().clone(), e.value().clone()))) as BoxedIter;
+                let mut iter = Box::new(
+                    mem.map
+                        .range(start_ik.clone()..)
+                        .map(|e| (e.key().clone(), e.value().clone())),
+                ) as BoxedIter;
                 if let Some((k, v)) = iter.next() {
                     let (user_k, _) = FusionStorage::decode_key(&k);
                     if user_k < end {
-                        heap.push(MergeItem { key: k.clone(), val: v, iter_idx: 1 + i });
+                        heap.push(MergeItem {
+                            key: k.clone(),
+                            val: v,
+                            iter_idx: 1 + i,
+                        });
                     }
-                    mem_iters.push(iter); 
+                    mem_iters.push(iter);
                 } else {
                     mem_iters.push(iter);
                 }
             }
         }
-        
+
         let sstables = self.storage.sstables.read().unwrap().clone();
-        let mut sst_iters: Vec<Option<crate::storage::sstable::SsTableIterator>> = Vec::with_capacity(sstables.len());
+        let mut sst_iters: Vec<Option<crate::storage::sstable::SsTableIterator>> =
+            Vec::with_capacity(sstables.len());
         let end_ik = FusionStorage::encode_key(end, u64::MAX);
-        
+
         for (i, sst) in sstables.iter().rev().enumerate() {
             let idx = 1 + mem_tables.len() + i;
-            
+
             // Check Overlap
             let sst_min = &sst.meta.first_key;
             let sst_max = &sst.meta.last_key;
@@ -1074,88 +1188,116 @@ impl Transaction for FusionTransaction {
             // Use seek optimization to jump to start key
             let mut it = sst.new_iterator(Some(&start_ik)).await?;
             if let Ok(Some((k, v))) = it.next().await {
-                 let current_k = k;
-                 let current_v = v;
-                 // Check if the first key we found is already past end
-                 // (This can happen if start_ik is not in SSTable and we landed on a key > end)
-                 if current_k >= start_ik {
-                     let (uk, _) = FusionStorage::decode_key(&current_k);
-                     if uk < end {
-                         heap.push(MergeItem { key: current_k, val: current_v, iter_idx: idx });
-                     }
-                 }
+                let current_k = k;
+                let current_v = v;
+                // Check if the first key we found is already past end
+                // (This can happen if start_ik is not in SSTable and we landed on a key > end)
+                if current_k >= start_ik {
+                    let (uk, _) = FusionStorage::decode_key(&current_k);
+                    if uk < end {
+                        heap.push(MergeItem {
+                            key: current_k,
+                            val: current_v,
+                            iter_idx: idx,
+                        });
+                    }
+                }
             }
             sst_iters.push(Some(it));
         }
-        
+
         // 3. Merge Loop
         let mut res = Vec::with_capacity(safe_limit.min(4096));
         let mut last_user_key: Option<Vec<u8>> = None;
-        
+
         while let Some(item) = heap.pop() {
             let k = item.key;
             let v = item.val;
             let idx = item.iter_idx;
-            
+
             let (user_k, ts) = FusionStorage::decode_key(&k);
             if user_k >= end {
                 break;
             }
-            
+
             // Advance Iterator (must happen before dedup skip)
             let mut next_item = None;
-            
+
             if idx == 0 {
                 while let Some((nk, nv)) = wb_iter.next() {
                     let (nuk, _nts) = FusionStorage::decode_key(&nk);
                     if nuk == user_k {
-                        if ts <= read_ts { continue; }
+                        if ts <= read_ts {
+                            continue;
+                        }
                     }
                     next_item = Some((nk, nv));
                     break;
                 }
                 if let Some((nk, nv)) = next_item {
-                    heap.push(MergeItem { key: nk, val: nv, iter_idx: 0 });
+                    heap.push(MergeItem {
+                        key: nk,
+                        val: nv,
+                        iter_idx: 0,
+                    });
                 }
             } else if idx <= mem_tables.len() {
                 let mem_idx = idx - 1;
                 while let Some((nk, nv)) = mem_iters[mem_idx].next() {
-                     let (nuk, _nts) = FusionStorage::decode_key(&nk);
-                     if nuk >= end { next_item = None; break; }
-                     if nuk == user_k {
-                         if ts <= read_ts { continue; }
-                     }
-                     next_item = Some((nk, nv));
-                     break;
+                    let (nuk, _nts) = FusionStorage::decode_key(&nk);
+                    if nuk >= end {
+                        next_item = None;
+                        break;
+                    }
+                    if nuk == user_k {
+                        if ts <= read_ts {
+                            continue;
+                        }
+                    }
+                    next_item = Some((nk, nv));
+                    break;
                 }
                 if let Some((nk, nv)) = next_item {
-                    heap.push(MergeItem { key: nk, val: nv, iter_idx: idx });
+                    heap.push(MergeItem {
+                        key: nk,
+                        val: nv,
+                        iter_idx: idx,
+                    });
                 }
             } else {
                 let sst_idx = idx - 1 - mem_tables.len();
                 if let Some(it) = &mut sst_iters[sst_idx] {
                     while let Ok(Some((nk, nv))) = it.next().await {
-                         let (nuk, _nts) = FusionStorage::decode_key(&nk);
-                         if nuk >= end { next_item = None; break; }
-                         if nuk == user_k {
-                             if ts <= read_ts { continue; }
-                         }
-                         next_item = Some((nk, nv));
-                         break;
+                        let (nuk, _nts) = FusionStorage::decode_key(&nk);
+                        if nuk >= end {
+                            next_item = None;
+                            break;
+                        }
+                        if nuk == user_k {
+                            if ts <= read_ts {
+                                continue;
+                            }
+                        }
+                        next_item = Some((nk, nv));
+                        break;
                     }
                     if let Some((nk, nv)) = next_item {
-                        heap.push(MergeItem { key: nk, val: nv, iter_idx: idx });
+                        heap.push(MergeItem {
+                            key: nk,
+                            val: nv,
+                            iter_idx: idx,
+                        });
                     }
                 }
             }
-            
+
             // Dedup: skip if same user key as last processed
             if let Some(ref last_uk) = last_user_key {
                 if last_uk.as_slice() == user_k {
                     continue;
                 }
             }
-            
+
             if ts <= read_ts {
                 last_user_key = Some(user_k.to_vec());
                 let (is_put, val) = FusionStorage::decode_value(&v);
@@ -1167,7 +1309,7 @@ impl Transaction for FusionTransaction {
                 }
             }
         }
-        
+
         Ok(res)
     }
 
@@ -1177,11 +1319,17 @@ impl Transaction for FusionTransaction {
         let mut end = prefix.to_vec();
         let mut found = false;
         while let Some(last) = end.last_mut() {
-            if *last < 255 { *last += 1; found = true; break; }
+            if *last < 255 {
+                *last += 1;
+                found = true;
+                break;
+            }
             end.pop();
         }
-        if !found { return Ok(0); }
-        
+        if !found {
+            return Ok(0);
+        }
+
         let results = self.scan_range(prefix, &end, None).await?;
         Ok(results.len())
     }
@@ -1200,20 +1348,21 @@ impl Transaction for FusionTransaction {
     async fn last(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         // Optimized last() using metadata
         let read_ts = self.read_ts;
-        
+
         // 1. Candidate from MemTables
         let mut max_key: Option<(Vec<u8>, Vec<u8>, u64)> = None;
-        let update_max = |k: &[u8], v: &[u8], ts: u64, current_max: &mut Option<(Vec<u8>, Vec<u8>, u64)>| {
-             if ts <= read_ts {
-                 if let Some((mk, _, _)) = current_max {
-                     if k > mk.as_slice() {
-                         *current_max = Some((k.to_vec(), v.to_vec(), ts));
-                     }
-                 } else {
-                     *current_max = Some((k.to_vec(), v.to_vec(), ts));
-                 }
-             }
-        };
+        let update_max =
+            |k: &[u8], v: &[u8], ts: u64, current_max: &mut Option<(Vec<u8>, Vec<u8>, u64)>| {
+                if ts <= read_ts {
+                    if let Some((mk, _, _)) = current_max {
+                        if k > mk.as_slice() {
+                            *current_max = Some((k.to_vec(), v.to_vec(), ts));
+                        }
+                    } else {
+                        *current_max = Some((k.to_vec(), v.to_vec(), ts));
+                    }
+                }
+            };
 
         // Scan MemTables (Active + Immutable)
         // Since MemTables are small, we can scan them.
@@ -1244,145 +1393,157 @@ impl Transaction for FusionTransaction {
         // We look for the SSTable that *could* contain the largest key.
         // Since SSTables might overlap, we need to check any SSTable whose range overlaps with (current_max_key..end).
         // If current_max is None, we check all SSTables in range (start..end).
-        
+
         let sstables = self.storage.sstables.read().unwrap().clone();
-        
+
         // Filter SSTables that overlap with range
         let mut relevant_ssts = Vec::new();
         for sst in sstables.iter() {
-             // Check if SSTable overlaps with [start, end)
-             // SST range: [first_key, last_key] (Internal Keys)
-             // We need to decode them to check User Keys? 
-             // Or just compare bytes? Internal Keys are UserKey + TS.
-             // User Key comparison is prefix of Internal Key.
-             // But TS is inverted.
-             // Let's assume metadata stores INTERNAL keys.
-             // We can check if sst.last_key >= start_ik AND sst.first_key < end_ik
-             
-             // Wait, SsTableMeta stores whatever we passed to `add_key`.
-             // In flush_loop, we pass `key` which is Internal Key.
-             // So metadata has Internal Keys.
-             
-             // Overlap check:
-             // SST: [Min, Max]
-             // Query: [Start, End)
-             // Overlap if Max >= Start AND Min < End
-             
-             // Actually, we want the LARGEST key.
-             // We should process SSTables that have the largest `last_key` first?
-             // Not necessarily, `last_key` is just the bound.
-             
-             // We just collect all candidates.
-             let sst_min = &sst.meta.first_key;
-             let sst_max = &sst.meta.last_key;
-             
-             if sst_max.as_slice() >= start_ik.as_slice() && sst_min.as_slice() < end_ik.as_slice() {
-                 relevant_ssts.push(sst.clone());
-             }
+            // Check if SSTable overlaps with [start, end)
+            // SST range: [first_key, last_key] (Internal Keys)
+            // We need to decode them to check User Keys?
+            // Or just compare bytes? Internal Keys are UserKey + TS.
+            // User Key comparison is prefix of Internal Key.
+            // But TS is inverted.
+            // Let's assume metadata stores INTERNAL keys.
+            // We can check if sst.last_key >= start_ik AND sst.first_key < end_ik
+
+            // Wait, SsTableMeta stores whatever we passed to `add_key`.
+            // In flush_loop, we pass `key` which is Internal Key.
+            // So metadata has Internal Keys.
+
+            // Overlap check:
+            // SST: [Min, Max]
+            // Query: [Start, End)
+            // Overlap if Max >= Start AND Min < End
+
+            // Actually, we want the LARGEST key.
+            // We should process SSTables that have the largest `last_key` first?
+            // Not necessarily, `last_key` is just the bound.
+
+            // We just collect all candidates.
+            let sst_min = &sst.meta.first_key;
+            let sst_max = &sst.meta.last_key;
+
+            if sst_max.as_slice() >= start_ik.as_slice() && sst_min.as_slice() < end_ik.as_slice() {
+                relevant_ssts.push(sst.clone());
+            }
         }
-        
+
         // For each relevant SSTable, we want to find the largest key < end.
         // Optimization: If `sst.last_key` < end, then `sst.last_key` is a candidate!
         // But `sst.last_key` might be a tombstone or older version.
         // We still need to check validity.
         // BUT, we can iterate *that specific block* where `last_key` resides.
-        
+
         // To be safe and correct without full reverse iterator:
         // We iterate RELEVANT SSTables.
-        // But we can optimize: 
+        // But we can optimize:
         // If we find a key `K` in MemTable, we only care about SSTables where `last_key > K`.
-        
+
         for sst in relevant_ssts {
             // Read the block containing the largest key <= end_ik
             // We use `index` to find the offset.
             // `index` maps StartKey -> Offset.
             // We want the block that starts <= end_ik.
-            
+
             // `sst.index` is BTreeMap. `range(..=end_ik).next_back()` gives the block starting before end_ik.
             // This block *might* contain keys < end_ik.
             // The *next* block starts > end_ik (or doesn't exist).
-            
+
             // So we just need to read this ONE block and scan it.
             // Wait, what if the block contains only keys >= end_ik? (Possible if block start == end_ik)
             // But we used `..=`.
-            
+
             // Let's get the block.
             // If the block contains keys < end, the largest one is our candidate.
             // If not, we might need the *previous* block.
             // But `range(..=)` gives the block where `start_key <= end_ik`.
             // So the keys in that block are `>= start_key`.
             // They *could* exceed `end_ik`.
-            
+
             // So we read this block, and iterate it.
             // Since block is small (4KB), scanning it is cheap.
             // We find the largest key in this block < end_ik.
-            
+
             // If this block yields nothing < end_ik, we check the *previous* block?
             // Yes.
-            
+
             // Heuristic: Check the last 2 blocks that might overlap.
             // 1. Block A: `range(..end_ik).next_back()` -> Starts < end_ik.
             // This is the primary candidate.
-            
+
             let mut candidates_blocks = Vec::new();
-            
-            if let Some((blk_start_key, offset)) = sst.index.range::<Vec<u8>, _>(..end_ik.clone()).next_back() {
-                 candidates_blocks.push(*offset);
-                 
-                 // Also check previous block in case the last block only has keys >= end (unlikely given the query, but possible)
-                 // Or if the last block is empty/filtered?
-                 if let Some((_, prev_offset)) = sst.index.range::<Vec<u8>, _>(..blk_start_key).next_back() {
-                      candidates_blocks.push(*prev_offset);
-                 }
+
+            if let Some((blk_start_key, offset)) =
+                sst.index.range::<Vec<u8>, _>(..end_ik.clone()).next_back()
+            {
+                candidates_blocks.push(*offset);
+
+                // Also check previous block in case the last block only has keys >= end (unlikely given the query, but possible)
+                // Or if the last block is empty/filtered?
+                if let Some((_, prev_offset)) =
+                    sst.index.range::<Vec<u8>, _>(..blk_start_key).next_back()
+                {
+                    candidates_blocks.push(*prev_offset);
+                }
             }
-            
+
             for offset in candidates_blocks {
                 if let Ok(block_data) = sst.read_block(offset).await {
-                     // Iterate block
-                     let mut cursor = std::io::Cursor::new(block_data);
-                     let mut count_buf = [0u8; 4];
-                     if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_ok() {
-                         let count = u32::from_le_bytes(count_buf);
-                         for _ in 0..count {
-                             // Read KV
-                             // (Simplified manual read to avoid dependency issues)
-                             let mut len_buf = [0u8; 4];
-                             if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() { break; }
-                             let k_len = u32::from_le_bytes(len_buf) as usize;
-                             let mut k = vec![0u8; k_len];
-                             if std::io::Read::read_exact(&mut cursor, &mut k).is_err() { break; }
-                             
-                             if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() { break; }
-                             let v_len = u32::from_le_bytes(len_buf) as usize;
-                             let mut v = vec![0u8; v_len];
-                             if std::io::Read::read_exact(&mut cursor, &mut v).is_err() { break; }
-                             
-                             // Check Range
-                             let (uk, ts) = FusionStorage::decode_key(&k);
-                             // Decode Internal Key to check against end
-                             // `end` is user key bound.
-                             // `k` is Internal.
-                             // `uk` is User Key.
-                             
-                             if uk < end && uk >= start {
-                                 update_max(&uk, &v, ts, &mut max_key);
-                             }
-                         }
-                     }
+                    // Iterate block
+                    let mut cursor = std::io::Cursor::new(block_data);
+                    let mut count_buf = [0u8; 4];
+                    if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_ok() {
+                        let count = u32::from_le_bytes(count_buf);
+                        for _ in 0..count {
+                            // Read KV
+                            // (Simplified manual read to avoid dependency issues)
+                            let mut len_buf = [0u8; 4];
+                            if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
+                                break;
+                            }
+                            let k_len = u32::from_le_bytes(len_buf) as usize;
+                            let mut k = vec![0u8; k_len];
+                            if std::io::Read::read_exact(&mut cursor, &mut k).is_err() {
+                                break;
+                            }
+
+                            if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
+                                break;
+                            }
+                            let v_len = u32::from_le_bytes(len_buf) as usize;
+                            let mut v = vec![0u8; v_len];
+                            if std::io::Read::read_exact(&mut cursor, &mut v).is_err() {
+                                break;
+                            }
+
+                            // Check Range
+                            let (uk, ts) = FusionStorage::decode_key(&k);
+                            // Decode Internal Key to check against end
+                            // `end` is user key bound.
+                            // `k` is Internal.
+                            // `uk` is User Key.
+
+                            if uk < end && uk >= start {
+                                update_max(&uk, &v, ts, &mut max_key);
+                            }
+                        }
+                    }
                 }
             }
         }
-        
+
         if let Some((k, v, _)) = max_key {
-             // Check if it's a delete (Tombstone)
-             let (is_put, val) = FusionStorage::decode_value(&v);
-             if is_put {
-                 Ok(Some((k, val.to_vec())))
-             } else {
-                 Ok(None) // Last value is a delete
-             }
+            // Check if it's a delete (Tombstone)
+            let (is_put, val) = FusionStorage::decode_value(&v);
+            if is_put {
+                Ok(Some((k, val.to_vec())))
+            } else {
+                Ok(None) // Last value is a delete
+            }
         } else {
-             Ok(None)
+            Ok(None)
         }
     }
 
@@ -1394,16 +1555,20 @@ impl Transaction for FusionTransaction {
         // Write Conflict Detection (OCC):
         // For each key in write_buffer, check if a newer version (ts > read_ts)
         // was committed by another transaction since we started.
-        let check_mem_conflict = |mem: &MemTable, search_key: &[u8], user_key: &[u8], read_ts: u64| -> Option<u64> {
-            mem.map.range(search_key.to_vec()..).next().and_then(|entry| {
-                let (k, ts) = FusionStorage::decode_key(entry.key());
-                if k == user_key && ts > read_ts {
-                    Some(ts)
-                } else {
-                    None
-                }
-            })
-        };
+        let check_mem_conflict =
+            |mem: &MemTable, search_key: &[u8], user_key: &[u8], read_ts: u64| -> Option<u64> {
+                mem.map
+                    .range(search_key.to_vec()..)
+                    .next()
+                    .and_then(|entry| {
+                        let (k, ts) = FusionStorage::decode_key(entry.key());
+                        if k == user_key && ts > read_ts {
+                            Some(ts)
+                        } else {
+                            None
+                        }
+                    })
+            };
 
         for (user_key, _) in &self.write_buffer {
             let search_key = FusionStorage::encode_key(user_key, u64::MAX);
@@ -1473,7 +1638,7 @@ impl Transaction for FusionTransaction {
         // Check rotation after insert
         let needs_rotate = {
             let active = self.storage.active_memtable.read().unwrap();
-            active.size.load(Ordering::Relaxed) > MEMTABLE_THRESHOLD as u64
+            active.size.load(Ordering::Relaxed) > self.storage.memtable_threshold as u64
         };
 
         if needs_rotate {
@@ -1504,7 +1669,7 @@ impl Storage for FusionStorage {
     }
 
     async fn create_snapshot(&self) -> Result<()> {
-        Ok(())
+        self.create_snapshot_now().await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

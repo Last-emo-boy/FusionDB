@@ -1,3 +1,4 @@
+use fusiondb::auth::UserRecord;
 use fusiondb::execution::Executor;
 use fusiondb::server::pg_server;
 use fusiondb::storage::memory::MemoryStorage;
@@ -14,13 +15,16 @@ async fn test_pg_protocol_simple_query() {
     let port = 19999; // Use high port to avoid conflicts
 
     tokio::spawn(async move {
-        pg_server::start_pg_server(executor, storage, port, "fusiondb", None).await;
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
     });
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=postgres password=fusiondb", port),
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
         NoTls,
     )
     .await
@@ -52,7 +56,10 @@ async fn test_pg_protocol_simple_query() {
 
     // simple_query returns SimpleQueryMessage variants
     // We expect at least a Row or CommandComplete
-    assert!(!results.is_empty(), "Expected non-empty response from SELECT");
+    assert!(
+        !results.is_empty(),
+        "Expected non-empty response from SELECT"
+    );
 
     let _ = std::fs::remove_file(&wal_path);
 }
@@ -66,13 +73,16 @@ async fn test_pg_protocol_extended_query() {
     let port = 19998;
 
     tokio::spawn(async move {
-        pg_server::start_pg_server(executor, storage, port, "fusiondb", None).await;
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
     });
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=postgres password=fusiondb", port),
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
         NoTls,
     )
     .await
@@ -124,12 +134,15 @@ async fn test_pg_protocol_transaction_commit() {
     let port = 19997;
 
     tokio::spawn(async move {
-        pg_server::start_pg_server(executor, storage, port, "fusiondb", None).await;
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=postgres password=fusiondb", port),
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
         NoTls,
     )
     .await
@@ -162,6 +175,108 @@ async fn test_pg_protocol_transaction_commit() {
 }
 
 #[tokio::test]
+async fn test_pg_protocol_rbac_denies_unregistered_non_legacy_user() {
+    let wal_path = format!("test_pg_rbac_{}.wal", std::process::id());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let executor = Arc::new(Executor::new(storage.clone()));
+    let port = 19995;
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let connect_result = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=alice password=fusiondb", port),
+        NoTls,
+    )
+    .await;
+    assert!(
+        connect_result.is_err(),
+        "unregistered non-legacy user should be rejected during authentication"
+    );
+
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
+async fn test_pg_protocol_rbac_allows_registered_user_permissions() {
+    let wal_path = format!("test_pg_rbac_allow_{}.wal", std::process::id());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+
+    {
+        let mut txn = storage.begin_transaction().await.expect("begin txn");
+        let mut alice = UserRecord::new("fusiondb", false);
+        alice.grant("allowed_test", "SELECT");
+        alice.grant("allowed_test", "INSERT");
+        fusiondb::auth::save_user(&mut *txn, "alice", &alice)
+            .await
+            .expect("save user");
+        txn.commit().await.expect("commit user txn");
+    }
+
+    let executor = Arc::new(Executor::new(storage.clone()));
+    let port = 19994;
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (admin_client, admin_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect as admin");
+    tokio::spawn(async move {
+        if let Err(e) = admin_connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+    admin_client
+        .simple_query("CREATE TABLE allowed_test (id INTEGER PRIMARY KEY, val TEXT)")
+        .await
+        .expect("admin create table failed");
+
+    let (alice_client, alice_connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=alice password=fusiondb", port),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect as alice");
+    tokio::spawn(async move {
+        if let Err(e) = alice_connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    alice_client
+        .simple_query("INSERT INTO allowed_test VALUES (1, 'ok')")
+        .await
+        .expect("alice insert should succeed");
+    let rows = alice_client
+        .simple_query("SELECT * FROM allowed_test")
+        .await
+        .expect("alice select should succeed");
+    assert!(!rows.is_empty(), "authorized user should read rows");
+
+    let denied = alice_client
+        .simple_query("CREATE TABLE forbidden_test (id INTEGER PRIMARY KEY)")
+        .await;
+    assert!(
+        denied.is_err(),
+        "user without ALL permission should be denied"
+    );
+
+    let _ = std::fs::remove_file(&wal_path);
+}
+#[tokio::test]
 async fn test_pg_protocol_transaction_rollback() {
     let wal_path = format!("test_pg_rb_{}.wal", std::process::id());
     let storage: Arc<dyn Storage> =
@@ -170,12 +285,15 @@ async fn test_pg_protocol_transaction_rollback() {
     let port = 19996;
 
     tokio::spawn(async move {
-        pg_server::start_pg_server(executor, storage, port, "fusiondb", None).await;
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=postgres password=fusiondb", port),
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
         NoTls,
     )
     .await
@@ -201,7 +319,10 @@ async fn test_pg_protocol_transaction_rollback() {
         .simple_query("INSERT INTO rb_test VALUES (2, 'rolled_back')")
         .await
         .expect("INSERT in txn failed");
-    client.simple_query("ROLLBACK").await.expect("ROLLBACK failed");
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK failed");
 
     let results = client
         .simple_query("SELECT * FROM rb_test")

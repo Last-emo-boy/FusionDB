@@ -27,7 +27,11 @@ async fn main() {
     // We only start TCP Server.
 
     println!("Starting server for benchmark on port {}...", TCP_PORT);
-    let storage = Arc::new(FusionStorage::new("benchmark.wal").await.expect("Failed to create storage"));
+    let storage = Arc::new(
+        FusionStorage::new("benchmark.wal")
+            .await
+            .expect("Failed to create storage"),
+    );
 
     // Start TCP Server
     let storage_tcp = storage.clone();

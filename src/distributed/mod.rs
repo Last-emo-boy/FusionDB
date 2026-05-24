@@ -1,11 +1,11 @@
-pub mod typ;
-pub mod store;
-pub mod network;
 pub mod api;
+pub mod network;
+pub mod store;
+pub mod typ;
 
-use std::sync::Arc;
-use openraft::Config;
 use openraft::storage::Adaptor;
+use openraft::Config;
+use std::sync::Arc;
 
 pub type FusionRaft = openraft::Raft<typ::TypeConfig>;
 
@@ -17,13 +17,7 @@ pub async fn new_raft_node(
     network: network::FusionNetworkFactory,
 ) -> Result<FusionRaft, Box<dyn std::error::Error>> {
     let (log_store, state_machine) = Adaptor::new(raft_store);
-    let raft = openraft::Raft::new(
-        node_id,
-        Arc::new(config),
-        network,
-        log_store,
-        state_machine,
-    )
-    .await?;
+    let raft =
+        openraft::Raft::new(node_id, Arc::new(config), network, log_store, state_machine).await?;
     Ok(raft)
 }

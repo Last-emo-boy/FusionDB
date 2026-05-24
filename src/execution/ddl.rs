@@ -1,9 +1,7 @@
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use crate::storage::Transaction;
-use sqlparser::ast::{
-    BinaryOperator, ColumnOption, Expr, SetExpr, Statement, TableFactor,
-};
+use sqlparser::ast::{BinaryOperator, ColumnOption, Expr, SetExpr, Statement, TableFactor};
 use std::collections::HashSet;
 
 use super::{Executor, QueryResult};
@@ -62,9 +60,10 @@ impl Executor {
     ) -> Result<QueryResult> {
         let table_name_str = table_name.to_string();
         let schema_key = format!("schema:{}", table_name_str);
-        let schema_bytes = txn.get(schema_key.as_bytes()).await?.ok_or_else(|| {
-            FusionError::Execution(format!("Table {} not found", table_name_str))
-        })?;
+        let schema_bytes = txn
+            .get(schema_key.as_bytes())
+            .await?
+            .ok_or_else(|| FusionError::Execution(format!("Table {} not found", table_name_str)))?;
         let schema: TableSchema = bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
 
@@ -83,14 +82,14 @@ impl Executor {
 
         Ok(QueryResult::Select {
             columns: vec!["Table".to_string(), "Create Table".to_string()],
-            rows: vec![vec![
-                Value::String(table_name_str),
-                Value::String(ddl),
-            ]],
+            rows: vec![vec![Value::String(table_name_str), Value::String(ddl)]],
         })
     }
 
-    pub(crate) async fn handle_show_tables(&self, txn: &mut dyn Transaction) -> Result<QueryResult> {
+    pub(crate) async fn handle_show_tables(
+        &self,
+        txn: &mut dyn Transaction,
+    ) -> Result<QueryResult> {
         let prefix = "schema:";
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
 
@@ -469,12 +468,10 @@ impl Executor {
         let cols: Vec<Column> = columns
             .iter()
             .map(|c| {
-                let is_primary = c.options.iter().any(|opt| {
-                    match &opt.option {
-                        ColumnOption::Unique(_) => false,
-                        ColumnOption::PrimaryKey(_) => true, 
-                        _ => false,
-                    }
+                let is_primary = c.options.iter().any(|opt| match &opt.option {
+                    ColumnOption::Unique(_) => false,
+                    ColumnOption::PrimaryKey(_) => true,
+                    _ => false,
                 });
                 let default_value = c.options.iter().find_map(|opt| {
                     if let ColumnOption::Default(expr) = &opt.option {
@@ -494,8 +491,15 @@ impl Executor {
                         IndexType::None
                     },
                     default_value,
-                    is_nullable: !is_primary && !c.options.iter().any(|opt| matches!(&opt.option, ColumnOption::NotNull)),
-                    is_unique: is_primary || c.options.iter().any(|opt| matches!(&opt.option, ColumnOption::Unique(_))),
+                    is_nullable: !is_primary
+                        && !c
+                            .options
+                            .iter()
+                            .any(|opt| matches!(&opt.option, ColumnOption::NotNull)),
+                    is_unique: is_primary
+                        || c.options
+                            .iter()
+                            .any(|opt| matches!(&opt.option, ColumnOption::Unique(_))),
                     check_expr: c.options.iter().find_map(|opt| {
                         if let ColumnOption::Check(expr) = &opt.option {
                             Some(format!("{}", expr))
@@ -606,8 +610,9 @@ impl Executor {
                                     col.index_type = IndexType::None;
                                 }
                             }
-                            let new_bytes = bincode::serialize(&schema)
-                                .map_err(|e| FusionError::Execution(format!("Serialize error: {}", e)))?;
+                            let new_bytes = bincode::serialize(&schema).map_err(|e| {
+                                FusionError::Execution(format!("Serialize error: {}", e))
+                            })?;
                             txn.put(schema_key.as_bytes(), &new_bytes).await?;
                         }
                     }
@@ -615,7 +620,10 @@ impl Executor {
                 txn.delete(meta_key.as_bytes()).await?;
                 dropped += 1;
             } else if !if_exists {
-                return Err(FusionError::Execution(format!("Index {} does not exist", index_name)));
+                return Err(FusionError::Execution(format!(
+                    "Index {} does not exist",
+                    index_name
+                )));
             }
         }
 
@@ -686,15 +694,20 @@ impl Executor {
                             col_name, table_name
                         )));
                     }
-                    let is_primary = column_def.options.iter().any(|opt| {
-                        matches!(&opt.option, ColumnOption::PrimaryKey(_))
-                    });
+                    let is_primary = column_def
+                        .options
+                        .iter()
+                        .any(|opt| matches!(&opt.option, ColumnOption::PrimaryKey(_)));
                     schema.columns.push(Column {
                         name: col_name.clone(),
                         data_type: format!("{}", column_def.data_type),
                         is_primary,
                         is_indexed: is_primary,
-                        index_type: if is_primary { IndexType::BTree } else { IndexType::None },
+                        index_type: if is_primary {
+                            IndexType::BTree
+                        } else {
+                            IndexType::None
+                        },
                         default_value: None,
                         is_nullable: true,
                         is_unique: false,
@@ -703,7 +716,9 @@ impl Executor {
                     messages.push(format!("Added column {}", col_name));
                 }
                 sqlparser::ast::AlterTableOperation::DropColumn {
-                    column_names, if_exists, ..
+                    column_names,
+                    if_exists,
+                    ..
                 } => {
                     for column_ident in column_names {
                         let col_name = column_ident.to_string();
@@ -721,10 +736,13 @@ impl Executor {
                                 let data_prefix = format!("data:{}:", table_name);
                                 let rows = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
                                 for (k, v) in rows {
-                                    if let Ok(mut row) = crate::common::encoding::RowDecoder::decode(&v) {
+                                    if let Ok(mut row) =
+                                        crate::common::encoding::RowDecoder::decode(&v)
+                                    {
                                         if idx < row.len() {
                                             row.remove(idx);
-                                            let new_v = crate::common::encoding::RowEncoder::encode(&row);
+                                            let new_v =
+                                                crate::common::encoding::RowEncoder::encode(&row);
                                             txn.put(&k, &new_v).await?;
                                         }
                                     }
@@ -795,7 +813,10 @@ impl Executor {
         // Check if view already exists
         if let Some(_) = txn.get(view_key.as_bytes()).await? {
             if !or_replace {
-                return Err(FusionError::Execution(format!("View {} already exists", view_name)));
+                return Err(FusionError::Execution(format!(
+                    "View {} already exists",
+                    view_name
+                )));
             }
         }
 
@@ -820,7 +841,10 @@ impl Executor {
 
             if txn.get(view_key.as_bytes()).await?.is_none() {
                 if !if_exists {
-                    return Err(FusionError::Execution(format!("View {} not found", view_name)));
+                    return Err(FusionError::Execution(format!(
+                        "View {} not found",
+                        view_name
+                    )));
                 }
                 continue;
             }

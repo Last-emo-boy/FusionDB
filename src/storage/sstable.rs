@@ -1,9 +1,9 @@
 use crate::common::Result;
+use moka::sync::Cache;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use moka::sync::Cache;
 
 use crc32fast::Hasher as Crc32Hasher;
 use fastbloom::BloomFilter;
@@ -38,7 +38,11 @@ pub struct SsTable {
 }
 
 impl SsTable {
-    pub async fn open(path: PathBuf, id: u64, block_cache: Arc<Cache<(u64, u64), Vec<u8>>>) -> Result<Self> {
+    pub async fn open(
+        path: PathBuf,
+        id: u64,
+        block_cache: Arc<Cache<(u64, u64), Vec<u8>>>,
+    ) -> Result<Self> {
         let mut file = tokio::fs::File::open(&path).await?;
         let len = file.metadata().await?.len();
 
@@ -86,13 +90,13 @@ impl SsTable {
         let filter: BloomFilter = bincode::deserialize(&filter_data).map_err(|e| {
             crate::common::FusionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
-        
+
         // Read Meta
         file.seek(SeekFrom::Start(meta_offset)).await?;
         let meta_len = len - 28 - meta_offset;
         let mut meta_data = vec![0u8; meta_len as usize];
         file.read_exact(&mut meta_data).await?;
-        
+
         let meta: SsTableMeta = bincode::deserialize(&meta_data).map_err(|e| {
             crate::common::FusionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
@@ -144,7 +148,7 @@ impl SsTable {
 
         for i in 0..blocks.len() {
             let offset = *blocks[i].1;
-            
+
             // Determine Block Length
             let next_offset = if i + 1 < blocks.len() {
                 *blocks[i + 1].1
@@ -171,23 +175,33 @@ impl SsTable {
 
             // Parse Block
             let mut cursor = std::io::Cursor::new(block_data);
-            
+
             let mut count_buf = [0u8; 4];
-            if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_err() { continue; }
+            if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_err() {
+                continue;
+            }
             let count = u32::from_le_bytes(count_buf);
 
             for _ in 0..count {
                 let mut len_buf = [0u8; 4];
-                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() { break; }
+                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
+                    break;
+                }
                 let k_len = u32::from_le_bytes(len_buf) as usize;
                 let mut k_buf = vec![0u8; k_len];
-                if std::io::Read::read_exact(&mut cursor, &mut k_buf).is_err() { break; }
+                if std::io::Read::read_exact(&mut cursor, &mut k_buf).is_err() {
+                    break;
+                }
 
                 let mut len_buf = [0u8; 4];
-                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() { break; }
+                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
+                    break;
+                }
                 let v_len = u32::from_le_bytes(len_buf) as usize;
                 let mut v_buf = vec![0u8; v_len];
-                if std::io::Read::read_exact(&mut cursor, &mut v_buf).is_err() { break; }
+                if std::io::Read::read_exact(&mut cursor, &mut v_buf).is_err() {
+                    break;
+                }
 
                 if k_buf.as_slice() >= search_key {
                     return Ok(Some((k_buf, v_buf)));
@@ -215,7 +229,10 @@ impl SsTable {
         if computed != stored_crc {
             return Err(crate::common::FusionError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("SSTable block CRC mismatch: expected {:08x}, got {:08x}", stored_crc, computed),
+                format!(
+                    "SSTable block CRC mismatch: expected {:08x}, got {:08x}",
+                    stored_crc, computed
+                ),
             )));
         }
         Ok(data)
@@ -225,13 +242,13 @@ impl SsTable {
         if let Some(data) = self.block_cache.get(&(self.id, offset)) {
             return Ok(data);
         }
-        
+
         // Find block length
         let _idx_keys: Vec<&Vec<u8>> = self.index.keys().collect();
         let idx_offsets: Vec<&u64> = self.index.values().collect();
-        
+
         let mut next_offset = self.file_len;
-        
+
         // Linear scan to find next offset? BTreeMap is sorted by key, not necessarily offset (though usually is).
         // Let's assume offsets are sorted.
         if let Ok(idx) = idx_offsets.binary_search(&&offset) {
@@ -239,13 +256,13 @@ impl SsTable {
                 next_offset = *idx_offsets[idx + 1];
             }
         }
-        
+
         let len = (next_offset - offset) as usize;
         let mut file = tokio::fs::File::open(&self.path).await?;
         file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; len];
         file.read_exact(&mut buf).await?;
-        
+
         self.block_cache.insert((self.id, offset), buf.clone());
         Ok(buf)
     }
@@ -253,7 +270,7 @@ impl SsTable {
     pub async fn new_iterator(&self, start_key: Option<&[u8]>) -> Result<SsTableIterator> {
         let index_keys: Vec<Vec<u8>> = self.index.keys().cloned().collect();
         let index_offsets: Vec<u64> = self.index.values().cloned().collect();
-        
+
         let start_idx = if let Some(key) = start_key {
             match index_keys.binary_search_by(|k| k.as_slice().cmp(key)) {
                 Ok(idx) => idx,
@@ -311,7 +328,7 @@ impl SsTableIterator {
                 self.file_len
             };
             let block_len = (next_offset - offset) as usize;
-            
+
             self.current_block_idx += 1;
 
             // Check Cache
@@ -331,23 +348,33 @@ impl SsTableIterator {
 
             // Parse Block
             let mut cursor = std::io::Cursor::new(block_data);
-            
+
             let mut count_buf = [0u8; 4];
-            if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_err() { continue; }
+            if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_err() {
+                continue;
+            }
             let count = u32::from_le_bytes(count_buf);
 
             for _ in 0..count {
                 let mut len_buf = [0u8; 4];
-                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() { break; }
+                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
+                    break;
+                }
                 let k_len = u32::from_le_bytes(len_buf) as usize;
                 let mut k_buf = vec![0u8; k_len];
-                if std::io::Read::read_exact(&mut cursor, &mut k_buf).is_err() { break; }
+                if std::io::Read::read_exact(&mut cursor, &mut k_buf).is_err() {
+                    break;
+                }
 
                 let mut len_buf = [0u8; 4];
-                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() { break; }
+                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
+                    break;
+                }
                 let v_len = u32::from_le_bytes(len_buf) as usize;
                 let mut v_buf = vec![0u8; v_len];
-                if std::io::Read::read_exact(&mut cursor, &mut v_buf).is_err() { break; }
+                if std::io::Read::read_exact(&mut cursor, &mut v_buf).is_err() {
+                    break;
+                }
 
                 self.current_block_entries.push_back((k_buf, v_buf));
             }
@@ -407,30 +434,30 @@ impl SsTableBuilder {
         if self.file.is_none() {
             self.init().await?;
         }
-        
+
         self.index.insert(start_key.clone(), self.current_offset);
 
         if self.first_key.is_none() {
-             self.first_key = Some(start_key.clone());
+            self.first_key = Some(start_key.clone());
         }
-        
+
         // Write Block: [Count: 4b] [Data] [CRC32: 4b]
         // CRC covers count + data
         if let Some(file) = &mut self.file {
-             let count_bytes = count.to_le_bytes();
+            let count_bytes = count.to_le_bytes();
 
-             // Compute CRC32 over count + data
-             let mut hasher = Crc32Hasher::new();
-             hasher.update(&count_bytes);
-             hasher.update(buf);
-             let crc = hasher.finalize();
+            // Compute CRC32 over count + data
+            let mut hasher = Crc32Hasher::new();
+            hasher.update(&count_bytes);
+            hasher.update(buf);
+            let crc = hasher.finalize();
 
-             file.write_all(&count_bytes).await?;
-             self.current_offset += 4;
-             file.write_all(buf).await?;
-             self.current_offset += buf.len() as u64;
-             file.write_all(&crc.to_le_bytes()).await?;
-             self.current_offset += 4;
+            file.write_all(&count_bytes).await?;
+            self.current_offset += 4;
+            file.write_all(buf).await?;
+            self.current_offset += buf.len() as u64;
+            file.write_all(&crc.to_le_bytes()).await?;
+            self.current_offset += 4;
         }
         Ok(())
     }
@@ -448,9 +475,9 @@ impl SsTableBuilder {
 
         let index_offset = self.current_offset;
         let index_bytes = bincode::serialize(&self.index).unwrap();
-        
+
         let mut file = self.file.unwrap();
-        
+
         file.write_all(&index_bytes).await?;
 
         let filter_offset = index_offset + index_bytes.len() as u64;
@@ -459,8 +486,8 @@ impl SsTableBuilder {
 
         let meta_offset = filter_offset + filter_bytes.len() as u64;
         let meta = SsTableMeta {
-             first_key: self.first_key.unwrap_or_default(),
-             last_key: self.last_key.unwrap_or_default(),
+            first_key: self.first_key.unwrap_or_default(),
+            last_key: self.last_key.unwrap_or_default(),
         };
         let meta_bytes = bincode::serialize(&meta).unwrap();
         file.write_all(&meta_bytes).await?;
@@ -470,7 +497,7 @@ impl SsTableBuilder {
         file.write_all(&filter_offset.to_le_bytes()).await?;
         file.write_all(&meta_offset.to_le_bytes()).await?;
         file.write_all(&SST_MAGIC.to_le_bytes()).await?;
-        
+
         file.sync_all().await?;
         Ok(())
     }

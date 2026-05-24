@@ -130,6 +130,28 @@ impl StorageConfig {
     pub fn sstable_path(&self) -> PathBuf {
         Path::new(&self.data_dir).join(&self.sstable_dir)
     }
+
+    /// Full path to inverted index snapshot file
+    pub fn inverted_index_path(&self) -> PathBuf {
+        Path::new(&self.data_dir).join("inverted_index.bin")
+    }
+
+    /// Full path to trigram index snapshot file
+    pub fn trigram_index_path(&self) -> PathBuf {
+        Path::new(&self.data_dir).join("trigram_index.bin")
+    }
+
+    /// MemTable flush threshold in bytes
+    pub fn memtable_flush_threshold_bytes(&self) -> usize {
+        self.memtable_flush_mb.saturating_mul(1024 * 1024)
+    }
+}
+
+impl ServerConfig {
+    /// Build a socket address string for a specific port.
+    pub fn socket_addr(&self, port: u16) -> String {
+        format!("{}:{}", self.bind, port)
+    }
 }
 
 impl Config {

@@ -216,15 +216,30 @@ mod tests {
 
     #[test]
     fn test_compare_integers() {
-        assert_eq!(Value::Integer(1).compare(&Value::Integer(2)), Ordering::Less);
-        assert_eq!(Value::Integer(2).compare(&Value::Integer(2)), Ordering::Equal);
-        assert_eq!(Value::Integer(3).compare(&Value::Integer(2)), Ordering::Greater);
+        assert_eq!(
+            Value::Integer(1).compare(&Value::Integer(2)),
+            Ordering::Less
+        );
+        assert_eq!(
+            Value::Integer(2).compare(&Value::Integer(2)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            Value::Integer(3).compare(&Value::Integer(2)),
+            Ordering::Greater
+        );
     }
 
     #[test]
     fn test_compare_mixed_numeric() {
-        assert_eq!(Value::Integer(1).compare(&Value::Float(1.5)), Ordering::Less);
-        assert_eq!(Value::Float(2.5).compare(&Value::Integer(2)), Ordering::Greater);
+        assert_eq!(
+            Value::Integer(1).compare(&Value::Float(1.5)),
+            Ordering::Less
+        );
+        assert_eq!(
+            Value::Float(2.5).compare(&Value::Integer(2)),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -292,7 +307,10 @@ mod tests {
     fn test_type_order() {
         assert!(Value::Null.get_type_order() < Value::Boolean(true).get_type_order());
         assert!(Value::Boolean(true).get_type_order() < Value::Integer(0).get_type_order());
-        assert_eq!(Value::Integer(0).get_type_order(), Value::Float(0.0).get_type_order());
+        assert_eq!(
+            Value::Integer(0).get_type_order(),
+            Value::Float(0.0).get_type_order()
+        );
         assert!(Value::Integer(0).get_type_order() < Value::String("".into()).get_type_order());
     }
 }

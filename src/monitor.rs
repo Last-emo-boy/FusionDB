@@ -10,7 +10,8 @@ const DEFAULT_SLOW_QUERY_THRESHOLD_MS: u64 = 100;
 
 lazy_static! {
     pub static ref GLOBAL_METRICS: Metrics = Metrics::default();
-    pub static ref SLOW_QUERY_LOG: SlowQueryLog = SlowQueryLog::new(DEFAULT_SLOW_QUERY_THRESHOLD_MS);
+    pub static ref SLOW_QUERY_LOG: SlowQueryLog =
+        SlowQueryLog::new(DEFAULT_SLOW_QUERY_THRESHOLD_MS);
 }
 
 #[derive(Default, Serialize)]
@@ -64,17 +65,25 @@ impl SlowQueryLog {
     pub fn record(&self, sql: &str, duration: Duration) {
         let ms = duration.as_secs_f64() * 1000.0;
         GLOBAL_METRICS.query_count.fetch_add(1, Ordering::Relaxed);
-        GLOBAL_METRICS.query_total_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        GLOBAL_METRICS
+            .query_total_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
 
         let threshold = self.threshold_ms.load(Ordering::Relaxed) as f64;
         if ms >= threshold {
-            GLOBAL_METRICS.slow_query_count.fetch_add(1, Ordering::Relaxed);
+            GLOBAL_METRICS
+                .slow_query_count
+                .fetch_add(1, Ordering::Relaxed);
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
             let entry = SlowQueryEntry {
-                sql: if sql.len() > 500 { format!("{}...", &sql[..500]) } else { sql.to_string() },
+                sql: if sql.len() > 500 {
+                    format!("{}...", &sql[..500])
+                } else {
+                    sql.to_string()
+                },
                 duration_ms: ms,
                 timestamp: format!("{:.3}", now.as_secs_f64()),
             };

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 use crate::common::{FusionError, Result};
@@ -74,7 +74,11 @@ pub async fn get_user(txn: &mut dyn Transaction, username: &str) -> Result<Optio
     }
 }
 
-pub async fn save_user(txn: &mut dyn Transaction, username: &str, record: &UserRecord) -> Result<()> {
+pub async fn save_user(
+    txn: &mut dyn Transaction,
+    username: &str,
+    record: &UserRecord,
+) -> Result<()> {
     let key = format!("user:{}", username);
     let bytes = serde_json::to_vec(record)
         .map_err(|e| FusionError::Execution(format!("User record encode error: {}", e)))?;
@@ -100,6 +104,9 @@ pub async fn check_permission(
     if username.is_empty() {
         return Ok(()); // Anonymous mode — no enforcement
     }
+    if username.eq_ignore_ascii_case("postgres") {
+        return Ok(()); // Legacy bootstrap superuser
+    }
     match get_user(txn, username).await? {
         Some(user) => {
             if user.has_permission(table, operation) {
@@ -111,10 +118,10 @@ pub async fn check_permission(
                 )))
             }
         }
-        None => {
-            // User not in RBAC system — allow (legacy compatibility)
-            Ok(())
-        }
+        None => Err(FusionError::Execution(format!(
+            "Permission denied: user '{}' is not registered in RBAC",
+            username
+        ))),
     }
 }
 

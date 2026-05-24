@@ -44,7 +44,9 @@ impl WalState {
             .create(true)
             .append(true)
             .open(&new_path)
-            .map_err(|e| FusionError::Storage(format!("Failed to open WAL segment {}: {}", new_path, e)))?;
+            .map_err(|e| {
+                FusionError::Storage(format!("Failed to open WAL segment {}: {}", new_path, e))
+            })?;
         self.writer = Some(BufWriter::new(file));
         Ok(())
     }
@@ -229,9 +231,13 @@ impl WalManager {
         match entry {
             WalEntry::Put(k, v) => {
                 writer.write_all(&[1u8]).map_err(Self::io_err)?;
-                writer.write_all(&(k.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
+                writer
+                    .write_all(&(k.len() as u32).to_le_bytes())
+                    .map_err(Self::io_err)?;
                 writer.write_all(k).map_err(Self::io_err)?;
-                writer.write_all(&(v.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
+                writer
+                    .write_all(&(v.len() as u32).to_le_bytes())
+                    .map_err(Self::io_err)?;
                 writer.write_all(v).map_err(Self::io_err)?;
                 let n = 1 + 4 + k.len() + 4 + v.len();
                 monitor::add_wal_bytes(n as u64);
@@ -239,7 +245,9 @@ impl WalManager {
             }
             WalEntry::Delete(k) => {
                 writer.write_all(&[2u8]).map_err(Self::io_err)?;
-                writer.write_all(&(k.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
+                writer
+                    .write_all(&(k.len() as u32).to_le_bytes())
+                    .map_err(Self::io_err)?;
                 writer.write_all(k).map_err(Self::io_err)?;
                 let n = 1 + 4 + k.len();
                 monitor::add_wal_bytes(n as u64);
@@ -322,7 +330,9 @@ impl WalManager {
 
     /// Replay all WAL segments in order, returning all entries.
     pub fn replay(&self) -> Result<Vec<WalEntry>> {
-        let _guard = self.state.lock()
+        let _guard = self
+            .state
+            .lock()
             .map_err(|_| FusionError::Storage("WAL Lock poisoned".to_string()))?;
 
         let segments = find_segments(&self.path);
@@ -342,7 +352,12 @@ impl WalManager {
             }
             let entries = Self::replay_single_file(seg_path, file_len)?;
             if !entries.is_empty() {
-                println!("WAL Replay: segment {} ({}) -> {} entries", seg_id, seg_path, entries.len());
+                println!(
+                    "WAL Replay: segment {} ({}) -> {} entries",
+                    seg_id,
+                    seg_path,
+                    entries.len()
+                );
             }
             all_entries.extend(entries);
         }
@@ -352,8 +367,9 @@ impl WalManager {
 
     /// Replay a single WAL file, truncating partial records at the end.
     fn replay_single_file(path: &str, file_len: u64) -> Result<Vec<WalEntry>> {
-        let file = File::open(path)
-            .map_err(|e| FusionError::Storage(format!("Failed to open WAL segment for replay: {}", e)))?;
+        let file = File::open(path).map_err(|e| {
+            FusionError::Storage(format!("Failed to open WAL segment for replay: {}", e))
+        })?;
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
         let mut valid_pos = 0u64;
@@ -381,18 +397,19 @@ impl WalManager {
                 Ok(u32::from_le_bytes(buf))
             };
 
-            let read_vec = |r: &mut BufReader<File>, n: usize, len: &mut usize| -> Result<Vec<u8>> {
-                let mut buf = vec![0u8; n];
-                r.read_exact(&mut buf).map_err(|e| {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        FusionError::Storage("Partial Record".to_string())
-                    } else {
-                        FusionError::Storage(format!("WAL Read Error: {}", e))
-                    }
-                })?;
-                *len += n;
-                Ok(buf)
-            };
+            let read_vec =
+                |r: &mut BufReader<File>, n: usize, len: &mut usize| -> Result<Vec<u8>> {
+                    let mut buf = vec![0u8; n];
+                    r.read_exact(&mut buf).map_err(|e| {
+                        if e.kind() == io::ErrorKind::UnexpectedEof {
+                            FusionError::Storage("Partial Record".to_string())
+                        } else {
+                            FusionError::Storage(format!("WAL Read Error: {}", e))
+                        }
+                    })?;
+                    *len += n;
+                    Ok(buf)
+                };
 
             let res = match opcode[0] {
                 1 => (|| -> Result<WalEntry> {
@@ -407,7 +424,12 @@ impl WalManager {
                     let k = read_vec(&mut reader, kl, &mut record_len)?;
                     Ok(WalEntry::Delete(k))
                 })(),
-                _ => return Err(FusionError::Storage(format!("Unknown WAL OpCode: {}", opcode[0]))),
+                _ => {
+                    return Err(FusionError::Storage(format!(
+                        "Unknown WAL OpCode: {}",
+                        opcode[0]
+                    )))
+                }
             };
 
             match res {
@@ -425,7 +447,9 @@ impl WalManager {
 
         // Truncate partial tail if needed
         if valid_pos < file_len {
-            let _ = OpenOptions::new().write(true).open(path)
+            let _ = OpenOptions::new()
+                .write(true)
+                .open(path)
                 .and_then(|f| f.set_len(valid_pos));
         }
 
@@ -434,7 +458,9 @@ impl WalManager {
 
     /// Truncate all WAL segments — delete old segments and reset the active segment.
     pub fn truncate(&self) -> Result<()> {
-        let mut ws = self.state.lock()
+        let mut ws = self
+            .state
+            .lock()
             .map_err(|_| FusionError::Storage("WAL Lock poisoned".to_string()))?;
 
         // Close current writer
@@ -471,15 +497,19 @@ impl WalManager {
 
         for (k, v) in iter {
             file.write_all(&[1u8]).map_err(Self::io_err)?;
-            file.write_all(&(k.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
+            file.write_all(&(k.len() as u32).to_le_bytes())
+                .map_err(Self::io_err)?;
             file.write_all(&k).map_err(Self::io_err)?;
-            file.write_all(&(v.len() as u32).to_le_bytes()).map_err(Self::io_err)?;
+            file.write_all(&(v.len() as u32).to_le_bytes())
+                .map_err(Self::io_err)?;
             file.write_all(&v).map_err(Self::io_err)?;
         }
         file.flush().map_err(Self::io_err)?;
 
         {
-            let mut ws = self.state.lock()
+            let mut ws = self
+                .state
+                .lock()
                 .map_err(|_| FusionError::Storage("WAL Lock poisoned".to_string()))?;
 
             // Delete all old segments first
@@ -491,12 +521,20 @@ impl WalManager {
 
             // Rename snapshot to base path
             if let Err(e) = fs::rename(&snap_path, &self.path) {
-                let file = OpenOptions::new().create(true).append(true).open(&self.path).map_err(Self::io_err)?;
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .map_err(Self::io_err)?;
                 ws.writer = Some(BufWriter::new(file));
                 return Err(Self::io_err(e));
             }
 
-            let file = OpenOptions::new().create(true).append(true).open(&self.path).map_err(Self::io_err)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(Self::io_err)?;
             let size = file.metadata().map(|m| m.len()).unwrap_or(0);
             ws.writer = Some(BufWriter::new(file));
             ws.segment_id = 0;
@@ -525,7 +563,10 @@ mod tests {
     fn test_segment_path() {
         assert_eq!(segment_path("data/fusion.wal", 0), "data/fusion.wal");
         assert_eq!(segment_path("data/fusion.wal", 1), "data/fusion.wal.seg.1");
-        assert_eq!(segment_path("data/fusion.wal", 42), "data/fusion.wal.seg.42");
+        assert_eq!(
+            segment_path("data/fusion.wal", 42),
+            "data/fusion.wal.seg.42"
+        );
     }
 
     #[test]
@@ -538,8 +579,10 @@ mod tests {
     fn test_wal_write_and_replay() {
         let path = format!("test_wal_seg_{}.wal", std::process::id());
         let wal = WalManager::new(&path).unwrap();
-        wal.append(&WalEntry::Put(b"key1".to_vec(), b"val1".to_vec())).unwrap();
-        wal.append(&WalEntry::Put(b"key2".to_vec(), b"val2".to_vec())).unwrap();
+        wal.append(&WalEntry::Put(b"key1".to_vec(), b"val1".to_vec()))
+            .unwrap();
+        wal.append(&WalEntry::Put(b"key2".to_vec(), b"val2".to_vec()))
+            .unwrap();
         wal.append(&WalEntry::Delete(b"key1".to_vec())).unwrap();
 
         // Re-open and replay
@@ -556,7 +599,8 @@ mod tests {
     fn test_wal_truncate_cleans_segments() {
         let path = format!("test_wal_trunc_{}.wal", std::process::id());
         let wal = WalManager::new(&path).unwrap();
-        wal.append(&WalEntry::Put(b"k".to_vec(), b"v".to_vec())).unwrap();
+        wal.append(&WalEntry::Put(b"k".to_vec(), b"v".to_vec()))
+            .unwrap();
         wal.truncate().unwrap();
 
         let entries = wal.replay().unwrap();

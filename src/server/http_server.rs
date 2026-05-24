@@ -1,7 +1,9 @@
 use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::{get, post},
+    extract::{Extension, Path, Request, State},
+    http::{header::AUTHORIZATION, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -9,13 +11,13 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 
-use crate::execution::Executor;
-// use crate::parser::parse_sql;
 use crate::catalog::TableSchema;
-use crate::common::Value;
+use crate::common::{FusionError, Value};
+use crate::execution::{Executor, PreparedStatementRecord};
 use crate::storage::Storage;
 
 use crate::storage::fusion::FusionStorage;
+use crate::storage::memory::MemoryStorage;
 
 // Zero-Copy Vector Search
 // Bypass SQL parser and plan, call FusionStorage::vector_search directly
@@ -44,35 +46,48 @@ pub struct VectorSearchResult {
     distance: f32,
 }
 
-#[deprecated(
-    note = "Use TCP Server for high performance. HTTP is kept only for backward compatibility and basic testing."
-)]
-pub async fn start_http_server(
-    executor: Arc<Executor>,
-    storage: Arc<dyn Storage>,
-    start_port: u16,
-    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
-) {
-    let state = AppState { executor, storage };
-
-    let app = Router::new()
+fn build_router(state: AppState) -> Router {
+    Router::new()
         .route("/health", get(health_check))
         .route("/query", post(handle_query))
-        .route("/prepare", post(handle_prepare))
+        .route("/prepare", post(handle_prepare).get(handle_list_prepared))
+        .route(
+            "/prepare/{statement_id}",
+            delete(handle_deallocate_prepared),
+        )
         .route("/execute", post(handle_execute))
         .route("/tables", get(handle_tables))
         .route("/metrics", get(handle_metrics))
         .route("/metrics/prometheus", get(handle_prometheus))
         .route("/slow_queries", get(handle_slow_queries))
         .route("/checkpoint", post(handle_checkpoint))
+        .route("/compact", post(handle_compact))
+        .route("/capabilities", get(handle_capabilities))
+        .route("/auth/context", get(handle_auth_context))
         .route("/vector_search", post(handle_vector_search))
         .route("/hybrid_search", post(handle_hybrid_search))
+        .layer(middleware::from_fn(auth_context_middleware))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state)
+}
+
+#[deprecated(
+    note = "Use TCP Server for high performance. HTTP is kept only for backward compatibility and basic testing."
+)]
+pub async fn start_http_server(
+    executor: Arc<Executor>,
+    storage: Arc<dyn Storage>,
+    bind: &str,
+    start_port: u16,
+    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+) {
+    let state = AppState { executor, storage };
+
+    let app = build_router(state);
 
     let mut port = start_port;
     let listener = loop {
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("{}:{}", bind, port);
         match TcpListener::bind(&addr).await {
             Ok(l) => break l,
             Err(_) => {
@@ -85,7 +100,11 @@ pub async fn start_http_server(
     };
 
     let addr = listener.local_addr().unwrap();
-    let scheme = if _tls_acceptor.is_some() { "https" } else { "http" };
+    let scheme = if _tls_acceptor.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     println!("FusionDB HTTP Server running on {}://{}", scheme, addr);
 
     // Write port to file for test scripts
@@ -100,77 +119,50 @@ pub async fn start_http_server(
     axum::serve(listener, app).await.unwrap();
 }
 
+async fn auth_context_middleware(mut request: Request, next: Next) -> Response {
+    let username = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer_username)
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-fusiondb-user")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+
+    request.extensions_mut().insert(RequestContext { username });
+    next.run(request).await
+}
+
+fn extract_bearer_username(header: &str) -> Option<String> {
+    let token = header.strip_prefix("Bearer ")?.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
 async fn health_check() -> &'static str {
     "OK"
 }
 
-async fn handle_metrics() -> Json<crate::monitor::Metrics> {
-    Json(crate::monitor::Metrics {
-        sql_parse_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .sql_parse_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        sql_plan_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .sql_plan_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        row_read_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .row_read_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        row_cache_hit_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .row_cache_hit_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        row_write_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .row_write_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        fts_search_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .fts_search_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        fts_doc_hits: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .fts_doc_hits
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        wal_write_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .wal_write_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        wal_write_bytes: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .wal_write_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        query_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .query_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        slow_query_count: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .slow_query_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        query_total_us: std::sync::atomic::AtomicU64::new(
-            crate::monitor::GLOBAL_METRICS
-                .query_total_us
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-    })
+async fn handle_metrics() -> ApiResponse<MetricsSnapshot> {
+    json_ok(MetricsSnapshot::capture())
 }
 
-async fn handle_slow_queries() -> Json<Vec<crate::monitor::SlowQueryEntry>> {
-    Json(crate::monitor::SLOW_QUERY_LOG.recent())
+async fn handle_slow_queries() -> ApiResponse<Vec<crate::monitor::SlowQueryEntry>> {
+    json_ok(crate::monitor::SLOW_QUERY_LOG.recent())
+}
+
+async fn handle_auth_context(
+    Extension(context): Extension<RequestContext>,
+) -> ApiResponse<AuthContextInfo> {
+    json_ok(AuthContextInfo::from_request_context(&context))
 }
 
 async fn handle_prometheus() -> String {
@@ -259,113 +251,213 @@ async fn handle_hybrid_search(
     }
 }
 
-async fn handle_checkpoint(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+async fn handle_checkpoint(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Envelope<OperationResponse>>) {
     match state.storage.create_snapshot().await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "ok", "message": "Checkpoint created" })),
-        ),
-        Err(e) => (
+        Ok(_) => json_ok(OperationResponse {
+            operation: "checkpoint".to_string(),
+            message: Some("Checkpoint created".to_string()),
+            supported: true,
+        }),
+        Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "status": "error", "error": format!("{:?}", e) })),
+            format!("Checkpoint Error: {:?}", e),
         ),
     }
+}
+
+async fn handle_compact(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Envelope<OperationResponse>>) {
+    if let Some(fusion) = state.storage.as_any().downcast_ref::<FusionStorage>() {
+        match fusion.compact_now().await {
+            Ok(true) => json_ok(OperationResponse {
+                operation: "compact".to_string(),
+                message: Some("Compaction completed".to_string()),
+                supported: true,
+            }),
+            Ok(false) => json_ok(OperationResponse {
+                operation: "compact".to_string(),
+                message: Some("Compaction skipped: not enough SSTables".to_string()),
+                supported: true,
+            }),
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Compaction Error: {:?}", e),
+            ),
+        }
+    } else {
+        json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Compaction is only available for FusionStorage",
+        )
+    }
+}
+
+async fn handle_capabilities(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Envelope<CapabilityInfo>>) {
+    json_ok(CapabilityInfo::from_storage(&state.storage))
 }
 
 async fn handle_query(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Json(payload): Json<QueryRequest>,
-) -> (StatusCode, Json<QueryResponse>) {
+) -> ApiResponse<Vec<QueryResultJson>> {
+    let username = context.username.unwrap_or_default();
+
+    if let Err(e) = state.executor.authorize_sql(&username, &payload.sql).await {
+        return json_error(StatusCode::FORBIDDEN, format!("{:?}", e));
+    }
+
     match state.executor.execute_sql(&payload.sql).await {
-        Ok(results) => (
-            StatusCode::OK,
-            Json(QueryResponse {
-                result: Some(results.into_iter().map(|r| r.into()).collect()),
-                error: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(QueryResponse {
-                result: None,
-                error: Some(format!("{:?}", e)),
-            }),
-        ),
+        Ok(results) => json_ok(results.into_iter().map(|r| r.into()).collect()),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{:?}", e)),
     }
 }
 
-async fn handle_tables(State(state): State<AppState>) -> (StatusCode, Json<Vec<TableInfo>>) {
-    // Start a read-only transaction (or just transaction, effectively read-only if we don't write)
+async fn handle_tables(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+) -> ApiResponse<Vec<TableInfo>> {
+    let username = context.username.unwrap_or_default();
+
     match state.storage.begin_transaction().await {
-        Ok(txn) => {
-            // Scan for keys starting with "schema:"
-            match txn.scan_prefix(b"schema:", None).await {
-                Ok(pairs) => {
-                    let mut tables = Vec::new();
-                    for (_, value) in pairs {
-                        if let Ok(schema) = bincode::deserialize::<TableSchema>(&value) {
-                            tables.push(TableInfo {
-                                name: schema.name,
-                                columns: schema
-                                    .columns
-                                    .into_iter()
-                                    .map(|c| ColumnInfo {
-                                        name: c.name,
-                                        data_type: c.data_type,
-                                        is_primary: c.is_primary,
-                                        is_indexed: c.is_indexed,
-                                        is_nullable: c.is_nullable,
-                                        is_unique: c.is_unique,
-                                        default_value: c.default_value,
-                                        index_type: format!("{:?}", c.index_type),
-                                    })
-                                    .collect(),
-                            });
+        Ok(txn) => match txn.scan_prefix(b"schema:", None).await {
+            Ok(pairs) => {
+                let mut tables = Vec::new();
+                for (_, value) in pairs {
+                    if let Ok(schema) = bincode::deserialize::<TableSchema>(&value) {
+                        if !username.is_empty()
+                            && state
+                                .executor
+                                .check_table_permission(&username, &schema.name, "SELECT")
+                                .await
+                                .is_err()
+                        {
+                            continue;
                         }
+                        tables.push(TableInfo {
+                            name: schema.name,
+                            columns: schema
+                                .columns
+                                .into_iter()
+                                .map(|c| ColumnInfo {
+                                    name: c.name,
+                                    data_type: c.data_type,
+                                    is_primary: c.is_primary,
+                                    is_indexed: c.is_indexed,
+                                    is_nullable: c.is_nullable,
+                                    is_unique: c.is_unique,
+                                    default_value: c.default_value,
+                                    index_type: format!("{:?}", c.index_type),
+                                })
+                                .collect(),
+                        });
                     }
-                    (StatusCode::OK, Json(tables))
                 }
-                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![])),
+                json_ok(tables)
             }
-        }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![])),
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Table listing error: {:?}", e),
+            ),
+        },
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Transaction Error: {:?}", e),
+        ),
     }
 }
 
 async fn handle_prepare(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Json(payload): Json<PrepareRequest>,
-) -> (StatusCode, Json<PrepareResponse>) {
-    match state.executor.register_prepared_statement(&payload.sql) {
-        Ok(id) => (
-            StatusCode::OK,
-            Json(PrepareResponse {
-                statement_id: id,
-                error: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(PrepareResponse {
-                statement_id: "".to_string(),
-                error: Some(format!("Prepare Error: {:?}", e)),
-            }),
+) -> (StatusCode, Json<Envelope<PreparedStatementInfo>>) {
+    let username = context.username.unwrap_or_default();
+
+    if let Err(e) = state.executor.authorize_sql(&username, &payload.sql).await {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            format!("Authorization Error: {:?}", e),
+        );
+    }
+
+    match state
+        .executor
+        .register_prepared_statement(&payload.sql, Some(&username))
+    {
+        Ok(record) => json_ok(record.into()),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("Prepare Error: {:?}", e)),
+    }
+}
+
+async fn handle_list_prepared(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+) -> (StatusCode, Json<Envelope<Vec<PreparedStatementInfo>>>) {
+    let username = context.username.unwrap_or_default();
+    let prepared = state
+        .executor
+        .list_prepared_statements(Some(&username))
+        .into_iter()
+        .map(PreparedStatementInfo::from)
+        .collect();
+    json_ok(prepared)
+}
+
+async fn handle_deallocate_prepared(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path(statement_id): Path<String>,
+) -> (StatusCode, Json<Envelope<PreparedStatementInfo>>) {
+    let username = context.username.unwrap_or_default();
+    match state
+        .executor
+        .remove_prepared_statement(&statement_id, Some(&username))
+    {
+        Ok(record) => json_ok(record.into()),
+        Err(e) => json_error(
+            prepared_statement_error_status(&e),
+            format!("Deallocate Error: {:?}", e),
         ),
     }
 }
 
 async fn handle_execute(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Json(payload): Json<ExecuteRequest>,
-) -> (StatusCode, Json<QueryResponse>) {
-    match state.executor.get_prepared_statement(&payload.statement_id) {
-        Ok(statements) => {
+) -> ApiResponse<Vec<QueryResultJson>> {
+    let username = context.username.unwrap_or_default();
+
+    match state
+        .executor
+        .get_prepared_statement_for_owner(&payload.statement_id, Some(&username))
+    {
+        Ok(record) => {
+            for statement in &record.statements {
+                if let Err(e) = state
+                    .executor
+                    .authorize_statement(&username, statement)
+                    .await
+                {
+                    return json_error(
+                        StatusCode::FORBIDDEN,
+                        format!("Authorization Error: {:?}", e),
+                    );
+                }
+            }
+
             let mut results = Vec::new();
             let params: Vec<Value> = payload.params.iter().map(Value::from_json).collect();
 
             match state.storage.begin_transaction().await {
                 Ok(mut txn) => {
-                    for stmt in statements {
+                    for stmt in record.statements {
                         match state
                             .executor
                             .execute_in_transaction_with_params(&stmt, &mut *txn, &params)
@@ -374,50 +466,32 @@ async fn handle_execute(
                             Ok(res) => results.push(res.into()),
                             Err(e) => {
                                 let _ = txn.rollback().await;
-                                return (
+                                return json_error(
                                     StatusCode::BAD_REQUEST,
-                                    Json(QueryResponse {
-                                        result: None,
-                                        error: Some(format!("Execution Error: {:?}", e)),
-                                    }),
+                                    format!("Execution Error: {:?}", e),
                                 );
                             }
                         }
                     }
                     if let Err(e) = txn.commit().await {
-                        return (
+                        return json_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(QueryResponse {
-                                result: None,
-                                error: Some(format!("Commit Error: {:?}", e)),
-                            }),
+                            format!("Commit Error: {:?}", e),
                         );
                     }
                 }
                 Err(e) => {
-                    return (
+                    return json_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(QueryResponse {
-                            result: None,
-                            error: Some(format!("Transaction Error: {:?}", e)),
-                        }),
-                    )
+                        format!("Transaction Error: {:?}", e),
+                    );
                 }
             }
-            (
-                StatusCode::OK,
-                Json(QueryResponse {
-                    result: Some(results),
-                    error: None,
-                }),
-            )
+            json_ok(results)
         }
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(QueryResponse {
-                result: None,
-                error: Some(format!("Statement Not Found: {:?}", e)),
-            }),
+        Err(e) => json_error(
+            prepared_statement_error_status(&e),
+            format!("Statement Error: {:?}", e),
         ),
     }
 }
@@ -428,15 +502,40 @@ pub struct AppState {
     storage: Arc<dyn Storage>,
 }
 
+#[derive(Clone, Default)]
+struct RequestContext {
+    username: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct QueryRequest {
     sql: String,
 }
 
-#[derive(Serialize)]
-pub struct QueryResponse {
-    result: Option<Vec<QueryResultJson>>,
+pub type ApiResponse<T> = (StatusCode, Json<Envelope<T>>);
+pub type QueryResponse = Envelope<Vec<QueryResultJson>>;
+
+#[derive(Serialize, Deserialize)]
+pub struct Envelope<T> {
+    status: String,
+    data: Option<T>,
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct MetricsSnapshot {
+    sql_parse_count: u64,
+    sql_plan_count: u64,
+    row_read_count: u64,
+    row_cache_hit_count: u64,
+    row_write_count: u64,
+    fts_search_count: u64,
+    fts_doc_hits: u64,
+    wal_write_count: u64,
+    wal_write_bytes: u64,
+    query_count: u64,
+    slow_query_count: u64,
+    query_total_us: u64,
 }
 
 #[derive(Deserialize)]
@@ -444,10 +543,36 @@ pub struct PrepareRequest {
     sql: String,
 }
 
-#[derive(Serialize)]
-pub struct PrepareResponse {
+#[derive(Serialize, Deserialize)]
+pub struct OperationResponse {
+    operation: String,
+    message: Option<String>,
+    supported: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PreparedStatementInfo {
     statement_id: String,
-    error: Option<String>,
+    sql: String,
+    statement_count: usize,
+    owner: Option<String>,
+    created_at_epoch_ms: u128,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CapabilityInfo {
+    backend: String,
+    snapshot_supported: bool,
+    compact_supported: bool,
+    prepared_statement_ownership: bool,
+    distributed_mode: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AuthContextInfo {
+    username: Option<String>,
+    authenticated: bool,
+    mode: String,
 }
 
 #[derive(Deserialize)]
@@ -456,14 +581,15 @@ pub struct ExecuteRequest {
     params: Vec<serde_json::Value>,
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
+#[derive(Serialize, Deserialize)]
 pub enum QueryResultJson {
     Select {
+        r#type: String,
         columns: Vec<String>,
         rows: Vec<Vec<serde_json::Value>>,
     },
     Success {
+        r#type: String,
         message: String,
     },
 }
@@ -477,24 +603,135 @@ impl From<crate::execution::QueryResult> for QueryResultJson {
                     .map(|row| row.iter().map(|v| v.to_json()).collect())
                     .collect();
                 QueryResultJson::Select {
+                    r#type: "select".to_string(),
                     columns,
                     rows: json_rows,
                 }
             }
-            crate::execution::QueryResult::Success { message } => {
-                QueryResultJson::Success { message }
-            }
+            crate::execution::QueryResult::Success { message } => QueryResultJson::Success {
+                r#type: "success".to_string(),
+                message,
+            },
         }
     }
 }
 
-#[derive(Serialize)]
+impl From<PreparedStatementRecord> for PreparedStatementInfo {
+    fn from(record: PreparedStatementRecord) -> Self {
+        Self {
+            statement_id: record.id,
+            sql: record.sql,
+            statement_count: record.statements.len(),
+            owner: record.owner,
+            created_at_epoch_ms: record.created_at_epoch_ms,
+        }
+    }
+}
+
+impl CapabilityInfo {
+    fn from_storage(storage: &Arc<dyn Storage>) -> Self {
+        let compact_supported = storage.as_any().downcast_ref::<FusionStorage>().is_some();
+        let backend = if compact_supported {
+            "FusionStorage"
+        } else if storage.as_any().downcast_ref::<MemoryStorage>().is_some() {
+            "MemoryStorage"
+        } else {
+            "GenericStorage"
+        };
+        Self {
+            backend: backend.to_string(),
+            snapshot_supported: true,
+            compact_supported,
+            prepared_statement_ownership: true,
+            distributed_mode: "isolated".to_string(),
+        }
+    }
+}
+
+impl AuthContextInfo {
+    fn from_request_context(context: &RequestContext) -> Self {
+        let username = context.username.clone();
+        let authenticated = username.is_some();
+        Self {
+            username,
+            authenticated,
+            mode: if authenticated {
+                "explicit_user".to_string()
+            } else {
+                "legacy_anonymous".to_string()
+            },
+        }
+    }
+}
+
+impl MetricsSnapshot {
+    fn capture() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let metrics = &crate::monitor::GLOBAL_METRICS;
+        Self {
+            sql_parse_count: metrics.sql_parse_count.load(Relaxed),
+            sql_plan_count: metrics.sql_plan_count.load(Relaxed),
+            row_read_count: metrics.row_read_count.load(Relaxed),
+            row_cache_hit_count: metrics.row_cache_hit_count.load(Relaxed),
+            row_write_count: metrics.row_write_count.load(Relaxed),
+            fts_search_count: metrics.fts_search_count.load(Relaxed),
+            fts_doc_hits: metrics.fts_doc_hits.load(Relaxed),
+            wal_write_count: metrics.wal_write_count.load(Relaxed),
+            wal_write_bytes: metrics.wal_write_bytes.load(Relaxed),
+            query_count: metrics.query_count.load(Relaxed),
+            slow_query_count: metrics.slow_query_count.load(Relaxed),
+            query_total_us: metrics.query_total_us.load(Relaxed),
+        }
+    }
+}
+
+fn prepared_statement_error_status(error: &FusionError) -> StatusCode {
+    match error {
+        FusionError::Execution(message) if message.contains("belongs to") => StatusCode::FORBIDDEN,
+        FusionError::Execution(message) if message.contains("not found") => StatusCode::NOT_FOUND,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn json_error<T>(
+    status_code: StatusCode,
+    error: impl Into<String>,
+) -> (StatusCode, Json<Envelope<T>>)
+where
+    T: Serialize,
+{
+    (
+        status_code,
+        Json(Envelope {
+            status: "error".to_string(),
+            data: None,
+            error: Some(error.into()),
+        }),
+    )
+}
+
+fn json_ok<T>(data: T) -> (StatusCode, Json<Envelope<T>>)
+where
+    T: Serialize,
+{
+    (
+        StatusCode::OK,
+        Json(Envelope {
+            status: "ok".to_string(),
+            data: Some(data),
+            error: None,
+        }),
+    )
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct TableInfo {
     name: String,
     columns: Vec<ColumnInfo>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ColumnInfo {
     name: String,
     data_type: String,
@@ -504,4 +741,268 @@ pub struct ColumnInfo {
     is_unique: bool,
     default_value: Option<String>,
     index_type: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request as HttpRequest;
+    use tower::util::ServiceExt;
+
+    use crate::auth::{save_user, UserRecord};
+    use crate::execution::Executor;
+    use crate::storage::memory::MemoryStorage;
+    use crate::storage::Storage;
+
+    async fn response_json<T: serde::de::DeserializeOwned>(response: Response) -> T {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert!(
+            status.is_success()
+                || status == StatusCode::FORBIDDEN
+                || status == StatusCode::NOT_FOUND,
+            "unexpected status: {status}, body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body).expect("decode json")
+    }
+
+    fn test_app(storage: Arc<dyn Storage>) -> Router {
+        let executor = Arc::new(Executor::new(storage.clone()));
+        build_router(AppState { executor, storage })
+    }
+
+    #[tokio::test]
+    async fn http_prepare_execute_and_deallocate_respect_owner_scope() {
+        let wal_path = format!("test_http_prepare_{}.wal", std::process::id());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = test_app(storage.clone());
+
+        let prepare_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .header("x-fusiondb-user", "alice")
+            .body(Body::from(r#"{"sql":"SELECT 1 AS value"}"#))
+            .expect("prepare request");
+        let prepare_response = app
+            .clone()
+            .oneshot(prepare_request)
+            .await
+            .expect("prepare response");
+        let prepare_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_response).await;
+        let prepared = prepare_envelope.data.expect("prepared data");
+        assert_eq!(prepared.owner.as_deref(), Some("alice"));
+        assert_eq!(prepared.statement_count, 1);
+
+        let list_request = HttpRequest::builder()
+            .method("GET")
+            .uri("/prepare")
+            .header("x-fusiondb-user", "alice")
+            .body(Body::empty())
+            .expect("list request");
+        let list_response = app
+            .clone()
+            .oneshot(list_request)
+            .await
+            .expect("list response");
+        let list_envelope: Envelope<Vec<PreparedStatementInfo>> =
+            response_json(list_response).await;
+        assert_eq!(list_envelope.data.expect("list data").len(), 1);
+
+        let execute_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .header("x-fusiondb-user", "alice")
+            .body(Body::from(format!(
+                r#"{{"statement_id":"{}","params":[]}}"#,
+                prepared.statement_id
+            )))
+            .expect("execute request");
+        let execute_response = app
+            .clone()
+            .oneshot(execute_request)
+            .await
+            .expect("execute response");
+        let execute_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_response).await;
+        assert!(execute_envelope.data.expect("execute data").len() == 1);
+
+        let forbidden_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .header("x-fusiondb-user", "bob")
+            .body(Body::from(format!(
+                r#"{{"statement_id":"{}","params":[]}}"#,
+                prepared.statement_id
+            )))
+            .expect("forbidden request");
+        let forbidden_response = app
+            .clone()
+            .oneshot(forbidden_request)
+            .await
+            .expect("forbidden response");
+        assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+
+        let delete_request = HttpRequest::builder()
+            .method("DELETE")
+            .uri(format!("/prepare/{}", prepared.statement_id))
+            .header("x-fusiondb-user", "alice")
+            .body(Body::empty())
+            .expect("delete request");
+        let delete_response = app
+            .clone()
+            .oneshot(delete_request)
+            .await
+            .expect("delete response");
+        let delete_envelope: Envelope<PreparedStatementInfo> = response_json(delete_response).await;
+        assert_eq!(
+            delete_envelope.data.expect("deleted data").statement_id,
+            prepared.statement_id
+        );
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_capabilities_and_auth_context_are_exposed() {
+        let wal_path = format!("test_http_caps_{}.wal", std::process::id());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = test_app(storage.clone());
+
+        let capabilities_request = HttpRequest::builder()
+            .method("GET")
+            .uri("/capabilities")
+            .body(Body::empty())
+            .expect("capabilities request");
+        let capabilities_response = app
+            .clone()
+            .oneshot(capabilities_request)
+            .await
+            .expect("capabilities response");
+        let capabilities: Envelope<CapabilityInfo> = response_json(capabilities_response).await;
+        let capability_data = capabilities.data.expect("capability data");
+        assert_eq!(capability_data.backend, "MemoryStorage");
+        assert!(!capability_data.compact_supported);
+        assert_eq!(capability_data.distributed_mode, "isolated");
+
+        let auth_request = HttpRequest::builder()
+            .method("GET")
+            .uri("/auth/context")
+            .header("x-fusiondb-user", "alice")
+            .body(Body::empty())
+            .expect("auth request");
+        let auth_response = app
+            .clone()
+            .oneshot(auth_request)
+            .await
+            .expect("auth response");
+        let auth_context: Envelope<AuthContextInfo> = response_json(auth_response).await;
+        let auth_data = auth_context.data.expect("auth data");
+        assert_eq!(auth_data.username.as_deref(), Some("alice"));
+        assert!(auth_data.authenticated);
+        assert_eq!(auth_data.mode, "explicit_user");
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_and_tables_enforce_rbac_for_registered_users() {
+        let wal_path = format!("test_http_rbac_{}.wal", std::process::id());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+
+        {
+            let mut txn = storage.begin_transaction().await.expect("begin txn");
+            let mut alice = UserRecord::new("fusiondb", false);
+            alice.grant("allowed_http", "SELECT");
+            save_user(&mut *txn, "alice", &alice)
+                .await
+                .expect("save user");
+            txn.commit().await.expect("commit user txn");
+        }
+
+        let app = test_app(storage.clone());
+
+        let create_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"CREATE TABLE allowed_http (id INTEGER PRIMARY KEY, val TEXT)"}"#,
+            ))
+            .expect("create request");
+        let create_response = app
+            .clone()
+            .oneshot(create_request)
+            .await
+            .expect("create response");
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let insert_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"INSERT INTO allowed_http VALUES (1, 'ok')"}"#,
+            ))
+            .expect("insert request");
+        let insert_response = app
+            .clone()
+            .oneshot(insert_request)
+            .await
+            .expect("insert response");
+        assert_eq!(insert_response.status(), StatusCode::OK);
+
+        let allowed_query = HttpRequest::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .header("x-fusiondb-user", "alice")
+            .body(Body::from(r#"{"sql":"SELECT * FROM allowed_http"}"#))
+            .expect("allowed query");
+        let allowed_response = app
+            .clone()
+            .oneshot(allowed_query)
+            .await
+            .expect("allowed response");
+        assert_eq!(allowed_response.status(), StatusCode::OK);
+
+        let forbidden_query = HttpRequest::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .header("x-fusiondb-user", "alice")
+            .body(Body::from(
+                r#"{"sql":"CREATE TABLE forbidden_http (id INTEGER PRIMARY KEY)"}"#,
+            ))
+            .expect("forbidden query");
+        let forbidden_response = app
+            .clone()
+            .oneshot(forbidden_query)
+            .await
+            .expect("forbidden response");
+        assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+
+        let tables_request = HttpRequest::builder()
+            .method("GET")
+            .uri("/tables")
+            .header("x-fusiondb-user", "alice")
+            .body(Body::empty())
+            .expect("tables request");
+        let tables_response = app
+            .clone()
+            .oneshot(tables_request)
+            .await
+            .expect("tables response");
+        let tables_envelope: Envelope<Vec<TableInfo>> = response_json(tables_response).await;
+        assert_eq!(tables_envelope.data.expect("tables data").len(), 1);
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
 }

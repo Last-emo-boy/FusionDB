@@ -2,8 +2,8 @@ use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use crate::storage::Transaction;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause,
-    OrderByKind, SelectItem, SetExpr, TableFactor,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, OrderByKind, SelectItem,
+    SetExpr, TableFactor,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -11,6 +11,100 @@ use std::collections::HashSet;
 use super::{AggregateAccumulator, Executor, QueryResult};
 
 impl Executor {
+    fn resolve_order_by_projection_index(
+        &self,
+        expr: &Expr,
+        projection: &[SelectItem],
+        columns: &[String],
+    ) -> Option<usize> {
+        if let Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::Number(n, _),
+            ..
+        }) = expr
+        {
+            if let Ok(position) = n.parse::<usize>() {
+                let index = position.checked_sub(1)?;
+                if index < columns.len() {
+                    return Some(index);
+                }
+            }
+        }
+
+        if let Expr::Identifier(ident) = expr {
+            if let Some(index) = columns
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(&ident.value))
+            {
+                return Some(index);
+            }
+        }
+
+        projection
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                SelectItem::UnnamedExpr(proj_expr) if proj_expr == expr => Some(index),
+                SelectItem::ExprWithAlias { expr: proj_expr, alias }
+                    if proj_expr == expr
+                        || matches!(expr, Expr::Identifier(ident) if alias.value.eq_ignore_ascii_case(&ident.value)) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+    }
+
+    fn evaluate_projection_order_value(
+        &self,
+        expr: &Expr,
+        projection: &[SelectItem],
+        columns: &[String],
+        row: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Option<Value> {
+        if let Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::Number(n, _),
+            ..
+        }) = expr
+        {
+            let index = n.parse::<usize>().ok()?.checked_sub(1)?;
+            if index >= columns.len() {
+                return None;
+            }
+
+            return projection.get(index).and_then(|item| match item {
+                SelectItem::UnnamedExpr(proj_expr)
+                | SelectItem::ExprWithAlias {
+                    expr: proj_expr, ..
+                } => self
+                    .evaluate_value(proj_expr, row, schema, params)
+                    .ok()
+                    .or_else(|| row.get(index).cloned()),
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                    row.get(index).cloned()
+                }
+            });
+        }
+
+        projection
+            .iter()
+            .find_map(|item| match item {
+                SelectItem::UnnamedExpr(proj_expr) if proj_expr == expr => self
+                    .evaluate_value(proj_expr, row, schema, params)
+                    .ok(),
+                SelectItem::ExprWithAlias {
+                    expr: proj_expr,
+                    alias,
+                } if proj_expr == expr
+                    || matches!(expr, Expr::Identifier(ident) if alias.value.eq_ignore_ascii_case(&ident.value)) =>
+                {
+                    self.evaluate_value(proj_expr, row, schema, params).ok()
+                }
+                _ => None,
+            })
+    }
+
     pub(crate) async fn handle_query(
         &self,
         query: &sqlparser::ast::Query,
@@ -129,20 +223,19 @@ impl Executor {
 
             // Push down limit only if no ORDER BY and no GROUP BY (simplified)
             let is_group_by_none = matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty());
-            
+
             // Optimization: Aggregates on PK (COUNT(*), MIN(id), MAX(id))
             if !is_join && select.selection.is_none() && is_group_by_none {
-                 let mut supported = true;
-                 let mut result_row = Vec::new();
-                 let mut col_names = Vec::new();
+                let mut supported = true;
+                let mut result_row = Vec::new();
+                let mut col_names = Vec::new();
 
-                 if let Some(table) = select.from.first() {
+                if let Some(table) = select.from.first() {
                     if let TableFactor::Table { name, .. } = &table.relation {
                         let table_name_str = name.to_string();
                         let schema_key = format!("schema:{}", table_name_str);
                         if let Ok(Some(schema_bytes)) = txn.get(schema_key.as_bytes()).await {
                             if let Ok(schema) = bincode::deserialize::<TableSchema>(&schema_bytes) {
-                                
                                 for proj_item in &select.projection {
                                     let expr = match proj_item {
                                         SelectItem::UnnamedExpr(expr) => Some(expr),
@@ -154,69 +247,93 @@ impl Executor {
                                     if let Some(Expr::Function(func)) = expr {
                                         let func_name = func.name.to_string().to_uppercase();
                                         if func_name == "COUNT" {
-                                             if let FunctionArguments::List(args) = &func.args {
-                                                 if args.args.len() == 1 {
-                                                     if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) = &args.args[0] {
-                                                         let prefix = format!("data:{}:", table_name_str);
-                                                         let count = txn.count_prefix(prefix.as_bytes()).await?;
-                                                         result_row.push(Value::Integer(count as i64));
-                                                         col_names.push("COUNT(*)".to_string());
-                                                         item_handled = true;
-                                                     }
-                                                 }
-                                             }
+                                            if let FunctionArguments::List(args) = &func.args {
+                                                if args.args.len() == 1 {
+                                                    if let FunctionArg::Unnamed(
+                                                        FunctionArgExpr::Wildcard,
+                                                    ) = &args.args[0]
+                                                    {
+                                                        let prefix =
+                                                            format!("data:{}:", table_name_str);
+                                                        let count = txn
+                                                            .count_prefix(prefix.as_bytes())
+                                                            .await?;
+                                                        result_row
+                                                            .push(Value::Integer(count as i64));
+                                                        col_names.push("COUNT(*)".to_string());
+                                                        item_handled = true;
+                                                    }
+                                                }
+                                            }
                                         } else if func_name == "MAX" || func_name == "MIN" {
-                                             if let FunctionArguments::List(args) = &func.args {
-                                                 if args.args.len() == 1 {
-                                                     if let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) = &args.args[0] {
-                                                         let mut pk_idx = None;
-                                                         for (i, col) in schema.columns.iter().enumerate() {
-                                                             if col.name.eq_ignore_ascii_case(&ident.value) {
-                                                                 if col.is_primary {
-                                                                     pk_idx = Some(i);
-                                                                 }
-                                                                 break;
-                                                             }
-                                                         }
+                                            if let FunctionArguments::List(args) = &func.args {
+                                                if args.args.len() == 1 {
+                                                    if let FunctionArg::Unnamed(
+                                                        FunctionArgExpr::Expr(Expr::Identifier(
+                                                            ident,
+                                                        )),
+                                                    ) = &args.args[0]
+                                                    {
+                                                        let mut pk_idx = None;
+                                                        for (i, col) in
+                                                            schema.columns.iter().enumerate()
+                                                        {
+                                                            if col
+                                                                .name
+                                                                .eq_ignore_ascii_case(&ident.value)
+                                                            {
+                                                                if col.is_primary {
+                                                                    pk_idx = Some(i);
+                                                                }
+                                                                break;
+                                                            }
+                                                        }
 
-                                                         if let Some(idx) = pk_idx {
-                                                             let prefix = format!("data:{}:", table_name_str);
-                                                             let min_key = prefix.as_bytes().to_vec();
-                                                             let mut max_key = prefix.as_bytes().to_vec();
-                                                             max_key.push(0xFF);
-                                                             
-                                                             let res = if func_name == "MIN" {
-                                                                 txn.first(&min_key, &max_key).await?
-                                                             } else {
-                                                                 txn.last(&min_key, &max_key).await?
-                                                             };
+                                                        if let Some(idx) = pk_idx {
+                                                            let prefix =
+                                                                format!("data:{}:", table_name_str);
+                                                            let min_key =
+                                                                prefix.as_bytes().to_vec();
+                                                            let mut max_key =
+                                                                prefix.as_bytes().to_vec();
+                                                            max_key.push(0xFF);
 
-                                                             let val = if let Some((_, v)) = res {
-                                                                 let row: Vec<Value> = crate::common::encoding::RowDecoder::decode_partial(&v, &[idx]).unwrap_or(vec![Value::Null; idx + 1]);
-                                                                 if idx < row.len() {
-                                                                     row[idx].clone()
-                                                                 } else {
-                                                                     Value::Null
-                                                                 }
-                                                             } else {
-                                                                 Value::Null
-                                                             };
-                                                             result_row.push(val);
-                                                             col_names.push(format!("{}({})", func_name, ident.value));
-                                                             item_handled = true;
-                                                         }
-                                                     }
-                                                 }
-                                             }
+                                                            let res = if func_name == "MIN" {
+                                                                txn.first(&min_key, &max_key)
+                                                                    .await?
+                                                            } else {
+                                                                txn.last(&min_key, &max_key).await?
+                                                            };
+
+                                                            let val = if let Some((_, v)) = res {
+                                                                let row: Vec<Value> = crate::common::encoding::RowDecoder::decode_partial(&v, &[idx]).unwrap_or(vec![Value::Null; idx + 1]);
+                                                                if idx < row.len() {
+                                                                    row[idx].clone()
+                                                                } else {
+                                                                    Value::Null
+                                                                }
+                                                            } else {
+                                                                Value::Null
+                                                            };
+                                                            result_row.push(val);
+                                                            col_names.push(format!(
+                                                                "{}({})",
+                                                                func_name, ident.value
+                                                            ));
+                                                            item_handled = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
-                                    
+
                                     if !item_handled {
                                         supported = false;
                                         break;
                                     }
                                 }
-                                
+
                                 if supported && !result_row.is_empty() {
                                     return Ok(QueryResult::Select {
                                         columns: col_names,
@@ -226,7 +343,7 @@ impl Executor {
                             }
                         }
                     }
-                 }
+                }
             }
 
             let push_down_limit = if is_group_by_none {
@@ -247,19 +364,31 @@ impl Executor {
                 let mut cols = HashSet::new();
                 for item in &select.projection {
                     match item {
-                         SelectItem::UnnamedExpr(expr) => self.extract_columns_from_expr(expr, &mut cols),
-                         SelectItem::ExprWithAlias { expr, .. } => self.extract_columns_from_expr(expr, &mut cols),
-                         _ => {}
+                        SelectItem::UnnamedExpr(expr) => {
+                            self.extract_columns_from_expr(expr, &mut cols)
+                        }
+                        SelectItem::ExprWithAlias { expr, .. } => {
+                            self.extract_columns_from_expr(expr, &mut cols)
+                        }
+                        _ => {}
                     }
+                }
+                if let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by {
+                    for expr in group_exprs {
+                        self.extract_columns_from_expr(expr, &mut cols);
+                    }
+                }
+                if let Some(having) = &select.having {
+                    self.extract_columns_from_expr(having, &mut cols);
                 }
                 if let Some(selection) = &select.selection {
                     self.extract_columns_from_expr(selection, &mut cols);
                 }
                 if let Some(order_by) = &query.order_by {
                     if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
-                         for expr in exprs {
-                             self.extract_columns_from_expr(&expr.expr, &mut cols);
-                         }
+                        for expr in exprs {
+                            self.extract_columns_from_expr(&expr.expr, &mut cols);
+                        }
                     }
                 }
                 if cols.is_empty() {
@@ -279,17 +408,31 @@ impl Executor {
             } else {
                 None
             };
-            let effective_selection = materialized_selection.as_ref().or(select.selection.as_ref());
+            let effective_selection = materialized_selection
+                .as_ref()
+                .or(select.selection.as_ref());
 
             // Recompute projection hint if subqueries were materialized
             let projection_hint = if materialized_selection.is_some() && !is_wildcard {
                 let mut cols = HashSet::new();
                 for item in &select.projection {
                     match item {
-                        SelectItem::UnnamedExpr(expr) => self.extract_columns_from_expr(expr, &mut cols),
-                        SelectItem::ExprWithAlias { expr, .. } => self.extract_columns_from_expr(expr, &mut cols),
+                        SelectItem::UnnamedExpr(expr) => {
+                            self.extract_columns_from_expr(expr, &mut cols)
+                        }
+                        SelectItem::ExprWithAlias { expr, .. } => {
+                            self.extract_columns_from_expr(expr, &mut cols)
+                        }
                         _ => {}
                     }
+                }
+                if let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by {
+                    for expr in group_exprs {
+                        self.extract_columns_from_expr(expr, &mut cols);
+                    }
+                }
+                if let Some(having) = &select.having {
+                    self.extract_columns_from_expr(having, &mut cols);
                 }
                 if let Some(sel) = effective_selection {
                     self.extract_columns_from_expr(sel, &mut cols);
@@ -301,16 +444,34 @@ impl Executor {
                         }
                     }
                 }
-                if cols.is_empty() { Some(vec![]) } else { Some(cols.into_iter().collect()) }
+                if cols.is_empty() {
+                    Some(vec![])
+                } else {
+                    Some(cols.into_iter().collect())
+                }
             } else {
                 projection_hint
             };
 
             let sel_option = effective_selection.cloned();
 
+            let join_limit = if is_join && effective_selection.is_none() && query.order_by.is_none()
+            {
+                push_down_limit
+            } else {
+                None
+            };
+
             let (mut schema, mut rows) = if is_join {
-                self.execute_join(&select.from, &sel_option, txn, params)
-                    .await?
+                self.execute_join(
+                    &select.from,
+                    &sel_option,
+                    &projection_hint,
+                    txn,
+                    params,
+                    join_limit,
+                )
+                .await?
             } else if let Some(table) = select.from.first() {
                 self.scan_single_table(
                     &table.relation,
@@ -332,11 +493,17 @@ impl Executor {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
                             col_names.push(format!("{}", expr));
-                            result_row.push(self.evaluate_value(expr, &empty_row, &empty_schema, params).unwrap_or(Value::Null));
+                            result_row.push(
+                                self.evaluate_value(expr, &empty_row, &empty_schema, params)
+                                    .unwrap_or(Value::Null),
+                            );
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {
                             col_names.push(alias.value.clone());
-                            result_row.push(self.evaluate_value(expr, &empty_row, &empty_schema, params).unwrap_or(Value::Null));
+                            result_row.push(
+                                self.evaluate_value(expr, &empty_row, &empty_schema, params)
+                                    .unwrap_or(Value::Null),
+                            );
                         }
                         _ => {}
                     }
@@ -545,8 +712,63 @@ impl Executor {
 
             if let Some(order_by) = &query.order_by {
                 if let OrderByKind::Expressions(exprs) = &order_by.kind {
+                    let projection = &select.projection;
+                    let rows_are_projected = matches!(
+                        select.group_by,
+                        sqlparser::ast::GroupByExpr::Expressions(ref group_exprs, _)
+                            if !group_exprs.is_empty()
+                    );
                     rows.sort_by(|a, b| {
                         for order_expr in exprs {
+                            if rows_are_projected {
+                                if let Some(index) = self.resolve_order_by_projection_index(
+                                    &order_expr.expr,
+                                    projection,
+                                    &columns,
+                                ) {
+                                    let val_a = a.get(index).cloned().unwrap_or(Value::Null);
+                                    let val_b = b.get(index).cloned().unwrap_or(Value::Null);
+                                    let ordering = self.compare_for_sort(&val_a, &val_b);
+                                    if ordering != Ordering::Equal {
+                                        return if order_expr.options.asc.unwrap_or(true) {
+                                            ordering
+                                        } else {
+                                            ordering.reverse()
+                                        };
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            if let Some((val_a, val_b)) = self
+                                .evaluate_projection_order_value(
+                                    &order_expr.expr,
+                                    projection,
+                                    &columns,
+                                    a,
+                                    &schema,
+                                    params,
+                                )
+                                .zip(self.evaluate_projection_order_value(
+                                    &order_expr.expr,
+                                    projection,
+                                    &columns,
+                                    b,
+                                    &schema,
+                                    params,
+                                ))
+                            {
+                                let ordering = self.compare_for_sort(&val_a, &val_b);
+                                if ordering != Ordering::Equal {
+                                    return if order_expr.options.asc.unwrap_or(true) {
+                                        ordering
+                                    } else {
+                                        ordering.reverse()
+                                    };
+                                }
+                                continue;
+                            }
+
                             let val_a = self
                                 .evaluate_value(&order_expr.expr, a, &schema, params)
                                 .unwrap_or(Value::Null);
@@ -589,13 +811,18 @@ impl Executor {
                 let mut bare_aggs: Vec<(Expr, String)> = Vec::new();
                 for item in &select.projection {
                     match item {
-                        SelectItem::UnnamedExpr(expr) => self.extract_aggregates_from_expr(expr, &mut bare_aggs),
-                        SelectItem::ExprWithAlias { expr, .. } => self.extract_aggregates_from_expr(expr, &mut bare_aggs),
+                        SelectItem::UnnamedExpr(expr) => {
+                            self.extract_aggregates_from_expr(expr, &mut bare_aggs)
+                        }
+                        SelectItem::ExprWithAlias { expr, .. } => {
+                            self.extract_aggregates_from_expr(expr, &mut bare_aggs)
+                        }
                         _ => {}
                     }
                 }
                 if !bare_aggs.is_empty() {
-                    let mut accs: Vec<AggregateAccumulator> = bare_aggs.iter()
+                    let mut accs: Vec<AggregateAccumulator> = bare_aggs
+                        .iter()
                         .map(|(_, name)| AggregateAccumulator::new(name))
                         .collect();
                     for row in &rows {
@@ -604,12 +831,21 @@ impl Executor {
                                 let arg_val = if let FunctionArguments::List(args) = &func.args {
                                     if args.args.is_empty() {
                                         Value::Integer(1)
-                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) = &args.args[0] {
+                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) =
+                                        &args.args[0]
+                                    {
                                         Value::Integer(1)
-                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = &args.args[0] {
-                                        self.evaluate_value(e, row, &schema, params).unwrap_or(Value::Null)
-                                    } else { Value::Null }
-                                } else { Value::Null };
+                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) =
+                                        &args.args[0]
+                                    {
+                                        self.evaluate_value(e, row, &schema, params)
+                                            .unwrap_or(Value::Null)
+                                    } else {
+                                        Value::Null
+                                    }
+                                } else {
+                                    Value::Null
+                                };
                                 accs[i].update(&arg_val);
                             }
                         }
@@ -627,24 +863,33 @@ impl Executor {
             let window_results: Vec<Option<Vec<Value>>> = if !is_wildcard
                 && matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty())
             {
-                select.projection.iter().map(|item| {
-                    let expr = match item {
-                        SelectItem::UnnamedExpr(e) => Some(e),
-                        SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
-                        _ => None,
-                    };
-                    if let Some(Expr::Function(func)) = expr {
-                        let fname = func.name.to_string().to_uppercase();
-                        if matches!(fname.as_str(), "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "LEAD") {
-                            if let Some(ref over) = func.over {
-                                if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
-                                    return Some(self.compute_window_function(&fname, spec, func, &rows, &schema, params));
+                select
+                    .projection
+                    .iter()
+                    .map(|item| {
+                        let expr = match item {
+                            SelectItem::UnnamedExpr(e) => Some(e),
+                            SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+                            _ => None,
+                        };
+                        if let Some(Expr::Function(func)) = expr {
+                            let fname = func.name.to_string().to_uppercase();
+                            if matches!(
+                                fname.as_str(),
+                                "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "LEAD"
+                            ) {
+                                if let Some(ref over) = func.over {
+                                    if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
+                                        return Some(self.compute_window_function(
+                                            &fname, spec, func, &rows, &schema, params,
+                                        ));
+                                    }
                                 }
                             }
                         }
-                    }
-                    None
-                }).collect()
+                        None
+                    })
+                    .collect()
             } else {
                 vec![]
             };
@@ -722,16 +967,26 @@ impl Executor {
                 pipe_operators: vec![],
             };
 
-            let left_result = Box::pin(self.handle_query(&make_query(left.clone()), txn, params)).await?;
-            let right_result = Box::pin(self.handle_query(&make_query(right.clone()), txn, params)).await?;
+            let left_result =
+                Box::pin(self.handle_query(&make_query(left.clone()), txn, params)).await?;
+            let right_result =
+                Box::pin(self.handle_query(&make_query(right.clone()), txn, params)).await?;
 
             let (left_cols, left_rows) = match left_result {
                 QueryResult::Select { columns, rows } => (columns, rows),
-                _ => return Err(FusionError::Execution("UNION left side must be SELECT".to_string())),
+                _ => {
+                    return Err(FusionError::Execution(
+                        "UNION left side must be SELECT".to_string(),
+                    ))
+                }
             };
             let (_, right_rows) = match right_result {
                 QueryResult::Select { columns, rows } => (columns, rows),
-                _ => return Err(FusionError::Execution("UNION right side must be SELECT".to_string())),
+                _ => {
+                    return Err(FusionError::Execution(
+                        "UNION right side must be SELECT".to_string(),
+                    ))
+                }
             };
 
             let mut combined = match op {
@@ -741,18 +996,34 @@ impl Executor {
                     all_rows
                 }
                 SetOperator::Intersect => {
-                    let right_set: HashSet<String> = right_rows.iter().map(|r| format!("{:?}", r)).collect();
-                    left_rows.into_iter().filter(|r| right_set.contains(&format!("{:?}", r))).collect()
+                    let right_set: HashSet<String> =
+                        right_rows.iter().map(|r| format!("{:?}", r)).collect();
+                    left_rows
+                        .into_iter()
+                        .filter(|r| right_set.contains(&format!("{:?}", r)))
+                        .collect()
                 }
                 SetOperator::Except => {
-                    let right_set: HashSet<String> = right_rows.iter().map(|r| format!("{:?}", r)).collect();
-                    left_rows.into_iter().filter(|r| !right_set.contains(&format!("{:?}", r))).collect()
+                    let right_set: HashSet<String> =
+                        right_rows.iter().map(|r| format!("{:?}", r)).collect();
+                    left_rows
+                        .into_iter()
+                        .filter(|r| !right_set.contains(&format!("{:?}", r)))
+                        .collect()
                 }
-                _ => return Err(FusionError::Execution(format!("Unsupported set operator: {:?}", op))),
+                _ => {
+                    return Err(FusionError::Execution(format!(
+                        "Unsupported set operator: {:?}",
+                        op
+                    )))
+                }
             };
 
             // Deduplicate unless ALL
-            let is_all = matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
+            let is_all = matches!(
+                set_quantifier,
+                SetQuantifier::All | SetQuantifier::AllByName
+            );
             if !is_all {
                 let mut seen = HashSet::new();
                 combined.retain(|row| seen.insert(format!("{:?}", row)));
@@ -764,19 +1035,25 @@ impl Executor {
                     combined.sort_by(|a, b| {
                         for oe in order_exprs {
                             let idx = match &oe.expr {
-                                Expr::Value(sqlparser::ast::ValueWithSpan { value: sqlparser::ast::Value::Number(n, _), .. }) => {
-                                    n.parse::<usize>().unwrap_or(1) - 1
-                                }
-                                Expr::Identifier(ident) => {
-                                    left_cols.iter().position(|c| c == &ident.value).unwrap_or(0)
-                                }
+                                Expr::Value(sqlparser::ast::ValueWithSpan {
+                                    value: sqlparser::ast::Value::Number(n, _),
+                                    ..
+                                }) => n.parse::<usize>().unwrap_or(1) - 1,
+                                Expr::Identifier(ident) => left_cols
+                                    .iter()
+                                    .position(|c| c == &ident.value)
+                                    .unwrap_or(0),
                                 _ => 0,
                             };
                             let va = a.get(idx).unwrap_or(&Value::Null);
                             let vb = b.get(idx).unwrap_or(&Value::Null);
                             let cmp = self.compare_for_sort(va, vb);
                             if cmp != Ordering::Equal {
-                                return if oe.options.asc.unwrap_or(true) { cmp } else { cmp.reverse() };
+                                return if oe.options.asc.unwrap_or(true) {
+                                    cmp
+                                } else {
+                                    cmp.reverse()
+                                };
                             }
                         }
                         Ordering::Equal
@@ -786,12 +1063,21 @@ impl Executor {
 
             // Apply LIMIT/OFFSET from the outer query
             if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
-                let off = offset.as_ref().and_then(|os| match &os.value {
-                    Expr::Value(sqlparser::ast::ValueWithSpan { value: sqlparser::ast::Value::Number(n, _), .. }) => n.parse::<usize>().ok(),
-                    _ => None,
-                }).unwrap_or(0);
+                let off = offset
+                    .as_ref()
+                    .and_then(|os| match &os.value {
+                        Expr::Value(sqlparser::ast::ValueWithSpan {
+                            value: sqlparser::ast::Value::Number(n, _),
+                            ..
+                        }) => n.parse::<usize>().ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
                 let lim = limit.as_ref().and_then(|e| match e {
-                    Expr::Value(sqlparser::ast::ValueWithSpan { value: sqlparser::ast::Value::Number(n, _), .. }) => n.parse::<usize>().ok(),
+                    Expr::Value(sqlparser::ast::ValueWithSpan {
+                        value: sqlparser::ast::Value::Number(n, _),
+                        ..
+                    }) => n.parse::<usize>().ok(),
                     _ => None,
                 });
                 combined = if let Some(l) = lim {
@@ -828,14 +1114,22 @@ impl Executor {
         }
 
         // Build partition keys for each row
-        let partition_keys: Vec<Vec<Value>> = rows.iter().map(|row| {
-            spec.partition_by.iter().map(|e| {
-                self.evaluate_value(e, row, schema, params).unwrap_or(Value::Null)
-            }).collect()
-        }).collect();
+        let partition_keys: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|row| {
+                spec.partition_by
+                    .iter()
+                    .map(|e| {
+                        self.evaluate_value(e, row, schema, params)
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect()
+            })
+            .collect();
 
         // Group row indices by partition key
-        let mut partitions: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        let mut partitions: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
         for (i, pk) in partition_keys.iter().enumerate() {
             let key = format!("{:?}", pk);
             partitions.entry(key).or_default().push(i);
@@ -849,11 +1143,19 @@ impl Executor {
             if !spec.order_by.is_empty() {
                 sorted_indices.sort_by(|&a, &b| {
                     for oe in &spec.order_by {
-                        let va = self.evaluate_value(&oe.expr, &rows[a], schema, params).unwrap_or(Value::Null);
-                        let vb = self.evaluate_value(&oe.expr, &rows[b], schema, params).unwrap_or(Value::Null);
+                        let va = self
+                            .evaluate_value(&oe.expr, &rows[a], schema, params)
+                            .unwrap_or(Value::Null);
+                        let vb = self
+                            .evaluate_value(&oe.expr, &rows[b], schema, params)
+                            .unwrap_or(Value::Null);
                         let cmp = self.compare_for_sort(&va, &vb);
                         if cmp != Ordering::Equal {
-                            return if oe.options.asc.unwrap_or(true) { cmp } else { cmp.reverse() };
+                            return if oe.options.asc.unwrap_or(true) {
+                                cmp
+                            } else {
+                                cmp.reverse()
+                            };
                         }
                     }
                     Ordering::Equal
@@ -876,11 +1178,19 @@ impl Executor {
                         while i + tie_count < sorted_indices.len() {
                             let next_idx = sorted_indices[i + tie_count];
                             let same = spec.order_by.iter().all(|oe| {
-                                let va = self.evaluate_value(&oe.expr, &rows[current_idx], schema, params).unwrap_or(Value::Null);
-                                let vb = self.evaluate_value(&oe.expr, &rows[next_idx], schema, params).unwrap_or(Value::Null);
+                                let va = self
+                                    .evaluate_value(&oe.expr, &rows[current_idx], schema, params)
+                                    .unwrap_or(Value::Null);
+                                let vb = self
+                                    .evaluate_value(&oe.expr, &rows[next_idx], schema, params)
+                                    .unwrap_or(Value::Null);
                                 va == vb
                             });
-                            if same { tie_count += 1; } else { break; }
+                            if same {
+                                tie_count += 1;
+                            } else {
+                                break;
+                            }
                         }
                         for j in 0..tie_count {
                             result[sorted_indices[i + j]] = Value::Integer(rank);
@@ -898,11 +1208,19 @@ impl Executor {
                         while i + tie_count < sorted_indices.len() {
                             let next_idx = sorted_indices[i + tie_count];
                             let same = spec.order_by.iter().all(|oe| {
-                                let va = self.evaluate_value(&oe.expr, &rows[current_idx], schema, params).unwrap_or(Value::Null);
-                                let vb = self.evaluate_value(&oe.expr, &rows[next_idx], schema, params).unwrap_or(Value::Null);
+                                let va = self
+                                    .evaluate_value(&oe.expr, &rows[current_idx], schema, params)
+                                    .unwrap_or(Value::Null);
+                                let vb = self
+                                    .evaluate_value(&oe.expr, &rows[next_idx], schema, params)
+                                    .unwrap_or(Value::Null);
                                 va == vb
                             });
-                            if same { tie_count += 1; } else { break; }
+                            if same {
+                                tie_count += 1;
+                            } else {
+                                break;
+                            }
                         }
                         for j in 0..tie_count {
                             result[sorted_indices[i + j]] = Value::Integer(rank);
@@ -916,37 +1234,67 @@ impl Executor {
                     let (offset, default_val) = if let FunctionArguments::List(args) = &func.args {
                         let off = if args.args.len() >= 2 {
                             if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = &args.args[1] {
-                                if let Ok(Value::Integer(n)) = self.evaluate_value(e, &rows[0], schema, params) {
+                                if let Ok(Value::Integer(n)) =
+                                    self.evaluate_value(e, &rows[0], schema, params)
+                                {
                                     n as usize
-                                } else { 1 }
-                            } else { 1 }
-                        } else { 1 };
+                                } else {
+                                    1
+                                }
+                            } else {
+                                1
+                            }
+                        } else {
+                            1
+                        };
                         let def = if args.args.len() >= 3 {
                             if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = &args.args[2] {
-                                self.evaluate_value(e, &rows[0], schema, params).unwrap_or(Value::Null)
-                            } else { Value::Null }
-                        } else { Value::Null };
+                                self.evaluate_value(e, &rows[0], schema, params)
+                                    .unwrap_or(Value::Null)
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        };
                         (off, def)
-                    } else { (1, Value::Null) };
+                    } else {
+                        (1, Value::Null)
+                    };
 
                     // Get the expression argument (first arg)
                     let arg_expr = if let FunctionArguments::List(args) = &func.args {
-                        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) = args.args.first() {
+                        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) =
+                            args.args.first()
+                        {
                             Some(e.clone())
-                        } else { None }
-                    } else { None };
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                     if let Some(ref arg_e) = arg_expr {
                         for (pos, &row_idx) in sorted_indices.iter().enumerate() {
                             let target_pos = if func_name == "LAG" {
-                                if pos >= offset { Some(pos - offset) } else { None }
+                                if pos >= offset {
+                                    Some(pos - offset)
+                                } else {
+                                    None
+                                }
                             } else {
                                 // LEAD
-                                if pos + offset < sorted_indices.len() { Some(pos + offset) } else { None }
+                                if pos + offset < sorted_indices.len() {
+                                    Some(pos + offset)
+                                } else {
+                                    None
+                                }
                             };
                             let val = if let Some(tp) = target_pos {
                                 let target_row_idx = sorted_indices[tp];
-                                self.evaluate_value(arg_e, &rows[target_row_idx], schema, params).unwrap_or(default_val.clone())
+                                self.evaluate_value(arg_e, &rows[target_row_idx], schema, params)
+                                    .unwrap_or(default_val.clone())
                             } else {
                                 default_val.clone()
                             };

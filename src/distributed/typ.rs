@@ -1,5 +1,5 @@
-use std::io::Cursor;
 use openraft::BasicNode;
+use std::io::Cursor;
 
 pub type NodeId = u64;
 

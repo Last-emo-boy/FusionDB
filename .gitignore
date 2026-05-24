@@ -1,6 +1,22 @@
 /target
 /external_benchmark
 /.trae
-benchmark_report_*.json
+
+# Runtime data and generated artifacts
+/data/
+/sstables/
+__pycache__/
+*.py[cod]
+*.log
+tmp_*
+probe_socket.txt
 server_port.txt
+test_*.wal
+test_explain_wal
+inverted_index.bin
+trigram_index.bin
+5000
+
+# Benchmark output
+benchmark_report_*.json
 *.wal

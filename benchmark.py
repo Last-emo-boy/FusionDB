@@ -50,6 +50,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -114,17 +119,24 @@ def sql(query: str, silent=True) -> Tuple[Optional[dict], float]:
         r = requests.post(BASE_URL, json={"sql": query}, timeout=60)
         ms = (time.perf_counter() - t0) * 1000
         r.raise_for_status()
-        return r.json(), ms
+        payload = r.json()
+        if isinstance(payload, dict) and "status" in payload and "data" in payload:
+            return payload, ms
+        return {"status": "ok", "data": payload, "error": None}, ms
     except Exception as e:
         if not silent:
             print(f"  [ERR] {query[:80]}… → {e}")
-        return None, 0
+        return {"status": "error", "data": None, "error": str(e)}, 0
 
-def sql_ok(q): sql(q)
+def sql_ok(q):
+    res, _ = sql(q)
+    return res
 
 def rows(res):
-    if not res or "result" not in res: return 0
-    first = res["result"][0] if res["result"] else {}
+    if not res or res.get("status") != "ok":
+        return 0
+    data = res.get("data") or []
+    first = data[0] if data else {}
     return len(first.get("rows", [])) if isinstance(first, dict) else 0
 
 def bench(name, query, iters=None, warmup=None, cat=""):
@@ -134,8 +146,8 @@ def bench(name, query, iters=None, warmup=None, cat=""):
     for _ in range(warmup): sql(query)
     for _ in range(iters):
         res, ms = sql(query)
-        if res and res.get("error"):
-            r.error = str(res["error"]); break
+        if res and res.get("status") == "error":
+            r.error = str(res.get("error") or "unknown error"); break
         r.times_ms.append(ms)
         r.row_count = rows(res)
     return r

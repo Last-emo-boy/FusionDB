@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use crate::common::{FusionError, Result};
-use super::{Storage, FusionStorage};
 use super::memory::MemoryStorage;
+use super::{FusionStorage, Storage};
+use crate::common::{FusionError, Result};
+use std::sync::Arc;
 
 /// Supported storage backend types.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

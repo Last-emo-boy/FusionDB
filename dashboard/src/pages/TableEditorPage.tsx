@@ -10,9 +10,10 @@ import {
   Hash,
   Type,
   ToggleLeft,
+  Shield,
 } from 'lucide-react';
-import { fetchTables, executeQuery } from '../lib/api';
-import type { TableInfo } from '../lib/api';
+import { fetchAuthContext, fetchTables, executeQuery } from '../lib/api';
+import type { AuthContextInfo, TableInfo } from '../lib/api';
 
 function formatValue(val: any): string {
   if (val === null || val === undefined) return 'NULL';
@@ -53,10 +54,12 @@ export default function TableEditorPage() {
   const [insertValues, setInsertValues] = useState<Record<string, string>>({});
   const [insertError, setInsertError] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<number | null>(null);
+  const [authContext, setAuthContext] = useState<AuthContextInfo | null>(null);
 
   const loadTables = async () => {
-    const t = await fetchTables();
+    const [t, auth] = await Promise.all([fetchTables(), fetchAuthContext()]);
     setTables(t);
+    setAuthContext(auth);
     if (t.length > 0 && !selectedTable) {
       setSelectedTable(t[0].name);
     }
@@ -75,18 +78,18 @@ export default function TableEditorPage() {
       ? `SELECT * FROM ${tableName} WHERE ${filter} LIMIT 200`
       : `SELECT * FROM ${tableName} LIMIT 200`;
     const res = await executeQuery(limitSql);
-    if (res.result && res.result[0]) {
-      const r = res.result[0];
-      setColumns(r.columns ?? []);
-      setRows(r.rows ?? []);
+    if (res.status === 'ok' && res.data && res.data[0]?.type === 'select') {
+      const r = res.data[0];
+      setColumns(r.columns);
+      setRows(r.rows);
     } else {
       setColumns([]);
       setRows([]);
     }
     // Get count
     const countRes = await executeQuery(`SELECT COUNT(*) FROM ${tableName}`);
-    if (countRes.result && countRes.result[0]?.rows?.[0]) {
-      const v = countRes.result[0].rows[0][0];
+    if (countRes.status === 'ok' && countRes.data && countRes.data[0]?.type === 'select' && countRes.data[0].rows[0]) {
+      const v = countRes.data[0].rows[0][0];
       setRowCount(typeof v === 'object' && 'Integer' in v ? v.Integer : null);
     }
     setLoading(false);
@@ -120,8 +123,8 @@ export default function TableEditorPage() {
 
     const sql = `INSERT INTO ${selectedTable} (${cols.join(', ')}) VALUES (${vals.join(', ')})`;
     const res = await executeQuery(sql);
-    if (res.error) {
-      setInsertError(res.error);
+    if (res.status === 'error' || res.error) {
+      setInsertError(res.error ?? 'Insert failed');
     } else {
       setInsertMode(false);
       setInsertValues({});
@@ -204,6 +207,10 @@ export default function TableEditorPage() {
                 )}
               </div>
               <div className="flex items-center gap-2">
+                <div className="hidden md:flex items-center gap-1.5 px-2 py-1 text-[11px] text-text-muted bg-bg-card border border-border rounded-md">
+                  <Shield size={11} />
+                  {authContext?.authenticated ? `HTTP user: ${authContext.username}` : 'legacy anonymous'}
+                </div>
                 <button
                   onClick={() => {
                     setInsertMode(!insertMode);

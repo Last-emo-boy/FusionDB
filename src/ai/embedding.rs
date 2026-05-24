@@ -1,6 +1,6 @@
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// Trait for embedding providers. Implementations convert text to vectors.
 pub trait EmbeddingProvider: Send + Sync {
@@ -134,7 +134,11 @@ mod tests {
         let provider = BuiltinEmbeddingProvider::new(64);
         let vec = provider.embed("hello world");
         let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.01, "Vector should be L2-normalized, got norm={}", norm);
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "Vector should be L2-normalized, got norm={}",
+            norm
+        );
     }
 
     #[test]
@@ -146,7 +150,12 @@ mod tests {
 
         let sim_12: f32 = v1.iter().zip(v2.iter()).map(|(a, b)| a * b).sum();
         let sim_13: f32 = v1.iter().zip(v3.iter()).map(|(a, b)| a * b).sum();
-        assert!(sim_12 > sim_13, "Similar texts should have higher cosine sim: {} vs {}", sim_12, sim_13);
+        assert!(
+            sim_12 > sim_13,
+            "Similar texts should have higher cosine sim: {} vs {}",
+            sim_12,
+            sim_13
+        );
     }
 
     #[test]

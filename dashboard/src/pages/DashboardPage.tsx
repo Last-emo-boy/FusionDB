@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   Database,
@@ -8,9 +8,27 @@ import {
   Search,
   AlertTriangle,
   RefreshCw,
+  Shield,
+  Layers3,
 } from 'lucide-react';
-import { fetchMetrics, fetchSlowQueries, fetchTables, createCheckpoint } from '../lib/api';
-import type { Metrics, SlowQuery, TableInfo } from '../lib/api';
+import {
+  createCheckpoint,
+  createCompaction,
+  fetchAuthContext,
+  fetchCapabilities,
+  fetchMetrics,
+  fetchSlowQueries,
+  fetchTables,
+  listPreparedStatements,
+} from '../lib/api';
+import type {
+  AuthContextInfo,
+  CapabilityInfo,
+  Metrics,
+  PreparedStatementInfo,
+  SlowQuery,
+  TableInfo,
+} from '../lib/api';
 
 function StatCard({
   icon: Icon,
@@ -39,20 +57,42 @@ function StatCard({
   );
 }
 
+function statusTone(success: boolean): string {
+  return success
+    ? 'bg-accent/10 border-accent/30 text-accent'
+    : 'bg-danger/10 border-danger/30 text-danger';
+}
+
 export default function DashboardPage() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [tables, setTables] = useState<TableInfo[]>([]);
   const [slowQueries, setSlowQueries] = useState<SlowQuery[]>([]);
+  const [capabilities, setCapabilities] = useState<CapabilityInfo | null>(null);
+  const [authContext, setAuthContext] = useState<AuthContextInfo | null>(null);
+  const [preparedStatements, setPreparedStatements] = useState<PreparedStatementInfo[]>([]);
   const [connected, setConnected] = useState<boolean | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [operationMessage, setOperationMessage] = useState<string | null>(null);
+  const [operationError, setOperationError] = useState<string | null>(null);
+  const [runningOperation, setRunningOperation] = useState<'checkpoint' | 'compact' | null>(null);
 
   const load = async () => {
     setRefreshing(true);
-    const [m, t, sq] = await Promise.all([fetchMetrics(), fetchTables(), fetchSlowQueries()]);
+    const [m, t, sq, caps, auth, prepared] = await Promise.all([
+      fetchMetrics(),
+      fetchTables(),
+      fetchSlowQueries(),
+      fetchCapabilities(),
+      fetchAuthContext(),
+      listPreparedStatements(),
+    ]);
     setMetrics(m);
     setTables(t);
     setSlowQueries(sq);
-    setConnected(m !== null);
+    setCapabilities(caps);
+    setAuthContext(auth);
+    setPreparedStatements(prepared);
+    setConnected(m !== null && caps !== null);
     setRefreshing(false);
   };
 
@@ -66,9 +106,34 @@ export default function DashboardPage() {
     ? Math.round(metrics.query_total_us / metrics.query_count)
     : 0;
 
+  const authSummary = useMemo(() => {
+    if (!authContext) return 'Authentication context unavailable';
+    if (!authContext.authenticated) return 'Legacy anonymous mode';
+    return `Scoped as ${authContext.username}`;
+  }, [authContext]);
+
+  const runOperation = async (kind: 'checkpoint' | 'compact') => {
+    setRunningOperation(kind);
+    setOperationMessage(null);
+    setOperationError(null);
+
+    const response = kind === 'checkpoint'
+      ? await createCheckpoint()
+      : await createCompaction();
+
+    if (response.status === 'ok' && response.data) {
+      const suffix = response.data.supported ? '' : ' (not supported by current backend)';
+      setOperationMessage(`${response.data.message ?? `${kind} completed`}${suffix}`);
+      await load();
+    } else {
+      setOperationError(response.error ?? `${kind} failed`);
+    }
+
+    setRunningOperation(null);
+  };
+
   return (
     <div className="p-6 max-w-[1200px]">
-      {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-xl font-semibold text-text-primary">Dashboard</h1>
@@ -96,19 +161,30 @@ export default function DashboardPage() {
             Refresh
           </button>
           <button
-            onClick={async () => {
-              const result = await createCheckpoint();
-              if (result.status === 'ok') load();
-            }}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-accent/10 border border-accent/30 rounded-md text-accent hover:bg-accent/20 transition-colors"
+            onClick={() => runOperation('checkpoint')}
+            disabled={runningOperation !== null || capabilities?.snapshot_supported === false}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-accent/10 border border-accent/30 rounded-md text-accent hover:bg-accent/20 transition-colors disabled:opacity-50"
           >
             <HardDrive size={12} />
-            Checkpoint
+            {runningOperation === 'checkpoint' ? 'Checkpointing...' : 'Checkpoint'}
+          </button>
+          <button
+            onClick={() => runOperation('compact')}
+            disabled={runningOperation !== null || !capabilities?.compact_supported}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-bg-card border border-border rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors disabled:opacity-50"
+          >
+            <Layers3 size={12} />
+            {runningOperation === 'compact' ? 'Compacting...' : 'Compact'}
           </button>
         </div>
       </div>
 
-      {/* Stats Grid */}
+      {(operationMessage || operationError) && (
+        <div className={`mb-4 rounded-lg border px-4 py-3 text-sm ${statusTone(!operationError)}`}>
+          {operationError ?? operationMessage}
+        </div>
+      )}
+
       <div className="grid grid-cols-4 gap-4 mb-6">
         <StatCard
           icon={Zap}
@@ -137,9 +213,47 @@ export default function DashboardPage() {
         />
       </div>
 
-      {/* Two column layout */}
+      <div className="grid grid-cols-3 gap-4 mb-4">
+        <div className="bg-bg-card border border-border rounded-lg p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Shield size={14} className="text-text-secondary" />
+            <span className="text-[11px] text-text-secondary uppercase tracking-wider">Auth Context</span>
+          </div>
+          <div className="text-sm text-text-primary font-medium">{authSummary}</div>
+          <div className="text-[11px] text-text-muted mt-1">
+            Mode: {authContext?.mode ?? 'unknown'}
+          </div>
+        </div>
+        <div className="bg-bg-card border border-border rounded-lg p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Database size={14} className="text-text-secondary" />
+            <span className="text-[11px] text-text-secondary uppercase tracking-wider">Backend</span>
+          </div>
+          <div className="text-sm text-text-primary font-medium">
+            {capabilities?.backend ?? 'Unknown'}
+          </div>
+          <div className="text-[11px] text-text-muted mt-1">
+            Distributed: {capabilities?.distributed_mode ?? 'unknown'}
+          </div>
+        </div>
+        <div className="bg-bg-card border border-border rounded-lg p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Layers3 size={14} className="text-text-secondary" />
+            <span className="text-[11px] text-text-secondary uppercase tracking-wider">Capabilities</span>
+          </div>
+          <div className="text-sm text-text-primary font-medium">
+            {capabilities?.compact_supported ? 'Compaction available' : 'Compaction unavailable'}
+          </div>
+          <div className="text-[11px] text-text-muted mt-1">
+            Prepared ownership: {capabilities?.prepared_statement_ownership ? 'enabled' : 'disabled'}
+          </div>
+          <div className="text-[11px] text-text-muted mt-1">
+            Visible prepared handles: {preparedStatements.length}
+          </div>
+        </div>
+      </div>
+
       <div className="grid grid-cols-2 gap-4">
-        {/* Tables */}
         <div className="bg-bg-card border border-border rounded-lg">
           <div className="px-4 py-3 border-b border-border flex items-center gap-2">
             <Database size={14} className="text-text-secondary" />
@@ -166,7 +280,6 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Slow Queries */}
         <div className="bg-bg-card border border-border rounded-lg">
           <div className="px-4 py-3 border-b border-border flex items-center gap-2">
             <AlertTriangle size={14} className="text-warning" />
@@ -187,7 +300,7 @@ export default function DashboardPage() {
                       {sq.sql}
                     </code>
                     <span className="text-xs text-warning font-mono shrink-0 ml-2">
-                      {(sq.duration_us / 1000).toFixed(1)}ms
+                      {sq.duration_ms.toFixed(1)}ms
                     </span>
                   </div>
                 </div>
@@ -197,26 +310,60 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Engine Stats */}
-      <div className="mt-4 grid grid-cols-3 gap-4">
-        <StatCard
-          icon={Search}
-          label="FTS Searches"
-          value={metrics?.fts_search_count ?? '—'}
-          sub={`${metrics?.fts_doc_hits ?? 0} doc hits`}
-        />
-        <StatCard
-          icon={Clock}
-          label="Slow Queries"
-          value={metrics?.slow_query_count ?? '—'}
-          sub="Above threshold"
-        />
-        <StatCard
-          icon={Activity}
-          label="WAL Syncs"
-          value={metrics?.wal_write_count ?? '—'}
-          sub={`${((metrics?.wal_write_bytes ?? 0) / 1024).toFixed(1)} KB total`}
-        />
+      <div className="mt-4 grid grid-cols-2 gap-4">
+        <div className="bg-bg-card border border-border rounded-lg">
+          <div className="px-4 py-3 border-b border-border flex items-center gap-2">
+            <Layers3 size={14} className="text-text-secondary" />
+            <span className="text-sm font-medium">Prepared Statements</span>
+            <span className="ml-auto text-xs text-text-muted">{preparedStatements.length} visible</span>
+          </div>
+          <div className="max-h-56 overflow-auto">
+            {preparedStatements.length === 0 ? (
+              <div className="p-4 text-sm text-text-muted text-center">
+                No prepared statements for the current user context
+              </div>
+            ) : (
+              preparedStatements.map((statement) => (
+                <div
+                  key={statement.statement_id}
+                  className="px-4 py-3 border-b border-border last:border-0 hover:bg-bg-hover transition-colors"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <code className="text-xs text-text-primary truncate max-w-[320px]">
+                      {statement.sql}
+                    </code>
+                    <span className="text-[11px] text-text-muted shrink-0">
+                      {statement.statement_count} stmt
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-text-muted">
+                    owner: {statement.owner ?? 'anonymous'}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-4">
+          <StatCard
+            icon={Search}
+            label="FTS Searches"
+            value={metrics?.fts_search_count ?? '—'}
+            sub={`${metrics?.fts_doc_hits ?? 0} doc hits`}
+          />
+          <StatCard
+            icon={Clock}
+            label="Slow Queries"
+            value={metrics?.slow_query_count ?? '—'}
+            sub="Above threshold"
+          />
+          <StatCard
+            icon={Activity}
+            label="WAL Syncs"
+            value={metrics?.wal_write_count ?? '—'}
+            sub={`${((metrics?.wal_write_bytes ?? 0) / 1024).toFixed(1)} KB total`}
+          />
+        </div>
       </div>
     </div>
   );

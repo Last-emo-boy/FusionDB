@@ -20,8 +20,14 @@ async fn main() -> Result<()> {
     // 1. Load Config
     let config = Config::load(CONFIG_PATH);
     println!("FusionDB v{} starting...", env!("CARGO_PKG_VERSION"));
-    println!("  HTTP:    {}:{}", config.server.bind, config.server.http_port);
-    println!("  PgWire:  {}:{}", config.server.bind, config.server.pg_port);
+    println!(
+        "  HTTP:    {}:{}",
+        config.server.bind, config.server.http_port
+    );
+    println!(
+        "  PgWire:  {}:{}",
+        config.server.bind, config.server.pg_port
+    );
     println!("  Data:    {}", config.storage.data_dir);
 
     // 2. Apply config to monitor
@@ -33,11 +39,12 @@ async fn main() -> Result<()> {
 
     // 3. Initialize Storage
     let wal_path = config.storage.wal_path();
-    let fusion = Arc::new(FusionStorage::new(wal_path.to_str().unwrap()).await?);
+    let fusion =
+        Arc::new(FusionStorage::with_config(wal_path.to_str().unwrap(), &config.storage).await?);
     let storage: Arc<dyn Storage> = fusion.clone();
 
     // 4. Initialize Executor
-    let executor = Arc::new(Executor::new(storage.clone()));
+    let executor = Arc::new(Executor::with_config(storage.clone(), &config.storage));
 
     // 5. Start Servers (returns shutdown handle)
     let shutdown_tx = server::start_server(executor, storage, &config).await;

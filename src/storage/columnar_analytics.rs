@@ -1,6 +1,4 @@
-use arrow::array::{
-    ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
@@ -9,10 +7,7 @@ use crate::common::Value;
 
 /// Converts row-oriented data (from the executor) into an Arrow RecordBatch
 /// for vectorized aggregation.
-pub fn rows_to_record_batch(
-    columns: &[String],
-    rows: &[Vec<Value>],
-) -> Option<RecordBatch> {
+pub fn rows_to_record_batch(columns: &[String], rows: &[Vec<Value>]) -> Option<RecordBatch> {
     if rows.is_empty() || columns.is_empty() {
         return None;
     }
@@ -28,8 +23,14 @@ pub fn rows_to_record_batch(
         for row in rows {
             if col_idx < row.len() {
                 match &row[col_idx] {
-                    Value::Integer(_) => { is_int = true; break; }
-                    Value::Float(_) => { is_float = true; break; }
+                    Value::Integer(_) => {
+                        is_int = true;
+                        break;
+                    }
+                    Value::Float(_) => {
+                        is_float = true;
+                        break;
+                    }
                     Value::Null => continue,
                     _ => break,
                 }
@@ -209,10 +210,26 @@ mod tests {
     fn sample_data() -> (Vec<String>, Vec<Vec<Value>>) {
         let columns = vec!["id".to_string(), "score".to_string(), "name".to_string()];
         let rows = vec![
-            vec![Value::Integer(1), Value::Float(85.5), Value::String("Alice".into())],
-            vec![Value::Integer(2), Value::Float(92.0), Value::String("Bob".into())],
-            vec![Value::Integer(3), Value::Float(78.3), Value::String("Carol".into())],
-            vec![Value::Integer(4), Value::Float(95.1), Value::String("Dave".into())],
+            vec![
+                Value::Integer(1),
+                Value::Float(85.5),
+                Value::String("Alice".into()),
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Float(92.0),
+                Value::String("Bob".into()),
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Float(78.3),
+                Value::String("Carol".into()),
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Float(95.1),
+                Value::String("Dave".into()),
+            ],
         ];
         (columns, rows)
     }

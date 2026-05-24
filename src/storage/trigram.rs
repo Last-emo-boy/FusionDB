@@ -1,8 +1,8 @@
+use crate::common::{FusionError, Result};
 use roaring::RoaringTreemap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 use std::path::Path;
-use crate::common::{Result, FusionError};
 
 /// Split text into trigrams (3-byte sequences)
 pub fn trigrams_bytes(s: &str) -> Vec<u32> {
@@ -46,8 +46,9 @@ impl TrigramIndex {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(FusionError::Io)?;
-        let index = bincode::deserialize_from(file)
-            .map_err(|e| FusionError::Execution(format!("Trigram deserialization error: {:?}", e)))?;
+        let index = bincode::deserialize_from(file).map_err(|e| {
+            FusionError::Execution(format!("Trigram deserialization error: {:?}", e))
+        })?;
         Ok(index)
     }
 
@@ -64,7 +65,7 @@ impl TrigramIndex {
         let col_map = table_map.entry(col.to_string()).or_default();
         let map = self.id_map.entry(table.to_string()).or_default();
         map.insert(row_id, row_id_str.to_string());
-        
+
         for tg in grams {
             col_map.entry(tg).or_default().insert(row_id);
         }
@@ -74,7 +75,7 @@ impl TrigramIndex {
         // Pattern processing: remove % and _
         let clean_pattern: String = pattern.chars().filter(|c| *c != '%' && *c != '_').collect();
         let grams = trigrams_bytes(&clean_pattern);
-        
+
         if grams.is_empty() {
             return None; // Pattern too short or empty
         }
@@ -97,15 +98,11 @@ impl TrigramIndex {
                 return Some(RoaringTreemap::new());
             }
         }
-        
+
         result
     }
 
-    pub fn map_ids_to_row_keys(
-        &self,
-        table: &str,
-        ids: &RoaringTreemap,
-    ) -> Vec<String> {
+    pub fn map_ids_to_row_keys(&self, table: &str, ids: &RoaringTreemap) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(map) = self.id_map.get(table) {
             for id in ids.iter() {

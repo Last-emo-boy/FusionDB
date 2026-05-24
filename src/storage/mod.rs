@@ -9,9 +9,9 @@ pub mod fusion;
 pub mod inverted_index;
 pub mod memory;
 pub mod sstable;
+pub mod trigram;
 pub mod vector_index;
 pub mod wal;
-pub mod trigram;
 
 pub use fusion::FusionStorage;
 pub use fusion::FusionTransaction;
@@ -28,17 +28,26 @@ pub trait Transaction: Send + Sync {
     async fn delete(&mut self, key: &[u8]) -> Result<()>;
 
     /// Scan keys with a prefix (merge storage and write buffer)
-    async fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    async fn scan_prefix(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// Scan keys in a range [start, end) with optional limit
-    async fn scan_range(&self, start: &[u8], end: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// Count keys with a prefix (optimized for COUNT(*))
     async fn count_prefix(&self, prefix: &[u8]) -> Result<usize>;
 
     /// Get first key-value pair in a range (optimized for MIN)
     async fn first(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>>;
-    
+
     /// Get last key-value pair in a range (optimized for MAX)
     async fn last(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>>;
 

@@ -24,12 +24,16 @@ impl Executor {
                 match op {
                     BinaryOperator::And => {
                         let l = self.evaluate_expr(left, row, schema, params)?;
-                        if !l { return Ok(false); }
+                        if !l {
+                            return Ok(false);
+                        }
                         return self.evaluate_expr(right, row, schema, params);
                     }
                     BinaryOperator::Or => {
                         let l = self.evaluate_expr(left, row, schema, params)?;
-                        if l { return Ok(true); }
+                        if l {
+                            return Ok(true);
+                        }
                         return self.evaluate_expr(right, row, schema, params);
                     }
                     _ => {}
@@ -130,7 +134,12 @@ impl Executor {
                     Ok(found)
                 }
             }
-            Expr::Like { expr, pattern, negated, .. } => {
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => {
                 let s = self.evaluate_value(expr, row, schema, params)?;
                 let p = self.evaluate_value(pattern, row, schema, params)?;
                 if let (Value::String(s_str), Value::String(p_str)) = (s, p) {
@@ -144,7 +153,12 @@ impl Executor {
                     Ok(false)
                 }
             }
-            Expr::ILike { expr, pattern, negated, .. } => {
+            Expr::ILike {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => {
                 let s = self.evaluate_value(expr, row, schema, params)?;
                 let p = self.evaluate_value(pattern, row, schema, params)?;
                 if let (Value::String(s_str), Value::String(p_str)) = (s, p) {
@@ -162,7 +176,12 @@ impl Executor {
                 let val = self.evaluate_value(expr, row, schema, params)?;
                 Ok(val != Value::Null)
             }
-            Expr::Between { expr, negated, low, high } => {
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
                 let low_val = self.evaluate_value(low, row, schema, params)?;
                 let high_val = self.evaluate_value(high, row, schema, params)?;
@@ -172,15 +191,15 @@ impl Executor {
                 Ok(if *negated { !result } else { result })
             }
             Expr::Nested(inner) => self.evaluate_expr(inner, row, schema, params),
-            Expr::UnaryOp { op, expr } => {
-                 match op {
-                     sqlparser::ast::UnaryOperator::Not => {
-                         let res = self.evaluate_expr(expr, row, schema, params)?;
-                         Ok(!res)
-                     }
-                     _ => Err(FusionError::Execution("Unsupported unary operator in boolean expression".to_string())),
-                 }
-            }
+            Expr::UnaryOp { op, expr } => match op {
+                sqlparser::ast::UnaryOperator::Not => {
+                    let res = self.evaluate_expr(expr, row, schema, params)?;
+                    Ok(!res)
+                }
+                _ => Err(FusionError::Execution(
+                    "Unsupported unary operator in boolean expression".to_string(),
+                )),
+            },
             Expr::IsFalse(inner) => {
                 let val = self.evaluate_value(inner, row, schema, params)?;
                 Ok(val == Value::Boolean(false))
@@ -189,17 +208,21 @@ impl Executor {
                 let val = self.evaluate_value(inner, row, schema, params)?;
                 Ok(val == Value::Boolean(true))
             }
-            Expr::Value(v) => {
-                match &v.value {
-                    SqlValue::Boolean(b) => Ok(*b),
-                    _ => Err(FusionError::Execution(format!("Cannot use {:?} as boolean", v.value))),
-                }
-            }
+            Expr::Value(v) => match &v.value {
+                SqlValue::Boolean(b) => Ok(*b),
+                _ => Err(FusionError::Execution(format!(
+                    "Cannot use {:?} as boolean",
+                    v.value
+                ))),
+            },
             _ => {
                 // Fallback: try evaluate_value and check if it's a boolean
                 match self.evaluate_value(expr, row, schema, params) {
                     Ok(Value::Boolean(b)) => Ok(b),
-                    Ok(_) => Err(FusionError::Execution(format!("Unsupported expression type: {}", expr))),
+                    Ok(_) => Err(FusionError::Execution(format!(
+                        "Unsupported expression type: {}",
+                        expr
+                    ))),
                     Err(e) => Err(e),
                 }
             }
@@ -259,7 +282,10 @@ impl Executor {
                         Value::Boolean(b) => Ok(Value::Boolean(!b)),
                         _ => Ok(Value::Null),
                     },
-                    _ => Err(FusionError::Execution(format!("Unsupported unary op: {}", op))),
+                    _ => Err(FusionError::Execution(format!(
+                        "Unsupported unary op: {}",
+                        op
+                    ))),
                 }
             }
             Expr::Array(arr) => {
@@ -394,29 +420,48 @@ impl Executor {
                     Ok(Value::Null)
                 }
             }
-            Expr::Cast { expr, data_type, .. } => {
+            Expr::Cast {
+                expr, data_type, ..
+            } => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
                 let type_str = format!("{}", data_type).to_uppercase();
                 match type_str.as_str() {
                     "INT" | "INTEGER" | "BIGINT" | "INT4" | "INT8" | "SMALLINT" => match val {
                         Value::Integer(_) => Ok(val),
                         Value::Float(f) => Ok(Value::Integer(f as i64)),
-                        Value::String(s) => s.trim().parse::<i64>()
-                            .map(Value::Integer)
-                            .map_err(|_| FusionError::Execution(format!("Cannot cast '{}' to INTEGER", s))),
+                        Value::String(s) => {
+                            s.trim().parse::<i64>().map(Value::Integer).map_err(|_| {
+                                FusionError::Execution(format!("Cannot cast '{}' to INTEGER", s))
+                            })
+                        }
                         Value::Boolean(b) => Ok(Value::Integer(if b { 1 } else { 0 })),
                         Value::Null => Ok(Value::Null),
-                        _ => Err(FusionError::Execution(format!("Cannot cast {:?} to INTEGER", val))),
+                        _ => Err(FusionError::Execution(format!(
+                            "Cannot cast {:?} to INTEGER",
+                            val
+                        ))),
                     },
-                    s if s.starts_with("FLOAT") || s.starts_with("DOUBLE") || s.starts_with("REAL") || s.starts_with("NUMERIC") || s.starts_with("DECIMAL") => match val {
-                        Value::Float(_) => Ok(val),
-                        Value::Integer(n) => Ok(Value::Float(n as f64)),
-                        Value::String(s) => s.trim().parse::<f64>()
-                            .map(Value::Float)
-                            .map_err(|_| FusionError::Execution(format!("Cannot cast '{}' to FLOAT", s))),
-                        Value::Null => Ok(Value::Null),
-                        _ => Err(FusionError::Execution(format!("Cannot cast {:?} to FLOAT", val))),
-                    },
+                    s if s.starts_with("FLOAT")
+                        || s.starts_with("DOUBLE")
+                        || s.starts_with("REAL")
+                        || s.starts_with("NUMERIC")
+                        || s.starts_with("DECIMAL") =>
+                    {
+                        match val {
+                            Value::Float(_) => Ok(val),
+                            Value::Integer(n) => Ok(Value::Float(n as f64)),
+                            Value::String(s) => {
+                                s.trim().parse::<f64>().map(Value::Float).map_err(|_| {
+                                    FusionError::Execution(format!("Cannot cast '{}' to FLOAT", s))
+                                })
+                            }
+                            Value::Null => Ok(Value::Null),
+                            _ => Err(FusionError::Execution(format!(
+                                "Cannot cast {:?} to FLOAT",
+                                val
+                            ))),
+                        }
+                    }
                     "TEXT" | "VARCHAR" | "CHAR" | "STRING" => match val {
                         Value::String(_) => Ok(val),
                         Value::Integer(n) => Ok(Value::String(n.to_string())),
@@ -439,15 +484,29 @@ impl Executor {
                         Value::String(s) => match s.to_lowercase().as_str() {
                             "true" | "t" | "1" | "yes" => Ok(Value::Boolean(true)),
                             "false" | "f" | "0" | "no" => Ok(Value::Boolean(false)),
-                            _ => Err(FusionError::Execution(format!("Cannot cast '{}' to BOOLEAN", s))),
+                            _ => Err(FusionError::Execution(format!(
+                                "Cannot cast '{}' to BOOLEAN",
+                                s
+                            ))),
                         },
                         Value::Null => Ok(Value::Null),
-                        _ => Err(FusionError::Execution(format!("Cannot cast {:?} to BOOLEAN", val))),
+                        _ => Err(FusionError::Execution(format!(
+                            "Cannot cast {:?} to BOOLEAN",
+                            val
+                        ))),
                     },
-                    _ => Err(FusionError::Execution(format!("Unsupported CAST target type: {}", type_str))),
+                    _ => Err(FusionError::Execution(format!(
+                        "Unsupported CAST target type: {}",
+                        type_str
+                    ))),
                 }
             }
-            Expr::Between { expr, negated, low, high } => {
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
                 let low_val = self.evaluate_value(low, row, schema, params)?;
                 let high_val = self.evaluate_value(high, row, schema, params)?;
@@ -564,6 +623,18 @@ impl Executor {
     }
 
     pub(crate) fn like_match(text: &str, pattern: &str) -> bool {
+        if !pattern.contains('%') && !pattern.contains('_') && !pattern.contains('?') {
+            return text == pattern;
+        }
+        if let Some(prefix) = Self::like_fixed_prefix(pattern) {
+            if prefix.len() == pattern.len() {
+                return text == pattern;
+            }
+            if pattern[prefix.len()..].chars().all(|c| c == '%') {
+                return text.starts_with(&prefix);
+            }
+        }
+
         let text_chars: Vec<char> = text.chars().collect();
         let pattern_chars: Vec<char> = pattern.chars().collect();
         let mut t_idx = 0;
@@ -572,16 +643,18 @@ impl Executor {
         let mut p_backup = None;
 
         while t_idx < text_chars.len() {
-            if p_idx < pattern_chars.len() && (pattern_chars[p_idx] == '?' || pattern_chars[p_idx] == text_chars[t_idx]) {
+            if p_idx < pattern_chars.len()
+                && (pattern_chars[p_idx] == '?' || pattern_chars[p_idx] == text_chars[t_idx])
+            {
                 t_idx += 1;
                 p_idx += 1;
             } else if p_idx < pattern_chars.len() && pattern_chars[p_idx] == '_' {
-                 t_idx += 1;
-                 p_idx += 1;
+                t_idx += 1;
+                p_idx += 1;
             } else if p_idx < pattern_chars.len() && pattern_chars[p_idx] == '%' {
                 p_backup = Some(p_idx + 1);
                 p_idx += 1;
-                t_backup = Some(t_idx + 1); 
+                t_backup = Some(t_idx + 1);
             } else if let Some(p_back) = p_backup {
                 p_idx = p_back;
                 t_idx = t_backup.unwrap();
@@ -606,29 +679,44 @@ impl Executor {
             .collect()
     }
 
-    pub(crate) fn resolve_column_index(&self, col_name: &str, schema: &TableSchema) -> Result<usize> {
+    pub(crate) fn like_fixed_prefix(pattern: &str) -> Option<String> {
+        let prefix: String = pattern
+            .chars()
+            .take_while(|c| *c != '%' && *c != '_' && *c != '?')
+            .collect();
+        if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix)
+        }
+    }
+
+    pub(crate) fn resolve_column_index(
+        &self,
+        col_name: &str,
+        schema: &TableSchema,
+    ) -> Result<usize> {
         if let Some(idx) = schema.columns.iter().position(|c| c.name == col_name) {
             return Ok(idx);
         }
 
-        if !col_name.contains('.') {
-            let suffix = format!(".{}", col_name);
-            let matches: Vec<usize> = schema
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.name.ends_with(&suffix) || c.name == col_name)
-                .map(|(i, _)| i)
-                .collect();
+        let fallback_name = col_name.rsplit('.').next().unwrap_or(col_name);
+        let suffix = format!(".{}", fallback_name);
+        let matches: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.name == fallback_name || c.name.ends_with(&suffix))
+            .map(|(i, _)| i)
+            .collect();
 
-            if matches.len() == 1 {
-                return Ok(matches[0]);
-            } else if matches.len() > 1 {
-                return Err(FusionError::Execution(format!(
-                    "Ambiguous column name: {}",
-                    col_name
-                )));
-            }
+        if matches.len() == 1 {
+            return Ok(matches[0]);
+        } else if matches.len() > 1 {
+            return Err(FusionError::Execution(format!(
+                "Ambiguous column name: {}",
+                col_name
+            )));
         }
 
         Err(FusionError::Execution(format!(
@@ -848,38 +936,57 @@ impl Executor {
             }
             "NULLIF" => {
                 if args.len() != 2 {
-                    return Err(FusionError::Execution("NULLIF requires 2 arguments".to_string()));
+                    return Err(FusionError::Execution(
+                        "NULLIF requires 2 arguments".to_string(),
+                    ));
                 }
                 let v1 = self.evaluate_arg(&args[0], row, schema, params)?;
                 let v2 = self.evaluate_arg(&args[1], row, schema, params)?;
-                if v1 == v2 { Ok(Value::Null) } else { Ok(v1) }
+                if v1 == v2 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(v1)
+                }
             }
             "SUBSTRING" | "SUBSTR" => {
                 if args.is_empty() || args.len() > 3 {
-                    return Err(FusionError::Execution("SUBSTRING requires 1-3 arguments".to_string()));
+                    return Err(FusionError::Execution(
+                        "SUBSTRING requires 1-3 arguments".to_string(),
+                    ));
                 }
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
-                let s = match val { Value::String(s) => s, _ => return Ok(Value::Null) };
+                let s = match val {
+                    Value::String(s) => s,
+                    _ => return Ok(Value::Null),
+                };
                 let start = if args.len() >= 2 {
                     match self.evaluate_arg(&args[1], row, schema, params)? {
                         Value::Integer(n) => (n - 1).max(0) as usize,
                         _ => 0,
                     }
-                } else { 0 };
+                } else {
+                    0
+                };
                 let len = if args.len() == 3 {
                     match self.evaluate_arg(&args[2], row, schema, params)? {
                         Value::Integer(n) => Some(n.max(0) as usize),
                         _ => None,
                     }
-                } else { None };
+                } else {
+                    None
+                };
                 let chars: Vec<char> = s.chars().collect();
-                let end = len.map(|l| (start + l).min(chars.len())).unwrap_or(chars.len());
+                let end = len
+                    .map(|l| (start + l).min(chars.len()))
+                    .unwrap_or(chars.len());
                 let result: String = chars[start.min(chars.len())..end].iter().collect();
                 Ok(Value::String(result))
             }
             "REPLACE" => {
                 if args.len() != 3 {
-                    return Err(FusionError::Execution("REPLACE requires 3 arguments".to_string()));
+                    return Err(FusionError::Execution(
+                        "REPLACE requires 3 arguments".to_string(),
+                    ));
                 }
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 let from = self.evaluate_arg(&args[1], row, schema, params)?;
@@ -913,7 +1020,9 @@ impl Executor {
                         Value::Integer(n) => n as i32,
                         _ => 0,
                     }
-                } else { 0 };
+                } else {
+                    0
+                };
                 match val {
                     Value::Float(f) => {
                         let factor = 10f64.powi(precision);
@@ -941,26 +1050,42 @@ impl Executor {
             }
             "MOD" => {
                 if args.len() < 2 {
-                    return Err(FusionError::Execution("MOD requires 2 arguments".to_string()));
+                    return Err(FusionError::Execution(
+                        "MOD requires 2 arguments".to_string(),
+                    ));
                 }
                 let a = self.evaluate_arg(&args[0], row, schema, params)?;
                 let b = self.evaluate_arg(&args[1], row, schema, params)?;
                 match (a, b) {
                     (Value::Integer(a), Value::Integer(b)) if b != 0 => Ok(Value::Integer(a % b)),
                     (Value::Float(a), Value::Float(b)) if b != 0.0 => Ok(Value::Float(a % b)),
-                    (Value::Integer(a), Value::Float(b)) if b != 0.0 => Ok(Value::Float(a as f64 % b)),
-                    (Value::Float(a), Value::Integer(b)) if b != 0 => Ok(Value::Float(a % b as f64)),
+                    (Value::Integer(a), Value::Float(b)) if b != 0.0 => {
+                        Ok(Value::Float(a as f64 % b))
+                    }
+                    (Value::Float(a), Value::Integer(b)) if b != 0 => {
+                        Ok(Value::Float(a % b as f64))
+                    }
                     _ => Ok(Value::Null),
                 }
             }
             "POWER" | "POW" => {
                 if args.len() < 2 {
-                    return Err(FusionError::Execution("POWER requires 2 arguments".to_string()));
+                    return Err(FusionError::Execution(
+                        "POWER requires 2 arguments".to_string(),
+                    ));
                 }
                 let base = self.evaluate_arg(&args[0], row, schema, params)?;
                 let exp = self.evaluate_arg(&args[1], row, schema, params)?;
-                let b = match base { Value::Integer(n) => n as f64, Value::Float(f) => f, _ => return Ok(Value::Null) };
-                let e = match exp { Value::Integer(n) => n as f64, Value::Float(f) => f, _ => return Ok(Value::Null) };
+                let b = match base {
+                    Value::Integer(n) => n as f64,
+                    Value::Float(f) => f,
+                    _ => return Ok(Value::Null),
+                };
+                let e = match exp {
+                    Value::Integer(n) => n as f64,
+                    Value::Float(f) => f,
+                    _ => return Ok(Value::Null),
+                };
                 Ok(Value::Float(b.powf(e)))
             }
             "SQRT" => {
@@ -1083,14 +1208,22 @@ impl Executor {
         }
     }
 
-    pub(crate) fn extract_aggregates_from_expr(&self, expr: &Expr, aggregates: &mut Vec<(Expr, String)>) {
+    pub(crate) fn extract_aggregates_from_expr(
+        &self,
+        expr: &Expr,
+        aggregates: &mut Vec<(Expr, String)>,
+    ) {
         match expr {
             Expr::Function(func) => {
                 let name = func.name.to_string().to_uppercase();
-                if matches!(name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "GROUP_CONCAT") {
+                if matches!(
+                    name.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "GROUP_CONCAT"
+                ) {
                     // Check for DISTINCT modifier (e.g., COUNT(DISTINCT col))
                     let is_distinct = if let FunctionArguments::List(args) = &func.args {
-                        args.duplicate_treatment == Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                        args.duplicate_treatment
+                            == Some(sqlparser::ast::DuplicateTreatment::Distinct)
                     } else {
                         false
                     };
@@ -1126,6 +1259,15 @@ impl Executor {
             Expr::Identifier(ident) => {
                 cols.insert(ident.value.clone());
             }
+            Expr::CompoundIdentifier(idents) => {
+                cols.insert(
+                    idents
+                        .iter()
+                        .map(|ident| ident.value.clone())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
+            }
             Expr::BinaryOp { left, right, .. } => {
                 self.extract_columns_from_expr(left, cols);
                 self.extract_columns_from_expr(right, cols);
@@ -1148,7 +1290,9 @@ impl Executor {
                     self.extract_columns_from_expr(e, cols);
                 }
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.extract_columns_from_expr(expr, cols);
                 self.extract_columns_from_expr(low, cols);
                 self.extract_columns_from_expr(high, cols);
@@ -1158,7 +1302,12 @@ impl Executor {
             Expr::InSubquery { expr, .. } => self.extract_columns_from_expr(expr, cols),
             Expr::Like { expr, .. } => self.extract_columns_from_expr(expr, cols),
             Expr::ILike { expr, .. } => self.extract_columns_from_expr(expr, cols),
-            Expr::Case { operand, conditions, else_result, .. } => {
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
                 if let Some(op) = operand {
                     self.extract_columns_from_expr(op, cols);
                 }
@@ -1223,13 +1372,20 @@ impl Executor {
     }
 
     // Optimize: Parallel Scan for Wildcard LIKE using Rayon
-    pub(crate) fn parallel_filter_rows(&self, rows: Vec<Vec<Value>>, filter_expr: &Expr, schema: &TableSchema, params: &[Value]) -> Vec<Vec<Value>> {
+    pub(crate) fn parallel_filter_rows(
+        &self,
+        rows: Vec<Vec<Value>>,
+        filter_expr: &Expr,
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Vec<Vec<Value>> {
         use rayon::iter::IntoParallelIterator;
         use rayon::iter::ParallelIterator;
-        
+
         rows.into_par_iter()
             .filter(|row| {
-                self.evaluate_expr(filter_expr, row, schema, params).unwrap_or(false)
+                self.evaluate_expr(filter_expr, row, schema, params)
+                    .unwrap_or(false)
             })
             .collect()
     }

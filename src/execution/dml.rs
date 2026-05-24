@@ -34,8 +34,16 @@ impl Executor {
             let mut mapping = Vec::new();
             for col_ident in columns {
                 let col_name = col_ident.value.clone();
-                let idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))
-                    .ok_or_else(|| FusionError::Execution(format!("Column {} not found in table {}", col_name, table_name_str)))?;
+                let idx = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                    .ok_or_else(|| {
+                        FusionError::Execution(format!(
+                            "Column {} not found in table {}",
+                            col_name, table_name_str
+                        ))
+                    })?;
                 mapping.push(idx);
             }
             Some(mapping)
@@ -60,16 +68,22 @@ impl Executor {
                     // If column list specified, map values to full row with defaults for missing columns
                     let row_values = if let Some(ref mapping) = col_mapping {
                         if raw_values.len() != mapping.len() {
-                            return Err(FusionError::Execution("Column count mismatch".to_string()));
+                            return Err(FusionError::Execution(
+                                "Column count mismatch".to_string(),
+                            ));
                         }
-                        let mut full_row: Vec<Value> = schema.columns.iter().map(|col| {
-                            // Use DEFAULT value if specified, otherwise NULL
-                            if let Some(ref def_str) = col.default_value {
-                                self.parse_default_value(def_str)
-                            } else {
-                                Value::Null
-                            }
-                        }).collect();
+                        let mut full_row: Vec<Value> = schema
+                            .columns
+                            .iter()
+                            .map(|col| {
+                                // Use DEFAULT value if specified, otherwise NULL
+                                if let Some(ref def_str) = col.default_value {
+                                    self.parse_default_value(def_str)
+                                } else {
+                                    Value::Null
+                                }
+                            })
+                            .collect();
                         for (i, &schema_idx) in mapping.iter().enumerate() {
                             full_row[schema_idx] = raw_values[i].clone();
                         }
@@ -86,7 +100,8 @@ impl Executor {
                     for (idx, col) in schema.columns.iter().enumerate() {
                         if !col.is_nullable && row_values[idx] == Value::Null {
                             return Err(FusionError::Execution(format!(
-                                "NOT NULL constraint violated for column '{}'", col.name
+                                "NOT NULL constraint violated for column '{}'",
+                                col.name
                             )));
                         }
                     }
@@ -94,10 +109,15 @@ impl Executor {
                     // Enforce CHECK constraints
                     for (idx, col) in schema.columns.iter().enumerate() {
                         if let Some(ref check_sql) = col.check_expr {
-                            let check_result = self.evaluate_check_constraint(check_sql, &col.name, &row_values[idx]);
+                            let check_result = self.evaluate_check_constraint(
+                                check_sql,
+                                &col.name,
+                                &row_values[idx],
+                            );
                             if !check_result {
                                 return Err(FusionError::Execution(format!(
-                                    "CHECK constraint violated for column '{}': {}", col.name, check_sql
+                                    "CHECK constraint violated for column '{}': {}",
+                                    col.name, check_sql
                                 )));
                             }
                         }
@@ -110,9 +130,12 @@ impl Executor {
                             let prefix = format!("data:{}:", table_name_str);
                             let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
                             for (_, v) in &existing {
-                                let existing_row: Vec<Value> = crate::common::encoding::RowDecoder::decode(v)
-                                    .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?;
-                                if idx < existing_row.len() && existing_row[idx] == row_values[idx] {
+                                let existing_row: Vec<Value> =
+                                    crate::common::encoding::RowDecoder::decode(v).map_err(
+                                        |e| FusionError::Execution(format!("Decode error: {}", e)),
+                                    )?;
+                                if idx < existing_row.len() && existing_row[idx] == row_values[idx]
+                                {
                                     return Err(FusionError::Execution(format!(
                                         "UNIQUE constraint violated for column '{}': duplicate value '{}'",
                                         col.name, crate::common::encoding::encode_key(&row_values[idx])
@@ -141,21 +164,56 @@ impl Executor {
                                 }
                                 sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
                                     // Load existing row, apply assignments using EXCLUDED references
-                                    let mut existing_row: Vec<Value> = crate::common::encoding::RowDecoder::decode(&existing_bytes)
-                                        .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?;
+                                    let mut existing_row: Vec<Value> =
+                                        crate::common::encoding::RowDecoder::decode(
+                                            &existing_bytes,
+                                        )
+                                        .map_err(|e| {
+                                            FusionError::Execution(format!("Decode error: {}", e))
+                                        })?;
+                                    let old_existing_row = existing_row.clone();
                                     for assignment in &do_update.assignments {
                                         let col_name = match &assignment.target {
-                                            sqlparser::ast::AssignmentTarget::ColumnName(name) => name.to_string(),
+                                            sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                                                name.to_string()
+                                            }
                                             _ => continue,
                                         };
                                         if let Some(col_idx) = schema.get_column_index(&col_name) {
                                             // Evaluate the value expression; EXCLUDED.col references map to the new row_values
-                                            let new_val = self.evaluate_upsert_value(&assignment.value, &existing_row, &row_values, &schema)?;
+                                            let new_val = self.evaluate_upsert_value(
+                                                &assignment.value,
+                                                &existing_row,
+                                                &row_values,
+                                                &schema,
+                                            )?;
                                             existing_row[col_idx] = new_val;
                                         }
                                     }
-                                    let value = crate::common::encoding::RowEncoder::encode(&existing_row);
+                                    let value =
+                                        crate::common::encoding::RowEncoder::encode(&existing_row);
                                     txn.put(key.as_bytes(), &value).await?;
+                                    for (idx, col) in schema.columns.iter().enumerate() {
+                                        if col.is_indexed && col.index_type == IndexType::HNSW {
+                                            let idx_name =
+                                                format!("hnsw_{}_{}", table_name_str, col.name);
+                                            if idx < old_existing_row.len()
+                                                && old_existing_row[idx] != existing_row[idx]
+                                            {
+                                                if matches!(old_existing_row[idx], Value::Vector(_))
+                                                {
+                                                    self.vector_index.delete(&idx_name, &row_id)?;
+                                                }
+                                                if let Value::Vector(vec) = &existing_row[idx] {
+                                                    self.vector_index.insert(
+                                                        &idx_name,
+                                                        row_id.clone(),
+                                                        vec.clone(),
+                                                    )?;
+                                                }
+                                            }
+                                        }
+                                    }
                                     monitor::inc_row_write();
                                     if returning.is_some() {
                                         inserted_rows.push(existing_row);
@@ -173,13 +231,18 @@ impl Executor {
 
                     // Update Cache
                     // self.row_cache.insert(key.clone(), row_values.clone());
-                    
+
                     // Update Trigram Index
-                    if let Some(ftxn) = txn.as_any().downcast_ref::<crate::storage::fusion::FusionTransaction>() {
+                    if let Some(ftxn) = txn
+                        .as_any()
+                        .downcast_ref::<crate::storage::fusion::FusionTransaction>()
+                    {
                         let storage = &ftxn.storage;
                         let mut idx_lock = storage.trigram_index.write().unwrap();
-                        
-                        let numeric_id = if let Some(n) = crate::common::encoding::decode_i64_comparable(&row_id) {
+
+                        let numeric_id = if let Some(n) =
+                            crate::common::encoding::decode_i64_comparable(&row_id)
+                        {
                             Some(n as u64)
                         } else if let Ok(n) = row_id.parse::<u64>() {
                             Some(n)
@@ -195,7 +258,13 @@ impl Executor {
                         if let Some(rid) = numeric_id {
                             for (i, val) in row_values.iter().enumerate() {
                                 if let Value::String(s) = val {
-                                    idx_lock.add_with_id_str(&table_name_str, &schema.columns[i].name, rid, &row_id, s);
+                                    idx_lock.add_with_id_str(
+                                        &table_name_str,
+                                        &schema.columns[i].name,
+                                        rid,
+                                        &row_id,
+                                        s,
+                                    );
                                 }
                             }
                         }
@@ -255,11 +324,16 @@ impl Executor {
 
             // INSERT ... SELECT: execute query then insert results
             let query_result = self.handle_query(query, txn, params).await?;
-            if let super::QueryResult::Select { rows: select_rows, .. } = query_result {
+            if let super::QueryResult::Select {
+                rows: select_rows, ..
+            } = query_result
+            {
                 let mut count = 0;
                 for row_values in select_rows {
                     if row_values.len() != schema.columns.len() {
-                        return Err(FusionError::Execution("Column count mismatch in INSERT ... SELECT".to_string()));
+                        return Err(FusionError::Execution(
+                            "Column count mismatch in INSERT ... SELECT".to_string(),
+                        ));
                     }
                     let row_id = if let Some(first) = row_values.first() {
                         encode_key(first)
@@ -270,6 +344,16 @@ impl Executor {
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
                     monitor::inc_row_write();
+
+                    for (idx, col) in schema.columns.iter().enumerate() {
+                        if col.is_indexed && col.index_type == IndexType::HNSW {
+                            if let Value::Vector(vec) = &row_values[idx] {
+                                let idx_name = format!("hnsw_{}_{}", table_name_str, col.name);
+                                self.vector_index
+                                    .insert(&idx_name, row_id.clone(), vec.clone())?;
+                            }
+                        }
+                    }
                     count += 1;
                 }
                 return Ok(QueryResult::Success {
@@ -373,9 +457,8 @@ impl Executor {
                                 }
                             }
                         } else if col.index_type == IndexType::HNSW {
-                            // Deletion from HNSW is complex and often not fully supported or expensive.
-                            // For this MVP, we might skip explicit deletion or implement a soft delete in VectorIndex.
-                            // self.vector_index.delete(...) // TODO
+                            let idx_name = format!("hnsw_{}_{}", table_name_str, col.name);
+                            self.vector_index.delete(&idx_name, row_id)?;
                         } else if let Some(val_str) = self.value_to_index_string(val) {
                             let index_key = format!(
                                 "index:{}:{}:{}:{}",
@@ -427,11 +510,16 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
         let prefix = format!("data:{}:", table_name_str);
-        
+
         // Optimization: Check for Primary Key (Clustered Index) Update
         let mut target_row_id: Option<String> = None;
         if let Some(sel) = &update.selection {
-            if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = sel {
+            if let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = sel
+            {
                 let is_pk = if let Expr::Identifier(ident) = left.as_ref() {
                     schema.get_column_index(&ident.value) == Some(0)
                 } else {
@@ -439,7 +527,9 @@ impl Executor {
                 };
 
                 if is_pk {
-                    let val = self.evaluate_value(right, &[], &schema, params).unwrap_or(Value::Null);
+                    let val = self
+                        .evaluate_value(right, &[], &schema, params)
+                        .unwrap_or(Value::Null);
                     if let Value::Integer(i) = val {
                         target_row_id = Some(crate::common::encoding::encode_i64_comparable(i));
                     } else if let Value::String(s) = val {
@@ -465,9 +555,10 @@ impl Executor {
         let mut updated_count = 0;
         let mut updated_rows: Vec<Vec<Value>> = Vec::new();
         for (k, v) in kv_pairs {
-            let mut row: Vec<Value> = crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
-                FusionError::Execution(format!("Data deserialization error: {}", e))
-            })?;
+            let mut row: Vec<Value> =
+                crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
+                    FusionError::Execution(format!("Data deserialization error: {}", e))
+                })?;
             let old_row = row.clone();
 
             let mut update_flag = true;
@@ -497,12 +588,13 @@ impl Executor {
                         )));
                     }
                 }
-                
+
                 // Enforce NOT NULL constraints after UPDATE
                 for (idx, col) in schema.columns.iter().enumerate() {
                     if !col.is_nullable && row[idx] == Value::Null {
                         return Err(FusionError::Execution(format!(
-                            "NOT NULL constraint violated for column '{}' during UPDATE", col.name
+                            "NOT NULL constraint violated for column '{}' during UPDATE",
+                            col.name
                         )));
                     }
                 }
@@ -512,7 +604,8 @@ impl Executor {
                     if let Some(ref check_sql) = col.check_expr {
                         if !self.evaluate_check_constraint(check_sql, &col.name, &row[idx]) {
                             return Err(FusionError::Execution(format!(
-                                "CHECK constraint violated for column '{}': {}", col.name, check_sql
+                                "CHECK constraint violated for column '{}': {}",
+                                col.name, check_sql
                             )));
                         }
                     }
@@ -552,6 +645,18 @@ impl Executor {
                                         );
                                         txn.put(index_key.as_bytes(), &[]).await?;
                                     }
+                                }
+                            } else if col.index_type == IndexType::HNSW {
+                                let idx_name = format!("hnsw_{}_{}", table_name_str, col.name);
+                                if matches!(old_val, Value::Vector(_)) {
+                                    self.vector_index.delete(&idx_name, row_id)?;
+                                }
+                                if let Value::Vector(vec) = new_val {
+                                    self.vector_index.insert(
+                                        &idx_name,
+                                        row_id.to_string(),
+                                        vec.clone(),
+                                    )?;
                                 }
                             } else {
                                 if let Some(old_val_str) = self.value_to_index_string(old_val) {
@@ -631,7 +736,9 @@ impl Executor {
         let mut result_rows = Vec::new();
 
         // Build column names from RETURNING items
-        let is_wildcard = ret_items.iter().any(|item| matches!(item, SelectItem::Wildcard(_)));
+        let is_wildcard = ret_items
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard(_)));
         if is_wildcard {
             col_names = schema.columns.iter().map(|c| c.name.clone()).collect();
             result_rows = rows.to_vec();
@@ -651,7 +758,9 @@ impl Executor {
                         SelectItem::ExprWithAlias { expr, .. } => expr,
                         _ => continue,
                     };
-                    let val = self.evaluate_value(expr, row, schema, &[]).unwrap_or(Value::Null);
+                    let val = self
+                        .evaluate_value(expr, row, schema, &[])
+                        .unwrap_or(Value::Null);
                     result_row.push(val);
                 }
                 result_rows.push(result_row);
@@ -677,7 +786,7 @@ impl Executor {
         let expr_str = if expr_str.to_uppercase().starts_with("CHECK") {
             let rest = expr_str[5..].trim();
             if rest.starts_with('(') && rest.ends_with(')') {
-                &rest[1..rest.len()-1]
+                &rest[1..rest.len() - 1]
             } else {
                 rest
             }
@@ -686,28 +795,31 @@ impl Executor {
         };
 
         // Try to parse the check expression
-        let parse_result = crate::parser::parse_sql(&format!(
-            "SELECT 1 WHERE {}", expr_str
-        ));
+        let parse_result = crate::parser::parse_sql(&format!("SELECT 1 WHERE {}", expr_str));
         if let Ok(stmts) = parse_result {
             if let Some(sqlparser::ast::Statement::Query(query)) = stmts.first() {
                 if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
                     if let Some(ref where_expr) = select.selection {
                         // Build a single-column schema and row for evaluation
                         use crate::catalog::{Column, IndexType, TableSchema};
-                        let schema = TableSchema::new("_check".to_string(), vec![Column {
-                            name: col_name.to_string(),
-                            data_type: "TEXT".to_string(),
-                            is_primary: false,
-                            is_indexed: false,
-                            index_type: IndexType::None,
-                            default_value: None,
-                            is_nullable: true,
-                            is_unique: false,
-                            check_expr: None,
-                        }]);
+                        let schema = TableSchema::new(
+                            "_check".to_string(),
+                            vec![Column {
+                                name: col_name.to_string(),
+                                data_type: "TEXT".to_string(),
+                                is_primary: false,
+                                is_indexed: false,
+                                index_type: IndexType::None,
+                                default_value: None,
+                                is_nullable: true,
+                                is_unique: false,
+                                check_expr: None,
+                            }],
+                        );
                         let row = vec![value.clone()];
-                        return self.evaluate_expr(where_expr, &row, &schema, &[]).unwrap_or(false);
+                        return self
+                            .evaluate_expr(where_expr, &row, &schema, &[])
+                            .unwrap_or(false);
                     }
                 }
             }

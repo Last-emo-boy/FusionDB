@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use openraft::log_id::RaftLogId;
 use openraft::{
-    Entry, EntryPayload, LogId, RaftLogReader, RaftSnapshotBuilder, RaftStorage,
-    Snapshot, SnapshotMeta, StorageError, StoredMembership, Vote,
+    Entry, EntryPayload, LogId, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot,
+    SnapshotMeta, StorageError, StoredMembership, Vote,
 };
 
 use super::typ::{NodeId, Request, Response, TypeConfig};
@@ -73,7 +73,9 @@ impl FusionRaftStore {
 // --- RaftLogReader ---
 
 impl RaftLogReader<TypeConfig> for FusionRaftStore {
-    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + Debug + openraft::OptionalSend>(
+    async fn try_get_log_entries<
+        RB: std::ops::RangeBounds<u64> + Clone + Debug + openraft::OptionalSend,
+    >(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
@@ -120,12 +122,10 @@ impl RaftStorage<TypeConfig> for FusionRaftStore {
         Ok(self.vote)
     }
 
-    async fn get_log_state(&mut self) -> Result<openraft::LogState<TypeConfig>, StorageError<NodeId>> {
-        let last_log_id = self
-            .log
-            .iter()
-            .next_back()
-            .map(|(_, e)| *e.get_log_id());
+    async fn get_log_state(
+        &mut self,
+    ) -> Result<openraft::LogState<TypeConfig>, StorageError<NodeId>> {
+        let last_log_id = self.log.iter().next_back().map(|(_, e)| *e.get_log_id());
         Ok(openraft::LogState {
             last_purged_log_id: self.last_purged,
             last_log_id,
@@ -168,10 +168,7 @@ impl RaftStorage<TypeConfig> for FusionRaftStore {
         Ok(())
     }
 
-    async fn purge_logs_upto(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let keys: Vec<_> = self.log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for k in keys {
             self.log.remove(&k);

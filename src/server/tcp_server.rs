@@ -44,7 +44,7 @@ async fn handle_connection(
     let (reader, writer) = socket.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
     let mut writer = tokio::io::BufWriter::new(writer);
-    
+
     let mut header_buf = [0u8; 7]; // 2 Magic + 1 Op + 4 Len
     let mut active_txn: Option<Box<dyn Transaction>> = None;
 
@@ -80,7 +80,8 @@ async fn handle_connection(
                 handle_vector_search(&mut writer, &payload, &storage).await?;
             }
             OP_SQL_QUERY => {
-                handle_sql_query(&mut writer, &payload, &executor, &storage, &mut active_txn).await?;
+                handle_sql_query(&mut writer, &payload, &executor, &storage, &mut active_txn)
+                    .await?;
             }
             _ => {
                 return Err(std::io::Error::new(
@@ -123,38 +124,63 @@ async fn handle_sql_query<W: AsyncWriteExt + Unpin>(
 
     // Execute first statement only for now
     let stmt = &stmts[0];
-    
+
     let result = match stmt {
         Statement::StartTransaction { .. } => {
-             if active_txn.is_some() {
-                 Err(std::io::Error::other("Nested transactions not supported"))
-             } else {
-                 *active_txn = Some(storage.begin_transaction().await.map_err(|e| std::io::Error::other(e.to_string()))?);
-                 Ok(QueryResult::Success { message: "Transaction started".to_string() })
-             }
-        },
+            if active_txn.is_some() {
+                Err(std::io::Error::other("Nested transactions not supported"))
+            } else {
+                *active_txn = Some(
+                    storage
+                        .begin_transaction()
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))?,
+                );
+                Ok(QueryResult::Success {
+                    message: "Transaction started".to_string(),
+                })
+            }
+        }
         Statement::Commit { .. } => {
-             if let Some(txn) = active_txn.take() {
-                 txn.commit().await.map_err(|e| std::io::Error::other(e.to_string()))?;
-                 Ok(QueryResult::Success { message: "Transaction committed".to_string() })
-             } else {
-                 Ok(QueryResult::Success { message: "No active transaction to commit".to_string() })
-             }
-        },
+            if let Some(txn) = active_txn.take() {
+                txn.commit()
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok(QueryResult::Success {
+                    message: "Transaction committed".to_string(),
+                })
+            } else {
+                Ok(QueryResult::Success {
+                    message: "No active transaction to commit".to_string(),
+                })
+            }
+        }
         Statement::Rollback { .. } => {
-             if let Some(txn) = active_txn.take() {
-                 txn.rollback().await.map_err(|e| std::io::Error::other(e.to_string()))?;
-                 Ok(QueryResult::Success { message: "Transaction rolled back".to_string() })
-             } else {
-                 Ok(QueryResult::Success { message: "No active transaction to rollback".to_string() })
-             }
-        },
+            if let Some(txn) = active_txn.take() {
+                txn.rollback()
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok(QueryResult::Success {
+                    message: "Transaction rolled back".to_string(),
+                })
+            } else {
+                Ok(QueryResult::Success {
+                    message: "No active transaction to rollback".to_string(),
+                })
+            }
+        }
         _ => {
-             if let Some(txn) = active_txn.as_mut() {
-                 executor.execute_in_transaction(stmt, &mut **txn).await.map_err(|e| std::io::Error::other(e.to_string()))
-             } else {
-                 executor.execute(stmt).await.map_err(|e| std::io::Error::other(e.to_string()))
-             }
+            if let Some(txn) = active_txn.as_mut() {
+                executor
+                    .execute_in_transaction(stmt, &mut **txn)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            } else {
+                executor
+                    .execute(stmt)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            }
         }
     };
 

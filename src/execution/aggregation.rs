@@ -22,7 +22,9 @@ impl AggregateAccumulator {
             "AVG" => AggregateAccumulator::Avg(0.0, 0),
             "MIN" => AggregateAccumulator::Min(None),
             "MAX" => AggregateAccumulator::Max(None),
-            "STRING_AGG" | "GROUP_CONCAT" => AggregateAccumulator::StringAgg(Vec::new(), ",".to_string()),
+            "STRING_AGG" | "GROUP_CONCAT" => {
+                AggregateAccumulator::StringAgg(Vec::new(), ",".to_string())
+            }
             _ => AggregateAccumulator::Count(0),
         }
     }

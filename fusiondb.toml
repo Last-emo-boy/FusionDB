@@ -15,3 +15,4 @@ slow_query_threshold_ms = 100
 
 [auth]
 password = "fusiondb"
+scram_sha256 = false

@@ -12,7 +12,7 @@ type NodeId = usize;
 pub struct InnerNode {
     prefix: Vec<u8>,
     // Flattened feature array: [feature_0_key_0, ..., feature_0_key_N, feature_1_key_0, ...]
-    features: Vec<u8>, 
+    features: Vec<u8>,
     children: Vec<NodeId>,
     anchors: Vec<Vec<u8>>, // Pivot keys
 }
@@ -48,7 +48,7 @@ impl FBTree {
             occupied: Vec::new(),
             next: None,
         });
-        
+
         Self {
             nodes: vec![Arc::new(RwLock::new(root))],
             root: 0,
@@ -68,10 +68,12 @@ impl FBTree {
         }
         features
     }
-    
+
     // Bulk Load from sorted iterator
-    pub fn bulk_load<I>(iter: I) -> Self 
-    where I: Iterator<Item=(Vec<u8>, Vec<u8>)> {
+    pub fn bulk_load<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = (Vec<u8>, Vec<u8>)>,
+    {
         let mut leaves = Vec::new();
         let mut current_leaf = LeafNode {
             keys: Vec::new(),
@@ -80,16 +82,16 @@ impl FBTree {
             occupied: Vec::new(),
             next: None,
         };
-        
+
         let mut nodes_arena = Vec::new();
-        
+
         for (k, v) in iter {
             if current_leaf.keys.len() >= FANOUT {
                 // Flush leaf
                 let id = nodes_arena.len();
                 nodes_arena.push(Arc::new(RwLock::new(Node::Leaf(current_leaf))));
                 leaves.push(id);
-                
+
                 current_leaf = LeafNode {
                     keys: Vec::new(),
                     values: Vec::new(),
@@ -98,7 +100,7 @@ impl FBTree {
                     next: None, // Will link later
                 };
             }
-            
+
             // Add to leaf
             let tag = Self::hash_tag(&k);
             current_leaf.keys.push(k);
@@ -106,23 +108,23 @@ impl FBTree {
             current_leaf.tags.push(tag);
             current_leaf.occupied.push(true);
         }
-        
+
         // Push last leaf
         let last_id = nodes_arena.len();
         nodes_arena.push(Arc::new(RwLock::new(Node::Leaf(current_leaf))));
         leaves.push(last_id);
-        
+
         // Link leaves
         for i in 0..leaves.len().saturating_sub(1) {
-            let next_id = leaves[i+1];
+            let next_id = leaves[i + 1];
             if let Node::Leaf(ref mut leaf) = *nodes_arena[leaves[i]].write().unwrap() {
                 leaf.next = Some(next_id);
             }
         }
-        
+
         // Build Inner Nodes
         let mut current_level_ids = leaves;
-        
+
         while current_level_ids.len() > 1 {
             let mut next_level_ids = Vec::new();
             let mut current_inner = InnerNode {
@@ -131,27 +133,27 @@ impl FBTree {
                 children: Vec::new(),
                 anchors: Vec::new(),
             };
-            
+
             for (_i, &child_id) in current_level_ids.iter().enumerate() {
                 if current_inner.children.len() >= FANOUT {
-                     // Flush inner
-                     let mut node = Node::Inner(current_inner);
-                     if let Node::Inner(ref mut inner) = node {
-                         Self::rebuild_inner_node(inner);
-                     }
-                     
-                     let id = nodes_arena.len();
-                     nodes_arena.push(Arc::new(RwLock::new(node)));
-                     next_level_ids.push(id);
-                     
-                     current_inner = InnerNode {
+                    // Flush inner
+                    let mut node = Node::Inner(current_inner);
+                    if let Node::Inner(ref mut inner) = node {
+                        Self::rebuild_inner_node(inner);
+                    }
+
+                    let id = nodes_arena.len();
+                    nodes_arena.push(Arc::new(RwLock::new(node)));
+                    next_level_ids.push(id);
+
+                    current_inner = InnerNode {
                         prefix: Vec::new(),
                         features: vec![0u8; FEATURE_SIZE * FANOUT],
                         children: Vec::new(),
                         anchors: Vec::new(),
                     };
                 }
-                
+
                 // Add child
                 if !current_inner.children.is_empty() {
                     // Anchor is min key of THIS child
@@ -160,25 +162,25 @@ impl FBTree {
                 }
                 current_inner.children.push(child_id);
             }
-            
+
             // Flush last inner
             let mut node = Node::Inner(current_inner);
             if let Node::Inner(ref mut inner) = node {
-                 Self::rebuild_inner_node(inner);
+                Self::rebuild_inner_node(inner);
             }
             let id = nodes_arena.len();
             nodes_arena.push(Arc::new(RwLock::new(node)));
             next_level_ids.push(id);
-            
+
             current_level_ids = next_level_ids;
         }
-        
+
         Self {
             nodes: nodes_arena,
             root: current_level_ids[0],
         }
     }
-    
+
     fn get_min_key_from_arena(arena: &[Arc<RwLock<Node>>], id: NodeId) -> Vec<u8> {
         let node = arena[id].read().unwrap();
         match &*node {
@@ -186,31 +188,39 @@ impl FBTree {
             Node::Inner(i) => Self::get_min_key_from_arena(arena, i.children[0]),
         }
     }
-    
+
     fn rebuild_inner_node(inner: &mut InnerNode) {
-        if inner.anchors.is_empty() { return; }
-        
+        if inner.anchors.is_empty() {
+            return;
+        }
+
         // 1. Calculate Common Prefix
         let mut prefix = inner.anchors[0].clone();
         for key in &inner.anchors[1..] {
-            let len = prefix.iter().zip(key.iter()).take_while(|(a, b)| a == b).count();
+            let len = prefix
+                .iter()
+                .zip(key.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
             prefix.truncate(len);
         }
         inner.prefix = prefix;
-        
+
         // 2. Build Features
         let plen = inner.prefix.len();
         inner.features.fill(0);
-        
+
         for (i, key) in inner.anchors.iter().enumerate() {
-            if i >= FANOUT { break; }
+            if i >= FANOUT {
+                break;
+            }
             let f = Self::extract_features(key, plen);
             for fid in 0..FEATURE_SIZE {
                 inner.features[fid * FANOUT + i] = f[fid];
             }
         }
     }
-    
+
     // Core FB+-Tree Logic: Find Child using Features
     fn find_child_index(&self, inner: &InnerNode, key: &[u8]) -> usize {
         let plen = inner.prefix.len();
@@ -221,21 +231,23 @@ impl FBTree {
                 return inner.children.len() - 1;
             }
         }
-        
+
         let mut candidates: u64 = if inner.anchors.len() >= 64 {
             u64::MAX
         } else {
             (1u64 << inner.anchors.len()) - 1
         };
-        
+
         for fid in 0..FEATURE_SIZE {
-            if plen + fid >= key.len() { break; }
+            if plen + fid >= key.len() {
+                break;
+            }
             let byte = key[plen + fid].wrapping_add(128);
-            
+
             let start = fid * FANOUT;
             let mut eq_mask = 0u64;
             let mut gt_mask = 0u64;
-            
+
             for i in 0..inner.anchors.len() {
                 if (candidates >> i) & 1 == 1 {
                     let f_byte = inner.features[start + i];
@@ -246,43 +258,43 @@ impl FBTree {
                     }
                 }
             }
-            
+
             if gt_mask != 0 {
                 return gt_mask.trailing_zeros() as usize;
             }
-            
+
             candidates &= eq_mask;
-            
+
             if candidates == 0 {
                 return inner.children.len() - 1;
             }
         }
-        
+
         match inner.anchors.binary_search_by(|a| a.as_slice().cmp(key)) {
-            Ok(idx) => idx + 1, 
+            Ok(idx) => idx + 1,
             Err(idx) => idx,
         }
     }
-    
+
     fn hash_tag(key: &[u8]) -> u8 {
         key.iter().fold(0u8, |acc, &x| acc.wrapping_add(x))
     }
 
     // Public API: insert (Wrapper for compatibility, just rebuilds tree for now or panic)
     pub fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
-       // Just append to root leaf if empty, else panic
-       // This is a hack for the `new()` -> `insert` usage in `build_fbtree`.
-       // Since we switched to bulk_load, we should update `build_fbtree`.
-       // But to keep `insert` signature for test code if any:
-       if self.nodes.len() == 1 {
-           if let Node::Leaf(ref mut leaf) = *self.nodes[0].write().unwrap() {
-               leaf.keys.push(key);
-               leaf.values.push(value);
-               // ...
-               // This is unsafe and incomplete. 
-               // Better to update `build_fbtree` to use `bulk_load`.
-           }
-       }
+        // Just append to root leaf if empty, else panic
+        // This is a hack for the `new()` -> `insert` usage in `build_fbtree`.
+        // Since we switched to bulk_load, we should update `build_fbtree`.
+        // But to keep `insert` signature for test code if any:
+        if self.nodes.len() == 1 {
+            if let Node::Leaf(ref mut leaf) = *self.nodes[0].write().unwrap() {
+                leaf.keys.push(key);
+                leaf.values.push(value);
+                // ...
+                // This is unsafe and incomplete.
+                // Better to update `build_fbtree` to use `bulk_load`.
+            }
+        }
     }
 
     // Public API: Get
@@ -312,7 +324,7 @@ impl FBTree {
             curr = next_node;
         }
     }
-    
+
     // Iterator
     pub fn scan(&self, start_key: &[u8]) -> FBTreeIterator<'_> {
         let mut curr = self.root;
@@ -330,22 +342,25 @@ impl FBTree {
             };
             curr = next_node;
         }
-        
+
         // 2. Find start index in leaf
         let mut idx = 0;
         {
-             let node = self.nodes[curr].read().unwrap();
-             if let Node::Leaf(leaf) = &*node {
-                  for (i, key) in leaf.keys.iter().enumerate() {
-                      if key.as_slice() >= start_key {
-                          idx = i;
-                          break;
-                      }
-                  }
-                  if idx == 0 && leaf.keys.len() > 0 && leaf.keys.last().unwrap().as_slice() < start_key {
-                      idx = leaf.keys.len(); 
-                  }
-             }
+            let node = self.nodes[curr].read().unwrap();
+            if let Node::Leaf(leaf) = &*node {
+                for (i, key) in leaf.keys.iter().enumerate() {
+                    if key.as_slice() >= start_key {
+                        idx = i;
+                        break;
+                    }
+                }
+                if idx == 0
+                    && leaf.keys.len() > 0
+                    && leaf.keys.last().unwrap().as_slice() < start_key
+                {
+                    idx = leaf.keys.len();
+                }
+            }
         }
 
         FBTreeIterator {

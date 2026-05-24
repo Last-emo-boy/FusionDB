@@ -5,7 +5,6 @@
 /// transactions.  All scan/count/first/last operations correctly merge the
 /// write buffer with the committed snapshot so that read-your-own-writes
 /// semantics are honoured within a transaction.
-
 use super::wal::{WalEntry, WalManager};
 use super::{Storage, Transaction};
 use crate::common::Result;
@@ -73,7 +72,10 @@ impl MemoryTransaction {
 
         // Merge: iterate both sources in order
         let mut storage_iter = data.range(start.to_vec()..end.to_vec()).peekable();
-        let mut wb_iter = self.write_buffer.range(start.to_vec()..end.to_vec()).peekable();
+        let mut wb_iter = self
+            .write_buffer
+            .range(start.to_vec()..end.to_vec())
+            .peekable();
 
         let mut result = Vec::new();
         loop {
@@ -146,7 +148,11 @@ impl Transaction for MemoryTransaction {
         Ok(())
     }
 
-    async fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    async fn scan_prefix(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // Compute end bound for prefix range
         let mut end = prefix.to_vec();
         let mut found = false;
@@ -164,7 +170,12 @@ impl Transaction for MemoryTransaction {
         self.scan_range(prefix, &end, limit).await
     }
 
-    async fn scan_range(&self, start: &[u8], end: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let merged = self.merged_range(start, end);
         let safe_limit = limit.unwrap_or(usize::MAX);
         Ok(merged.into_iter().take(safe_limit).collect())

@@ -1,3 +1,3 @@
 pub mod embedding;
 
-pub use embedding::{EmbeddingProvider, BuiltinEmbeddingProvider};
+pub use embedding::{BuiltinEmbeddingProvider, EmbeddingProvider};

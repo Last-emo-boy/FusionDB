@@ -2,14 +2,22 @@ use crate::catalog::{IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use crate::monitor;
 use crate::storage::Transaction;
+use futures::stream::StreamExt;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    TableFactor, Value as SqlValue,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, TableFactor,
+    TableWithJoins, Value as SqlValue,
 };
 use std::collections::{HashMap, HashSet};
-use futures::stream::StreamExt;
 
 use super::Executor;
+
+const SMALL_INDEX_FETCH_THRESHOLD: usize = 64;
+const JOIN_INDEX_PROBE_THRESHOLD: usize = 128;
+
+pub(crate) struct IndexScanPlan {
+    row_ids: HashSet<String>,
+    exact: bool,
+}
 
 impl Executor {
     pub(crate) async fn scan_table_base(
@@ -31,9 +39,10 @@ impl Executor {
                 let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
                 let mut rows = Vec::with_capacity(kv_pairs.len());
                 for (_, v) in kv_pairs {
-                    let row: Vec<Value> = crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
-                        FusionError::Execution(format!("Data deserialization error: {}", e))
-                    })?;
+                    let row: Vec<Value> =
+                        crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
+                            FusionError::Execution(format!("Data deserialization error: {}", e))
+                        })?;
                     rows.push(row);
                 }
                 return Ok((schema, rows));
@@ -44,34 +53,564 @@ impl Executor {
             if let Some(view_bytes) = txn.get(view_key.as_bytes()).await? {
                 let view_sql = String::from_utf8(view_bytes)
                     .map_err(|e| FusionError::Execution(format!("View decode error: {}", e)))?;
-                let stmts = crate::parser::parse_sql(&format!("SELECT * FROM ({}) AS _v", view_sql))?;
+                let stmts =
+                    crate::parser::parse_sql(&format!("SELECT * FROM ({}) AS _v", view_sql))?;
                 if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next() {
                     let result = Box::pin(self.handle_query(&query, txn, &[])).await?;
                     if let super::QueryResult::Select { columns, rows } = result {
                         use crate::catalog::{Column, IndexType};
-                        let cols: Vec<Column> = columns.iter().map(|c| Column {
-                            name: c.clone(),
-                            data_type: "TEXT".to_string(),
-                            is_primary: false,
-                            is_indexed: false,
-                            index_type: IndexType::None,
-                            default_value: None,
-                            is_nullable: true,
-                            is_unique: false,
-                            check_expr: None,
-                        }).collect();
+                        let cols: Vec<Column> = columns
+                            .iter()
+                            .map(|c| Column {
+                                name: c.clone(),
+                                data_type: "TEXT".to_string(),
+                                is_primary: false,
+                                is_indexed: false,
+                                index_type: IndexType::None,
+                                default_value: None,
+                                is_nullable: true,
+                                is_unique: false,
+                                check_expr: None,
+                            })
+                            .collect();
                         let schema = TableSchema::new(table_name, cols);
                         return Ok((schema, rows));
                     }
                 }
             }
 
-            Err(FusionError::Execution(format!("Table {} not found", table_name)))
+            Err(FusionError::Execution(format!(
+                "Table {} not found",
+                table_name
+            )))
         } else {
             Err(FusionError::Execution(
                 "Unsupported table factor".to_string(),
             ))
         }
+    }
+
+    pub(crate) fn relation_names(&self, relation: &TableFactor) -> HashSet<String> {
+        let mut names = HashSet::new();
+        if let TableFactor::Table { name, alias, .. } = relation {
+            names.insert(name.to_string());
+            if let Some(alias) = alias {
+                names.insert(alias.name.value.clone());
+            }
+        }
+        names
+    }
+
+    fn split_conjunctive_predicates(expr: &Expr, out: &mut Vec<Expr>) {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } = expr
+        {
+            Self::split_conjunctive_predicates(left, out);
+            Self::split_conjunctive_predicates(right, out);
+        } else {
+            out.push(expr.clone());
+        }
+    }
+
+    fn combine_predicates(predicates: Vec<Expr>) -> Option<Expr> {
+        let mut iter = predicates.into_iter();
+        let first = iter.next()?;
+        Some(iter.fold(first, |acc, expr| Expr::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOperator::And,
+            right: Box::new(expr),
+        }))
+    }
+
+    fn predicate_uses_only_relations(&self, expr: &Expr, relation_names: &HashSet<String>) -> bool {
+        let mut columns = HashSet::new();
+        self.extract_columns_from_expr(expr, &mut columns);
+        if columns.is_empty() {
+            return false;
+        }
+
+        columns.into_iter().all(|column| {
+            column
+                .split('.')
+                .next()
+                .map(|prefix| relation_names.contains(prefix))
+                .unwrap_or(false)
+        })
+    }
+
+    fn take_relation_predicate(
+        &self,
+        predicates: &mut Vec<Expr>,
+        relation_names: &HashSet<String>,
+    ) -> Option<Expr> {
+        let mut local = Vec::new();
+        let mut remaining = Vec::new();
+
+        for predicate in predicates.drain(..) {
+            if self.predicate_uses_only_relations(&predicate, relation_names) {
+                local.push(predicate);
+            } else {
+                remaining.push(predicate);
+            }
+        }
+
+        *predicates = remaining;
+        Self::combine_predicates(local)
+    }
+
+    fn predicate_uses_only_schema(&self, expr: &Expr, schema: &TableSchema) -> bool {
+        let mut columns = HashSet::new();
+        self.extract_columns_from_expr(expr, &mut columns);
+        if columns.is_empty() {
+            return false;
+        }
+
+        columns
+            .into_iter()
+            .all(|column| self.schema_contains_column_reference(&column, schema))
+    }
+
+    fn take_schema_predicate(
+        &self,
+        predicates: &mut Vec<Expr>,
+        schema: &TableSchema,
+    ) -> Option<Expr> {
+        let mut local = Vec::new();
+        let mut remaining = Vec::new();
+
+        for predicate in predicates.drain(..) {
+            if self.predicate_uses_only_schema(&predicate, schema) {
+                local.push(predicate);
+            } else {
+                remaining.push(predicate);
+            }
+        }
+
+        *predicates = remaining;
+        Self::combine_predicates(local)
+    }
+
+    fn column_name_from_expr(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(idents) => Some(
+                idents
+                    .iter()
+                    .map(|ident| ident.value.clone())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            _ => None,
+        }
+    }
+
+    fn resolve_schema_column_index(&self, expr: &Expr, schema: &TableSchema) -> Option<usize> {
+        let col_name = Self::column_name_from_expr(expr)?;
+        self.resolve_column_index(&col_name, schema).ok()
+    }
+
+    fn resolve_schema_column_index_strict(
+        &self,
+        expr: &Expr,
+        schema: &TableSchema,
+    ) -> Option<usize> {
+        let col_name = Self::column_name_from_expr(expr)?;
+        if col_name.contains('.') {
+            schema
+                .columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(&col_name))
+        } else {
+            self.resolve_column_index(&col_name, schema).ok()
+        }
+    }
+
+    fn schema_contains_column_reference(&self, col_name: &str, schema: &TableSchema) -> bool {
+        if col_name.contains('.') {
+            schema
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(col_name))
+        } else {
+            self.resolve_column_index(col_name, schema).is_ok()
+        }
+    }
+
+    fn resolve_schema_column_name(
+        &self,
+        expr: &Expr,
+        schema: &TableSchema,
+    ) -> Option<(usize, String)> {
+        let idx = self.resolve_schema_column_index(expr, schema)?;
+        Some((idx, schema.columns[idx].name.clone()))
+    }
+
+    fn join_constraint_expr<'a>(
+        join_operator: &'a sqlparser::ast::JoinOperator,
+    ) -> Option<&'a Expr> {
+        match join_operator {
+            sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::Left(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::RightOuter(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::Right(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::FullOuter(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr)) => {
+                Some(expr)
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_join_keys(
+        &self,
+        expr: &Expr,
+        left_schema: &TableSchema,
+        right_schema: &TableSchema,
+    ) -> Option<(Vec<usize>, Vec<usize>, Option<Expr>)> {
+        let mut predicates = Vec::new();
+        Self::split_conjunctive_predicates(expr, &mut predicates);
+
+        let mut left_key_indices = Vec::new();
+        let mut right_key_indices = Vec::new();
+        let mut residual = Vec::new();
+
+        for predicate in predicates {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = &predicate
+            else {
+                residual.push(predicate);
+                continue;
+            };
+
+            let left_in_left = self.resolve_schema_column_index_strict(left, left_schema);
+            let left_in_right = self.resolve_schema_column_index_strict(left, right_schema);
+            let right_in_left = self.resolve_schema_column_index_strict(right, left_schema);
+            let right_in_right = self.resolve_schema_column_index_strict(right, right_schema);
+
+            if let (Some(l_idx), Some(r_idx)) = (left_in_left, right_in_right) {
+                if left_in_right.is_none() && right_in_left.is_none() {
+                    left_key_indices.push(l_idx);
+                    right_key_indices.push(r_idx);
+                    continue;
+                }
+            }
+
+            if let (Some(l_idx), Some(r_idx)) = (right_in_left, left_in_right) {
+                if right_in_right.is_none() && left_in_left.is_none() {
+                    left_key_indices.push(l_idx);
+                    right_key_indices.push(r_idx);
+                    continue;
+                }
+            }
+
+            residual.push(predicate);
+        }
+
+        if left_key_indices.is_empty() {
+            None
+        } else {
+            Some((
+                left_key_indices,
+                right_key_indices,
+                Self::combine_predicates(residual),
+            ))
+        }
+    }
+
+    fn row_key(row: &[Value], indices: &[usize]) -> Vec<Value> {
+        indices.iter().map(|index| row[*index].clone()).collect()
+    }
+
+    fn projection_matches_schema(
+        &self,
+        projection: &Option<Vec<String>>,
+        schema: &TableSchema,
+    ) -> bool {
+        let Some(columns) = projection else {
+            return false;
+        };
+
+        if columns.len() != schema.columns.len() {
+            return false;
+        }
+
+        columns
+            .iter()
+            .zip(schema.columns.iter())
+            .all(|(projected, actual)| projected.eq_ignore_ascii_case(&actual.name))
+    }
+
+    fn project_join_rows(
+        &self,
+        schema: TableSchema,
+        rows: Vec<Vec<Value>>,
+        projection: &Option<Vec<String>>,
+    ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+        let Some(columns) = projection else {
+            return Ok((schema, rows));
+        };
+
+        if columns.is_empty() || self.projection_matches_schema(projection, &schema) {
+            return Ok((schema, rows));
+        }
+
+        let mut projection_indices = Vec::with_capacity(columns.len());
+        let mut projected_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            let index = self.resolve_column_index(column, &schema)?;
+            projection_indices.push(index);
+            projected_columns.push(schema.columns[index].clone());
+        }
+
+        let projected_rows = rows
+            .into_iter()
+            .map(|row| {
+                projection_indices
+                    .iter()
+                    .map(|index| row[*index].clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        Ok((
+            TableSchema::new(schema.name.clone(), projected_columns),
+            projected_rows,
+        ))
+    }
+
+    fn collect_join_column_references(&self, from: &[TableWithJoins]) -> HashSet<String> {
+        let mut columns = HashSet::new();
+
+        for table in from {
+            for join in &table.joins {
+                if let Some(expr) = Self::join_constraint_expr(&join.join_operator) {
+                    self.extract_columns_from_expr(expr, &mut columns);
+                }
+            }
+        }
+
+        columns
+    }
+
+    fn build_stage_join_projection(
+        &self,
+        schema: &TableSchema,
+        projection: &Option<Vec<String>>,
+        pending_predicates: &[Expr],
+        join_column_refs: &HashSet<String>,
+    ) -> Option<Vec<String>> {
+        let Some(projected_columns) = projection else {
+            return None;
+        };
+
+        let mut required = HashSet::new();
+
+        for column in projected_columns {
+            if let Ok(index) = self.resolve_column_index(column, schema) {
+                required.insert(schema.columns[index].name.to_ascii_lowercase());
+            }
+        }
+
+        for predicate in pending_predicates {
+            let mut columns = HashSet::new();
+            self.extract_columns_from_expr(predicate, &mut columns);
+            for column in columns {
+                if let Ok(index) = self.resolve_column_index(&column, schema) {
+                    required.insert(schema.columns[index].name.to_ascii_lowercase());
+                }
+            }
+        }
+
+        for column in join_column_refs {
+            if let Ok(index) = self.resolve_column_index(column, schema) {
+                required.insert(schema.columns[index].name.to_ascii_lowercase());
+            }
+        }
+
+        if required.is_empty() || required.len() >= schema.columns.len() {
+            return None;
+        }
+
+        let stage_projection: Vec<String> = schema
+            .columns
+            .iter()
+            .filter(|column| required.contains(&column.name.to_ascii_lowercase()))
+            .map(|column| column.name.clone())
+            .collect();
+
+        if stage_projection.is_empty() || stage_projection.len() >= schema.columns.len() {
+            None
+        } else {
+            Some(stage_projection)
+        }
+    }
+
+    fn apply_stage_join_projection(
+        &self,
+        schema: TableSchema,
+        rows: Vec<Vec<Value>>,
+        projection: &Option<Vec<String>>,
+        pending_predicates: &[Expr],
+        join_column_refs: &HashSet<String>,
+    ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+        let stage_projection = self.build_stage_join_projection(
+            &schema,
+            projection,
+            pending_predicates,
+            join_column_refs,
+        );
+        self.project_join_rows(schema, rows, &stage_projection)
+    }
+
+    fn value_to_primary_row_id(value: &Value) -> Option<String> {
+        match value {
+            Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(*i)),
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    async fn fetch_full_row_by_id(
+        &self,
+        table_name: &str,
+        row_id: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<Vec<Value>>> {
+        let data_key = format!("data:{}:{}", table_name, row_id);
+        if let Some(row) = self.row_cache.get(&data_key) {
+            monitor::inc_row_cache_hit();
+            return Ok(Some(row));
+        }
+
+        if let Some(data_bytes) = txn.get(data_key.as_bytes()).await? {
+            monitor::inc_row_read();
+            let row = crate::common::encoding::RowDecoder::decode(&data_bytes).map_err(|e| {
+                FusionError::Execution(format!("Data deserialization error: {}", e))
+            })?;
+            self.row_cache.insert(data_key, row.clone());
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn fetch_rows_by_join_key(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        key_col_idx: usize,
+        key_value: &Value,
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<Vec<Value>>> {
+        let column = &schema.columns[key_col_idx];
+
+        if column.is_primary {
+            if let Some(row_id) = Self::value_to_primary_row_id(key_value) {
+                if let Some(row) = self.fetch_full_row_by_id(table_name, &row_id, txn).await? {
+                    return Ok(vec![row]);
+                }
+            }
+            return Ok(Vec::new());
+        }
+
+        if !(column.is_indexed && column.index_type == IndexType::BTree) {
+            return Ok(Vec::new());
+        }
+
+        let Some(value_str) = self.value_to_index_string(key_value) else {
+            return Ok(Vec::new());
+        };
+
+        let index_prefix = format!("index:{}:{}:{}:", table_name, column.name, value_str);
+        let index_entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
+        let mut seen_row_ids = HashSet::new();
+        let mut rows = Vec::new();
+
+        for (key, _) in index_entries {
+            let parts: Vec<&str> = std::str::from_utf8(&key).unwrap().split(':').collect();
+            let Some(row_id) = parts.last() else {
+                continue;
+            };
+            if !seen_row_ids.insert((*row_id).to_string()) {
+                continue;
+            }
+            if let Some(row) = self.fetch_full_row_by_id(table_name, row_id, txn).await? {
+                rows.push(row);
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn choose_indexed_join_probe_pair(
+        &self,
+        left_key_indices: &[usize],
+        right_key_indices: &[usize],
+        right_schema: &TableSchema,
+    ) -> Option<(usize, usize)> {
+        left_key_indices
+            .iter()
+            .copied()
+            .zip(right_key_indices.iter().copied())
+            .find(|(_, right_idx)| {
+                let column = &right_schema.columns[*right_idx];
+                column.is_primary || (column.is_indexed && column.index_type == IndexType::BTree)
+            })
+    }
+
+    fn should_attempt_join_probe(
+        left_rows_len: usize,
+        distinct_probe_keys: usize,
+        limit: Option<usize>,
+    ) -> bool {
+        distinct_probe_keys > 0
+            && (left_rows_len <= JOIN_INDEX_PROBE_THRESHOLD
+                || distinct_probe_keys <= JOIN_INDEX_PROBE_THRESHOLD
+                || limit.is_some_and(|value| value <= JOIN_INDEX_PROBE_THRESHOLD))
+    }
+
+    fn combine_optional_predicates(predicates: Vec<Option<Expr>>) -> Option<Expr> {
+        Self::combine_predicates(predicates.into_iter().flatten().collect())
+    }
+
+    fn index_candidate_cap(
+        limit: Option<usize>,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+    ) -> usize {
+        let base = limit.unwrap_or(128).max(32);
+        let multiplier = if order_by.is_some() { 16 } else { 8 };
+        base.saturating_mul(multiplier).clamp(128, 4096)
+    }
+
+    fn should_use_index_plan(
+        candidate_count: usize,
+        limit: Option<usize>,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+    ) -> bool {
+        candidate_count > 0 && candidate_count <= Self::index_candidate_cap(limit, order_by)
+    }
+
+    fn filter_rows_with_expr(
+        &self,
+        rows: Vec<Vec<Value>>,
+        schema: &TableSchema,
+        expr: &Expr,
+        params: &[Value],
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut filtered = Vec::new();
+        for row in rows {
+            if self.evaluate_expr(expr, &row, schema, params)? {
+                filtered.push(row);
+            }
+        }
+        Ok(filtered)
     }
 
     pub(crate) fn prefix_schema_columns(
@@ -95,208 +634,443 @@ impl Executor {
         }
     }
 
+    async fn apply_join_step(
+        &self,
+        left_schema: TableSchema,
+        left_rows: Vec<Vec<Value>>,
+        relation: &TableFactor,
+        join_operator: Option<&sqlparser::ast::JoinOperator>,
+        pending_predicates: &mut Vec<Expr>,
+        projection: &Option<Vec<String>>,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+        limit: Option<usize>,
+    ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+        let right_relation_names = self.relation_names(relation);
+        let mut left_rows = left_rows;
+        let mut join_predicates = Vec::new();
+
+        if let Some(on_expr) = join_operator.and_then(Self::join_constraint_expr) {
+            Self::split_conjunctive_predicates(on_expr, &mut join_predicates);
+        }
+
+        if let Some(left_local) = self.take_schema_predicate(&mut join_predicates, &left_schema) {
+            left_rows = self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
+        }
+
+        let where_right = self.take_relation_predicate(pending_predicates, &right_relation_names);
+        let join_right = self.take_relation_predicate(&mut join_predicates, &right_relation_names);
+        let right_selection = Self::combine_optional_predicates(vec![where_right, join_right]);
+
+        let right_table_name = match relation {
+            TableFactor::Table { name, .. } => Some(name.to_string()),
+            _ => None,
+        };
+        let schema_for_probe = if let Some(table_name) = &right_table_name {
+            let schema_key = format!("schema:{}", table_name);
+            txn.get(schema_key.as_bytes())
+                .await?
+                .map(|schema_bytes| {
+                    bincode::deserialize(&schema_bytes).map_err(|e| {
+                        FusionError::Execution(format!("Schema deserialization error: {}", e))
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        let (right_schema_base, right_rows) = if right_selection.is_some() {
+            self.scan_single_table(relation, &right_selection, &None, txn, params, None, None)
+                .await?
+        } else {
+            self.scan_table_base(relation, txn).await?
+        };
+        let mut right_schema = right_schema_base.clone();
+        self.prefix_schema_columns(&mut right_schema, relation)?;
+
+        let mut new_columns = left_schema.columns.clone();
+        new_columns.extend(right_schema.columns.clone());
+        let new_schema = TableSchema::new("join_result".to_string(), new_columns);
+
+        let is_left_outer = matches!(
+            join_operator,
+            Some(
+                sqlparser::ast::JoinOperator::LeftOuter(_) | sqlparser::ast::JoinOperator::Left(_)
+            )
+        );
+        let supports_left_driven_probe = matches!(
+            join_operator,
+            Some(
+                sqlparser::ast::JoinOperator::Inner(_)
+                    | sqlparser::ast::JoinOperator::Join(_)
+                    | sqlparser::ast::JoinOperator::LeftOuter(_)
+                    | sqlparser::ast::JoinOperator::Left(_)
+            )
+        );
+
+        let join_expr = Self::combine_predicates(join_predicates.clone());
+        if supports_left_driven_probe && right_table_name.is_some() {
+            if let Some(expr) = &join_expr {
+                if let Some((left_key_indices, right_key_indices, residual_expr)) =
+                    self.extract_join_keys(expr, &left_schema, &right_schema)
+                {
+                    let probe_schema = schema_for_probe.as_ref().unwrap_or(&right_schema_base);
+                    if let Some((probe_left_idx, probe_right_idx)) = self
+                        .choose_indexed_join_probe_pair(
+                            &left_key_indices,
+                            &right_key_indices,
+                            probe_schema,
+                        )
+                    {
+                        let mut distinct_probe_keys = HashSet::new();
+                        for left_row in &left_rows {
+                            distinct_probe_keys.insert(left_row[probe_left_idx].clone());
+                        }
+
+                        if Self::should_attempt_join_probe(
+                            left_rows.len(),
+                            distinct_probe_keys.len(),
+                            limit,
+                        ) {
+                            monitor::inc_plan();
+                            let right_table_name = right_table_name.unwrap();
+                            let mut probed_rows = Vec::new();
+                            let mut probe_cache: HashMap<Value, Vec<Vec<Value>>> = HashMap::new();
+
+                            for left_row in &left_rows {
+                                let probe_key = left_row[probe_left_idx].clone();
+                                if !probe_cache.contains_key(&probe_key) {
+                                    let mut candidates = self
+                                        .fetch_rows_by_join_key(
+                                            &right_table_name,
+                                            probe_schema,
+                                            probe_right_idx,
+                                            &probe_key,
+                                            txn,
+                                        )
+                                        .await?;
+                                    if let Some(selection) = &right_selection {
+                                        candidates = self.filter_rows_with_expr(
+                                            candidates,
+                                            probe_schema,
+                                            selection,
+                                            params,
+                                        )?;
+                                    }
+                                    probe_cache.insert(probe_key.clone(), candidates);
+                                }
+
+                                let candidates = probe_cache.get(&probe_key).unwrap();
+                                let mut matched = false;
+                                for right_row in candidates {
+                                    let left_key = Self::row_key(left_row, &left_key_indices);
+                                    let right_key = Self::row_key(right_row, &right_key_indices);
+                                    if left_key != right_key {
+                                        continue;
+                                    }
+
+                                    let mut joined_row = left_row.clone();
+                                    joined_row.extend(right_row.clone());
+                                    if let Some(residual) = &residual_expr {
+                                        if !self.evaluate_expr(
+                                            residual,
+                                            &joined_row,
+                                            &new_schema,
+                                            params,
+                                        )? {
+                                            continue;
+                                        }
+                                    }
+                                    matched = true;
+                                    probed_rows.push(joined_row);
+                                    if limit.is_some_and(|value| probed_rows.len() >= value) {
+                                        break;
+                                    }
+                                }
+
+                                if !matched && is_left_outer {
+                                    let mut joined_row = left_row.clone();
+                                    joined_row
+                                        .extend(vec![Value::Null; right_schema.columns.len()]);
+                                    probed_rows.push(joined_row);
+                                }
+
+                                if limit.is_some_and(|value| probed_rows.len() >= value) {
+                                    break;
+                                }
+                            }
+
+                            return self.project_join_rows(new_schema, probed_rows, projection);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut new_rows = Vec::new();
+        let mut hash_join_executed = false;
+
+        if !matches!(
+            join_operator,
+            Some(sqlparser::ast::JoinOperator::CrossJoin(_)) | None
+        ) {
+            if let Some(expr) = &join_expr {
+                if let Some((left_key_indices, right_key_indices, residual_expr)) =
+                    self.extract_join_keys(expr, &left_schema, &right_schema)
+                {
+                    hash_join_executed = true;
+                    monitor::inc_plan();
+
+                    let build_right = is_left_outer || right_rows.len() <= left_rows.len();
+                    if build_right {
+                        let mut hash_map: HashMap<Vec<Value>, Vec<&Vec<Value>>> =
+                            HashMap::with_capacity(right_rows.len());
+                        for right_row in &right_rows {
+                            let key = Self::row_key(right_row, &right_key_indices);
+                            hash_map.entry(key).or_default().push(right_row);
+                        }
+
+                        for left_row in &left_rows {
+                            let key = Self::row_key(left_row, &left_key_indices);
+                            let mut matched = false;
+                            if let Some(matches) = hash_map.get(&key) {
+                                for right_row in matches {
+                                    let mut joined_row = left_row.clone();
+                                    joined_row.extend((*right_row).clone());
+                                    if let Some(residual) = &residual_expr {
+                                        if !self.evaluate_expr(
+                                            residual,
+                                            &joined_row,
+                                            &new_schema,
+                                            params,
+                                        )? {
+                                            continue;
+                                        }
+                                    }
+                                    matched = true;
+                                    new_rows.push(joined_row);
+                                    if limit.is_some_and(|value| new_rows.len() >= value) {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !matched && is_left_outer {
+                                let mut joined_row = left_row.clone();
+                                joined_row.extend(vec![Value::Null; right_schema.columns.len()]);
+                                new_rows.push(joined_row);
+                            }
+
+                            if limit.is_some_and(|value| new_rows.len() >= value) {
+                                break;
+                            }
+                        }
+                    } else {
+                        let mut hash_map: HashMap<Vec<Value>, Vec<&Vec<Value>>> =
+                            HashMap::with_capacity(left_rows.len());
+                        for left_row in &left_rows {
+                            let key = Self::row_key(left_row, &left_key_indices);
+                            hash_map.entry(key).or_default().push(left_row);
+                        }
+
+                        for right_row in &right_rows {
+                            let key = Self::row_key(right_row, &right_key_indices);
+                            if let Some(matches) = hash_map.get(&key) {
+                                for left_row in matches {
+                                    let mut joined_row = (*left_row).clone();
+                                    joined_row.extend(right_row.clone());
+                                    if let Some(residual) = &residual_expr {
+                                        if !self.evaluate_expr(
+                                            residual,
+                                            &joined_row,
+                                            &new_schema,
+                                            params,
+                                        )? {
+                                            continue;
+                                        }
+                                    }
+                                    new_rows.push(joined_row);
+                                    if limit.is_some_and(|value| new_rows.len() >= value) {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if limit.is_some_and(|value| new_rows.len() >= value) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !hash_join_executed {
+            let row_width = left_schema.columns.len() + right_schema.columns.len();
+            for left_row in &left_rows {
+                let mut matched = false;
+                for right_row in &right_rows {
+                    let mut joined_row = Vec::with_capacity(row_width);
+                    joined_row.extend_from_slice(left_row);
+                    joined_row.extend_from_slice(right_row);
+
+                    let match_join = if let Some(expr) = &join_expr {
+                        self.evaluate_expr(expr, &joined_row, &new_schema, params)?
+                    } else {
+                        true
+                    };
+
+                    if match_join {
+                        new_rows.push(joined_row);
+                        matched = true;
+                        if limit.is_some_and(|value| new_rows.len() >= value) {
+                            break;
+                        }
+                    }
+                }
+
+                if !matched && is_left_outer {
+                    let mut joined_row = left_row.clone();
+                    joined_row.extend(vec![Value::Null; right_schema.columns.len()]);
+                    new_rows.push(joined_row);
+                }
+
+                if limit.is_some_and(|value| new_rows.len() >= value) {
+                    break;
+                }
+            }
+        }
+
+        self.project_join_rows(new_schema, new_rows, projection)
+    }
+
     pub(crate) async fn execute_join(
         &self,
         from: &[sqlparser::ast::TableWithJoins],
         selection: &Option<Expr>,
+        projection: &Option<Vec<String>>,
         txn: &mut dyn Transaction,
         params: &[Value],
+        limit: Option<usize>,
     ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
         let first = &from[0];
-        let (mut schema, mut rows) = self.scan_table_base(&first.relation, txn).await?;
+        let mut pending_predicates = Vec::new();
+        let join_column_refs = self.collect_join_column_references(from);
+        if let Some(expr) = selection {
+            Self::split_conjunctive_predicates(expr, &mut pending_predicates);
+        }
+
+        let first_relation_names = self.relation_names(&first.relation);
+        let first_selection =
+            self.take_relation_predicate(&mut pending_predicates, &first_relation_names);
+        let (mut schema, mut rows) = if first_selection.is_some() {
+            self.scan_single_table(
+                &first.relation,
+                &first_selection,
+                &None,
+                txn,
+                params,
+                None,
+                None,
+            )
+            .await?
+        } else {
+            self.scan_table_base(&first.relation, txn).await?
+        };
 
         self.prefix_schema_columns(&mut schema, &first.relation)?;
 
         for join in &first.joins {
-            let (right_schema_base, right_rows) = self.scan_table_base(&join.relation, txn).await?;
-            let mut right_schema = right_schema_base;
-            self.prefix_schema_columns(&mut right_schema, &join.relation)?;
-
-            let mut new_columns = schema.columns.clone();
-            new_columns.extend(right_schema.columns.clone());
-            let new_schema = TableSchema::new("join_result".to_string(), new_columns);
-
-            let mut new_rows = Vec::new();
-            let is_left_outer = matches!(
-                join.join_operator,
-                sqlparser::ast::JoinOperator::LeftOuter(_) | sqlparser::ast::JoinOperator::Left(_)
-            );
-
-            // Try Hash Join Optimization
-            let mut hash_join_executed = false;
-
-            // Check if we can use Hash Join (Simple Equi-Join)
-            if let sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(
-                expr,
-            ))
-            | sqlparser::ast::JoinOperator::Left(sqlparser::ast::JoinConstraint::On(expr))
-            | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr)) =
-                &join.join_operator
-            {
-                if let Expr::BinaryOp {
-                    left,
-                    op: BinaryOperator::Eq,
-                    right,
-                } = expr
-                {
-                    let l_name = match left.as_ref() {
-                        Expr::Identifier(i) => Some(i.value.clone()),
-                        Expr::CompoundIdentifier(ids) => Some(
-                            ids.iter()
-                                .map(|i| i.value.clone())
-                                .collect::<Vec<_>>()
-                                .join("."),
-                        ),
-                        _ => None,
-                    };
-
-                    let r_name = match right.as_ref() {
-                        Expr::Identifier(i) => Some(i.value.clone()),
-                        Expr::CompoundIdentifier(ids) => Some(
-                            ids.iter()
-                                .map(|i| i.value.clone())
-                                .collect::<Vec<_>>()
-                                .join("."),
-                        ),
-                        _ => None,
-                    };
-
-                    if let (Some(ln), Some(rn)) = (l_name, r_name) {
-                        let l_idx_opt = self.resolve_column_index(&ln, &schema).ok();
-                        let r_idx_opt = self.resolve_column_index(&rn, &right_schema).ok();
-
-                        let (left_key_idx, right_key_idx) =
-                            if let (Some(l_idx), Some(r_idx)) = (l_idx_opt, r_idx_opt) {
-                                (l_idx, r_idx)
-                            } else {
-                                let l_idx_rev = self.resolve_column_index(&ln, &right_schema).ok();
-                                let r_idx_rev = self.resolve_column_index(&rn, &schema).ok();
-                                if let (Some(l_idx), Some(r_idx)) = (l_idx_rev, r_idx_rev) {
-                                    (r_idx, l_idx)
-                                } else {
-                                    (usize::MAX, usize::MAX)
-                                }
-                            };
-
-                        if left_key_idx != usize::MAX {
-                            hash_join_executed = true;
-                            monitor::inc_plan();
-
-                            // Build Phase (Right Table) — pre-allocate HashMap
-                            let mut hash_map: HashMap<Value, Vec<&Vec<Value>>> = HashMap::with_capacity(right_rows.len());
-                            for r_row in &right_rows {
-                                let key = r_row[right_key_idx].clone();
-                                hash_map.entry(key).or_default().push(r_row);
-                            }
-
-                            // Probe Phase (Left Table)
-                            for l_row in &rows {
-                                let key = &l_row[left_key_idx];
-                                if let Some(matches) = hash_map.get(key) {
-                                    for r_row in matches {
-                                        let mut joined_row = l_row.clone();
-                                        joined_row.extend((*r_row).clone());
-                                        new_rows.push(joined_row);
-                                    }
-                                } else if is_left_outer {
-                                    let mut joined_row = l_row.clone();
-                                    for _ in 0..right_schema.columns.len() {
-                                        joined_row.push(Value::Null);
-                                    }
-                                    new_rows.push(joined_row);
-                                }
-                            }
-                    }
-                }
-            }
-            }
-
-            if !hash_join_executed {
-                // Fallback to Nested Loop Join
-                let row_width = schema.columns.len() + right_schema.columns.len();
-                for left_row in &rows {
-                    let mut matched = false;
-                    for right_row in &right_rows {
-                        let mut joined_row = Vec::with_capacity(row_width);
-                        joined_row.extend_from_slice(left_row);
-                        joined_row.extend_from_slice(right_row);
-
-                        let mut match_join = true;
-                        match &join.join_operator {
-                            sqlparser::ast::JoinOperator::Inner(constraint)
-                            | sqlparser::ast::JoinOperator::LeftOuter(constraint)
-                            | sqlparser::ast::JoinOperator::Left(constraint)
-                            | sqlparser::ast::JoinOperator::RightOuter(constraint)
-                            | sqlparser::ast::JoinOperator::Right(constraint)
-                            | sqlparser::ast::JoinOperator::FullOuter(constraint)
-                            | sqlparser::ast::JoinOperator::Join(constraint) => {
-                                if let sqlparser::ast::JoinConstraint::On(expr) = constraint {
-                                    let res =
-                                        self.evaluate_expr(expr, &joined_row, &new_schema, params)?;
-                                    if !res {
-                                        match_join = false;
-                                    }
-                                }
-                            }
-                            sqlparser::ast::JoinOperator::CrossJoin(_) => {}
-                            _ => {}
-                        }
-
-                        if match_join {
-                            new_rows.push(joined_row);
-                            matched = true;
-                        }
-                    }
-
-                    if !matched && is_left_outer {
-                        let mut joined_row = left_row.clone();
-                        for _ in 0..right_schema.columns.len() {
-                            joined_row.push(Value::Null);
-                        }
-                        new_rows.push(joined_row);
-                    }
-                }
-            }
-
-            schema = new_schema;
-            rows = new_rows;
+            (schema, rows) = self
+                .apply_join_step(
+                    schema,
+                    rows,
+                    &join.relation,
+                    Some(&join.join_operator),
+                    &mut pending_predicates,
+                    &None,
+                    txn,
+                    params,
+                    limit,
+                )
+                .await?;
+            (schema, rows) = self.apply_stage_join_projection(
+                schema,
+                rows,
+                projection,
+                &pending_predicates,
+                &join_column_refs,
+            )?;
         }
 
         for table in from.iter().skip(1) {
-            let (right_schema_base, right_rows) =
-                self.scan_table_base(&table.relation, txn).await?;
-            let mut right_schema = right_schema_base;
-            self.prefix_schema_columns(&mut right_schema, &table.relation)?;
+            (schema, rows) = self
+                .apply_join_step(
+                    schema,
+                    rows,
+                    &table.relation,
+                    None,
+                    &mut pending_predicates,
+                    &None,
+                    txn,
+                    params,
+                    limit,
+                )
+                .await?;
+            (schema, rows) = self.apply_stage_join_projection(
+                schema,
+                rows,
+                projection,
+                &pending_predicates,
+                &join_column_refs,
+            )?;
 
-            let mut new_columns = schema.columns.clone();
-            new_columns.extend(right_schema.columns.clone());
-            let new_schema = TableSchema::new("join_result".to_string(), new_columns);
-
-            let mut new_rows = Vec::with_capacity(rows.len() * right_rows.len());
-            for left_row in &rows {
-                for right_row in &right_rows {
-                    let mut joined_row = Vec::with_capacity(left_row.len() + right_row.len());
-                    joined_row.extend_from_slice(left_row);
-                    joined_row.extend_from_slice(right_row);
-                    new_rows.push(joined_row);
-                }
+            for join in &table.joins {
+                (schema, rows) = self
+                    .apply_join_step(
+                        schema,
+                        rows,
+                        &join.relation,
+                        Some(&join.join_operator),
+                        &mut pending_predicates,
+                        &None,
+                        txn,
+                        params,
+                        limit,
+                    )
+                    .await?;
+                (schema, rows) = self.apply_stage_join_projection(
+                    schema,
+                    rows,
+                    projection,
+                    &pending_predicates,
+                    &join_column_refs,
+                )?;
             }
-            schema = new_schema;
-            rows = new_rows;
         }
 
-        if let Some(expr) = selection {
-            let mut filtered_rows = Vec::new();
-            for row in rows {
-                if self.evaluate_expr(expr, &row, &schema, params)? {
-                    filtered_rows.push(row);
+        if !pending_predicates.is_empty() {
+            let remaining_selection = Self::combine_predicates(pending_predicates);
+            if let Some(expr) = &remaining_selection {
+                let mut filtered_rows = Vec::new();
+                for row in rows {
+                    if self.evaluate_expr(expr, &row, &schema, params)? {
+                        filtered_rows.push(row);
+                        if limit.is_some_and(|value| filtered_rows.len() >= value) {
+                            break;
+                        }
+                    }
                 }
+                rows = filtered_rows;
             }
-            rows = filtered_rows;
+        } else if let Some(value) = limit {
+            if rows.len() > value {
+                rows.truncate(value);
+            }
         }
 
-        Ok((schema, rows))
+        self.project_join_rows(schema, rows, projection)
     }
 
     #[allow(clippy::type_complexity)]
@@ -309,7 +1083,7 @@ impl Executor {
         params: &'a [Value],
         limit: Option<usize>,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<HashSet<String>>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Option<IndexScanPlan>>> + Send + 'a>,
     > {
         Box::pin(async move {
             match expr {
@@ -318,35 +1092,34 @@ impl Executor {
                     op: BinaryOperator::Eq,
                     right,
                 } => {
-                    let col_name = if let Expr::Identifier(ident) = left.as_ref() {
-                        Some(ident.value.clone())
-                    } else {
-                        None
-                    };
+                    if let Some((col_idx, storage_col_name)) =
+                        self.resolve_schema_column_name(left, schema)
+                    {
+                        if schema.columns[col_idx].is_indexed
+                            && schema.columns[col_idx].index_type == IndexType::BTree
+                        {
+                            let val = self
+                                .evaluate_value(right, &[], schema, params)
+                                .unwrap_or(Value::Null);
+                            if let Some(val_str) = self.value_to_index_string(&val) {
+                                let index_prefix = format!(
+                                    "index:{}:{}:{}:",
+                                    table_name, storage_col_name, val_str
+                                );
+                                let index_entries =
+                                    txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
 
-                    if let Some(col_name) = col_name {
-                        if let Some(col_idx) = schema.get_column_index(&col_name) {
-                            if schema.columns[col_idx].is_indexed
-                                && schema.columns[col_idx].index_type == IndexType::BTree
-                            {
-                                let val = self
-                                    .evaluate_value(right, &[], schema, params)
-                                    .unwrap_or(Value::Null);
-                                if let Some(val_str) = self.value_to_index_string(&val) {
-                                    let index_prefix =
-                                        format!("index:{}:{}:{}:", table_name, col_name, val_str);
-                                    let index_entries =
-                                                txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
-
-                                    let mut row_ids = HashSet::new();
-                                    for (k, _) in index_entries {
-                                        let parts: Vec<&str> =
-                                            std::str::from_utf8(&k).unwrap().split(':').collect();
-                                        let row_id = parts.last().unwrap();
-                                        row_ids.insert(row_id.to_string());
-                                    }
-                                    return Ok(Some(row_ids));
+                                let mut row_ids = HashSet::new();
+                                for (k, _) in index_entries {
+                                    let parts: Vec<&str> =
+                                        std::str::from_utf8(&k).unwrap().split(':').collect();
+                                    let row_id = parts.last().unwrap();
+                                    row_ids.insert(row_id.to_string());
                                 }
+                                return Ok(Some(IndexScanPlan {
+                                    row_ids,
+                                    exact: true,
+                                }));
                             }
                         }
                     }
@@ -389,8 +1162,9 @@ impl Executor {
                                                 "fts:{}:{}:{}:",
                                                 table_name, col_name, token
                                             );
-                                            let index_entries =
-                                                txn.scan_prefix(index_prefix.as_bytes(), None).await?;
+                                            let index_entries = txn
+                                                .scan_prefix(index_prefix.as_bytes(), None)
+                                                .await?;
 
                                             let mut current_token_row_ids = HashSet::new();
                                             for (k, _) in index_entries {
@@ -414,13 +1188,21 @@ impl Executor {
                                             }
 
                                             if candidate_row_ids.as_ref().unwrap().is_empty() {
-                                                return Ok(Some(HashSet::new()));
+                                                return Ok(Some(IndexScanPlan {
+                                                    row_ids: HashSet::new(),
+                                                    exact: false,
+                                                }));
                                             }
                                         }
                                         if let Some(res) = &candidate_row_ids {
                                             monitor::add_fts_hits(res.len() as u64);
                                         }
-                                        return Ok(candidate_row_ids);
+                                        return Ok(candidate_row_ids.map(|row_ids| {
+                                            IndexScanPlan {
+                                                row_ids,
+                                                exact: false,
+                                            }
+                                        }));
                                     }
                                 }
                             }
@@ -435,110 +1217,203 @@ impl Executor {
                     if *negated {
                         return Ok(None);
                     }
-                    
-                    if let Expr::Identifier(ident) = col_expr.as_ref() {
-                         if let Some(col_idx) = schema.get_column_index(&ident.value) {
-                             let col = &schema.columns[col_idx];
-                             if col.is_indexed {
-                                 let mut all_row_ids = HashSet::new();
-                                 for item in list {
-                                     let val = self.evaluate_value(item, &[], schema, params).unwrap_or(Value::Null);
-                                     
-                                     if col.is_primary {
-                                          let val_str = match &val {
-                                              Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(*i)),
-                                              Value::String(s) => Some(s.clone()),
-                                              _ => None,
-                                          };
-                                          if let Some(s) = val_str {
-                                              let key = format!("data:{}:{}", table_name, s);
-                                              if txn.get(key.as_bytes()).await?.is_some() {
-                                                  all_row_ids.insert(s);
-                                              }
-                                          }
-                                     } else if let Some(val_str) = self.value_to_index_string(&val) {
-                                           let index_prefix = format!("index:{}:{}:{}:", table_name, col.name, val_str);
-                                           let kv = txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
-                                           for (k, _) in kv {
-                                               let parts: Vec<&str> = std::str::from_utf8(&k).unwrap().split(':').collect();
-                                               if let Some(row_id) = parts.last() {
-                                                   all_row_ids.insert(row_id.to_string());
-                                               }
-                                           }
-                                     }
-                                 }
-                                 return Ok(Some(all_row_ids));
-                              }
-                         }
-                     }
+
+                    if let Some((col_idx, storage_col_name)) =
+                        self.resolve_schema_column_name(col_expr, schema)
+                    {
+                        let col = &schema.columns[col_idx];
+                        if col.is_indexed {
+                            let mut all_row_ids = HashSet::new();
+                            for item in list {
+                                let val = self
+                                    .evaluate_value(item, &[], schema, params)
+                                    .unwrap_or(Value::Null);
+
+                                if col.is_primary {
+                                    let val_str = match &val {
+                                        Value::Integer(i) => {
+                                            Some(crate::common::encoding::encode_i64_comparable(*i))
+                                        }
+                                        Value::String(s) => Some(s.clone()),
+                                        _ => None,
+                                    };
+                                    if let Some(s) = val_str {
+                                        let key = format!("data:{}:{}", table_name, s);
+                                        if txn.get(key.as_bytes()).await?.is_some() {
+                                            all_row_ids.insert(s);
+                                        }
+                                    }
+                                } else if let Some(val_str) = self.value_to_index_string(&val) {
+                                    let index_prefix = format!(
+                                        "index:{}:{}:{}:",
+                                        table_name, storage_col_name, val_str
+                                    );
+                                    let kv =
+                                        txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
+                                    for (k, _) in kv {
+                                        let parts: Vec<&str> =
+                                            std::str::from_utf8(&k).unwrap().split(':').collect();
+                                        if let Some(row_id) = parts.last() {
+                                            all_row_ids.insert(row_id.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(Some(IndexScanPlan {
+                                row_ids: all_row_ids,
+                                exact: true,
+                            }));
+                        }
+                    }
                 }
-                Expr::Like { expr, pattern, negated, .. } => {
-                      if *negated {
-                          return Ok(None);
-                      }
-                      // Check if it's a prefix scan: LIKE 'prefix%'
-                      if let (Expr::Identifier(ident), Expr::Value(val_with_span)) = (expr.as_ref(), pattern.as_ref()) {
-                           if let SqlValue::SingleQuotedString(pattern_str) = &val_with_span.value {
-                               if !pattern_str.starts_with('%') && !pattern_str.starts_with('_') {
-                                   let prefix: String = pattern_str.chars().take_while(|c| *c != '%' && *c != '_').collect();
-                                   
-                                   if !prefix.is_empty() {
-                                       if let Some(col_idx) = schema.get_column_index(&ident.value) {
-                                           let col = &schema.columns[col_idx];
-                                           if col.is_indexed {
-                                               let mut all_row_ids = HashSet::new();
-                                               
-                                               if col.is_primary {
-                                                   let key_prefix = format!("data:{}:{}", table_name, prefix);
-                                                   let kv = txn.scan_prefix(key_prefix.as_bytes(), limit).await?;
-                                                   for (k, _) in kv {
-                                                       let parts: Vec<&str> = std::str::from_utf8(&k).unwrap().split(':').collect();
-                                                       if let Some(row_id) = parts.last() {
-                                                           all_row_ids.insert(row_id.to_string());
-                                                       }
-                                                   }
-                                               } else {
-                                                   let index_prefix = format!("index:{}:{}:{}", table_name, col.name, prefix);
-                                                   let kv = txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
-                                                   for (k, _) in kv {
-                                                       let parts: Vec<&str> = std::str::from_utf8(&k).unwrap().split(':').collect();
-                                                       if let Some(row_id) = parts.last() {
-                                                            all_row_ids.insert(row_id.to_string());
-                                                       }
-                                                   }
-                                               }
-                                               
-                                               if !all_row_ids.is_empty() {
-                                                   return Ok(Some(all_row_ids));
-                                               }
-                                           }
-                                       }
-                                   }
-                               }
-                               
-                               // Trigram Index Fallback for wildcard LIKE
-                               if let Some(col_idx) = schema.get_column_index(&ident.value) {
-                                   let col = &schema.columns[col_idx];
-                                   if col.is_indexed {
-                                       if let Some(ftxn) = txn.as_any().downcast_ref::<crate::storage::fusion::FusionTransaction>() {
-                                           let storage = &ftxn.storage;
-                                           let idx_guard = storage.trigram_index.read().unwrap();
-                                           if let Some(ids) = idx_guard.search(table_name, &col.name, pattern_str) {
-                                               let row_keys = idx_guard.map_ids_to_row_keys(table_name, &ids);
-                                               if !row_keys.is_empty() {
-                                                   let mut set = HashSet::new();
-                                                   for s in row_keys {
-                                                       set.insert(s);
-                                                   }
-                                                   return Ok(Some(set));
-                                               }
-                                           }
-                                       }
-                                   }
-                               }
-                           }
-                      }
-                 }
+                Expr::Like {
+                    expr,
+                    pattern,
+                    negated,
+                    ..
+                } => {
+                    if *negated {
+                        return Ok(None);
+                    }
+                    // Check if it's a prefix scan: LIKE 'prefix%'
+                    if let (Some((col_idx, storage_col_name)), Expr::Value(val_with_span)) = (
+                        self.resolve_schema_column_name(expr, schema),
+                        pattern.as_ref(),
+                    ) {
+                        if let SqlValue::SingleQuotedString(pattern_str) = &val_with_span.value {
+                            if let Some(prefix) = Self::like_fixed_prefix(pattern_str) {
+                                let col = &schema.columns[col_idx];
+                                if col.is_indexed {
+                                    let mut all_row_ids = HashSet::new();
+
+                                    if col.is_primary {
+                                        let key_prefix = format!("data:{}:{}", table_name, prefix);
+                                        let kv =
+                                            txn.scan_prefix(key_prefix.as_bytes(), limit).await?;
+                                        for (k, _) in kv {
+                                            let parts: Vec<&str> = std::str::from_utf8(&k)
+                                                .unwrap()
+                                                .split(':')
+                                                .collect();
+                                            if let Some(row_id) = parts.last() {
+                                                all_row_ids.insert(row_id.to_string());
+                                            }
+                                        }
+                                    } else {
+                                        let index_prefix = format!(
+                                            "index:{}:{}:{}",
+                                            table_name, storage_col_name, prefix
+                                        );
+                                        let kv =
+                                            txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
+                                        for (k, _) in kv {
+                                            let parts: Vec<&str> = std::str::from_utf8(&k)
+                                                .unwrap()
+                                                .split(':')
+                                                .collect();
+                                            if let Some(row_id) = parts.last() {
+                                                all_row_ids.insert(row_id.to_string());
+                                            }
+                                        }
+                                    }
+
+                                    if !all_row_ids.is_empty() {
+                                        return Ok(Some(IndexScanPlan {
+                                            row_ids: all_row_ids,
+                                            exact: true,
+                                        }));
+                                    }
+                                }
+                            }
+
+                            // Trigram Index Fallback for wildcard LIKE
+                            let col = &schema.columns[col_idx];
+                            if col.is_indexed {
+                                if let Some(ftxn) =
+                                    txn.as_any()
+                                        .downcast_ref::<crate::storage::fusion::FusionTransaction>()
+                                {
+                                    let storage = &ftxn.storage;
+                                    let idx_guard = storage.trigram_index.read().unwrap();
+                                    if let Some(ids) =
+                                        idx_guard.search(table_name, &storage_col_name, pattern_str)
+                                    {
+                                        let row_keys =
+                                            idx_guard.map_ids_to_row_keys(table_name, &ids);
+                                        if !row_keys.is_empty() {
+                                            let mut set = HashSet::new();
+                                            for s in row_keys {
+                                                set.insert(s);
+                                            }
+                                            return Ok(Some(IndexScanPlan {
+                                                row_ids: set,
+                                                exact: false,
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Expr::Between {
+                    expr,
+                    low,
+                    high,
+                    negated,
+                } => {
+                    if *negated {
+                        return Ok(None);
+                    }
+                    if let Some((col_idx, _storage_col_name)) =
+                        self.resolve_schema_column_name(expr, schema)
+                    {
+                        let col = &schema.columns[col_idx];
+                        let low_val = self
+                            .evaluate_value(low, &[], schema, params)
+                            .unwrap_or(Value::Null);
+                        let high_val = self
+                            .evaluate_value(high, &[], schema, params)
+                            .unwrap_or(Value::Null);
+
+                        if col.is_primary {
+                            let low_encoded = match low_val {
+                                Value::Integer(i) => {
+                                    Some(crate::common::encoding::encode_i64_comparable(i))
+                                }
+                                Value::String(s) => Some(s),
+                                _ => None,
+                            };
+                            let high_encoded = match high_val {
+                                Value::Integer(i) => {
+                                    Some(crate::common::encoding::encode_i64_comparable(i))
+                                }
+                                Value::String(s) => Some(s),
+                                _ => None,
+                            };
+
+                            if let (Some(low_key), Some(high_key)) = (low_encoded, high_encoded) {
+                                let start = format!("data:{}:{}", table_name, low_key);
+                                let end = format!("data:{}:{}\u{0}", table_name, high_key);
+                                let kv = txn
+                                    .scan_range(start.as_bytes(), end.as_bytes(), limit)
+                                    .await?;
+                                let mut row_ids = HashSet::new();
+                                for (k, _) in kv {
+                                    let parts: Vec<&str> =
+                                        std::str::from_utf8(&k).unwrap().split(':').collect();
+                                    if let Some(row_id) = parts.last() {
+                                        row_ids.insert(row_id.to_string());
+                                    }
+                                }
+                                return Ok(Some(IndexScanPlan {
+                                    row_ids,
+                                    exact: true,
+                                }));
+                            }
+                        }
+                    }
+                }
                 Expr::BinaryOp {
                     left,
                     op: BinaryOperator::And,
@@ -554,9 +1429,17 @@ impl Executor {
                     match (left_res, right_res) {
                         (Some(l), Some(r)) => {
                             // AND: intersect both index results for tighter filtering
-                            return Ok(Some(l.intersection(&r).cloned().collect()));
+                            return Ok(Some(IndexScanPlan {
+                                row_ids: l.row_ids.intersection(&r.row_ids).cloned().collect(),
+                                exact: l.exact && r.exact,
+                            }));
                         }
-                        (Some(s), None) | (None, Some(s)) => return Ok(Some(s)),
+                        (Some(s), None) | (None, Some(s)) => {
+                            return Ok(Some(IndexScanPlan {
+                                row_ids: s.row_ids,
+                                exact: false,
+                            }))
+                        }
                         (None, None) => {}
                     }
                 }
@@ -574,7 +1457,10 @@ impl Executor {
 
                     // OR: both sides must have index results to be useful
                     if let (Some(l), Some(r)) = (left_res, right_res) {
-                        return Ok(Some(l.union(&r).cloned().collect()));
+                        return Ok(Some(IndexScanPlan {
+                            row_ids: l.row_ids.union(&r.row_ids).cloned().collect(),
+                            exact: l.exact && r.exact,
+                        }));
                     }
                 }
                 Expr::Nested(inner) => {
@@ -610,27 +1496,34 @@ impl Executor {
                     let view_sql = String::from_utf8(view_bytes)
                         .map_err(|e| FusionError::Execution(format!("View decode error: {}", e)))?;
                     let stmts = crate::parser::parse_sql(&view_sql)?;
-                    if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next() {
+                    if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next()
+                    {
                         let result = Box::pin(self.handle_query(&query, txn, params)).await?;
                         if let super::QueryResult::Select { columns, rows } = result {
                             use crate::catalog::{Column, IndexType};
-                            let cols: Vec<Column> = columns.iter().map(|c| Column {
-                                name: c.clone(),
-                                data_type: "TEXT".to_string(),
-                                is_primary: false,
-                                is_indexed: false,
-                                index_type: IndexType::None,
-                                default_value: None,
-                                is_nullable: true,
-                                is_unique: false,
-                                check_expr: None,
-                            }).collect();
+                            let cols: Vec<Column> = columns
+                                .iter()
+                                .map(|c| Column {
+                                    name: c.clone(),
+                                    data_type: "TEXT".to_string(),
+                                    is_primary: false,
+                                    is_indexed: false,
+                                    index_type: IndexType::None,
+                                    default_value: None,
+                                    is_nullable: true,
+                                    is_unique: false,
+                                    check_expr: None,
+                                })
+                                .collect();
                             let schema = TableSchema::new(table_name, cols);
                             return Ok((schema, rows));
                         }
                     }
                 }
-                return Err(FusionError::Execution(format!("Table {} not found", table_name)));
+                return Err(FusionError::Execution(format!(
+                    "Table {} not found",
+                    table_name
+                )));
             }
 
             let schema_bytes = schema_bytes_opt.unwrap();
@@ -653,7 +1546,11 @@ impl Executor {
                         indices.push(idx);
                     }
                 }
-                if indices.is_empty() { None } else { Some(indices) }
+                if indices.is_empty() {
+                    None
+                } else {
+                    Some(indices)
+                }
             } else {
                 None
             };
@@ -668,48 +1565,57 @@ impl Executor {
                 }
             }
             if pk_index.is_none() && !schema.columns.is_empty() {
-                 pk_index = Some(0);
+                pk_index = Some(0);
             }
 
             if let Some(pk_idx) = pk_index {
                 let projection_is_pk_only = if let Some(proj) = projection {
                     proj.iter().all(|name| {
-                        schema.get_column_index(name).map(|idx| idx == pk_idx).unwrap_or(false)
+                        self.resolve_column_index(name, &schema)
+                            .ok()
+                            .map(|idx| idx == pk_idx)
+                            .unwrap_or(false)
                     })
                 } else {
                     false
                 };
 
                 if projection_is_pk_only {
-                     let selection_is_pk_only = if let Some(sel) = selection {
-                         let mut cols = HashSet::new();
-                         self.extract_columns_from_expr(sel, &mut cols);
-                         cols.iter().all(|name| {
-                            schema.get_column_index(name).map(|idx| idx == pk_idx).unwrap_or(false)
-                         })
-                     } else {
+                    let selection_is_pk_only = if let Some(sel) = selection {
+                        let mut cols = HashSet::new();
+                        self.extract_columns_from_expr(sel, &mut cols);
+                        cols.iter().all(|name| {
+                            self.resolve_column_index(name, &schema)
+                                .ok()
+                                .map(|idx| idx == pk_idx)
+                                .unwrap_or(false)
+                        })
+                    } else {
                         true
-                     };
-                     
-                     if selection_is_pk_only {
-                         let order_by_is_pk_only = if let Some(ob) = order_by {
-                             let mut cols = HashSet::new();
-                             if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
-                                 for expr in exprs {
-                                     self.extract_columns_from_expr(&expr.expr, &mut cols);
-                                 }
-                             }
-                             cols.iter().all(|name| {
-                                schema.get_column_index(name).map(|idx| idx == pk_idx).unwrap_or(false)
-                             })
-                         } else {
-                            true
-                         };
+                    };
 
-                         if order_by_is_pk_only {
-                             key_only_scan = true;
-                         }
-                     }
+                    if selection_is_pk_only {
+                        let order_by_is_pk_only = if let Some(ob) = order_by {
+                            let mut cols = HashSet::new();
+                            if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+                                for expr in exprs {
+                                    self.extract_columns_from_expr(&expr.expr, &mut cols);
+                                }
+                            }
+                            cols.iter().all(|name| {
+                                self.resolve_column_index(name, &schema)
+                                    .ok()
+                                    .map(|idx| idx == pk_idx)
+                                    .unwrap_or(false)
+                            })
+                        } else {
+                            true
+                        };
+
+                        if order_by_is_pk_only {
+                            key_only_scan = true;
+                        }
+                    }
                 }
             }
 
@@ -717,18 +1623,17 @@ impl Executor {
             let effective_limit = if let Some(ob) = order_by {
                 let mut is_pk_asc = false;
                 if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
-                     if exprs.len() == 1 {
-                          let expr = &exprs[0];
-                          if expr.options.asc.unwrap_or(true) {
-                               if let Expr::Identifier(ident) = &expr.expr {
-                                    if let Some(idx) = schema.get_column_index(&ident.value) {
-                                         if schema.columns[idx].is_primary || idx == 0 {
-                                             is_pk_asc = true;
-                                         }
-                                    }
-                               }
-                          }
-                     }
+                    if exprs.len() == 1 {
+                        let expr = &exprs[0];
+                        if expr.options.asc.unwrap_or(true) {
+                            if self
+                                .resolve_schema_column_index(&expr.expr, &schema)
+                                .is_some_and(|idx| schema.columns[idx].is_primary || idx == 0)
+                            {
+                                is_pk_asc = true;
+                            }
+                        }
+                    }
                 }
                 if is_pk_asc {
                     limit
@@ -741,6 +1646,7 @@ impl Executor {
 
             let mut rows = Vec::new();
             let mut index_used = false;
+            let mut selection_fully_applied = selection.is_none();
 
             // Optimization: Vector Search (HNSW)
             if let Some(order_by) = order_by {
@@ -759,9 +1665,11 @@ impl Executor {
                                 } = sort_expr
                                 {
                                     if op_str == "<->" {
-                                        if let Expr::Identifier(ident) = left.as_ref() {
+                                        if let Some(col_name) =
+                                            Self::column_name_from_expr(left.as_ref())
+                                        {
                                             vector_search_args =
-                                                Some((ident.value.clone(), right.as_ref().clone()));
+                                                Some((col_name, right.as_ref().clone()));
                                         }
                                     }
                                 }
@@ -771,17 +1679,19 @@ impl Executor {
                                         if let FunctionArguments::List(args) = &func.args {
                                             if args.args.len() == 2 {
                                                 if let FunctionArg::Unnamed(
-                                                    FunctionArgExpr::Expr(Expr::Identifier(ident)),
+                                                    FunctionArgExpr::Expr(col_expr),
                                                 ) = &args.args[0]
                                                 {
                                                     if let FunctionArg::Unnamed(
                                                         FunctionArgExpr::Expr(val_expr),
                                                     ) = &args.args[1]
                                                     {
-                                                        vector_search_args = Some((
-                                                            ident.value.clone(),
-                                                            val_expr.clone(),
-                                                        ));
+                                                        if let Some(col_name) =
+                                                            Self::column_name_from_expr(col_expr)
+                                                        {
+                                                            vector_search_args =
+                                                                Some((col_name, val_expr.clone()));
+                                                        }
                                                     }
                                                 }
                                             }
@@ -839,11 +1749,9 @@ impl Executor {
                     right,
                 } = sel
                 {
-                    let is_pk = if let Expr::Identifier(ident) = left.as_ref() {
-                        self.resolve_column_index(&ident.value, &schema).ok() == Some(0)
-                    } else {
-                        false
-                    };
+                    let is_pk = pk_index.is_some_and(|pk_idx| {
+                        self.resolve_schema_column_index(left, &schema) == Some(pk_idx)
+                    });
 
                     if is_pk {
                         let val = self
@@ -862,7 +1770,10 @@ impl Executor {
 
                             if let Some(v) = txn.get(key.as_bytes()).await? {
                                 monitor::inc_row_read();
-                                let row: Vec<Value> = crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
+                                let row: Vec<Value> = crate::common::encoding::RowDecoder::decode(
+                                    &v,
+                                )
+                                .map_err(|e| {
                                     FusionError::Execution(format!(
                                         "Data deserialization error: {}",
                                         e
@@ -883,45 +1794,55 @@ impl Executor {
             if let Some(sel) = selection {
                 if !index_used {
                     if let Expr::BinaryOp { left, op, right } = sel {
-                        let is_pk = if let Expr::Identifier(ident) = left.as_ref() {
-                            self.resolve_column_index(&ident.value, &schema).ok() == Some(0)
-                        } else {
-                            false
-                        };
+                        let is_pk = pk_index.is_some_and(|pk_idx| {
+                            self.resolve_schema_column_index(left, &schema) == Some(pk_idx)
+                        });
 
                         if is_pk {
                             let val = self
                                 .evaluate_value(right, &[], &schema, params)
                                 .unwrap_or(Value::Null);
-                            
+
                             if let Value::Integer(limit_val) = val {
                                 let table_prefix = format!("data:{}:", table_name);
                                 let min_key = table_prefix.as_bytes().to_vec();
                                 let mut max_key = table_prefix.as_bytes().to_vec();
-                                max_key.push(0xFF); 
+                                max_key.push(0xFF);
 
                                 let (start_key, end_key) = match op {
                                     BinaryOperator::Gt => {
-                                        let encoded = crate::common::encoding::encode_i64_comparable(limit_val);
+                                        let encoded =
+                                            crate::common::encoding::encode_i64_comparable(
+                                                limit_val,
+                                            );
                                         let mut key = table_prefix.into_bytes();
                                         key.extend_from_slice(encoded.as_bytes());
                                         key.push(0x00);
                                         (Some(key), Some(max_key))
                                     }
                                     BinaryOperator::GtEq => {
-                                        let encoded = crate::common::encoding::encode_i64_comparable(limit_val);
+                                        let encoded =
+                                            crate::common::encoding::encode_i64_comparable(
+                                                limit_val,
+                                            );
                                         let mut key = table_prefix.into_bytes();
                                         key.extend_from_slice(encoded.as_bytes());
                                         (Some(key), Some(max_key))
                                     }
                                     BinaryOperator::Lt => {
-                                        let encoded = crate::common::encoding::encode_i64_comparable(limit_val);
+                                        let encoded =
+                                            crate::common::encoding::encode_i64_comparable(
+                                                limit_val,
+                                            );
                                         let mut key = table_prefix.into_bytes();
                                         key.extend_from_slice(encoded.as_bytes());
                                         (Some(min_key), Some(key))
                                     }
                                     BinaryOperator::LtEq => {
-                                        let encoded = crate::common::encoding::encode_i64_comparable(limit_val);
+                                        let encoded =
+                                            crate::common::encoding::encode_i64_comparable(
+                                                limit_val,
+                                            );
                                         let mut key = table_prefix.into_bytes();
                                         key.extend_from_slice(encoded.as_bytes());
                                         key.push(0x00);
@@ -932,6 +1853,7 @@ impl Executor {
 
                                 if let (Some(start), Some(end)) = (start_key, end_key) {
                                     index_used = true;
+                                    selection_fully_applied = true;
                                     let kv_pairs = txn.scan_range(&start, &end, limit).await?;
                                     for (k, v) in kv_pairs {
                                         let row = if key_only_scan {
@@ -940,9 +1862,12 @@ impl Executor {
                                             if let Some(pk_str) = k_str.strip_prefix(&prefix) {
                                                 let mut r = vec![Value::Null; schema.columns.len()];
                                                 if let Some(pk_idx) = pk_index {
-                                                    let is_int = matches!(schema.columns[pk_idx].data_type.as_str(), "INTEGER" | "BIGINT");
+                                                    let is_int = matches!(
+                                                        schema.columns[pk_idx].data_type.as_str(),
+                                                        "INTEGER" | "BIGINT"
+                                                    );
                                                     let pk_val = if is_int {
-                                                         if let Some(i) = crate::common::encoding::decode_i64_comparable(pk_str) {
+                                                        if let Some(i) = crate::common::encoding::decode_i64_comparable(pk_str) {
                                                              Value::Integer(i)
                                                          } else {
                                                              Value::String(pk_str.to_string())
@@ -958,22 +1883,29 @@ impl Executor {
                                             }
                                         } else {
                                             if let Some(indices) = &projection_indices {
-                                                crate::common::encoding::RowDecoder::decode_partial(&v, indices).map_err(|e| {
-                                                    FusionError::Execution(format!("Data partial deserialization error: {}", e))
+                                                crate::common::encoding::RowDecoder::decode_partial(
+                                                    &v, indices,
+                                                )
+                                                .map_err(|e| {
+                                                    FusionError::Execution(format!(
+                                                        "Data partial deserialization error: {}",
+                                                        e
+                                                    ))
                                                 })?
                                             } else {
-                                                crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
-                                                    FusionError::Execution(format!("Data deserialization error: {}", e))
-                                                })?
+                                                crate::common::encoding::RowDecoder::decode(&v)
+                                                    .map_err(|e| {
+                                                        FusionError::Execution(format!(
+                                                            "Data deserialization error: {}",
+                                                            e
+                                                        ))
+                                                    })?
                                             }
                                         };
-                                        let matches = self.evaluate_expr(sel, &row, &schema, params)?;
-                                        if matches {
-                                            rows.push(row);
-                                            if let Some(l) = limit {
-                                                if rows.len() >= l {
-                                                    break;
-                                                }
+                                        rows.push(row);
+                                        if let Some(l) = limit {
+                                            if rows.len() >= l {
+                                                break;
                                             }
                                         }
                                     }
@@ -987,93 +1919,103 @@ impl Executor {
             // Try Index Scan
             if !index_used {
                 if let Some(sel) = selection {
-                    if let Some(row_ids) = self
-                        .try_index_scan(sel, &table_name, &schema, txn, params, limit)
+                    let index_probe_limit =
+                        Self::index_candidate_cap(limit, order_by).saturating_add(1);
+                    if let Some(index_plan) = self
+                        .try_index_scan(
+                            sel,
+                            &table_name,
+                            &schema,
+                            txn,
+                            params,
+                            Some(index_probe_limit),
+                        )
                         .await?
                     {
-                        let mut row_ids_vec: Vec<String> = row_ids.into_iter().collect();
-                        
+                        let mut row_ids_vec: Vec<String> = index_plan.row_ids.into_iter().collect();
+                        row_ids_vec.sort_unstable();
+
                         if order_by.is_none() {
-                             if let Some(l) = limit {
-                                 if row_ids_vec.len() > l {
-                                     row_ids_vec.truncate(l);
-                                 }
-                             }
-                        }
-
-                        if row_ids_vec.len() <= 10000 {
-                            index_used = true;
-                        
-                            let txn_ref = &*txn;
-                        
-                        let table_name_for_stream = table_name.clone();
-                        let schema_cols = schema.columns.clone();
-                        let projection_indices_for_stream = projection_indices.clone();
-                        let executor_for_stream = self;
-
-                        let fetch_stream = futures::stream::iter(row_ids_vec)
-                            .map(|row_id| {
-                                let table_name = table_name_for_stream.clone();
-                                let schema_cols = schema_cols.clone();
-                                let projection_indices = projection_indices_for_stream.clone();
-                                let executor = executor_for_stream;
-                                
-                                async move {
-                                let data_key = format!("data:{}:{}", table_name, row_id);
-                                
-                                if let Some(row) = executor.row_cache.get(&data_key) {
-                                    return Ok::<_, FusionError>(Some((row_id, row, true)));
-                                }
-                                
-                                if key_only_scan {
-                                    let mut r = vec![Value::Null; schema_cols.len()];
-                                    if let Some(pk_idx) = pk_index {
-                                        let is_int = matches!(schema_cols[pk_idx].data_type.as_str(), "INTEGER" | "BIGINT");
-                                        let pk_val = if is_int {
-                                             if let Some(i) = crate::common::encoding::decode_i64_comparable(&row_id) {
-                                                 Value::Integer(i)
-                                             } else {
-                                                 Value::String(row_id.clone())
-                                             }
-                                        } else {
-                                            Value::String(row_id.clone())
-                                        };
-                                        r[pk_idx] = pk_val;
-                                    }
-                                    return Ok(Some((row_id, r, true)));
-                                }
-
-                                if let Some(data_bytes) = txn_ref.get(data_key.as_bytes()).await? {
-                                    let row: Vec<Value> = if let Some(indices) = &projection_indices {
-                                        crate::common::encoding::RowDecoder::decode_partial(&data_bytes, indices).map_err(|e| {
-                                            FusionError::Execution(format!("Data partial deserialization error: {}", e))
-                                        })?
-                                    } else {
-                                        crate::common::encoding::RowDecoder::decode(&data_bytes).map_err(|e| {
-                                            FusionError::Execution(format!("Data deserialization error: {}", e))
-                                        })?
-                                    };
-                                    Ok(Some((row_id, row, false)))
-                                } else {
-                                    Ok(None)
+                            if let Some(l) = limit {
+                                if row_ids_vec.len() > l {
+                                    row_ids_vec.truncate(l);
                                 }
                             }
-                            })
-                            .buffer_unordered(128);
+                        }
 
-                            let mut stream = fetch_stream;
-                        while let Some(res) = stream.next().await {
-                            let res = res?;
-                            if let Some((row_id, row, from_cache)) = res {
-                                if !from_cache {
-                                    monitor::inc_row_read();
+                        if Self::should_use_index_plan(row_ids_vec.len(), limit, order_by) {
+                            index_used = true;
+                            selection_fully_applied = index_plan.exact;
+
+                            if row_ids_vec.len() <= SMALL_INDEX_FETCH_THRESHOLD {
+                                for row_id in row_ids_vec {
                                     let data_key = format!("data:{}:{}", table_name, row_id);
-                                    self.row_cache.insert(data_key, row.clone());
-                                } else {
-                                    monitor::inc_row_cache_hit();
-                                }
 
-                                if self.evaluate_expr(sel, &row, &schema, params)? {
+                                    let row = if let Some(row) = self.row_cache.get(&data_key) {
+                                        monitor::inc_row_cache_hit();
+                                        row
+                                    } else if key_only_scan {
+                                        let mut r = vec![Value::Null; schema.columns.len()];
+                                        if let Some(pk_idx) = pk_index {
+                                            let is_int = matches!(
+                                                schema.columns[pk_idx].data_type.as_str(),
+                                                "INTEGER" | "BIGINT"
+                                            );
+                                            let pk_val = if is_int {
+                                                if let Some(i) =
+                                                    crate::common::encoding::decode_i64_comparable(
+                                                        &row_id,
+                                                    )
+                                                {
+                                                    Value::Integer(i)
+                                                } else {
+                                                    Value::String(row_id.clone())
+                                                }
+                                            } else {
+                                                Value::String(row_id.clone())
+                                            };
+                                            r[pk_idx] = pk_val;
+                                        }
+                                        r
+                                    } else if let Some(data_bytes) =
+                                        txn.get(data_key.as_bytes()).await?
+                                    {
+                                        monitor::inc_row_read();
+                                        let row: Vec<Value> =
+                                            if let Some(indices) = &projection_indices {
+                                                crate::common::encoding::RowDecoder::decode_partial(
+                                                    &data_bytes,
+                                                    indices,
+                                                )
+                                                .map_err(|e| {
+                                                    FusionError::Execution(format!(
+                                                        "Data partial deserialization error: {}",
+                                                        e
+                                                    ))
+                                                })?
+                                            } else {
+                                                crate::common::encoding::RowDecoder::decode(
+                                                    &data_bytes,
+                                                )
+                                                .map_err(|e| {
+                                                    FusionError::Execution(format!(
+                                                        "Data deserialization error: {}",
+                                                        e
+                                                    ))
+                                                })?
+                                            };
+                                        self.row_cache.insert(data_key, row.clone());
+                                        row
+                                    } else {
+                                        continue;
+                                    };
+
+                                    if !index_plan.exact
+                                        && !self.evaluate_expr(sel, &row, &schema, params)?
+                                    {
+                                        continue;
+                                    }
+
                                     rows.push(row);
                                     if let Some(l) = limit {
                                         if rows.len() >= l {
@@ -1081,8 +2023,92 @@ impl Executor {
                                         }
                                     }
                                 }
+                            } else {
+                                let txn_ref = &*txn;
+
+                                let table_name_for_stream = table_name.clone();
+                                let schema_cols = schema.columns.clone();
+                                let projection_indices_for_stream = projection_indices.clone();
+                                let executor_for_stream = self;
+
+                                let fetch_stream = futures::stream::iter(row_ids_vec)
+                                    .map(|row_id| {
+                                        let table_name = table_name_for_stream.clone();
+                                        let schema_cols = schema_cols.clone();
+                                        let projection_indices = projection_indices_for_stream.clone();
+                                        let executor = executor_for_stream;
+
+                                        async move {
+                                        let data_key = format!("data:{}:{}", table_name, row_id);
+
+                                        if let Some(row) = executor.row_cache.get(&data_key) {
+                                            return Ok::<_, FusionError>(Some((row_id, row, true)));
+                                        }
+
+                                        if key_only_scan {
+                                            let mut r = vec![Value::Null; schema_cols.len()];
+                                            if let Some(pk_idx) = pk_index {
+                                                let is_int = matches!(schema_cols[pk_idx].data_type.as_str(), "INTEGER" | "BIGINT");
+                                                let pk_val = if is_int {
+                                                     if let Some(i) = crate::common::encoding::decode_i64_comparable(&row_id) {
+                                                         Value::Integer(i)
+                                                     } else {
+                                                         Value::String(row_id.clone())
+                                                     }
+                                                } else {
+                                                    Value::String(row_id.clone())
+                                                };
+                                                r[pk_idx] = pk_val;
+                                            }
+                                            return Ok(Some((row_id, r, true)));
+                                        }
+
+                                        if let Some(data_bytes) = txn_ref.get(data_key.as_bytes()).await? {
+                                            let row: Vec<Value> = if let Some(indices) = &projection_indices {
+                                                crate::common::encoding::RowDecoder::decode_partial(&data_bytes, indices).map_err(|e| {
+                                                    FusionError::Execution(format!("Data partial deserialization error: {}", e))
+                                                })?
+                                            } else {
+                                                crate::common::encoding::RowDecoder::decode(&data_bytes).map_err(|e| {
+                                                    FusionError::Execution(format!("Data deserialization error: {}", e))
+                                                })?
+                                            };
+                                            Ok(Some((row_id, row, false)))
+                                        } else {
+                                            Ok(None)
+                                        }
+                                    }
+                                    })
+                                    .buffer_unordered(128);
+
+                                let mut stream = fetch_stream;
+                                while let Some(res) = stream.next().await {
+                                    let res = res?;
+                                    if let Some((row_id, row, from_cache)) = res {
+                                        if !from_cache {
+                                            monitor::inc_row_read();
+                                            let data_key =
+                                                format!("data:{}:{}", table_name, row_id);
+                                            self.row_cache.insert(data_key, row.clone());
+                                        } else {
+                                            monitor::inc_row_cache_hit();
+                                        }
+
+                                        if !index_plan.exact
+                                            && !self.evaluate_expr(sel, &row, &schema, params)?
+                                        {
+                                            continue;
+                                        }
+
+                                        rows.push(row);
+                                        if let Some(l) = limit {
+                                            if rows.len() >= l {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
                         }
                     }
                 }
@@ -1092,38 +2118,43 @@ impl Executor {
             if !index_used {
                 let prefix_str = format!("data:{}:", table_name);
                 let prefix = prefix_str.as_bytes().to_vec();
-                
+
                 let scan_limit = if selection.is_none() {
                     effective_limit
                 } else {
                     None
                 };
-                
+
                 let kv_pairs = txn.scan_prefix(&prefix, scan_limit).await?;
-                
+
                 for (k, v) in kv_pairs {
                     let row_res = if key_only_scan {
-                         let k_str = String::from_utf8_lossy(&k);
-                         let prefix_str = String::from_utf8_lossy(&prefix);
-                         if let Some(pk_str) = k_str.strip_prefix(prefix_str.as_ref()) {
-                             let mut r = vec![Value::Null; schema.columns.len()];
-                             if let Some(pk_idx) = pk_index {
-                                 let is_int = matches!(schema.columns[pk_idx].data_type.as_str(), "INTEGER" | "BIGINT");
-                                 let pk_val = if is_int {
-                                      if let Some(i) = crate::common::encoding::decode_i64_comparable(pk_str) {
-                                          Value::Integer(i)
-                                      } else {
-                                          Value::String(pk_str.to_string())
-                                          }
-                                 } else {
-                                     Value::String(pk_str.to_string())
-                                 };
-                                 r[pk_idx] = pk_val;
-                             }
-                             Some(r)
-                         } else {
-                             None
-                         }
+                        let k_str = String::from_utf8_lossy(&k);
+                        let prefix_str = String::from_utf8_lossy(&prefix);
+                        if let Some(pk_str) = k_str.strip_prefix(prefix_str.as_ref()) {
+                            let mut r = vec![Value::Null; schema.columns.len()];
+                            if let Some(pk_idx) = pk_index {
+                                let is_int = matches!(
+                                    schema.columns[pk_idx].data_type.as_str(),
+                                    "INTEGER" | "BIGINT"
+                                );
+                                let pk_val = if is_int {
+                                    if let Some(i) =
+                                        crate::common::encoding::decode_i64_comparable(pk_str)
+                                    {
+                                        Value::Integer(i)
+                                    } else {
+                                        Value::String(pk_str.to_string())
+                                    }
+                                } else {
+                                    Value::String(pk_str.to_string())
+                                };
+                                r[pk_idx] = pk_val;
+                            }
+                            Some(r)
+                        } else {
+                            None
+                        }
                     } else {
                         if let Some(indices) = &projection_indices {
                             crate::common::encoding::RowDecoder::decode_partial(&v, indices).ok()
@@ -1133,24 +2164,27 @@ impl Executor {
                     };
 
                     if let Some(row) = row_res {
-                         if let Some(sel) = &selection {
-                             if self.evaluate_expr(sel, &row, &schema, params)? {
-                                 rows.push(row);
-                                 if let Some(l) = limit {
-                                     if rows.len() >= l { break; }
-                                 }
-                             }
-                         } else {
-                             rows.push(row);
-                             if let Some(l) = limit {
-                                 if rows.len() >= l { break; }
-                             }
-                         }
+                        if let Some(sel) = &selection {
+                            if self.evaluate_expr(sel, &row, &schema, params)? {
+                                rows.push(row);
+                                if let Some(l) = limit {
+                                    if rows.len() >= l {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            rows.push(row);
+                            if let Some(l) = limit {
+                                if rows.len() >= l {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
-
             } else if let Some(sel) = selection {
-                if rows.len() > 1000 {
+                if !selection_fully_applied && rows.len() > 1000 {
                     let filtered_rows = self.parallel_filter_rows(rows, sel, &schema, params);
                     rows = filtered_rows;
                     if let Some(l) = limit {
@@ -1158,7 +2192,7 @@ impl Executor {
                             rows.truncate(l);
                         }
                     }
-                } else {
+                } else if !selection_fully_applied {
                     let mut filtered_rows = Vec::new();
                     for row in rows {
                         if self.evaluate_expr(sel, &row, &schema, params)? {
