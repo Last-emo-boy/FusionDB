@@ -202,6 +202,77 @@ async fn test_full_table_scan_reuses_row_cache() {
 }
 
 #[tokio::test]
+async fn test_full_table_projection_reuses_full_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE full_project_cache (id INTEGER PRIMARY KEY, name TEXT, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO full_project_cache VALUES (1, 'Alice', 'a'), (2, 'Bob', 'b')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM full_project_cache").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::String("Alice".to_string()),
+                Value::String("a".to_string())
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("Bob".to_string()),
+                Value::String("b".to_string())
+            ]
+        ]
+    );
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, name, payload) in [(1_i64, "Alice", "a"), (2_i64, "Bob", "b")] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(name.to_string()),
+                Value::String(payload.to_string()),
+            ]);
+            let corrupt_col_idx = 1usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+
+            let key = format!(
+                "data:full_project_cache:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(&executor, "SELECT name FROM full_project_cache").await;
+    assert_eq!(cols, vec!["name"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("Alice".to_string())],
+            vec![Value::String("Bob".to_string())]
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_insert_overwrite_invalidates_full_scan_row_cache() {
     let (executor, wal) = setup().await;
     exec_ok(

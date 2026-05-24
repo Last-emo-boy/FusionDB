@@ -1,0 +1,31 @@
+{
+  "task_id": "TASK-042",
+  "status": "passed",
+  "verified_at": "2026-05-25T06:45:57.3332296+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_full_table_projection_reuses_full_row_cache -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_full_table_scan_reuses_row_cache -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_index_projection_does_not_poison_row_cache -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ],
+  "constraints": [
+    "Only database core was changed.",
+    "dashboard/ was not modified."
+  ]
+}

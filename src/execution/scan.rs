@@ -2343,23 +2343,30 @@ impl Executor {
                         }
                     } else if zero_column_projection {
                         Some(Vec::new())
-                    } else if projection_indices.is_none() {
+                    } else {
                         match std::str::from_utf8(&k) {
                             Ok(key_str) => {
                                 if let Some(row) = self.row_cache.get(key_str) {
                                     monitor::inc_row_cache_hit();
                                     Some(row)
-                                } else {
+                                } else if projection_indices.is_none() {
                                     Self::decode_row_for_projection(&v, None).ok().map(|row| {
                                         self.row_cache.insert(key_str.to_string(), row.clone());
                                         row
                                     })
+                                } else {
+                                    Self::decode_row_for_projection(
+                                        &v,
+                                        projection_indices.as_deref(),
+                                    )
+                                    .ok()
                                 }
                             }
-                            Err(_) => Self::decode_row_for_projection(&v, None).ok(),
+                            Err(_) => {
+                                Self::decode_row_for_projection(&v, projection_indices.as_deref())
+                                    .ok()
+                            }
                         }
-                    } else {
-                        Self::decode_row_for_projection(&v, projection_indices.as_deref()).ok()
                     };
 
                     if let Some(row) = row_res {

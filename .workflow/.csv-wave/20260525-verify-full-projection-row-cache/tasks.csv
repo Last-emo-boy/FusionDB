@@ -1,0 +1,6 @@
+id,verification,status
+TASK-042,"cargo fmt --check",passed
+TASK-042,"cargo test --test sql_integration test_full_table_projection_reuses_full_row_cache -- --nocapture",passed
+TASK-042,"cargo test --test sql_integration test_full_table_scan_reuses_row_cache -- --nocapture",passed
+TASK-042,"cargo test --test sql_integration test_index_projection_does_not_poison_row_cache -- --nocapture",passed
+TASK-042,"cargo check --lib",passed

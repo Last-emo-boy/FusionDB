@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-042,"Reuse full row cache for full-scan projection queries","src/execution/scan.rs;tests/sql_integration.rs",completed

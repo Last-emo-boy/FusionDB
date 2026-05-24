@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-042,completed,"Full-scan projection queries now reuse cached full rows before falling back to storage partial decode.",".workflow/.csv-wave/20260525-execute-full-projection-row-cache/tasks.csv",
