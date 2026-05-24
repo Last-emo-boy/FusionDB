@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-043,completed,"CREATE INDEX backfill now reuses cached full rows before falling back to decode_column.",".workflow/.csv-wave/20260525-execute-create-index-row-cache/tasks.csv",

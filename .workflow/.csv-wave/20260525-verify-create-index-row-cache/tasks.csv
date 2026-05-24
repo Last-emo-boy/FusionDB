@@ -1,0 +1,6 @@
+id,verification,status
+TASK-043,"cargo fmt --check",passed
+TASK-043,"cargo test --test sql_integration test_create_index_reuses_row_cache_for_backfill -- --nocapture",passed
+TASK-043,"cargo test --test sql_integration test_create_btree_index -- --nocapture",passed
+TASK-043,"cargo test --test sql_integration test_index_projection_does_not_poison_row_cache -- --nocapture",passed
+TASK-043,"cargo check --lib",passed

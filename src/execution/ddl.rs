@@ -1,5 +1,6 @@
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
+use crate::monitor;
 use crate::storage::Transaction;
 use sqlparser::ast::{BinaryOperator, ColumnOption, Expr, SetExpr, Statement, TableFactor};
 use std::collections::HashSet;
@@ -438,13 +439,21 @@ impl Executor {
 
         let mut count = 0;
         for (k, v) in kv_pairs {
-            let parts: Vec<&str> = std::str::from_utf8(&k).unwrap().split(':').collect();
-            let row_id = parts.last().unwrap();
+            let key_str = std::str::from_utf8(&k)
+                .map_err(|e| FusionError::Execution(format!("Data key decode error: {}", e)))?;
+            let row_id = key_str
+                .rsplit(':')
+                .next()
+                .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?;
 
-            let val =
+            let val = if let Some(row) = self.row_cache.get(key_str) {
+                monitor::inc_row_cache_hit();
+                row.get(col_idx).cloned()
+            } else {
                 crate::common::encoding::RowDecoder::decode_column(&v, col_idx).map_err(|e| {
                     FusionError::Execution(format!("Data deserialization error: {}", e))
-                })?;
+                })?
+            };
             let Some(val) = val else {
                 continue;
             };

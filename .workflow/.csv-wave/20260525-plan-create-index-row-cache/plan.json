@@ -1,0 +1,37 @@
+{
+  "task_id": "TASK-043",
+  "title": "Reuse row cache during CREATE INDEX backfill",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/ddl.rs",
+    "tests/sql_integration.rs"
+  ],
+  "exclusions": [
+    "dashboard/"
+  ],
+  "hypothesis": "CREATE INDEX backfill can reuse already cached full rows for indexed column values instead of decoding the indexed column from row bytes again.",
+  "waves": [
+    {
+      "wave": 1,
+      "skill": "maestro-plan",
+      "status": "completed"
+    },
+    {
+      "wave": 2,
+      "skill": "maestro-execute",
+      "status": "completed"
+    },
+    {
+      "wave": 3,
+      "skill": "maestro-verify",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_create_index_reuses_row_cache_for_backfill -- --nocapture",
+    "cargo test --test sql_integration test_create_btree_index -- --nocapture",
+    "cargo test --test sql_integration test_index_projection_does_not_poison_row_cache -- --nocapture",
+    "cargo check --lib"
+  ]
+}

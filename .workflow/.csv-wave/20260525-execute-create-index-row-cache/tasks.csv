@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-043,"Use cached full rows before decode_column during CREATE INDEX backfill",completed,"src/execution/ddl.rs;tests/sql_integration.rs"

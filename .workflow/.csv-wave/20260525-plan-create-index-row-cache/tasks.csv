@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-043,"Reuse row cache during CREATE INDEX backfill","src/execution/ddl.rs;tests/sql_integration.rs",completed

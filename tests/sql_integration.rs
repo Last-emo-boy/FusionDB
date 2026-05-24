@@ -1599,6 +1599,89 @@ async fn test_create_btree_index() {
 }
 
 #[tokio::test]
+async fn test_create_index_reuses_row_cache_for_backfill() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE index_backfill_cache (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO index_backfill_cache VALUES (1, 'Alice', 30), (2, 'Bob', 42)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM index_backfill_cache").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::String("Alice".to_string()),
+                Value::Integer(30)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("Bob".to_string()),
+                Value::Integer(42)
+            ]
+        ]
+    );
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, name, age) in [(1_i64, "Alice", 30_i64), (2_i64, "Bob", 42_i64)] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(name.to_string()),
+                Value::Integer(age),
+            ]);
+            let corrupt_col_idx = 1usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+
+            let key = format!(
+                "data:index_backfill_cache:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let msg = exec_ok(
+        &executor,
+        "CREATE INDEX idx_index_backfill_cache_name ON index_backfill_cache (name)",
+    )
+    .await;
+    assert!(msg.contains("indexed 2 rows"));
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT * FROM index_backfill_cache WHERE name = 'Bob'",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "name", "age"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::String("Bob".to_string()),
+            Value::Integer(42)
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_index_projection_does_not_poison_row_cache() {
     let (executor, wal) = setup().await;
     exec_ok(
