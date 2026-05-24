@@ -93,6 +93,38 @@ async fn test_drop_table() {
 }
 
 #[tokio::test]
+async fn test_drop_table_invalidates_row_cache() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE drop_cache_stale (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO drop_cache_stale VALUES (1, 'Alice')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM drop_cache_stale WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+    );
+
+    exec_ok(&executor, "DROP TABLE drop_cache_stale").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE drop_cache_stale (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM drop_cache_stale WHERE id = 1").await;
+    assert_eq!(rows.len(), 0);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_drop_table_if_exists() {
     let (executor, wal) = setup().await;
     let msg = exec_ok(&executor, "DROP TABLE IF EXISTS nonexistent").await;
@@ -2838,6 +2870,40 @@ async fn test_truncate_table() {
     exec_ok(&executor, "INSERT INTO trunc_test VALUES (10, 'new')").await;
     let (_, rows) = query(&executor, "SELECT * FROM trunc_test").await;
     assert_eq!(rows.len(), 1);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_truncate_table_invalidates_row_cache() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE trunc_cache_stale (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO trunc_cache_stale VALUES (1, 'Alice')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_cache_stale WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+    );
+
+    exec_ok(&executor, "TRUNCATE TABLE trunc_cache_stale").await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_cache_stale WHERE id = 1").await;
+    assert_eq!(rows.len(), 0);
+
+    exec_ok(&executor, "INSERT INTO trunc_cache_stale VALUES (1, 'Bob')").await;
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_cache_stale WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Bob".to_string())]]
+    );
     cleanup(&wal);
 }
 

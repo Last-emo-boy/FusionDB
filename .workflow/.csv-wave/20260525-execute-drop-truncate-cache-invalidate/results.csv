@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-047,completed,"DROP TABLE and TRUNCATE now invalidate row_cache entries for deleted data keys.",".workflow/.csv-wave/20260525-execute-drop-truncate-cache-invalidate/tasks.csv",

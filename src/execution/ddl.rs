@@ -619,6 +619,9 @@ impl Executor {
             let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
             for (k, _) in kv_pairs {
                 txn.delete(&k).await?;
+                if let Ok(key_str) = std::str::from_utf8(&k) {
+                    self.row_cache.invalidate(key_str);
+                }
             }
 
             let index_prefix = format!("index:{}:", table_name);
@@ -713,6 +716,9 @@ impl Executor {
             let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
             for (k, _) in &kv_pairs {
                 txn.delete(k).await?;
+                if let Ok(key_str) = std::str::from_utf8(k) {
+                    self.row_cache.invalidate(key_str);
+                }
             }
             count += kv_pairs.len();
 

@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-047,"Verify DROP TABLE and TRUNCATE do not leave stale row_cache entries",completed,"src/execution/ddl.rs;tests/sql_integration.rs"

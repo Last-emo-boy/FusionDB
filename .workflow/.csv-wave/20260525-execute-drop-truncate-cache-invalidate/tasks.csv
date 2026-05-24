@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-047,"Invalidate row_cache entries when DROP TABLE and TRUNCATE delete data keys",completed,"src/execution/ddl.rs;tests/sql_integration.rs"
