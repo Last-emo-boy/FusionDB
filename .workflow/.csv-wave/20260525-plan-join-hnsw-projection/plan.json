@@ -1,0 +1,55 @@
+{
+  "session_id": "20260525-plan-join-hnsw-projection",
+  "phase": "database-core-performance",
+  "goal": "Avoid unnecessary full-row decoding in join base scans and HNSW projected result fetches.",
+  "scope": {
+    "include": [
+      "src/execution/scan.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-019"
+      ]
+    },
+    {
+      "wave": 2,
+      "tasks": [
+        "TASK-020"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-019",
+      "title": "Join first relation projection decode",
+      "files": [
+        "src/execution/scan.rs"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TASK-020",
+      "title": "HNSW projected row decode",
+      "files": [
+        "src/execution/scan.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_hnsw_order_by_projection -- --nocapture",
+    "cargo test --test sql_integration test_join_projection_pushdown_with_group_by -- --nocapture",
+    "cargo test --test sql_integration test_inner_join_with_left_filter_and_indexed_right_probe -- --nocapture",
+    "cargo test --test sql_integration test_inner_join_multi_key_uses_indexed_probe_column -- --nocapture",
+    "cargo check --lib"
+  ]
+}

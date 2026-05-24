@@ -1,0 +1,16 @@
+{
+  "id": "TASK-019",
+  "title": "Join first relation projection decode",
+  "status": "completed",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "summary": "Added a join base scan helper that derives stage projection from final projection, pending predicates, and join key references, then scans the first join input with projection-aware decoding.",
+  "risk": "Limited to first join input to avoid changing indexed join probe row-width expectations.",
+  "verification": [
+    "cargo test --test sql_integration test_join_projection_pushdown_with_group_by -- --nocapture",
+    "cargo test --test sql_integration test_inner_join_with_left_filter_and_indexed_right_probe -- --nocapture",
+    "cargo test --test sql_integration test_inner_join_multi_key_uses_indexed_probe_column -- --nocapture"
+  ]
+}

@@ -90,6 +90,70 @@ impl Executor {
         }
     }
 
+    async fn scan_join_base(
+        &self,
+        relation: &TableFactor,
+        projection: &Option<Vec<String>>,
+        pending_predicates: &[Expr],
+        join_column_refs: &HashSet<String>,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+        if projection.is_none() {
+            return self.scan_table_base(relation, txn).await;
+        }
+
+        let TableFactor::Table { name, .. } = relation else {
+            return self.scan_table_base(relation, txn).await;
+        };
+
+        let table_name = name.to_string();
+        let schema_key = format!("schema:{}", table_name);
+        let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
+            return self.scan_table_base(relation, txn).await;
+        };
+
+        let schema: TableSchema = bincode::deserialize(&schema_bytes)
+            .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
+
+        let mut prefixed_schema = schema.clone();
+        self.prefix_schema_columns(&mut prefixed_schema, relation)?;
+        let stage_projection = self.build_stage_join_projection(
+            &prefixed_schema,
+            projection,
+            pending_predicates,
+            join_column_refs,
+        );
+
+        let Some(stage_projection) = stage_projection else {
+            return self.scan_table_base(relation, txn).await;
+        };
+
+        let base_projection: Vec<String> = stage_projection
+            .iter()
+            .filter_map(|column| {
+                self.resolve_column_index(column, &schema)
+                    .ok()
+                    .map(|index| schema.columns[index].name.clone())
+            })
+            .collect();
+
+        if base_projection.is_empty() || base_projection.len() >= schema.columns.len() {
+            return self.scan_table_base(relation, txn).await;
+        }
+
+        self.scan_single_table(
+            relation,
+            &None,
+            &Some(base_projection),
+            txn,
+            params,
+            None,
+            None,
+        )
+        .await
+    }
+
     pub(crate) fn relation_names(&self, relation: &TableFactor) -> HashSet<String> {
         let mut names = HashSet::new();
         if let TableFactor::Table { name, alias, .. } = relation {
@@ -1011,7 +1075,15 @@ impl Executor {
             )
             .await?
         } else {
-            self.scan_table_base(&first.relation, txn).await?
+            self.scan_join_base(
+                &first.relation,
+                projection,
+                &pending_predicates,
+                &join_column_refs,
+                txn,
+                params,
+            )
+            .await?
         };
 
         self.prefix_schema_columns(&mut schema, &first.relation)?;
@@ -1739,8 +1811,9 @@ impl Executor {
                                 }
 
                                 if let Some((col_name, query_expr)) = vector_search_args {
-                                    if let Some(idx) = schema.get_column_index(&col_name) {
+                                    if let Ok(idx) = self.resolve_column_index(&col_name, &schema) {
                                         if schema.columns[idx].index_type == IndexType::HNSW {
+                                            let storage_col_name = schema.columns[idx].name.clone();
                                             let query_val = self.evaluate_value(
                                                 &query_expr,
                                                 &[],
@@ -1748,8 +1821,10 @@ impl Executor {
                                                 params,
                                             )?;
                                             if let Value::Vector(query_vec) = query_val {
-                                                let idx_name =
-                                                    format!("hnsw_{}_{}", table_name, col_name);
+                                                let idx_name = format!(
+                                                    "hnsw_{}_{}",
+                                                    table_name, storage_col_name
+                                                );
                                                 let search_results = self
                                                     .vector_index
                                                     .search(&idx_name, &query_vec, l)?;
@@ -1762,9 +1837,15 @@ impl Executor {
                                                         txn.get(key.as_bytes()).await?
                                                     {
                                                         if let Ok(row) =
-                                                            crate::common::encoding::RowDecoder::decode(&data)
+                                                            Self::decode_row_for_projection(
+                                                                &data,
+                                                                projection_indices.as_deref(),
+                                                            )
                                                         {
-                                                            self.row_cache.insert(key, row.clone());
+                                                            if projection_indices.is_none() {
+                                                                self.row_cache
+                                                                    .insert(key, row.clone());
+                                                            }
                                                             rows.push(row);
                                                         }
                                                     }

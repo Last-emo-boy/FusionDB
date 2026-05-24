@@ -1,0 +1,3 @@
+id,status,summary,artifacts,error
+TASK-019,completed,"Join first relation base scan now uses projection-aware decode when safe.","src/execution/scan.rs",""
+TASK-020,completed,"HNSW top-k fetch path now uses projection-aware decode and has integration coverage.","src/execution/scan.rs;tests/sql_integration.rs",""

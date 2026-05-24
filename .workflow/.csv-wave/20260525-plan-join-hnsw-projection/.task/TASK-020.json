@@ -1,0 +1,15 @@
+{
+  "id": "TASK-020",
+  "title": "HNSW projected row decode",
+  "status": "completed",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "summary": "Changed HNSW top-k row fetches to use projection-aware decoding and only cache rows when the fetch decoded a full row.",
+  "risk": "ORDER BY columns remain included by the existing query projection hint, so vector distance sorting still has the embedding column available.",
+  "verification": [
+    "cargo test --test sql_integration test_hnsw_order_by_projection -- --nocapture"
+  ]
+}

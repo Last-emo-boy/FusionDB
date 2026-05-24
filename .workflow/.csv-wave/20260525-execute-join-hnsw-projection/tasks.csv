@@ -1,0 +1,3 @@
+id,title,wave,status,files,summary,error
+TASK-019,Join first relation projection decode,1,completed,"src/execution/scan.rs","First join input can partial-decode required stage columns while keeping schema shape.", ""
+TASK-020,HNSW projected row decode,2,completed,"src/execution/scan.rs;tests/sql_integration.rs","HNSW row fetches now honor projection decoding and avoid partial row cache writes.", ""

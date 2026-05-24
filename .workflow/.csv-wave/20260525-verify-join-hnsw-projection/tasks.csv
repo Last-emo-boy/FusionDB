@@ -1,0 +1,7 @@
+id,command,status,notes
+V1,cargo fmt --check,passed,"formatting clean"
+V2,cargo test --test sql_integration test_hnsw_order_by_projection -- --nocapture,passed,"covers HNSW projection-aware row fetch"
+V3,cargo test --test sql_integration test_join_projection_pushdown_with_group_by -- --nocapture,passed,"covers join projection and aggregate flow"
+V4,cargo test --test sql_integration test_inner_join_with_left_filter_and_indexed_right_probe -- --nocapture,passed,"covers indexed join probe regression"
+V5,cargo test --test sql_integration test_inner_join_multi_key_uses_indexed_probe_column -- --nocapture,passed,"covers multi-key indexed join regression"
+V6,cargo check --lib,passed,"library type check clean"

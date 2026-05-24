@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,Join base decode exploration,Inspect join scanning and stage projection ordering,performance,,,1,completed,"First join input can use stage projection to partial decode required columns while preserving schema shape.",
+E2,HNSW decode exploration,Inspect HNSW top-k row fetches for projection-aware decoding,performance,,,1,completed,"HNSW row fetches decoded full rows and inserted them into row_cache even when projection was partial.",
+P1,Plan generation,Generate TASKs for join and HNSW projection decode reuse,planning,E1;E2,E1;E2,2,completed,"Plan TASK-019..020: first-relation join projection decode and HNSW projection-aware row fetch.",

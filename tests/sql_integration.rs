@@ -2441,6 +2441,36 @@ async fn test_multi_column_order_by() {
 }
 
 #[tokio::test]
+async fn test_hnsw_order_by_projection() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE vec_items (id INTEGER PRIMARY KEY, embedding VECTOR, label TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO vec_items VALUES (1, EMBEDDING('red apple'), 'apple'), (2, EMBEDDING('blue ocean'), 'ocean'), (3, EMBEDDING('green apple'), 'green')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_vec_items_embedding ON vec_items (embedding) USING HNSW",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM vec_items ORDER BY VECTOR_DISTANCE(embedding, EMBEDDING('red apple')) LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![fusiondb::common::Value::Integer(1)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_rbac_create_drop_user() {
     let (executor, wal) = setup().await;
     // Create user
