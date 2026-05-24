@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-038,completed,"UPSERT DO UPDATE now reuses cached existing rows and invalidates the updated key after write.",".workflow/.csv-wave/20260525-execute-upsert-row-cache/tasks.csv",

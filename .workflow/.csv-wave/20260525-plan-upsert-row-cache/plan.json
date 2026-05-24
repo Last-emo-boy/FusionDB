@@ -1,0 +1,36 @@
+{
+  "task_id": "TASK-038",
+  "title": "Reuse row cache for UPSERT DO UPDATE existing rows",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/dml.rs",
+    "tests/sql_integration.rs"
+  ],
+  "exclusions": [
+    "dashboard/"
+  ],
+  "hypothesis": "When an UPSERT conflict resolves to DO UPDATE, the old row can be reused from row_cache instead of decoding the just-fetched data bytes again.",
+  "waves": [
+    {
+      "wave": 1,
+      "skill": "maestro-plan",
+      "status": "completed"
+    },
+    {
+      "wave": 2,
+      "skill": "maestro-execute",
+      "status": "completed"
+    },
+    {
+      "wave": 3,
+      "skill": "maestro-verify",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_upsert_do_update_reuses_row_cache_for_existing_row -- --nocapture",
+    "cargo test --test sql_integration test_upsert_do_update_invalidates_row_cache_for_index_lookup -- --nocapture",
+    "cargo check --lib"
+  ]
+}

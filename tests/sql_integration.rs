@@ -3328,6 +3328,77 @@ async fn test_upsert_do_update_invalidates_row_cache_for_index_lookup() {
 }
 
 #[tokio::test]
+async fn test_upsert_do_update_reuses_row_cache_for_existing_row() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE upsert_reuse (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_upsert_reuse_name ON upsert_reuse (name)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO upsert_reuse VALUES (1, 'Alice', 10)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM upsert_reuse WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::String("Alice".to_string()),
+            Value::Integer(10)
+        ]]
+    );
+
+    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::String("Alice".to_string()),
+        Value::Integer(10),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut corrupt_row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"data:upsert_reuse:8000000000000001", &corrupt_row)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    exec_ok(
+        &executor,
+        "INSERT INTO upsert_reuse VALUES (1, 'Alice', 99) ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "SELECT * FROM upsert_reuse WHERE name = 'Alice'").await;
+    assert_eq!(cols, vec!["id", "name", "val"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::String("Alice".to_string()),
+            Value::Integer(99)
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_upsert_do_nothing() {
     let (executor, wal) = setup().await;
     exec_ok(

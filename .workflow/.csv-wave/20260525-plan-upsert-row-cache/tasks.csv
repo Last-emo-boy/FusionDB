@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-038,"Reuse row cache for UPSERT DO UPDATE existing rows","src/execution/dml.rs;tests/sql_integration.rs",completed

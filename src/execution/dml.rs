@@ -278,13 +278,20 @@ impl Executor {
                                 }
                                 sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
                                     // Load existing row, apply assignments using EXCLUDED references
-                                    let mut existing_row: Vec<Value> =
-                                        crate::common::encoding::RowDecoder::decode(
-                                            &existing_bytes,
-                                        )
-                                        .map_err(|e| {
-                                            FusionError::Execution(format!("Decode error: {}", e))
-                                        })?;
+                                    let mut existing_row: Vec<Value> = if let Some(row) =
+                                        self.row_cache.get(&key)
+                                    {
+                                        monitor::inc_row_cache_hit();
+                                        row
+                                    } else {
+                                        crate::common::encoding::RowDecoder::decode(&existing_bytes)
+                                            .map_err(|e| {
+                                                FusionError::Execution(format!(
+                                                    "Decode error: {}",
+                                                    e
+                                                ))
+                                            })?
+                                    };
                                     let old_existing_row = existing_row.clone();
                                     for assignment in &do_update.assignments {
                                         let col_name = match &assignment.target {

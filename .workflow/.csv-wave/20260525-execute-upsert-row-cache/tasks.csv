@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-038,"Add row_cache hit path before decoding existing UPSERT conflict row",completed,"src/execution/dml.rs;tests/sql_integration.rs"

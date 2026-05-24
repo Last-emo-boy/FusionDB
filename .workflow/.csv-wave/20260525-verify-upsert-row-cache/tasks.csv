@@ -1,0 +1,5 @@
+id,verification,status
+TASK-038,"cargo fmt --check",passed
+TASK-038,"cargo test --test sql_integration test_upsert_do_update_reuses_row_cache_for_existing_row -- --nocapture",passed
+TASK-038,"cargo test --test sql_integration test_upsert_do_update_invalidates_row_cache_for_index_lookup -- --nocapture",passed
+TASK-038,"cargo check --lib",passed
