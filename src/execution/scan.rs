@@ -1898,8 +1898,9 @@ impl Executor {
 
                             if let Some(v) = txn.get(key.as_bytes()).await? {
                                 monitor::inc_row_read();
-                                let row: Vec<Value> = crate::common::encoding::RowDecoder::decode(
+                                let row = Self::decode_row_for_projection(
                                     &v,
+                                    projection_indices.as_deref(),
                                 )
                                 .map_err(|e| {
                                     FusionError::Execution(format!(

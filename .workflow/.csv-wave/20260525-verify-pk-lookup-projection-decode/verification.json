@@ -1,0 +1,29 @@
+{
+  "session_id": "20260525-verify-pk-lookup-projection-decode",
+  "status": "passed",
+  "scope": [
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_primary_key_equality_projection_skips_unused_column_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_primary_key_only_equality_projection -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ]
+}

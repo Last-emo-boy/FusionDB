@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-025,maestro-plan,"database-core-performance primary-key equality projection decode",1,completed,"Primary-key equality lookup can reuse projection-aware decoding for non key-only projections.",".workflow/.csv-wave/20260525-plan-pk-lookup-projection-decode/plan.json",""

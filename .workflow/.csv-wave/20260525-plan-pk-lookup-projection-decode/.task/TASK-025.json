@@ -1,0 +1,14 @@
+{
+  "id": "TASK-025",
+  "title": "Primary-key equality lookup projection decode",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "scope": [
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "summary": "Use projection-aware partial decoding for primary-key equality lookups when full rows are unnecessary."
+}

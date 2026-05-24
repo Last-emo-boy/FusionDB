@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-025,maestro-verify,"database-core-performance primary-key equality projection decode",3,completed,"Formatting, targeted projection regression, existing key-only regression, and lib check passed.",".workflow/.csv-wave/20260525-verify-pk-lookup-projection-decode/verification.json",""

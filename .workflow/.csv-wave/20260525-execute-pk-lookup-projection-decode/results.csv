@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-025,completed,"Primary-key equality lookups now avoid decoding unused projected-out columns.","src/execution/scan.rs;tests/sql_integration.rs",""

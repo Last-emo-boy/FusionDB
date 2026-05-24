@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-025,maestro-execute,"database-core-performance primary-key equality projection decode --method cli",2,completed,"Primary-key equality lookup now respects projection-aware partial decoding.","src/execution/scan.rs;tests/sql_integration.rs",""
