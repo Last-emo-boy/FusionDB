@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,COUNT fast path exploration,Compare COUNT(*) fast path with COUNT(1) and COUNT(NULL) generic aggregate behavior,performance,,,1,completed,"COUNT(*) used count_prefix; COUNT(1) still entered generic aggregation despite being row-count-equivalent.",
+E2,COUNT semantics exploration,Identify arguments that must not be mapped to row count,correctness,,,1,completed,"COUNT(NULL) and COUNT(DISTINCT ...) must remain on the generic aggregate path.",
+P1,Plan generation,Generate TASKs for literal COUNT count_prefix reuse,planning,E1;E2,E1;E2,2,completed,"Plan TASK-011..012: add eligibility helper and extend no-filter aggregate fast path with semantic guard tests.",

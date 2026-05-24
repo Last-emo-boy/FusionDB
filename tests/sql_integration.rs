@@ -323,6 +323,26 @@ async fn test_select_count_literal() {
 }
 
 #[tokio::test]
+async fn test_select_count_null_literal() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO nums VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "SELECT COUNT(NULL) FROM nums").await;
+    assert_eq!(cols, vec!["COUNT(NULL)"]);
+    assert_eq!(rows[0][0], Value::Integer(0));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_min_max_primary_key() {
     let (executor, wal) = setup().await;
     exec_ok(

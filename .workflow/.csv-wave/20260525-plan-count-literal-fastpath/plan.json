@@ -1,0 +1,53 @@
+{
+  "session_id": "20260525-plan-count-literal-fastpath",
+  "phase": "database-core-performance",
+  "goal": "Use Transaction::count_prefix for no-filter COUNT calls whose argument is statically non-NULL.",
+  "scope": {
+    "include": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-011"
+      ]
+    },
+    {
+      "wave": 2,
+      "tasks": [
+        "TASK-012"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-011",
+      "title": "COUNT row-count eligibility helper",
+      "files": [
+        "src/execution/query.rs"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TASK-012",
+      "title": "COUNT literal count_prefix fast path",
+      "files": [
+        "src/execution/query.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_select_count_literal -- --nocapture",
+    "cargo test --test sql_integration test_select_count_null_literal -- --nocapture",
+    "cargo check --lib"
+  ]
+}

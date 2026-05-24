@@ -2,8 +2,8 @@ use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use crate::storage::Transaction;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, OrderByKind, SelectItem,
-    SetExpr, TableFactor,
+    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause,
+    OrderByKind, SelectItem, SetExpr, TableFactor,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -11,6 +11,16 @@ use std::collections::HashSet;
 use super::{AggregateAccumulator, Executor, QueryResult};
 
 impl Executor {
+    fn count_prefix_eligible_arg(arg: &FunctionArg) -> bool {
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => true,
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => {
+                !matches!(value.value, sqlparser::ast::Value::Null)
+            }
+            _ => false,
+        }
+    }
+
     fn resolve_order_by_projection_index(
         &self,
         expr: &Expr,
@@ -248,21 +258,21 @@ impl Executor {
                                         let func_name = func.name.to_string().to_uppercase();
                                         if func_name == "COUNT" {
                                             if let FunctionArguments::List(args) = &func.args {
-                                                if args.args.len() == 1 {
-                                                    if let FunctionArg::Unnamed(
-                                                        FunctionArgExpr::Wildcard,
-                                                    ) = &args.args[0]
-                                                    {
-                                                        let prefix =
-                                                            format!("data:{}:", table_name_str);
-                                                        let count = txn
-                                                            .count_prefix(prefix.as_bytes())
-                                                            .await?;
-                                                        result_row
-                                                            .push(Value::Integer(count as i64));
-                                                        col_names.push("COUNT(*)".to_string());
-                                                        item_handled = true;
-                                                    }
+                                                let duplicate_treatment = args.duplicate_treatment;
+                                                if args.args.len() == 1
+                                                    && duplicate_treatment
+                                                        != Some(DuplicateTreatment::Distinct)
+                                                    && Self::count_prefix_eligible_arg(
+                                                        &args.args[0],
+                                                    )
+                                                {
+                                                    let prefix =
+                                                        format!("data:{}:", table_name_str);
+                                                    let count =
+                                                        txn.count_prefix(prefix.as_bytes()).await?;
+                                                    result_row.push(Value::Integer(count as i64));
+                                                    col_names.push(format!("{}", func));
+                                                    item_handled = true;
                                                 }
                                             }
                                         } else if func_name == "MAX" || func_name == "MIN" {

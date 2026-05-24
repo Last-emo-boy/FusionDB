@@ -1,0 +1,19 @@
+{
+  "id": "TASK-011",
+  "title": "COUNT row-count eligibility helper",
+  "description": "Add a helper that identifies COUNT arguments that can safely use a row-count fast path.",
+  "scope": [
+    "src/execution/query.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Treat wildcard and non-NULL literal values as row-count-equivalent",
+    "Exclude NULL, identifiers, expressions, and DISTINCT from this helper"
+  ],
+  "convergence_criteria": [
+    "COUNT(*) remains eligible",
+    "COUNT(1) and other non-NULL literal COUNT calls are eligible",
+    "COUNT(NULL) is not eligible"
+  ],
+  "status": "completed"
+}

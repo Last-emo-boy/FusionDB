@@ -1,0 +1,3 @@
+id,task_id,status,files_changed,result,error
+X1,TASK-011,completed,"src/execution/query.rs","COUNT fast path eligibility is explicit and excludes NULL and non-literal expressions.",
+X2,TASK-012,completed,"src/execution/query.rs;tests/sql_integration.rs","COUNT(1) returns the same result through the storage count path; COUNT(NULL) is covered by regression test.",

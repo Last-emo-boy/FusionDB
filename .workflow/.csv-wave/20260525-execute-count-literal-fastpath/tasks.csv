@@ -1,0 +1,3 @@
+id,task_id,title,files,status,summary,error
+X1,TASK-011,COUNT row-count eligibility helper,"src/execution/query.rs",completed,"Added a narrow helper for wildcard and non-NULL literal COUNT arguments.",
+X2,TASK-012,COUNT literal count_prefix fast path,"src/execution/query.rs;tests/sql_integration.rs",completed,"Eligible no-filter COUNT calls now reuse count_prefix; COUNT(NULL) remains on the generic aggregate path.",
