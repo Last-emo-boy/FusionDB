@@ -1,0 +1,36 @@
+{
+  "task_id": "TASK-048",
+  "title": "Clean RowDecoder partial decode hot path",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/common/encoding.rs"
+  ],
+  "exclusions": [
+    "dashboard/"
+  ],
+  "hypothesis": "Projection scans call RowDecoder::decode_partial on hot paths; removing debug-output error handling and aligning bounds checks reduces per-row overhead while preserving partial decode behavior.",
+  "waves": [
+    {
+      "wave": 1,
+      "skill": "maestro-plan",
+      "status": "completed"
+    },
+    {
+      "wave": 2,
+      "skill": "maestro-execute",
+      "status": "completed"
+    },
+    {
+      "wave": 3,
+      "skill": "maestro-verify",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test encoding --lib -- --nocapture",
+    "cargo test --test sql_integration test_primary_key_equality_projection_skips_unused_column_decode -- --nocapture",
+    "cargo test --test sql_integration test_select_projection -- --nocapture",
+    "cargo check --lib"
+  ]
+}

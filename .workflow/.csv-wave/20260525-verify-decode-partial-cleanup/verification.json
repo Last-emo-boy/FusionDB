@@ -1,0 +1,31 @@
+{
+  "task_id": "TASK-048",
+  "status": "passed",
+  "verified_at": "2026-05-25T07:43:48.9635334+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test encoding --lib -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_primary_key_equality_projection_skips_unused_column_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_projection -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ],
+  "constraints": [
+    "Only database core was changed.",
+    "dashboard/ was not modified."
+  ]
+}

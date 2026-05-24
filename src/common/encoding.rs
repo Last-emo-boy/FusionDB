@@ -49,6 +49,22 @@ mod tests {
     }
 
     #[test]
+    fn test_row_encoding_partial_duplicate_indices() {
+        let row = vec![
+            Value::Integer(12345),
+            Value::String("hello world".to_string()),
+            Value::Boolean(true),
+        ];
+
+        let encoded = RowEncoder::encode(&row);
+        let decoded = RowDecoder::decode_partial(&encoded, &[1, 1]).expect("Decoding failed");
+
+        assert_eq!(decoded[0], Value::Null);
+        assert_eq!(decoded[1], Value::String("hello world".to_string()));
+        assert_eq!(decoded[2], Value::Null);
+    }
+
+    #[test]
     fn test_row_encoding_single_column() {
         let row = vec![
             Value::Integer(12345),
@@ -278,17 +294,17 @@ impl RowDecoder {
             return bincode::deserialize(data);
         }
 
-        let count = u16::from_le_bytes([data[0], data[1]]);
-        let header_size = 2 + 4 * count as usize;
+        let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let header_size = 2 + 4 * count;
 
         if data.len() < header_size {
             return bincode::deserialize(data);
         }
 
-        let mut row = vec![Value::Null; count as usize];
+        let mut row = vec![Value::Null; count];
 
         for &idx in indices {
-            if idx >= count as usize {
+            if idx >= count {
                 continue;
             }
 
@@ -300,7 +316,7 @@ impl RowDecoder {
                 data[off_pos + 3],
             ]) as usize;
 
-            let end = if idx + 1 < count as usize {
+            let end = if idx + 1 < count {
                 let next_off_pos = off_pos + 4;
                 u32::from_le_bytes([
                     data[next_off_pos],
@@ -312,15 +328,12 @@ impl RowDecoder {
                 data.len()
             };
 
-            if start >= data.len() || end > data.len() {
+            if start > data.len() || end > data.len() || start > end {
                 return bincode::deserialize(data);
             }
 
             let val_bytes = &data[start..end];
-            row[idx] = bincode::deserialize(val_bytes).map_err(|e| {
-                eprintln!("DEBUG: RowDecoder Partial Fail. Count: {}, Idx: {}, Start: {}, End: {}, DataLen: {}, Err: {}", count, idx, start, end, data.len(), e);
-                e
-            })?;
+            row[idx] = bincode::deserialize(val_bytes)?;
         }
 
         Ok(row)

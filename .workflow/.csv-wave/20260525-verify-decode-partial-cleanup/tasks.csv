@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-048,"Verify partial row decoding and projection scans",completed,"src/common/encoding.rs"

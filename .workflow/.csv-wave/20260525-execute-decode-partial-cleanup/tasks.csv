@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-048,"Clean RowDecoder::decode_partial hot path and preserve duplicate-index behavior",completed,"src/common/encoding.rs"

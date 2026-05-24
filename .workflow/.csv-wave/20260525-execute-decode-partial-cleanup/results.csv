@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-048,completed,"RowDecoder::decode_partial now uses usize count/header arithmetic, full-decode-compatible bounds checks, and direct deserialize error propagation.",".workflow/.csv-wave/20260525-execute-decode-partial-cleanup/tasks.csv",
