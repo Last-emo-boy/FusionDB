@@ -1,0 +1,20 @@
+{
+  "id": "TASK-006",
+  "title": "MIN/MAX primary-key single-column decode",
+  "description": "Use RowDecoder::decode_column in the no-filter MIN/MAX primary-key aggregate fast path.",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Keep COUNT(*) behavior on Transaction::count_prefix",
+    "Preserve NULL result behavior for empty tables and decode failures"
+  ],
+  "convergence_criteria": [
+    "MIN/MAX(pk) fast path no longer calls decode_partial",
+    "A focused integration test verifies SELECT MIN(id), MAX(id)",
+    "cargo check and targeted tests pass"
+  ],
+  "status": "completed"
+}

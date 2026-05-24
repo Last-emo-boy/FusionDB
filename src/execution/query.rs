@@ -306,12 +306,9 @@ impl Executor {
                                                             };
 
                                                             let val = if let Some((_, v)) = res {
-                                                                let row: Vec<Value> = crate::common::encoding::RowDecoder::decode_partial(&v, &[idx]).unwrap_or(vec![Value::Null; idx + 1]);
-                                                                if idx < row.len() {
-                                                                    row[idx].clone()
-                                                                } else {
-                                                                    Value::Null
-                                                                }
+                                                                crate::common::encoding::RowDecoder::decode_column(&v, idx)
+                                                                    .unwrap_or(None)
+                                                                    .unwrap_or(Value::Null)
                                                             } else {
                                                                 Value::Null
                                                             };

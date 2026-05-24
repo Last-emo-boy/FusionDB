@@ -276,6 +276,26 @@ async fn test_select_count_star() {
 }
 
 #[tokio::test]
+async fn test_select_min_max_primary_key() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, label TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO nums VALUES (3, 'c'), (1, 'a'), (2, 'b')",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "SELECT MIN(id), MAX(id) FROM nums").await;
+    assert_eq!(cols, vec!["MIN(id)", "MAX(id)"]);
+    assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(3)]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_in_list() {
     let (executor, wal) = setup().await;
     exec_ok(

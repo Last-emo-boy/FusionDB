@@ -49,6 +49,21 @@ mod tests {
     }
 
     #[test]
+    fn test_row_encoding_single_column() {
+        let row = vec![
+            Value::Integer(12345),
+            Value::String("hello world".to_string()),
+            Value::Boolean(true),
+        ];
+
+        let encoded = RowEncoder::encode(&row);
+
+        let decoded = RowDecoder::decode_column(&encoded, 1).expect("Decoding failed");
+        assert_eq!(decoded, Some(Value::String("hello world".to_string())));
+        assert_eq!(RowDecoder::decode_column(&encoded, 4).unwrap(), None);
+    }
+
+    #[test]
     fn test_rollback_scenario() {
         let row = vec![
             Value::Integer(9999999),
@@ -159,6 +174,45 @@ impl RowEncoder {
 pub struct RowDecoder;
 
 impl RowDecoder {
+    fn column_bounds(data: &[u8], idx: usize) -> Option<(usize, usize)> {
+        if data.len() < 2 {
+            return None;
+        }
+
+        let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let header_size = 2 + 4 * count;
+
+        if data.len() < header_size || idx >= count {
+            return None;
+        }
+
+        let off_pos = 2 + idx * 4;
+        let start = u32::from_le_bytes([
+            data[off_pos],
+            data[off_pos + 1],
+            data[off_pos + 2],
+            data[off_pos + 3],
+        ]) as usize;
+
+        let end = if idx + 1 < count {
+            let next_off_pos = off_pos + 4;
+            u32::from_le_bytes([
+                data[next_off_pos],
+                data[next_off_pos + 1],
+                data[next_off_pos + 2],
+                data[next_off_pos + 3],
+            ]) as usize
+        } else {
+            data.len()
+        };
+
+        if start > data.len() || end > data.len() || start > end {
+            return None;
+        }
+
+        Some((start, end))
+    }
+
     pub fn decode(data: &[u8]) -> bincode::Result<Vec<Value>> {
         if data.len() < 2 {
             return bincode::deserialize(data);
@@ -203,6 +257,19 @@ impl RowDecoder {
         }
 
         Ok(row)
+    }
+
+    pub fn decode_column(data: &[u8], idx: usize) -> bincode::Result<Option<Value>> {
+        if data.len() < 2 {
+            let row: Vec<Value> = bincode::deserialize(data)?;
+            return Ok(row.get(idx).cloned());
+        }
+
+        let Some((start, end)) = Self::column_bounds(data, idx) else {
+            return Ok(None);
+        };
+
+        bincode::deserialize(&data[start..end]).map(Some)
     }
 
     // Partially decode row, returning full Vec<Value> but with Nulls for skipped columns

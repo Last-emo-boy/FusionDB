@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,Aggregate decode exploration,Map MIN/MAX primary-key fast path row decoding behavior while excluding dashboard,architecture,,,1,completed,"MIN/MAX(pk) uses first/last key lookup but decoded a sparse row-shaped Vec through decode_partial.",
+E2,Encoding helper exploration,Check RowEncoder row format for offset-based single column extraction,implementation,,,1,completed,"Encoded rows contain a count and per-column absolute offsets, so one column can be decoded without allocating the whole row.",
+P1,Plan generation,Generate TASKs for single-column aggregate decode optimization,planning,E1;E2,E1;E2,2,completed,"Plan TASK-005..006: add RowDecoder::decode_column and use it for MIN/MAX(pk).",

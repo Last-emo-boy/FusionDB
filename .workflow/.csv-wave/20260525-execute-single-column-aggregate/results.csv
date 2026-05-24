@@ -1,0 +1,3 @@
+id,task_id,status,files_changed,result,error
+X1,TASK-005,completed,"src/common/encoding.rs","RowDecoder::decode_column decodes a single Value using row offsets and returns None when the index is absent.",
+X2,TASK-006,completed,"src/execution/query.rs;tests/sql_integration.rs","MIN/MAX(primary key) aggregate fast path avoids full sparse row allocation and is covered by an integration test.",

@@ -1,0 +1,54 @@
+{
+  "session_id": "20260525-plan-single-column-aggregate",
+  "phase": "database-core-performance",
+  "goal": "Reduce row allocation in core aggregate fast paths without touching dashboard.",
+  "scope": {
+    "include": [
+      "src/common/encoding.rs",
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-005"
+      ]
+    },
+    {
+      "wave": 2,
+      "tasks": [
+        "TASK-006"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-005",
+      "title": "Single-column row decoder",
+      "files": [
+        "src/common/encoding.rs"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TASK-006",
+      "title": "MIN/MAX primary-key single-column decode",
+      "files": [
+        "src/execution/query.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test test_row_encoding_single_column --lib -- --nocapture",
+    "cargo test --test sql_integration test_select_min_max_primary_key -- --nocapture"
+  ]
+}

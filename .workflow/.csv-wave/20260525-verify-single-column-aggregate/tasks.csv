@@ -1,0 +1,5 @@
+id,task_id,command,status,notes
+V1,TASK-005,cargo fmt --check,passed,Formatting check passed.
+V2,TASK-005,cargo test test_row_encoding_single_column --lib -- --nocapture,passed,Focused RowDecoder single-column unit test passed.
+V3,TASK-006,cargo test --test sql_integration test_select_min_max_primary_key -- --nocapture,passed,Focused SQL MIN/MAX primary-key integration test passed.
+V4,TASK-006,cargo check --lib,passed,Library type check passed.

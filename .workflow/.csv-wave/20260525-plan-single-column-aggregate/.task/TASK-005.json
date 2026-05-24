@@ -1,0 +1,19 @@
+{
+  "id": "TASK-005",
+  "title": "Single-column row decoder",
+  "description": "Add RowDecoder::decode_column so callers can extract one encoded Value without allocating a full row Vec.",
+  "scope": [
+    "src/common/encoding.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve legacy bincode Vec<Value> fallback behavior",
+    "Return None for out-of-range column indexes"
+  ],
+  "convergence_criteria": [
+    "RowDecoder exposes decode_column(data, idx)",
+    "The helper validates encoded row bounds before slicing",
+    "A focused unit test covers successful decode and out-of-range lookup"
+  ],
+  "status": "completed"
+}

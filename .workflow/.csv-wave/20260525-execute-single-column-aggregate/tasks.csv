@@ -1,0 +1,3 @@
+id,task_id,title,files,status,summary,error
+X1,TASK-005,Single-column row decoder,"src/common/encoding.rs",completed,"Added offset-bound extraction and public decode_column with legacy fallback.",
+X2,TASK-006,MIN/MAX primary-key single-column decode,"src/execution/query.rs;tests/sql_integration.rs",completed,"Replaced decode_partial use in MIN/MAX(pk) fast path and added SQL regression coverage.",
