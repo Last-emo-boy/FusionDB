@@ -797,14 +797,27 @@ impl Executor {
                                 let data_prefix = format!("data:{}:", table_name);
                                 let rows = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
                                 for (k, v) in rows {
-                                    if let Ok(mut row) =
-                                        crate::common::encoding::RowDecoder::decode(&v)
-                                    {
+                                    let key_str = std::str::from_utf8(&k).ok();
+                                    let row = if let Some(key_str) = key_str {
+                                        if let Some(row) = self.row_cache.get(key_str) {
+                                            monitor::inc_row_cache_hit();
+                                            Some(row)
+                                        } else {
+                                            crate::common::encoding::RowDecoder::decode(&v).ok()
+                                        }
+                                    } else {
+                                        crate::common::encoding::RowDecoder::decode(&v).ok()
+                                    };
+
+                                    if let Some(mut row) = row {
                                         if idx < row.len() {
                                             row.remove(idx);
                                             let new_v =
                                                 crate::common::encoding::RowEncoder::encode(&row);
                                             txn.put(&k, &new_v).await?;
+                                            if let Some(key_str) = key_str {
+                                                self.row_cache.invalidate(key_str);
+                                            }
                                         }
                                     }
                                 }

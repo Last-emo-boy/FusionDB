@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-044,"Use cached full rows before decode during ALTER TABLE DROP COLUMN rewrites and invalidate rewritten keys",completed,"src/execution/ddl.rs;tests/sql_integration.rs"

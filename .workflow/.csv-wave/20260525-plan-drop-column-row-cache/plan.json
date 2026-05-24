@@ -1,0 +1,36 @@
+{
+  "task_id": "TASK-044",
+  "title": "Reuse row cache during ALTER TABLE DROP COLUMN rewrites",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/ddl.rs",
+    "tests/sql_integration.rs"
+  ],
+  "exclusions": [
+    "dashboard/"
+  ],
+  "hypothesis": "ALTER TABLE DROP COLUMN can reuse already cached full rows while rewriting stored rows, then invalidate the rewritten keys to avoid stale row shapes.",
+  "waves": [
+    {
+      "wave": 1,
+      "skill": "maestro-plan",
+      "status": "completed"
+    },
+    {
+      "wave": 2,
+      "skill": "maestro-execute",
+      "status": "completed"
+    },
+    {
+      "wave": 3,
+      "skill": "maestro-verify",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_alter_table_drop_column_reuses_row_cache -- --nocapture",
+    "cargo test --test sql_integration test_alter_table_drop_column -- --nocapture",
+    "cargo check --lib"
+  ]
+}

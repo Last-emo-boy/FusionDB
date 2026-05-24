@@ -1,0 +1,5 @@
+id,verification,status
+TASK-044,"cargo fmt --check",passed
+TASK-044,"cargo test --test sql_integration test_alter_table_drop_column_reuses_row_cache -- --nocapture",passed
+TASK-044,"cargo test --test sql_integration test_alter_table_drop_column -- --nocapture",passed
+TASK-044,"cargo check --lib",passed

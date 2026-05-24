@@ -2363,6 +2363,79 @@ async fn test_alter_table_drop_column() {
 }
 
 #[tokio::test]
+async fn test_alter_table_drop_column_reuses_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE drop_cache (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO drop_cache VALUES (1, 'Alice', 30), (2, 'Bob', 25)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM drop_cache").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::String("Alice".to_string()),
+                Value::Integer(30)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("Bob".to_string()),
+                Value::Integer(25)
+            ]
+        ]
+    );
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, name, age) in [(1_i64, "Alice", 30_i64), (2_i64, "Bob", 25_i64)] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(name.to_string()),
+                Value::Integer(age),
+            ]);
+            let corrupt_col_idx = 1usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+
+            let key = format!(
+                "data:drop_cache:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    exec_ok(&executor, "ALTER TABLE drop_cache DROP COLUMN age").await;
+
+    let (cols, rows) = query(&executor, "SELECT * FROM drop_cache").await;
+    assert_eq!(cols, vec!["id", "name"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::String("Alice".to_string())],
+            vec![Value::Integer(2), Value::String("Bob".to_string())]
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_alter_table_rename_column() {
     let (executor, wal) = setup().await;
     exec_ok(

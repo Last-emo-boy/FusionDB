@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-044,"Reuse row cache during ALTER TABLE DROP COLUMN rewrites","src/execution/ddl.rs;tests/sql_integration.rs",completed

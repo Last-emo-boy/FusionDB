@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-044,completed,"ALTER TABLE DROP COLUMN now reuses cached full rows for rewrites and invalidates rewritten cache keys.",".workflow/.csv-wave/20260525-execute-drop-column-row-cache/tasks.csv",
