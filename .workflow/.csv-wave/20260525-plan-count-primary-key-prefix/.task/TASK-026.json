@@ -1,0 +1,14 @@
+{
+  "id": "TASK-026",
+  "title": "COUNT(primary key) prefix count fast path",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "summary": "Use prefix row counting for COUNT(primary_key) in unfiltered single-table aggregate queries."
+}

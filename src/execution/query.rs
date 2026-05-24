@@ -11,11 +11,24 @@ use std::collections::HashSet;
 use super::{AggregateAccumulator, Executor, QueryResult};
 
 impl Executor {
-    fn count_prefix_eligible_arg(arg: &FunctionArg) -> bool {
+    fn count_prefix_eligible_arg(arg: &FunctionArg, schema: &TableSchema) -> bool {
         match arg {
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => true,
             FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => {
                 !matches!(value.value, sqlparser::ast::Value::Null)
+            }
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => schema
+                .columns
+                .iter()
+                .any(|col| col.is_primary && col.name.eq_ignore_ascii_case(&ident.value)),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(idents))) => {
+                let Some(ident) = idents.last() else {
+                    return false;
+                };
+                schema
+                    .columns
+                    .iter()
+                    .any(|col| col.is_primary && col.name.eq_ignore_ascii_case(&ident.value))
             }
             _ => false,
         }
@@ -281,6 +294,7 @@ impl Executor {
                                                         != Some(DuplicateTreatment::Distinct)
                                                     && Self::count_prefix_eligible_arg(
                                                         &args.args[0],
+                                                        &schema,
                                                     )
                                                 {
                                                     let prefix =

@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-026,maestro-verify,"database-core-performance count primary key prefix",3,completed,"Formatting, primary-key count regression, literal count regressions, and lib check passed.",".workflow/.csv-wave/20260525-verify-count-primary-key-prefix/verification.json",""

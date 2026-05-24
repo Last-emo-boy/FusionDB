@@ -323,6 +323,55 @@ async fn test_select_count_literal() {
 }
 
 #[tokio::test]
+async fn test_select_count_primary_key_uses_prefix_count() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE count_pk (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+
+    let mut rows = Vec::new();
+    for id in [1_i64, 2] {
+        let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(id),
+            Value::String(format!("payload-{}", id)),
+        ]);
+        let off_pos = 2;
+        let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        let end = u32::from_le_bytes(row[off_pos + 4..off_pos + 8].try_into().unwrap()) as usize;
+        for byte in &mut row[start..end] {
+            *byte = 0xff;
+        }
+        rows.push((id, row));
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, row) in rows {
+            let key = format!(
+                "data:count_pk:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(&executor, "SELECT COUNT(id) FROM count_pk").await;
+    assert_eq!(cols, vec!["COUNT(id)"]);
+    assert_eq!(rows[0][0], Value::Integer(2));
+
+    let (cols, rows) = query(&executor, "SELECT COUNT(count_pk.id) FROM count_pk").await;
+    assert_eq!(cols, vec!["COUNT(count_pk.id)"]);
+    assert_eq!(rows[0][0], Value::Integer(2));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_select_count_null_literal() {
     let (executor, wal) = setup().await;
     exec_ok(

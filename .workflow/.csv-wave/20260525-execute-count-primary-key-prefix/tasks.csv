@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-026,maestro-execute,"database-core-performance count primary key prefix --method cli",2,completed,"COUNT(primary_key) now reuses the prefix-count aggregate fast path.","src/execution/query.rs;tests/sql_integration.rs",""

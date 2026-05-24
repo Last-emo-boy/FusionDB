@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-026,maestro-plan,"database-core-performance count primary key prefix",1,completed,"COUNT(primary_key) can use count_prefix in the existing aggregate fast path.",".workflow/.csv-wave/20260525-plan-count-primary-key-prefix/plan.json",""
