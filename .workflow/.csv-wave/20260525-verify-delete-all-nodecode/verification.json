@@ -1,0 +1,33 @@
+{
+  "session_id": "20260525-verify-delete-all-nodecode",
+  "status": "passed",
+  "scope": [
+    "src/execution/dml.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_delete_all_without_secondary_index_skips_row_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_delete_all -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_delete_primary_key_updates_secondary_index -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ]
+}

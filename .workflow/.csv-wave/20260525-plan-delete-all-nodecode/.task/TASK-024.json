@@ -1,0 +1,14 @@
+{
+  "id": "TASK-024",
+  "title": "Unconditional DELETE no-decode fast path",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "scope": [
+    "src/execution/dml.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "summary": "Skip full-row decoding for DELETE FROM table when RETURNING is absent and the table has no non-primary indexes."
+}

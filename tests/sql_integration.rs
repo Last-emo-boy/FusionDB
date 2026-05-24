@@ -519,6 +519,52 @@ async fn test_delete_all() {
     cleanup(&wal);
 }
 
+#[tokio::test]
+async fn test_delete_all_without_secondary_index_skips_row_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE fast_del_all (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+
+    let mut rows = Vec::new();
+    for id in [1_i64, 2] {
+        let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(id),
+            Value::String(format!("payload-{}", id)),
+        ]);
+        let corrupt_col_idx = 1usize;
+        let off_pos = 2 + corrupt_col_idx * 4;
+        let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        for byte in &mut row[start..] {
+            *byte = 0xff;
+        }
+        rows.push((id, row));
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, row) in rows {
+            let key = format!(
+                "data:fast_del_all:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let msg = exec_ok(&executor, "DELETE FROM fast_del_all").await;
+    assert!(msg.contains("Deleted 2"));
+    let (_, rows) = query(&executor, "SELECT * FROM fast_del_all").await;
+    assert_eq!(rows.len(), 0);
+    cleanup(&wal_path);
+}
+
 // ==================== GROUP BY Tests ====================
 
 #[tokio::test]

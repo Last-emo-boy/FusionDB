@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-024,completed,"Unconditional DELETE now has a conservative no-decode fast path.","src/execution/dml.rs;tests/sql_integration.rs",""

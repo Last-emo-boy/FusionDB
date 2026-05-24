@@ -462,12 +462,12 @@ impl Executor {
             self.primary_key_row_id_from_eq_selection(delete.selection.as_ref(), &schema, params);
 
         if delete.returning.is_none() {
-            if let Some(row_id) = &target_row_id {
-                let no_secondary_indexes = schema
-                    .columns
-                    .iter()
-                    .all(|col| !col.is_indexed || col.is_primary);
-                if no_secondary_indexes {
+            let no_secondary_indexes = schema
+                .columns
+                .iter()
+                .all(|col| !col.is_indexed || col.is_primary);
+            if no_secondary_indexes {
+                if let Some(row_id) = &target_row_id {
                     let key = format!("{}{}", prefix, row_id);
                     if txn.get(key.as_bytes()).await?.is_some() {
                         txn.delete(key.as_bytes()).await?;
@@ -479,6 +479,21 @@ impl Executor {
 
                     return Ok(QueryResult::Success {
                         message: "Deleted 0 rows".to_string(),
+                    });
+                }
+
+                if delete.selection.is_none() {
+                    let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                    let deleted_count = kv_pairs.len();
+                    for (k, _) in kv_pairs {
+                        txn.delete(&k).await?;
+                        if let Ok(key_str) = std::str::from_utf8(&k) {
+                            self.row_cache.invalidate(key_str);
+                        }
+                    }
+
+                    return Ok(QueryResult::Success {
+                        message: format!("Deleted {} rows", deleted_count),
                     });
                 }
             }

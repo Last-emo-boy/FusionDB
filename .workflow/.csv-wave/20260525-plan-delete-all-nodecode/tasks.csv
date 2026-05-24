@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-024,maestro-plan,"database-core-performance delete all no decode",1,completed,"Unconditional DELETE can skip row decode when no RETURNING and no non-primary indexes exist.",".workflow/.csv-wave/20260525-plan-delete-all-nodecode/plan.json",""

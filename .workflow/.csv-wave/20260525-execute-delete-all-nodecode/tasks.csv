@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-024,maestro-execute,"database-core-performance delete all no decode --method cli",2,completed,"Direct prefix deletion implemented for eligible unconditional DELETE.","src/execution/dml.rs;tests/sql_integration.rs",""

@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-024,maestro-verify,"database-core-performance delete all no decode",3,completed,"Formatting, targeted delete regressions, secondary-index regression, and lib check passed.",".workflow/.csv-wave/20260525-verify-delete-all-nodecode/verification.json",""
