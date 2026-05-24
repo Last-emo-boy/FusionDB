@@ -2098,18 +2098,16 @@ impl Executor {
                                             }
                                         } else {
                                             let cache_key = std::str::from_utf8(&k).ok();
-                                            if projection_indices.is_none() {
-                                                if let Some(key_str) = cache_key {
-                                                    if let Some(row) = self.row_cache.get(key_str) {
-                                                        monitor::inc_row_cache_hit();
-                                                        rows.push(row);
-                                                        if let Some(l) = limit {
-                                                            if rows.len() >= l {
-                                                                break;
-                                                            }
+                                            if let Some(key_str) = cache_key {
+                                                if let Some(row) = self.row_cache.get(key_str) {
+                                                    monitor::inc_row_cache_hit();
+                                                    rows.push(row);
+                                                    if let Some(l) = limit {
+                                                        if rows.len() >= l {
+                                                            break;
                                                         }
-                                                        continue;
                                                     }
+                                                    continue;
                                                 }
                                             }
 

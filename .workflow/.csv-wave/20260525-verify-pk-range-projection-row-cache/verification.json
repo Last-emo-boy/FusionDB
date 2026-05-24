@@ -1,0 +1,31 @@
+{
+  "task_id": "TASK-041",
+  "status": "passed",
+  "verified_at": "2026-05-25T06:37:53.6982391+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_primary_key_range_projection_reuses_full_row_cache -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_primary_key_range_reuses_row_cache -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_commuted_primary_key_range_skips_nonmatching_row_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ],
+  "constraints": [
+    "Only database core was changed.",
+    "dashboard/ was not modified."
+  ]
+}

@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-041,"Reuse full row cache for primary-key range projection scans","src/execution/scan.rs;tests/sql_integration.rs",completed

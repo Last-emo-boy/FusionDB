@@ -1,0 +1,6 @@
+id,verification,status
+TASK-041,"cargo fmt --check",passed
+TASK-041,"cargo test --test sql_integration test_primary_key_range_projection_reuses_full_row_cache -- --nocapture",passed
+TASK-041,"cargo test --test sql_integration test_primary_key_range_reuses_row_cache -- --nocapture",passed
+TASK-041,"cargo test --test sql_integration test_commuted_primary_key_range_skips_nonmatching_row_decode -- --nocapture",passed
+TASK-041,"cargo check --lib",passed
