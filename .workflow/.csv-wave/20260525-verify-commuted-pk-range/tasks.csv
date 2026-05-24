@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-034,maestro-verify,"database-core-performance commuted primary-key range scan",3,completed,"Commuted range tests, existing greater-than range regression, formatting, and library check passed.",".workflow/.csv-wave/20260525-verify-commuted-pk-range/verification.json",""

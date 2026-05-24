@@ -236,18 +236,17 @@ impl Executor {
                     .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
 
                 if let Some(sel) = selection {
-                    if let Expr::BinaryOp {
-                        left,
-                        op: BinaryOperator::Eq,
-                        right,
-                    } = sel
-                    {
-                        if (self.explain_column_index(left, &schema) == Some(0)
-                            && !self.explain_expr_has_column_reference(right))
-                            || (self.explain_column_index(right, &schema) == Some(0)
-                                && !self.explain_expr_has_column_reference(left))
-                        {
-                            return Ok("Primary Key Lookup (Clustered Index)".to_string());
+                    if let Expr::BinaryOp { left, op, right } = sel {
+                        if *op == BinaryOperator::Eq {
+                            if (self.explain_column_index(left, &schema) == Some(0)
+                                && !self.explain_expr_has_column_reference(right))
+                                || (self.explain_column_index(right, &schema) == Some(0)
+                                    && !self.explain_expr_has_column_reference(left))
+                            {
+                                return Ok("Primary Key Lookup (Clustered Index)".to_string());
+                            }
+                        } else if self.explain_primary_key_range(left, op, right, &schema) {
+                            return Ok("Primary Key Range Scan (Clustered Index)".to_string());
                         }
                     }
 
@@ -287,6 +286,26 @@ impl Executor {
         let mut cols = HashSet::new();
         self.extract_columns_from_expr(expr, &mut cols);
         !cols.is_empty()
+    }
+
+    fn explain_primary_key_range(
+        &self,
+        left: &Expr,
+        op: &BinaryOperator,
+        right: &Expr,
+        schema: &TableSchema,
+    ) -> bool {
+        if !matches!(
+            op,
+            BinaryOperator::Gt | BinaryOperator::GtEq | BinaryOperator::Lt | BinaryOperator::LtEq
+        ) {
+            return false;
+        }
+
+        (self.explain_column_index(left, schema) == Some(0)
+            && !self.explain_expr_has_column_reference(right))
+            || (self.explain_column_index(right, schema) == Some(0)
+                && !self.explain_expr_has_column_reference(left))
     }
 
     fn check_index_usage(&self, expr: &Expr, schema: &TableSchema, result: &mut Option<String>) {

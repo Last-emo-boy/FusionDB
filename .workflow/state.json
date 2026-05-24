@@ -1,9 +1,9 @@
 {
   "workflow_name": "FusionDB",
   "created_at": "2026-05-25T01:15:27.4681925+08:00",
-  "updated_at": "2026-05-25T05:29:18.7381992+08:00",
+  "updated_at": "2026-05-25T05:38:36.6001794+08:00",
   "current_phase": "database-core-performance",
-  "current_session": ".workflow/.maestro/maestro-20260525-052918",
+  "current_session": ".workflow/.maestro/maestro-20260525-053836",
   "constraints": [
     "Only iterate database core; do not modify dashboard/"
   ],
@@ -215,6 +215,16 @@
     },
     {
       "path": ".workflow/.csv-wave/20260525-verify-pk-lookup-row-cache/verification.json",
+      "type": "verification",
+      "status": "passed"
+    },
+    {
+      "path": ".workflow/.maestro/maestro-20260525-053836/status.json",
+      "type": "maestro-session",
+      "status": "completed"
+    },
+    {
+      "path": ".workflow/.csv-wave/20260525-verify-commuted-pk-range/verification.json",
       "type": "verification",
       "status": "passed"
     }

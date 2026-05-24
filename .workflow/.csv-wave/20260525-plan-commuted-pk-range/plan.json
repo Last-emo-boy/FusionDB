@@ -1,0 +1,41 @@
+{
+  "session_id": "20260525-plan-commuted-pk-range",
+  "phase": "database-core-performance",
+  "goal": "Normalize commuted primary-key range predicates such as literal < id into clustered range scans.",
+  "scope": {
+    "include": [
+      "src/execution/ddl.rs",
+      "src/execution/scan.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-034"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-034",
+      "title": "Commuted primary-key range scan",
+      "files": [
+        "src/execution/ddl.rs",
+        "src/execution/scan.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration commuted_primary_key_range -- --nocapture",
+    "cargo test --test sql_integration test_select_with_where_gt -- --nocapture",
+    "cargo check --lib"
+  ]
+}

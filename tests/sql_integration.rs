@@ -266,6 +266,81 @@ async fn test_select_with_where_gt() {
 }
 
 #[tokio::test]
+async fn test_select_with_commuted_primary_key_range() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE range_commuted (id INTEGER PRIMARY KEY, val INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO range_commuted VALUES (1, 10), (2, 20), (3, 30)",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "SELECT id FROM range_commuted WHERE 1 < id").await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]);
+
+    let (_, rows) = query(&executor, "SELECT id FROM range_commuted WHERE 3 > id").await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
+
+    let (_, rows) = query(&executor, "SELECT id FROM range_commuted WHERE 2 <= id").await;
+    assert_eq!(rows, vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]);
+
+    let (_, rows) = query(&executor, "SELECT id FROM range_commuted WHERE 2 >= id").await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_commuted_primary_key_range_skips_nonmatching_row_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE range_commuted_decode (id INTEGER PRIMARY KEY, val TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO range_commuted_decode VALUES (2, 'two')",
+    )
+    .await;
+
+    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::String("one".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut corrupt_row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"data:range_commuted_decode:8000000000000001", &corrupt_row)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT val FROM range_commuted_decode WHERE 1 < id",
+    )
+    .await;
+    assert_eq!(cols, vec!["val"]);
+    assert_eq!(rows, vec![vec![Value::String("two".to_string())]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_select_with_limit() {
     let (executor, wal) = setup().await;
     exec_ok(&executor, "CREATE TABLE nums (id INTEGER PRIMARY KEY)").await;
@@ -1587,6 +1662,27 @@ async fn test_explain_commuted_btree_index_scan() {
     assert_eq!(rows.len(), 1);
     if let Value::String(plan) = &rows[0][0] {
         assert!(plan.contains("Index Scan"));
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_commuted_primary_key_range_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_range_commuted (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT * FROM explain_range_commuted WHERE 1 < id",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Primary Key Range Scan"));
     }
     cleanup(&wal);
 }

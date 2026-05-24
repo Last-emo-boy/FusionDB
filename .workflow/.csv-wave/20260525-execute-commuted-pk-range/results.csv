@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-034,completed,"Commuted primary-key range predicates now use clustered range scans and EXPLAIN reports the range access path.","src/execution/ddl.rs;src/execution/scan.rs;tests/sql_integration.rs",""

@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-034,maestro-execute,"database-core-performance commuted primary-key range scan --method cli",2,completed,"Added range predicate normalization for primary-key scans and EXPLAIN reporting for commuted primary-key ranges.","src/execution/ddl.rs;src/execution/scan.rs;tests/sql_integration.rs",""

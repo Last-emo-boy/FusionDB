@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-034,maestro-plan,"database-core-performance commuted primary-key range scan",1,completed,"Primary-key range predicates with the literal on the left can be normalized into clustered range scans.",".workflow/.csv-wave/20260525-plan-commuted-pk-range/plan.json",""

@@ -1,0 +1,30 @@
+{
+  "session_id": "20260525-verify-commuted-pk-range",
+  "status": "passed",
+  "scope": [
+    "src/execution/ddl.rs",
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration commuted_primary_key_range -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_with_where_gt -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ]
+}

@@ -360,6 +360,45 @@ impl Executor {
         }
     }
 
+    fn primary_key_range_value_expr<'a>(
+        &self,
+        left: &'a Expr,
+        op: &BinaryOperator,
+        right: &'a Expr,
+        schema: &TableSchema,
+        pk_idx: usize,
+    ) -> Option<(BinaryOperator, &'a Expr)> {
+        let normalized_op = match op {
+            BinaryOperator::Gt => BinaryOperator::Gt,
+            BinaryOperator::GtEq => BinaryOperator::GtEq,
+            BinaryOperator::Lt => BinaryOperator::Lt,
+            BinaryOperator::LtEq => BinaryOperator::LtEq,
+            _ => return None,
+        };
+
+        if self.resolve_schema_column_index(left, schema) == Some(pk_idx) {
+            if self.expr_has_column_reference(right) {
+                None
+            } else {
+                Some((normalized_op, right))
+            }
+        } else if self.resolve_schema_column_index(right, schema) == Some(pk_idx) {
+            if self.expr_has_column_reference(left) {
+                return None;
+            }
+            let flipped_op = match op {
+                BinaryOperator::Gt => BinaryOperator::Lt,
+                BinaryOperator::GtEq => BinaryOperator::LtEq,
+                BinaryOperator::Lt => BinaryOperator::Gt,
+                BinaryOperator::LtEq => BinaryOperator::GtEq,
+                _ => return None,
+            };
+            Some((flipped_op, left))
+        } else {
+            None
+        }
+    }
+
     fn expr_has_column_reference(&self, expr: &Expr) -> bool {
         let mut cols = HashSet::new();
         self.extract_columns_from_expr(expr, &mut cols);
@@ -1989,13 +2028,11 @@ impl Executor {
             if let Some(sel) = selection {
                 if !index_used {
                     if let Expr::BinaryOp { left, op, right } = sel {
-                        let is_pk = pk_index.is_some_and(|pk_idx| {
-                            self.resolve_schema_column_index(left, &schema) == Some(pk_idx)
-                        });
-
-                        if is_pk {
+                        if let Some((range_op, value_expr)) = pk_index.and_then(|pk_idx| {
+                            self.primary_key_range_value_expr(left, op, right, &schema, pk_idx)
+                        }) {
                             let val = self
-                                .evaluate_value(right, &[], &schema, params)
+                                .evaluate_value(value_expr, &[], &schema, params)
                                 .unwrap_or(Value::Null);
 
                             if let Value::Integer(limit_val) = val {
@@ -2004,7 +2041,7 @@ impl Executor {
                                 let mut max_key = table_prefix.as_bytes().to_vec();
                                 max_key.push(0xFF);
 
-                                let (start_key, end_key) = match op {
+                                let (start_key, end_key) = match range_op {
                                     BinaryOperator::Gt => {
                                         let encoded =
                                             crate::common::encoding::encode_i64_comparable(
