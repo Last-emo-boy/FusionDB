@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-033,maestro-execute,"database-core-performance primary-key lookup row cache --method cli",2,completed,"Primary-key point lookup now checks row_cache for full-row projections and inserts decoded full rows on cache miss.","src/execution/scan.rs;tests/sql_integration.rs",""

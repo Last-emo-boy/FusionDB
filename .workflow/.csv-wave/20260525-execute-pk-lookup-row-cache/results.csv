@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-033,completed,"Repeated full-row primary-key point lookups now avoid redundant row decoding through row_cache reuse.","src/execution/scan.rs;tests/sql_integration.rs",""

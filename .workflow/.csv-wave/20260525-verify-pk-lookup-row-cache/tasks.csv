@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-033,maestro-verify,"database-core-performance primary-key lookup row cache",3,completed,"Primary-key point lookup cache test, partial projection regression, formatting, and library check passed.",".workflow/.csv-wave/20260525-verify-pk-lookup-row-cache/verification.json",""

@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-033,maestro-plan,"database-core-performance primary-key lookup row cache",1,completed,"Full-row primary-key point lookups can reuse row_cache after cache invalidation paths were already covered.",".workflow/.csv-wave/20260525-plan-pk-lookup-row-cache/plan.json",""

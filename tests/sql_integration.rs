@@ -1440,6 +1440,52 @@ async fn test_primary_key_only_equality_projection() {
 }
 
 #[tokio::test]
+async fn test_primary_key_point_lookup_reuses_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_lookup_cache (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO pk_lookup_cache VALUES (1, 'Alice')").await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM pk_lookup_cache WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+    );
+
+    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::String("Alice".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut corrupt_row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"data:pk_lookup_cache:8000000000000001", &corrupt_row)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(&executor, "SELECT * FROM pk_lookup_cache WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_primary_key_equality_projection_skips_unused_column_decode() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
