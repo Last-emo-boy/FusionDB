@@ -312,6 +312,60 @@ impl Executor {
         Some((idx, schema.columns[idx].name.clone()))
     }
 
+    fn equality_schema_column_value_expr<'a>(
+        &self,
+        left: &'a Expr,
+        right: &'a Expr,
+        schema: &TableSchema,
+    ) -> Option<(usize, String, &'a Expr)> {
+        if let Some((idx, name)) = self.resolve_schema_column_name(left, schema) {
+            if self.expr_has_column_reference(right) {
+                None
+            } else {
+                Some((idx, name, right))
+            }
+        } else {
+            self.resolve_schema_column_name(right, schema)
+                .and_then(|(idx, name)| {
+                    if self.expr_has_column_reference(left) {
+                        None
+                    } else {
+                        Some((idx, name, left))
+                    }
+                })
+        }
+    }
+
+    fn equality_primary_key_value_expr<'a>(
+        &self,
+        left: &'a Expr,
+        right: &'a Expr,
+        schema: &TableSchema,
+        pk_idx: usize,
+    ) -> Option<&'a Expr> {
+        if self.resolve_schema_column_index(left, schema) == Some(pk_idx) {
+            if self.expr_has_column_reference(right) {
+                None
+            } else {
+                Some(right)
+            }
+        } else if self.resolve_schema_column_index(right, schema) == Some(pk_idx) {
+            if self.expr_has_column_reference(left) {
+                None
+            } else {
+                Some(left)
+            }
+        } else {
+            None
+        }
+    }
+
+    fn expr_has_column_reference(&self, expr: &Expr) -> bool {
+        let mut cols = HashSet::new();
+        self.extract_columns_from_expr(expr, &mut cols);
+        !cols.is_empty()
+    }
+
     fn join_constraint_expr<'a>(
         join_operator: &'a sqlparser::ast::JoinOperator,
     ) -> Option<&'a Expr> {
@@ -1199,14 +1253,14 @@ impl Executor {
                     op: BinaryOperator::Eq,
                     right,
                 } => {
-                    if let Some((col_idx, storage_col_name)) =
-                        self.resolve_schema_column_name(left, schema)
+                    if let Some((col_idx, storage_col_name, value_expr)) =
+                        self.equality_schema_column_value_expr(left, right, schema)
                     {
                         if schema.columns[col_idx].is_indexed
                             && schema.columns[col_idx].index_type == IndexType::BTree
                         {
                             let val = self
-                                .evaluate_value(right, &[], schema, params)
+                                .evaluate_value(value_expr, &[], schema, params)
                                 .unwrap_or(Value::Null);
                             if let Some(val_str) = self.value_to_index_string(&val) {
                                 let index_prefix = format!(
@@ -1869,13 +1923,11 @@ impl Executor {
                     right,
                 } = sel
                 {
-                    let is_pk = pk_index.is_some_and(|pk_idx| {
-                        self.resolve_schema_column_index(left, &schema) == Some(pk_idx)
-                    });
-
-                    if is_pk {
+                    if let Some(value_expr) = pk_index.and_then(|pk_idx| {
+                        self.equality_primary_key_value_expr(left, right, &schema, pk_idx)
+                    }) {
                         let val = self
-                            .evaluate_value(right, &[], &schema, params)
+                            .evaluate_value(value_expr, &[], &schema, params)
                             .unwrap_or(Value::Null);
                         let row_id = match val {
                             Value::Integer(i) => {

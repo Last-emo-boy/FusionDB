@@ -239,13 +239,15 @@ impl Executor {
                     if let Expr::BinaryOp {
                         left,
                         op: BinaryOperator::Eq,
-                        ..
+                        right,
                     } = sel
                     {
-                        if let Expr::Identifier(ident) = left.as_ref() {
-                            if schema.get_column_index(&ident.value) == Some(0) {
-                                return Ok("Primary Key Lookup (Clustered Index)".to_string());
-                            }
+                        if (self.explain_column_index(left, &schema) == Some(0)
+                            && !self.explain_expr_has_column_reference(right))
+                            || (self.explain_column_index(right, &schema) == Some(0)
+                                && !self.explain_expr_has_column_reference(left))
+                        {
+                            return Ok("Primary Key Lookup (Clustered Index)".to_string());
                         }
                     }
 
@@ -266,22 +268,50 @@ impl Executor {
         }
     }
 
+    fn explain_column_index(&self, expr: &Expr, schema: &TableSchema) -> Option<usize> {
+        match expr {
+            Expr::Identifier(ident) => self.resolve_column_index(&ident.value, schema).ok(),
+            Expr::CompoundIdentifier(idents) => {
+                let col_name = idents
+                    .iter()
+                    .map(|ident| ident.value.clone())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                self.resolve_column_index(&col_name, schema).ok()
+            }
+            _ => None,
+        }
+    }
+
+    fn explain_expr_has_column_reference(&self, expr: &Expr) -> bool {
+        let mut cols = HashSet::new();
+        self.extract_columns_from_expr(expr, &mut cols);
+        !cols.is_empty()
+    }
+
     fn check_index_usage(&self, expr: &Expr, schema: &TableSchema, result: &mut Option<String>) {
         match expr {
             Expr::BinaryOp {
                 left,
                 op: BinaryOperator::Eq,
-                ..
+                right,
             } => {
-                if let Expr::Identifier(ident) = left.as_ref() {
-                    if let Some(idx) = schema.get_column_index(&ident.value) {
-                        if schema.columns[idx].is_indexed {
-                            *result = Some(format!(
-                                "{} ({:?})",
-                                ident.value, schema.columns[idx].index_type
-                            ));
-                        }
-                    }
+                let indexed_column = [left.as_ref(), right.as_ref()]
+                    .into_iter()
+                    .filter_map(|expr| self.explain_column_index(expr, schema))
+                    .find(|idx| {
+                        schema.columns[*idx].is_indexed
+                            && ((self.explain_column_index(left, schema) == Some(*idx)
+                                && !self.explain_expr_has_column_reference(right))
+                                || (self.explain_column_index(right, schema) == Some(*idx)
+                                    && !self.explain_expr_has_column_reference(left)))
+                    });
+
+                if let Some(idx) = indexed_column {
+                    *result = Some(format!(
+                        "{} ({:?})",
+                        schema.columns[idx].name, schema.columns[idx].index_type
+                    ));
                 }
             }
             Expr::MatchAgainst { columns, .. } => {

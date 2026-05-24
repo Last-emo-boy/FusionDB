@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-032,maestro-execute,"database-core-performance commuted equality lookup --method cli",2,completed,"Extended scan, DML, and EXPLAIN equality detection to accept literal = column while rejecting column-to-column fast-path matches.","src/execution/ddl.rs;src/execution/dml.rs;src/execution/scan.rs;tests/sql_integration.rs",""

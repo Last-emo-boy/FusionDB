@@ -1,0 +1,44 @@
+{
+  "session_id": "20260525-plan-commuted-equality-lookup",
+  "phase": "database-core-performance",
+  "goal": "Recognize commuted equality predicates such as literal = indexed_column as equivalent lookup candidates without accepting column-to-column comparisons.",
+  "scope": {
+    "include": [
+      "src/execution/ddl.rs",
+      "src/execution/dml.rs",
+      "src/execution/scan.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-032"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-032",
+      "title": "Commuted equality lookup fast paths",
+      "files": [
+        "src/execution/ddl.rs",
+        "src/execution/dml.rs",
+        "src/execution/scan.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration commuted -- --nocapture",
+    "cargo test --test sql_integration qualified_primary_key -- --nocapture",
+    "cargo test --test sql_integration test_explain -- --nocapture",
+    "cargo check --lib"
+  ]
+}

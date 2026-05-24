@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-032,maestro-plan,"database-core-performance commuted equality lookup",1,completed,"Equality predicates with constants on the left can use the same primary-key and BTree lookup paths as column = constant predicates.",".workflow/.csv-wave/20260525-plan-commuted-equality-lookup/plan.json",""

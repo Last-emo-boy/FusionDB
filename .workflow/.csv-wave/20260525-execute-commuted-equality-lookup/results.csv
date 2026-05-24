@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-032,completed,"Commuted equality predicates now hit primary-key and BTree fast paths across SELECT diagnostics and DML execution.","src/execution/ddl.rs;src/execution/dml.rs;src/execution/scan.rs;tests/sql_integration.rs",""

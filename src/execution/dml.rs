@@ -16,16 +16,64 @@ impl Executor {
         params: &[Value],
         allowed_qualifiers: &[String],
     ) -> Option<String> {
-        let Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } = selection?
-        else {
+        let Expr::BinaryOp { left, op, right } = selection? else {
+            return None;
+        };
+        if *op != BinaryOperator::Eq {
+            return None;
+        }
+
+        let (pk_expr, value_expr) = if self
+            .primary_key_column_name(left.as_ref(), schema, allowed_qualifiers)
+            .is_some()
+        {
+            (left.as_ref(), right.as_ref())
+        } else if self
+            .primary_key_column_name(right.as_ref(), schema, allowed_qualifiers)
+            .is_some()
+        {
+            (right.as_ref(), left.as_ref())
+        } else {
             return None;
         };
 
-        let col_name = match left.as_ref() {
+        let col_name = self.primary_key_column_name(pk_expr, schema, allowed_qualifiers)?;
+        let mut value_columns = HashSet::new();
+        self.extract_columns_from_expr(value_expr, &mut value_columns);
+        if !value_columns.is_empty() {
+            return None;
+        }
+
+        let pk_idx = schema.get_primary_key_index()?;
+        if pk_idx != 0 {
+            return None;
+        }
+
+        let col_idx = schema
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(col_name))?;
+        if col_idx != pk_idx {
+            return None;
+        }
+
+        match self
+            .evaluate_value(value_expr, &[], schema, params)
+            .unwrap_or(Value::Null)
+        {
+            Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(i)),
+            Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn primary_key_column_name<'a>(
+        &self,
+        expr: &'a Expr,
+        schema: &TableSchema,
+        allowed_qualifiers: &[String],
+    ) -> Option<&'a str> {
+        let col_name = match expr {
             Expr::Identifier(ident) => &ident.value,
             Expr::CompoundIdentifier(idents) => {
                 if idents.len() < 2 {
@@ -51,25 +99,14 @@ impl Executor {
         };
 
         let pk_idx = schema.get_primary_key_index()?;
-        if pk_idx != 0 {
-            return None;
-        }
-
         let col_idx = schema
             .columns
             .iter()
             .position(|col| col.name.eq_ignore_ascii_case(col_name))?;
-        if col_idx != pk_idx {
-            return None;
-        }
-
-        match self
-            .evaluate_value(right, &[], schema, params)
-            .unwrap_or(Value::Null)
-        {
-            Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(i)),
-            Value::String(s) => Some(s),
-            _ => None,
+        if col_idx == pk_idx {
+            Some(col_name)
+        } else {
+            None
         }
     }
 

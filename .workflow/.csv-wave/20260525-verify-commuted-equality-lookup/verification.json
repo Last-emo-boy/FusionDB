@@ -1,0 +1,35 @@
+{
+  "session_id": "20260525-verify-commuted-equality-lookup",
+  "status": "passed",
+  "scope": [
+    "src/execution/ddl.rs",
+    "src/execution/dml.rs",
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration commuted -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration qualified_primary_key -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_explain -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ]
+}

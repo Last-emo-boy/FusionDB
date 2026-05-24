@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-032,maestro-verify,"database-core-performance commuted equality lookup",3,completed,"Commuted equality tests, prior qualified primary-key regression, EXPLAIN regression, formatting, and library check passed.",".workflow/.csv-wave/20260525-verify-commuted-equality-lookup/verification.json",""
