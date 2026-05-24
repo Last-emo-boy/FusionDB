@@ -477,6 +477,30 @@ impl Executor {
         }
     }
 
+    fn primary_key_row_from_id(
+        schema: &TableSchema,
+        pk_index: Option<usize>,
+        row_id: &str,
+    ) -> Vec<Value> {
+        let mut row = vec![Value::Null; schema.columns.len()];
+        if let Some(pk_idx) = pk_index {
+            if pk_idx < schema.columns.len() {
+                let is_int = matches!(
+                    schema.columns[pk_idx].data_type.as_str(),
+                    "INTEGER" | "BIGINT"
+                );
+                row[pk_idx] = if is_int {
+                    crate::common::encoding::decode_i64_comparable(row_id)
+                        .map(Value::Integer)
+                        .unwrap_or_else(|| Value::String(row_id.to_string()))
+                } else {
+                    Value::String(row_id.to_string())
+                };
+            }
+        }
+        row
+    }
+
     async fn fetch_full_row_by_id(
         &self,
         table_name: &str,
@@ -1768,6 +1792,14 @@ impl Executor {
                         if let Some(id) = row_id {
                             let key = format!("data:{}:{}", table_name, id);
 
+                            if key_only_scan {
+                                if txn.get(key.as_bytes()).await?.is_some() {
+                                    let row = Self::primary_key_row_from_id(&schema, pk_index, &id);
+                                    return Ok((schema, vec![row]));
+                                }
+                                return Ok((schema, vec![]));
+                            }
+
                             if let Some(v) = txn.get(key.as_bytes()).await? {
                                 monitor::inc_row_read();
                                 let row: Vec<Value> = crate::common::encoding::RowDecoder::decode(
@@ -1860,24 +1892,9 @@ impl Executor {
                                             let k_str = String::from_utf8_lossy(&k);
                                             let prefix = format!("data:{}:", table_name);
                                             if let Some(pk_str) = k_str.strip_prefix(&prefix) {
-                                                let mut r = vec![Value::Null; schema.columns.len()];
-                                                if let Some(pk_idx) = pk_index {
-                                                    let is_int = matches!(
-                                                        schema.columns[pk_idx].data_type.as_str(),
-                                                        "INTEGER" | "BIGINT"
-                                                    );
-                                                    let pk_val = if is_int {
-                                                        if let Some(i) = crate::common::encoding::decode_i64_comparable(pk_str) {
-                                                             Value::Integer(i)
-                                                         } else {
-                                                             Value::String(pk_str.to_string())
-                                                         }
-                                                    } else {
-                                                        Value::String(pk_str.to_string())
-                                                    };
-                                                    r[pk_idx] = pk_val;
-                                                }
-                                                r
+                                                Self::primary_key_row_from_id(
+                                                    &schema, pk_index, pk_str,
+                                                )
                                             } else {
                                                 continue;
                                             }
@@ -1955,28 +1972,7 @@ impl Executor {
                                         monitor::inc_row_cache_hit();
                                         row
                                     } else if key_only_scan {
-                                        let mut r = vec![Value::Null; schema.columns.len()];
-                                        if let Some(pk_idx) = pk_index {
-                                            let is_int = matches!(
-                                                schema.columns[pk_idx].data_type.as_str(),
-                                                "INTEGER" | "BIGINT"
-                                            );
-                                            let pk_val = if is_int {
-                                                if let Some(i) =
-                                                    crate::common::encoding::decode_i64_comparable(
-                                                        &row_id,
-                                                    )
-                                                {
-                                                    Value::Integer(i)
-                                                } else {
-                                                    Value::String(row_id.clone())
-                                                }
-                                            } else {
-                                                Value::String(row_id.clone())
-                                            };
-                                            r[pk_idx] = pk_val;
-                                        }
-                                        r
+                                        Self::primary_key_row_from_id(&schema, pk_index, &row_id)
                                     } else if let Some(data_bytes) =
                                         txn.get(data_key.as_bytes()).await?
                                     {
@@ -2004,7 +2000,9 @@ impl Executor {
                                                     ))
                                                 })?
                                             };
-                                        self.row_cache.insert(data_key, row.clone());
+                                        if projection_indices.is_none() {
+                                            self.row_cache.insert(data_key, row.clone());
+                                        }
                                         row
                                     } else {
                                         continue;
@@ -2042,38 +2040,26 @@ impl Executor {
                                         let data_key = format!("data:{}:{}", table_name, row_id);
 
                                         if let Some(row) = executor.row_cache.get(&data_key) {
-                                            return Ok::<_, FusionError>(Some((row_id, row, true)));
+                                            return Ok::<_, FusionError>(Some((row_id, row, true, false, false)));
                                         }
 
                                         if key_only_scan {
-                                            let mut r = vec![Value::Null; schema_cols.len()];
-                                            if let Some(pk_idx) = pk_index {
-                                                let is_int = matches!(schema_cols[pk_idx].data_type.as_str(), "INTEGER" | "BIGINT");
-                                                let pk_val = if is_int {
-                                                     if let Some(i) = crate::common::encoding::decode_i64_comparable(&row_id) {
-                                                         Value::Integer(i)
-                                                     } else {
-                                                         Value::String(row_id.clone())
-                                                     }
-                                                } else {
-                                                    Value::String(row_id.clone())
-                                                };
-                                                r[pk_idx] = pk_val;
-                                            }
-                                            return Ok(Some((row_id, r, true)));
+                                            let schema = TableSchema::new(table_name.clone(), schema_cols);
+                                            let r = Self::primary_key_row_from_id(&schema, pk_index, &row_id);
+                                            return Ok(Some((row_id, r, false, false, false)));
                                         }
 
                                         if let Some(data_bytes) = txn_ref.get(data_key.as_bytes()).await? {
-                                            let row: Vec<Value> = if let Some(indices) = &projection_indices {
+                                            let (row, cacheable): (Vec<Value>, bool) = if let Some(indices) = &projection_indices {
                                                 crate::common::encoding::RowDecoder::decode_partial(&data_bytes, indices).map_err(|e| {
                                                     FusionError::Execution(format!("Data partial deserialization error: {}", e))
-                                                })?
+                                                }).map(|row| (row, false))?
                                             } else {
                                                 crate::common::encoding::RowDecoder::decode(&data_bytes).map_err(|e| {
                                                     FusionError::Execution(format!("Data deserialization error: {}", e))
-                                                })?
+                                                }).map(|row| (row, true))?
                                             };
-                                            Ok(Some((row_id, row, false)))
+                                            Ok(Some((row_id, row, false, cacheable, true)))
                                         } else {
                                             Ok(None)
                                         }
@@ -2084,13 +2070,22 @@ impl Executor {
                                 let mut stream = fetch_stream;
                                 while let Some(res) = stream.next().await {
                                     let res = res?;
-                                    if let Some((row_id, row, from_cache)) = res {
-                                        if !from_cache {
+                                    if let Some((
+                                        row_id,
+                                        row,
+                                        from_cache,
+                                        cacheable,
+                                        read_storage,
+                                    )) = res
+                                    {
+                                        if read_storage {
                                             monitor::inc_row_read();
-                                            let data_key =
-                                                format!("data:{}:{}", table_name, row_id);
-                                            self.row_cache.insert(data_key, row.clone());
-                                        } else {
+                                            if cacheable {
+                                                let data_key =
+                                                    format!("data:{}:{}", table_name, row_id);
+                                                self.row_cache.insert(data_key, row.clone());
+                                            }
+                                        } else if from_cache {
                                             monitor::inc_row_cache_hit();
                                         }
 
@@ -2132,26 +2127,7 @@ impl Executor {
                         let k_str = String::from_utf8_lossy(&k);
                         let prefix_str = String::from_utf8_lossy(&prefix);
                         if let Some(pk_str) = k_str.strip_prefix(prefix_str.as_ref()) {
-                            let mut r = vec![Value::Null; schema.columns.len()];
-                            if let Some(pk_idx) = pk_index {
-                                let is_int = matches!(
-                                    schema.columns[pk_idx].data_type.as_str(),
-                                    "INTEGER" | "BIGINT"
-                                );
-                                let pk_val = if is_int {
-                                    if let Some(i) =
-                                        crate::common::encoding::decode_i64_comparable(pk_str)
-                                    {
-                                        Value::Integer(i)
-                                    } else {
-                                        Value::String(pk_str.to_string())
-                                    }
-                                } else {
-                                    Value::String(pk_str.to_string())
-                                };
-                                r[pk_idx] = pk_val;
-                            }
-                            Some(r)
+                            Some(Self::primary_key_row_from_id(&schema, pk_index, pk_str))
                         } else {
                             None
                         }

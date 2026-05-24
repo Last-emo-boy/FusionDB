@@ -784,6 +784,58 @@ async fn test_create_btree_index() {
     cleanup(&wal);
 }
 
+#[tokio::test]
+async fn test_index_projection_does_not_poison_row_cache() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 42)",
+    )
+    .await;
+    exec_ok(&executor, "CREATE INDEX idx_name ON users (name)").await;
+
+    let (cols, rows) = query(&executor, "SELECT name FROM users WHERE name = 'Bob'").await;
+    assert_eq!(cols, vec!["name"]);
+    assert_eq!(rows, vec![vec![Value::String("Bob".to_string())]]);
+
+    let (cols, rows) = query(&executor, "SELECT * FROM users WHERE name = 'Bob'").await;
+    assert_eq!(cols, vec!["id", "name", "age"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::String("Bob".to_string()),
+            Value::Integer(42)
+        ]]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_primary_key_only_equality_projection() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, payload TEXT, score INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO nums VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "SELECT id FROM nums WHERE id = 2").await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+    cleanup(&wal);
+}
+
 // ==================== EXPLAIN Tests ====================
 
 #[tokio::test]

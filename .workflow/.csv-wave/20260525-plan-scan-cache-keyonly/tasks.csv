@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,Index scan cache exploration,Inspect scan_single_table BTree index fetch paths for partial decode and row_cache writes,correctness,,,1,completed,"Index scan stored decoded rows in row_cache even when projection_indices made the row sparse.",
+E2,Primary-key key-only exploration,Inspect PK equality/range/full scan key-only paths for duplicated decode avoidance,performance,,,1,completed,"Range/full scans already derive PK-only rows from keys; equality lookup still decoded the full row.",
+P1,Plan generation,Generate TASKs for index cache correctness and PK-only equality decode avoidance,planning,E1;E2,E1;E2,2,completed,"Plan TASK-007..008: gate cache writes to full-row decodes and share key-derived primary-key row construction.",

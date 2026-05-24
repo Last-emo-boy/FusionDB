@@ -1,0 +1,3 @@
+id,task_id,title,files,status,summary,error
+X1,TASK-007,Avoid caching partial index rows,"src/execution/scan.rs;tests/sql_integration.rs",completed,"Index scans now cache only full-row decodes; a regression test covers projected index lookup followed by SELECT *.",
+X2,TASK-008,Key-only primary-key equality lookup,"src/execution/scan.rs;tests/sql_integration.rs",completed,"PK-only equality lookup now derives the row from the key and shares key-only row construction across scan paths.",

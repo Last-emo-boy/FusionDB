@@ -1,0 +1,20 @@
+{
+  "id": "TASK-007",
+  "title": "Avoid caching partial index rows",
+  "description": "Prevent BTree index scan projection pushdown from inserting sparse partial rows into the full-row cache.",
+  "scope": [
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Keep full-row cache hits and full-row cache writes intact",
+    "Preserve index scan filtering and limit behavior"
+  ],
+  "convergence_criteria": [
+    "Index scan writes to row_cache only when full row decoding was used",
+    "Streamed index scan tracks whether a row was read from storage and whether it is cacheable",
+    "A regression test proves projected index scans do not affect a later SELECT *"
+  ],
+  "status": "completed"
+}

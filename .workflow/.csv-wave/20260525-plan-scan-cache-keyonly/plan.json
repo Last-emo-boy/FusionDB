@@ -1,0 +1,54 @@
+{
+  "session_id": "20260525-plan-scan-cache-keyonly",
+  "phase": "database-core-performance",
+  "goal": "Improve scan-path cache correctness and avoid unnecessary full row decode for primary-key-only lookups.",
+  "scope": {
+    "include": [
+      "src/execution/scan.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-007"
+      ]
+    },
+    {
+      "wave": 2,
+      "tasks": [
+        "TASK-008"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-007",
+      "title": "Avoid caching partial index rows",
+      "files": [
+        "src/execution/scan.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TASK-008",
+      "title": "Key-only primary-key equality lookup",
+      "files": [
+        "src/execution/scan.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_index_projection_does_not_poison_row_cache -- --nocapture",
+    "cargo test --test sql_integration test_primary_key_only_equality_projection -- --nocapture"
+  ]
+}

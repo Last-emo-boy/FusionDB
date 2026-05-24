@@ -1,0 +1,5 @@
+id,task_id,command,status,notes
+V1,TASK-007,cargo fmt --check,passed,Formatting check passed.
+V2,TASK-007,cargo test --test sql_integration test_index_projection_does_not_poison_row_cache -- --nocapture,passed,Projected index scan no longer poisons later full-row reads.
+V3,TASK-008,cargo test --test sql_integration test_primary_key_only_equality_projection -- --nocapture,passed,PK-only equality projection returns the correct key value.
+V4,TASK-007;TASK-008,cargo check --lib,passed,Library type check passed.

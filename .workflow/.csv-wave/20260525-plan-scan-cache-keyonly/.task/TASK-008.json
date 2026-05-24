@@ -1,0 +1,20 @@
+{
+  "id": "TASK-008",
+  "title": "Key-only primary-key equality lookup",
+  "description": "Avoid full row decode for primary-key equality queries when projection, selection, and ordering only require the primary key.",
+  "scope": [
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Only use key-derived rows when key_only_scan is already proven safe",
+    "Preserve missing-row behavior"
+  ],
+  "convergence_criteria": [
+    "Primary-key equality lookup returns a key-derived sparse row under key_only_scan",
+    "Range/full/index key-only paths share the same helper",
+    "A focused SQL integration test verifies SELECT id FROM table WHERE id = value"
+  ],
+  "status": "completed"
+}
