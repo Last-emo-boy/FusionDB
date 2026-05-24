@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-046,completed,"scan_table_base now stores decoded full rows in row_cache after cache misses.",".workflow/.csv-wave/20260525-execute-scan-base-cache-warm/tasks.csv",

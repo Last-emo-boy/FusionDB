@@ -1,0 +1,31 @@
+{
+  "task_id": "TASK-046",
+  "status": "passed",
+  "verified_at": "2026-05-25T07:24:23.5217957+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_join_base_scan_populates_row_cache -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_join_base_scan_reuses_row_cache -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_inner_join -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ],
+  "constraints": [
+    "Only database core was changed.",
+    "dashboard/ was not modified."
+  ]
+}

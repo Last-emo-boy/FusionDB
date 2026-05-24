@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-046,"Warm row cache from scan_table_base","src/execution/scan.rs;tests/sql_integration.rs",completed

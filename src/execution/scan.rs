@@ -44,9 +44,15 @@ impl Executor {
                             monitor::inc_row_cache_hit();
                             row
                         } else {
-                            crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
-                                FusionError::Execution(format!("Data deserialization error: {}", e))
-                            })?
+                            let row =
+                                crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
+                                    FusionError::Execution(format!(
+                                        "Data deserialization error: {}",
+                                        e
+                                    ))
+                                })?;
+                            self.row_cache.insert(key_str.to_string(), row.clone());
+                            row
                         }
                     } else {
                         crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
