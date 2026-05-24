@@ -600,9 +600,20 @@ impl Executor {
         let mut deleted_count = 0;
         let mut deleted_rows: Vec<Vec<Value>> = Vec::new();
         for (k, v) in kv_pairs {
-            let row: Vec<Value> = crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
-                FusionError::Execution(format!("Data deserialization error: {}", e))
-            })?;
+            let row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
+                if let Some(row) = self.row_cache.get(key_str) {
+                    monitor::inc_row_cache_hit();
+                    row
+                } else {
+                    crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
+                        FusionError::Execution(format!("Data deserialization error: {}", e))
+                    })?
+                }
+            } else {
+                crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
+                    FusionError::Execution(format!("Data deserialization error: {}", e))
+                })?
+            };
 
             let mut delete_flag = true;
             if let Some(selection) = &delete.selection {

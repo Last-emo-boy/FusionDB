@@ -940,6 +940,60 @@ async fn test_delete_primary_key_updates_secondary_index() {
 }
 
 #[tokio::test]
+async fn test_delete_primary_key_reuses_row_cache_for_secondary_index() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE del_cache (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_del_cache_name ON del_cache (name)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO del_cache VALUES (2, 'Bob')").await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM del_cache WHERE id = 2").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(2), Value::String("Bob".to_string())]]
+    );
+
+    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(2),
+        Value::String("Bob".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut corrupt_row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"data:del_cache:8000000000000002", &corrupt_row)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let msg = exec_ok(&executor, "DELETE FROM del_cache WHERE id = 2").await;
+    assert!(msg.contains("Deleted 1"));
+
+    {
+        let txn = storage.begin_transaction().await.unwrap();
+        let index_key = b"index:del_cache:name:Bob:8000000000000002";
+        assert!(txn.get(index_key).await.unwrap().is_none());
+    }
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_delete_all() {
     let (executor, wal) = setup().await;
     exec_ok(

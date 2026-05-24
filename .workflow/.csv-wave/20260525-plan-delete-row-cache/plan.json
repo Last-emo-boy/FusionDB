@@ -1,0 +1,39 @@
+{
+  "session_id": "20260525-plan-delete-row-cache",
+  "phase": "database-core-performance",
+  "goal": "Reuse row_cache during DELETE row processing to avoid repeated full-row decode when cached rows are already available.",
+  "scope": {
+    "include": [
+      "src/execution/dml.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-036"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-036",
+      "title": "DELETE row-cache reuse",
+      "files": [
+        "src/execution/dml.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_delete_primary_key_reuses_row_cache_for_secondary_index -- --nocapture",
+    "cargo test --test sql_integration test_delete_primary_key_updates_secondary_index -- --nocapture",
+    "cargo check --lib"
+  ]
+}

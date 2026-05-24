@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-036,maestro-execute,"database-core-performance DELETE row cache --method cli",2,completed,"DELETE now checks row_cache before decoding storage bytes and reuses cached rows for selection and index cleanup.","src/execution/dml.rs;tests/sql_integration.rs",""

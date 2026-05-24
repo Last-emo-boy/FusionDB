@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-036,maestro-verify,"database-core-performance DELETE row cache",3,completed,"DELETE row-cache test, secondary index deletion regression, formatting, and library check passed.",".workflow/.csv-wave/20260525-verify-delete-row-cache/verification.json",""

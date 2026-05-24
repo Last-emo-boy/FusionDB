@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-036,completed,"DELETE reuses cached rows to avoid redundant row decoding while preserving secondary index cleanup.","src/execution/dml.rs;tests/sql_integration.rs",""

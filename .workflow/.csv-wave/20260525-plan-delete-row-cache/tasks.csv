@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-036,maestro-plan,"database-core-performance DELETE row cache",1,completed,"DELETE can reuse full rows already present in row_cache before updating secondary indexes.",".workflow/.csv-wave/20260525-plan-delete-row-cache/plan.json",""
