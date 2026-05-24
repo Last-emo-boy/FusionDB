@@ -1,0 +1,14 @@
+{
+  "id": "TASK-029",
+  "title": "UPDATE/upsert row-cache invalidation",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "scope": [
+    "src/execution/dml.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "summary": "Invalidate row_cache after UPDATE and ON CONFLICT DO UPDATE write modified rows."
+}

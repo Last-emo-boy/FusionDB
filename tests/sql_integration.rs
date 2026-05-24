@@ -1144,6 +1144,35 @@ async fn test_index_projection_does_not_poison_row_cache() {
 }
 
 #[tokio::test]
+async fn test_update_invalidates_row_cache_for_index_lookup() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 42)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_users_name_cache ON users (name)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM users WHERE name = 'Bob'").await;
+    assert_eq!(rows[0][2], Value::Integer(42));
+
+    exec_ok(&executor, "UPDATE users SET age = 43 WHERE id = 2").await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM users WHERE name = 'Bob'").await;
+    assert_eq!(rows[0][2], Value::Integer(43));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_primary_key_only_equality_projection() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -2644,6 +2673,35 @@ async fn test_upsert_do_update() {
         rows[1][1],
         fusiondb::common::Value::String("Bob".to_string())
     );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_upsert_do_update_invalidates_row_cache_for_index_lookup() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE up_cache (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO up_cache VALUES (1, 'Alice', 10)").await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_up_cache_name ON up_cache (name)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM up_cache WHERE name = 'Alice'").await;
+    assert_eq!(rows[0][2], Value::Integer(10));
+
+    exec_ok(
+        &executor,
+        "INSERT INTO up_cache VALUES (1, 'Alice', 99) ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM up_cache WHERE name = 'Alice'").await;
+    assert_eq!(rows[0][2], Value::Integer(99));
     cleanup(&wal);
 }
 

@@ -236,6 +236,7 @@ impl Executor {
                                     let value =
                                         crate::common::encoding::RowEncoder::encode(&existing_row);
                                     txn.put(key.as_bytes(), &value).await?;
+                                    self.row_cache.invalidate(&key);
                                     for (idx, col) in schema.columns.iter().enumerate() {
                                         if col.is_indexed && col.index_type == IndexType::HNSW {
                                             let idx_name =
@@ -682,6 +683,9 @@ impl Executor {
 
                 let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
                 txn.put(&k, &new_value_bytes).await?;
+                if let Ok(key_str) = std::str::from_utf8(&k) {
+                    self.row_cache.invalidate(key_str);
+                }
 
                 let parts: Vec<&str> = std::str::from_utf8(&k).unwrap().split(':').collect();
                 let row_id = parts.last().unwrap();

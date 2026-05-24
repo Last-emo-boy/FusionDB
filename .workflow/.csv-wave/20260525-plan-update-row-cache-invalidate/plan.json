@@ -1,0 +1,39 @@
+{
+  "session_id": "20260525-plan-update-row-cache-invalidate",
+  "phase": "database-core-performance",
+  "goal": "Keep row-cache reads correct after UPDATE and upsert writes so broader cache reuse remains safe.",
+  "scope": {
+    "include": [
+      "src/execution/dml.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-029"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-029",
+      "title": "UPDATE/upsert row-cache invalidation",
+      "files": [
+        "src/execution/dml.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_update_invalidates_row_cache_for_index_lookup -- --nocapture",
+    "cargo test --test sql_integration test_upsert_do_update_invalidates_row_cache_for_index_lookup -- --nocapture",
+    "cargo check --lib"
+  ]
+}

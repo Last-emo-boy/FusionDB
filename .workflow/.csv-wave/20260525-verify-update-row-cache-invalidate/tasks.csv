@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-029,maestro-verify,"database-core-performance update row cache invalidate",3,completed,"Formatting, UPDATE cache regression, upsert cache regression, and lib check passed.",".workflow/.csv-wave/20260525-verify-update-row-cache-invalidate/verification.json",""

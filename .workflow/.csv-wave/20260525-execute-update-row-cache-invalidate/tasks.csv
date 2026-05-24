@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-029,maestro-execute,"database-core-performance update row cache invalidate --method cli",2,completed,"UPDATE and upsert conflict writes now invalidate cached full rows.","src/execution/dml.rs;tests/sql_integration.rs",""

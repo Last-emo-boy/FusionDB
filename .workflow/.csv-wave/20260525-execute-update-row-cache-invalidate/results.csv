@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-029,completed,"Row cache remains coherent after UPDATE and ON CONFLICT DO UPDATE writes.","src/execution/dml.rs;tests/sql_integration.rs",""

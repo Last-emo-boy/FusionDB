@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-029,maestro-plan,"database-core-performance update row cache invalidate",1,completed,"UPDATE and upsert writes must invalidate cached full rows before broader scan cache reuse.",".workflow/.csv-wave/20260525-plan-update-row-cache-invalidate/plan.json",""
