@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-037,completed,"UPDATE reuses cached rows to avoid redundant row decoding while preserving row-cache invalidation after writes.","src/execution/dml.rs;tests/sql_integration.rs",""

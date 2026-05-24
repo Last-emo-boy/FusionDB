@@ -1,0 +1,29 @@
+{
+  "session_id": "20260525-verify-update-row-cache",
+  "status": "passed",
+  "scope": [
+    "src/execution/dml.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_update_primary_key_reuses_row_cache_for_secondary_index -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_update_invalidates_row_cache_for_index_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ]
+}

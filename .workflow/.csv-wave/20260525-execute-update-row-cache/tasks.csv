@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-037,maestro-execute,"database-core-performance UPDATE row cache --method cli",2,completed,"UPDATE now checks row_cache before decoding storage bytes and reuses cached rows for selection, assignment evaluation, and index maintenance.","src/execution/dml.rs;tests/sql_integration.rs",""

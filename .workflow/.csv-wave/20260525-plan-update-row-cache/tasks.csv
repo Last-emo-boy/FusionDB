@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-037,maestro-plan,"database-core-performance UPDATE row cache",1,completed,"UPDATE can reuse full rows already present in row_cache before applying assignments and index maintenance.",".workflow/.csv-wave/20260525-plan-update-row-cache/plan.json",""
