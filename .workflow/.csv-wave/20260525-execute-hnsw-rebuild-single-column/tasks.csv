@@ -1,0 +1,3 @@
+id,title,wave,status,files,summary,error
+TASK-021,HNSW rebuild single-column decode,1,completed,"src/storage/fusion.rs","HNSW rebuild decodes only target vector columns.", ""
+TASK-022,HNSW rebuild batch insert,2,completed,"src/storage/fusion.rs","HNSW rebuild batches vectors by index name and inserts once per index.", ""

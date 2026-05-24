@@ -1,0 +1,50 @@
+{
+  "session_id": "20260525-plan-hnsw-rebuild-single-column",
+  "phase": "database-core-performance",
+  "goal": "Avoid full-row decoding and per-row vector index insertion during HNSW rebuild.",
+  "scope": {
+    "include": [
+      "src/storage/fusion.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-021"
+      ]
+    },
+    {
+      "wave": 2,
+      "tasks": [
+        "TASK-022"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-021",
+      "title": "HNSW rebuild single-column decode",
+      "files": [
+        "src/storage/fusion.rs"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TASK-022",
+      "title": "HNSW rebuild batch insert",
+      "files": [
+        "src/storage/fusion.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test fusion_rebuild_vector_index_decodes_only_hnsw_columns --lib -- --nocapture",
+    "cargo check --lib"
+  ]
+}

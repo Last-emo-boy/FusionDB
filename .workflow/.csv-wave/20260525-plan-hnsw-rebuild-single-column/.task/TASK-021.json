@@ -1,0 +1,14 @@
+{
+  "id": "TASK-021",
+  "title": "HNSW rebuild single-column decode",
+  "status": "completed",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "summary": "Changed `FusionStorage::rebuild_vector_index` to decode only HNSW vector columns with `RowDecoder::decode_column` instead of decoding full rows.",
+  "risk": "Rows with missing or non-vector HNSW values are skipped as before.",
+  "verification": [
+    "cargo test fusion_rebuild_vector_index_decodes_only_hnsw_columns --lib -- --nocapture"
+  ]
+}

@@ -480,14 +480,12 @@ impl FusionStorage {
             if let Ok(key_str) = std::str::from_utf8(&k) {
                 if let Some(table_name) = key_str.strip_prefix(prefix) {
                     if let Ok(schema) = bincode::deserialize::<crate::catalog::TableSchema>(&v) {
-                        // Find HNSW columns
                         let mut hnsw_cols = Vec::new();
                         for (idx, col) in schema.columns.iter().enumerate() {
                             if col.is_indexed && col.index_type == crate::catalog::IndexType::HNSW {
-                                hnsw_cols.push((idx, col.name.clone()));
-                                // Ensure index exists
                                 let idx_name = format!("hnsw_{}_{}", table_name, col.name);
                                 self.vector_index.create_index(&idx_name);
+                                hnsw_cols.push((idx, idx_name));
                             }
                         }
 
@@ -495,30 +493,37 @@ impl FusionStorage {
                             continue;
                         }
 
-                        // Scan data for this table
                         let data_prefix = format!("data:{}:", table_name);
                         if let Ok(data_pairs) = txn.scan_prefix(data_prefix.as_bytes(), None).await
                         {
-                            for (dk, dv) in data_pairs {
-                                if let Ok(row) = crate::common::encoding::RowDecoder::decode(&dv) {
-                                    let parts: Vec<&str> =
-                                        std::str::from_utf8(&dk).unwrap().split(':').collect();
-                                    let row_id = parts.last().unwrap().to_string();
+                            let mut batches: HashMap<String, Vec<(String, Vec<f32>)>> =
+                                HashMap::new();
 
-                                    for (col_idx, col_name) in &hnsw_cols {
-                                        if let Some(crate::common::Value::Vector(vec)) =
-                                            row.get(*col_idx)
-                                        {
-                                            let idx_name =
-                                                format!("hnsw_{}_{}", table_name, col_name);
-                                            let _ = self.vector_index.insert(
-                                                &idx_name,
-                                                row_id.clone(),
-                                                vec.clone(),
-                                            );
-                                        }
+                            for (dk, dv) in data_pairs {
+                                let Some(row_id) = std::str::from_utf8(&dk)
+                                    .ok()
+                                    .and_then(|key| key.rsplit(':').next())
+                                    .map(|value| value.to_string())
+                                else {
+                                    continue;
+                                };
+
+                                for (col_idx, idx_name) in &hnsw_cols {
+                                    if let Ok(Some(crate::common::Value::Vector(vec))) =
+                                        crate::common::encoding::RowDecoder::decode_column(
+                                            &dv, *col_idx,
+                                        )
+                                    {
+                                        batches
+                                            .entry(idx_name.clone())
+                                            .or_default()
+                                            .push((row_id.clone(), vec));
                                     }
                                 }
+                            }
+
+                            for (idx_name, items) in batches {
+                                let _ = self.vector_index.batch_insert(&idx_name, items);
                             }
                         }
                     }
@@ -1684,6 +1689,90 @@ mod tests {
 
     fn cleanup_storage_dir(path: &Path) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn fusion_rebuild_vector_index_decodes_only_hnsw_columns() {
+        let data_dir = unique_storage_dir("rebuild_hnsw_single_column");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        let schema = crate::catalog::TableSchema::new(
+            "vec_rebuild".to_string(),
+            vec![
+                crate::catalog::Column {
+                    name: "id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    is_primary: true,
+                    is_indexed: true,
+                    index_type: crate::catalog::IndexType::BTree,
+                    default_value: None,
+                    is_nullable: false,
+                    is_unique: true,
+                    check_expr: None,
+                },
+                crate::catalog::Column {
+                    name: "embedding".to_string(),
+                    data_type: "VECTOR".to_string(),
+                    is_primary: false,
+                    is_indexed: true,
+                    index_type: crate::catalog::IndexType::HNSW,
+                    default_value: None,
+                    is_nullable: true,
+                    is_unique: false,
+                    check_expr: None,
+                },
+                crate::catalog::Column {
+                    name: "payload".to_string(),
+                    data_type: "TEXT".to_string(),
+                    is_primary: false,
+                    is_indexed: false,
+                    index_type: crate::catalog::IndexType::None,
+                    default_value: None,
+                    is_nullable: true,
+                    is_unique: false,
+                    check_expr: None,
+                },
+            ],
+        );
+
+        let mut row = crate::common::encoding::RowEncoder::encode(&[
+            crate::common::Value::Integer(1),
+            crate::common::Value::Vector(vec![1.0, 0.0]),
+            crate::common::Value::String("payload".to_string()),
+        ]);
+        let corrupt_col_idx = 2usize;
+        let off_pos = 2 + corrupt_col_idx * 4;
+        let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        for byte in &mut row[start..] {
+            *byte = 0xff;
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            let schema_bytes = bincode::serialize(&schema).unwrap();
+            txn.put(b"schema:vec_rebuild", &schema_bytes).await.unwrap();
+            txn.put(b"data:vec_rebuild:0000000000000001", &row)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        storage.rebuild_vector_index().await;
+
+        let results = storage
+            .vector_index
+            .search("hnsw_vec_rebuild_embedding", &[1.0, 0.0], 1)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "0000000000000001");
+
+        cleanup_storage_dir(&data_dir);
     }
 
     #[tokio::test]

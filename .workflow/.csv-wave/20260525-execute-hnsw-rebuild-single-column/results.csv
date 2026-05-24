@@ -1,0 +1,3 @@
+id,status,summary,artifacts,error
+TASK-021,completed,"HNSW rebuild now uses RowDecoder::decode_column for vector columns.","src/storage/fusion.rs",""
+TASK-022,completed,"HNSW rebuild now uses VectorIndex::batch_insert per rebuilt index.","src/storage/fusion.rs",""

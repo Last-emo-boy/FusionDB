@@ -1,0 +1,14 @@
+{
+  "id": "TASK-022",
+  "title": "HNSW rebuild batch insert",
+  "status": "completed",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "summary": "Grouped rebuilt vectors by HNSW index name and used `VectorIndex::batch_insert` once per index.",
+  "risk": "Batch insert uses existing vector dimension validation and returns errors that rebuild continues to tolerate.",
+  "verification": [
+    "cargo check --lib"
+  ]
+}

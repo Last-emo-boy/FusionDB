@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,HNSW rebuild decode exploration,Inspect vector index rebuild path for row decode scope,performance,,,1,completed,"HNSW rebuild only needs HNSW vector columns but decoded complete row values.",
+E2,HNSW rebuild insert exploration,Inspect vector index rebuild insertion path,performance,,,1,completed,"VectorIndex already supports batch_insert, avoiding repeated wrapper lock and building once per index.",
+P1,Plan generation,Generate TASKs for HNSW rebuild decode and insert optimizations,planning,E1;E2,E1;E2,2,completed,"Plan TASK-021..022: decode HNSW columns only and batch insert per index.",

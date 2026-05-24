@@ -1,0 +1,4 @@
+id,command,status,notes
+V1,cargo fmt --check,passed,"formatting clean"
+V2,cargo test fusion_rebuild_vector_index_decodes_only_hnsw_columns --lib -- --nocapture,passed,"covers HNSW rebuild single-column decode"
+V3,cargo check --lib,passed,"library type check clean"
