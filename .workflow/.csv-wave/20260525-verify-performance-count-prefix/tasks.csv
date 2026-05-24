@@ -1,0 +1,5 @@
+id,title,description,layer,phase_dir,check_type,deps,context_from,wave,status,findings,gaps_found,fix_plan,error
+1,Formatting,Run rustfmt check for modified Rust files,truth,.workflow/.csv-wave/20260525-plan-performance-count-prefix,command,,,,completed,"cargo fmt --check passed.",[],,
+2,Core compile,Compile core library after storage changes,truth,.workflow/.csv-wave/20260525-plan-performance-count-prefix,command,1,1,1,completed,"cargo check --lib passed.",[],,
+3,Fusion storage tests,Verify Fusion count and first behavior,truth,.workflow/.csv-wave/20260525-plan-performance-count-prefix,command,2,2,1,completed,"cargo test storage::fusion::tests --lib -- --nocapture passed.",[],,
+4,Memory storage tests,Verify Memory merge scan/count/first/last behavior,truth,.workflow/.csv-wave/20260525-plan-performance-count-prefix,command,2,2,1,completed,"cargo test storage::memory::tests --lib -- --nocapture passed.",[],,

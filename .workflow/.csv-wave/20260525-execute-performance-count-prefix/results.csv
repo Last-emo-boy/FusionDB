@@ -1,0 +1,5 @@
+id,status,findings,files_modified,tests_passed,error
+TASK-001,completed,"Fusion count_prefix counts through shared visible-range traversal without full scan_range materialization.","src/storage/fusion.rs","cargo fmt --check; cargo check --lib; cargo test storage::fusion::tests --lib -- --nocapture",
+TASK-002,completed,"Fusion first returns the first visible row through the same traversal and stops immediately.","src/storage/fusion.rs","cargo fmt --check; cargo check --lib; cargo test storage::fusion::tests --lib -- --nocapture",
+TASK-003,completed,"Memory count_prefix, first and limited scan_range use visitor traversal and can short-circuit.","src/storage/memory.rs","cargo fmt --check; cargo check --lib; cargo test storage::memory::tests --lib -- --nocapture",
+TASK-004,completed,"Memory last tracks the most recent visited row without building a full merged range vector.","src/storage/memory.rs","cargo fmt --check; cargo check --lib; cargo test storage::memory::tests --lib -- --nocapture",

@@ -1,0 +1,19 @@
+{
+  "id": "TASK-002",
+  "title": "Non-materializing Fusion first",
+  "description": "Optimize FusionTransaction::first so primary-key MIN fast paths can return the first visible row without allocating a temporary scan_range result vector.",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve Fusion scan_range visibility, tombstone and de-dup semantics",
+    "Keep behavior aligned with Transaction::first"
+  ],
+  "convergence_criteria": [
+    "FusionTransaction::first no longer calls scan_range just to take one row",
+    "A focused FusionStorage first regression test passes",
+    "Existing storage tests pass"
+  ],
+  "status": "completed"
+}

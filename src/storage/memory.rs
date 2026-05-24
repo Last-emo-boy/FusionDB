@@ -64,10 +64,22 @@ impl MemoryTransaction {
         }
     }
 
-    /// Build a merged snapshot: committed data overlaid with the write buffer.
-    /// Returns an iterator-like BTreeMap of live key-value pairs in the given
-    /// range `[start, end)`.
-    fn merged_range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut end = prefix.to_vec();
+        while let Some(last) = end.last_mut() {
+            if *last < 255 {
+                *last += 1;
+                return Some(end);
+            }
+            end.pop();
+        }
+        None
+    }
+
+    fn for_each_merged_range<F>(&self, start: &[u8], end: &[u8], mut visit: F)
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
         let data = self.storage.data.read();
 
         // Merge: iterate both sources in order
@@ -77,51 +89,63 @@ impl MemoryTransaction {
             .range(start.to_vec()..end.to_vec())
             .peekable();
 
-        let mut result = Vec::new();
         loop {
-            match (storage_iter.peek(), wb_iter.peek()) {
+            let should_continue = match (storage_iter.peek(), wb_iter.peek()) {
                 (Some(&(sk, _)), Some(&(wk, _))) => {
                     match sk.cmp(wk) {
                         std::cmp::Ordering::Less => {
-                            // Storage key comes first; only include if not shadowed by wb
-                            if !self.write_buffer.contains_key(sk) {
-                                result.push((sk.clone(), data.get(sk).unwrap().clone()));
+                            if !visit(sk, data.get(sk).unwrap()) {
+                                return;
                             }
                             storage_iter.next();
+                            true
                         }
                         std::cmp::Ordering::Equal => {
                             // Write buffer wins
                             if let Some(val) = wb_iter.peek().and_then(|(_, v)| v.as_ref()) {
-                                result.push((wk.clone(), val.clone()));
+                                if !visit(wk, val) {
+                                    return;
+                                }
                             }
                             // else: tombstone, skip
                             storage_iter.next();
                             wb_iter.next();
+                            true
                         }
                         std::cmp::Ordering::Greater => {
                             if let Some(val) = wb_iter.peek().and_then(|(_, v)| v.as_ref()) {
-                                result.push((wk.clone(), val.clone()));
+                                if !visit(wk, val) {
+                                    return;
+                                }
                             }
                             wb_iter.next();
+                            true
                         }
                     }
                 }
                 (Some(&(sk, sv)), None) => {
-                    if !self.write_buffer.contains_key(sk) {
-                        result.push((sk.clone(), sv.clone()));
+                    if !visit(sk, sv) {
+                        return;
                     }
                     storage_iter.next();
+                    true
                 }
                 (None, Some(&(wk, wv))) => {
                     if let Some(val) = wv {
-                        result.push((wk.clone(), val.clone()));
+                        if !visit(wk, val) {
+                            return;
+                        }
                     }
                     wb_iter.next();
+                    true
                 }
-                (None, None) => break,
+                (None, None) => false,
+            };
+
+            if !should_continue {
+                break;
             }
         }
-        result
     }
 }
 
@@ -153,21 +177,10 @@ impl Transaction for MemoryTransaction {
         prefix: &[u8],
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        // Compute end bound for prefix range
-        let mut end = prefix.to_vec();
-        let mut found = false;
-        while let Some(last) = end.last_mut() {
-            if *last < 255 {
-                *last += 1;
-                found = true;
-                break;
-            }
-            end.pop();
+        if let Some(end) = Self::prefix_end(prefix) {
+            return self.scan_range(prefix, &end, limit).await;
         }
-        if !found {
-            return Ok(Vec::new());
-        }
-        self.scan_range(prefix, &end, limit).await
+        Ok(Vec::new())
     }
 
     async fn scan_range(
@@ -176,24 +189,48 @@ impl Transaction for MemoryTransaction {
         end: &[u8],
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let merged = self.merged_range(start, end);
         let safe_limit = limit.unwrap_or(usize::MAX);
-        Ok(merged.into_iter().take(safe_limit).collect())
+        if safe_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::with_capacity(safe_limit.min(4096));
+        self.for_each_merged_range(start, end, |key, value| {
+            result.push((key.to_vec(), value.to_vec()));
+            result.len() < safe_limit
+        });
+        Ok(result)
     }
 
     async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
-        let results = self.scan_prefix(prefix, None).await?;
-        Ok(results.len())
+        let Some(end) = Self::prefix_end(prefix) else {
+            return Ok(0);
+        };
+
+        let mut count = 0;
+        self.for_each_merged_range(prefix, &end, |_key, _value| {
+            count += 1;
+            true
+        });
+        Ok(count)
     }
 
     async fn first(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let results = self.scan_range(start, end, Some(1)).await?;
-        Ok(results.into_iter().next())
+        let mut first = None;
+        self.for_each_merged_range(start, end, |key, value| {
+            first = Some((key.to_vec(), value.to_vec()));
+            false
+        });
+        Ok(first)
     }
 
     async fn last(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let merged = self.merged_range(start, end);
-        Ok(merged.into_iter().last())
+        let mut last = None;
+        self.for_each_merged_range(start, end, |key, value| {
+            last = Some((key.to_vec(), value.to_vec()));
+            true
+        });
+        Ok(last)
     }
 
     async fn commit(self: Box<Self>) -> Result<()> {

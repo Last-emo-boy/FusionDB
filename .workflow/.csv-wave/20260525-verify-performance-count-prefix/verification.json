@@ -1,0 +1,33 @@
+{
+  "session_id": "20260525-verify-performance-count-prefix",
+  "status": "passed",
+  "scope": [
+    "src/storage/fusion.rs",
+    "src/storage/memory.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test storage::fusion::tests --lib -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test storage::memory::tests --lib -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_count_star -- --nocapture",
+      "status": "passed"
+    }
+  ]
+}

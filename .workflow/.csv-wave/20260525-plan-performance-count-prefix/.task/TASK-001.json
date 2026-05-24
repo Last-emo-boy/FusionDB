@@ -1,0 +1,20 @@
+{
+  "id": "TASK-001",
+  "title": "Non-materializing Fusion COUNT prefix",
+  "description": "Optimize FusionTransaction::count_prefix so COUNT(*) can count visible keys without allocating a Vec of every matching key/value pair.",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve scan_range MVCC visibility, tombstone and de-dup semantics",
+    "Keep the change limited to database core behavior and focused tests"
+  ],
+  "convergence_criteria": [
+    "FusionTransaction::count_prefix no longer calls scan_range just to count",
+    "scan_range and count_prefix share the same visible-range merge logic",
+    "A focused FusionStorage count_prefix regression test passes",
+    "Existing SELECT COUNT(*) integration test passes"
+  ],
+  "status": "planned"
+}

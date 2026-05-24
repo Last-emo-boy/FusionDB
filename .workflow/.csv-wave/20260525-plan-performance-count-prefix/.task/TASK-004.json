@@ -1,0 +1,19 @@
+{
+  "id": "TASK-004",
+  "title": "Non-materializing Memory last",
+  "description": "Optimize MemoryTransaction::last so it tracks the last visible row during merge traversal instead of building a full merged Vec.",
+  "scope": [
+    "src/storage/memory.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve MemoryTransaction ordering semantics",
+    "Keep existing tests passing"
+  ],
+  "convergence_criteria": [
+    "MemoryTransaction::last uses the shared merge traversal",
+    "No dead merged_range helper remains",
+    "Memory storage tests pass without warnings"
+  ],
+  "status": "completed"
+}

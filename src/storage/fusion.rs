@@ -71,7 +71,7 @@ use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::sstable::{SsTable, SsTableBuilder};
 use crate::storage::vector_index::VectorIndex;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 
 struct MergeItem {
@@ -403,6 +403,18 @@ impl FusionStorage {
             return (false, &[]);
         }
         (data[0] == 1, &data[1..])
+    }
+
+    fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut end = prefix.to_vec();
+        while let Some(last) = end.last_mut() {
+            if *last < 255 {
+                *last += 1;
+                return Some(end);
+            }
+            end.pop();
+        }
+        None
     }
 
     fn sstable_path_for(&self, id: u64) -> PathBuf {
@@ -921,130 +933,11 @@ pub struct FusionTransaction {
     pub read_ts: u64,
 }
 
-#[async_trait]
-impl Transaction for FusionTransaction {
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // 1. Read-Your-Own-Writes
-        for (k, v) in self.write_buffer.iter().rev() {
-            if k == key {
-                if let Ok(_s) = std::str::from_utf8(key) {
-                    // if s.contains("9999999") {
-                    //    eprintln!("DEBUG: FusionTransaction::get HIT WriteBuffer. Key: {}, ValLen: {}, Val: {:?}", s, v.as_ref().map(|x| x.len()).unwrap_or(0), v);
-                    // }
-                }
-                return Ok(v.clone());
-            }
-        }
-
-        // 2. Scan Storage (Active + Immutable) for latest version <= read_ts
-        let search_key = FusionStorage::encode_key(key, self.read_ts);
-
-        // Helper to check a memtable
-        let check_mem = |mem: &MemTable| -> Option<Vec<u8>> {
-            // Range scan starting from (Key, MAX-read_ts)
-            // The first entry >= search_key
-            let entry = mem.map.range(search_key.clone()..).next();
-            if let Some(ent) = entry {
-                let (k, _ts) = FusionStorage::decode_key(ent.key());
-                if k == key {
-                    // Found valid version
-                    let (is_put, val) = FusionStorage::decode_value(ent.value());
-                    if is_put {
-                        return Some(val.to_vec());
-                    } else {
-                        return Some(Vec::new());
-                    } // Tombstone found, stop searching
-                }
-            }
-            None
-        };
-
-        // Check Active
-        {
-            let active = self.storage.active_memtable.read().unwrap();
-            if let Some(val) = check_mem(&active) {
-                if val.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(val));
-            }
-        }
-
-        // Check Immutable
-        {
-            let imm = self.storage.immutable_memtables.read().unwrap();
-            for mem in imm.iter().rev() {
-                if let Some(val) = check_mem(mem) {
-                    if val.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(val));
-                }
-            }
-        }
-
-        // Check SSTables
-        let sstables: Vec<Arc<SsTable>> = {
-            let guard = self.storage.sstables.read().unwrap();
-            guard.clone()
-        };
-
-        for sst in sstables.iter().rev() {
-            if let Ok(Some((k_bytes, v_bytes))) = sst.find_ge(&search_key).await {
-                let (k, _ts) = FusionStorage::decode_key(&k_bytes);
-                if k == key {
-                    let (is_put, val) = FusionStorage::decode_value(&v_bytes);
-                    if is_put {
-                        return Ok(Some(val.to_vec()));
-                    } else {
-                        return Ok(None);
-                    } // Tombstone found
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.write_buffer.push((key.to_vec(), Some(value.to_vec())));
-        Ok(())
-    }
-
-    async fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.write_buffer.push((key.to_vec(), None));
-        Ok(())
-    }
-
-    async fn scan_prefix(
-        &self,
-        prefix: &[u8],
-        limit: Option<usize>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut end = prefix.to_vec();
-        let mut found = false;
-        while let Some(last) = end.last_mut() {
-            if *last < 255 {
-                *last += 1;
-                found = true;
-                break;
-            }
-            end.pop();
-        }
-        if found {
-            return self.scan_range(prefix, &end, limit).await;
-        } else {
-            return Ok(Vec::new());
-        }
-    }
-
-    async fn scan_range(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        limit: Option<usize>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let safe_limit = limit.unwrap_or(usize::MAX);
+impl FusionTransaction {
+    async fn for_each_visible_range<F>(&self, start: &[u8], end: &[u8], mut visit: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool + Send,
+    {
         let read_ts = self.read_ts;
         let start_ik = FusionStorage::encode_key(start, u64::MAX);
 
@@ -1062,27 +955,20 @@ impl Transaction for FusionTransaction {
         }
 
         // WriteBuffer
-        let mut wb_items = Vec::new();
+        let mut wb_latest = BTreeMap::new();
         for (k, v) in &self.write_buffer {
             if k.as_slice() >= start && k.as_slice() < end {
-                let ik = FusionStorage::encode_key(k, u64::MAX);
-                let iv = match v {
-                    Some(val) => {
-                        let encoded = FusionStorage::encode_value(true, val);
-                        // if let Ok(s) = std::str::from_utf8(k) {
-                        //    if s.contains("800000000098967f") {
-                        //        eprintln!("DEBUG: scan_range WB. Key: {}, OriginalLen: {}, EncodedWithFlagLen: {}, First4: {:?}", s, val.len(), encoded.len(), &encoded[..std::cmp::min(4, encoded.len())]);
-                        //    }
-                        // }
-                        encoded
-                    }
-                    None => FusionStorage::encode_value(false, &[]),
-                };
-                wb_items.push((ik, iv));
+                wb_latest.insert(k.clone(), v.clone());
             }
         }
-        wb_items.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut wb_iter = wb_items.into_iter();
+        let mut wb_iter = wb_latest.into_iter().map(|(k, v)| {
+            let ik = FusionStorage::encode_key(&k, u64::MAX);
+            let iv = match v {
+                Some(val) => FusionStorage::encode_value(true, &val),
+                None => FusionStorage::encode_value(false, &[]),
+            };
+            (ik, iv)
+        });
 
         // 2. Initialize Heap
         let mut heap = BinaryHeap::new();
@@ -1207,7 +1093,6 @@ impl Transaction for FusionTransaction {
         }
 
         // 3. Merge Loop
-        let mut res = Vec::with_capacity(safe_limit.min(4096));
         let mut last_user_key: Option<Vec<u8>> = None;
 
         while let Some(item) = heap.pop() {
@@ -1219,6 +1104,7 @@ impl Transaction for FusionTransaction {
             if user_k >= end {
                 break;
             }
+            let current_visible = idx == 0 || ts <= read_ts;
 
             // Advance Iterator (must happen before dedup skip)
             let mut next_item = None;
@@ -1226,10 +1112,8 @@ impl Transaction for FusionTransaction {
             if idx == 0 {
                 while let Some((nk, nv)) = wb_iter.next() {
                     let (nuk, _nts) = FusionStorage::decode_key(&nk);
-                    if nuk == user_k {
-                        if ts <= read_ts {
-                            continue;
-                        }
+                    if nuk == user_k && current_visible {
+                        continue;
                     }
                     next_item = Some((nk, nv));
                     break;
@@ -1249,10 +1133,8 @@ impl Transaction for FusionTransaction {
                         next_item = None;
                         break;
                     }
-                    if nuk == user_k {
-                        if ts <= read_ts {
-                            continue;
-                        }
+                    if nuk == user_k && current_visible {
+                        continue;
                     }
                     next_item = Some((nk, nv));
                     break;
@@ -1273,10 +1155,8 @@ impl Transaction for FusionTransaction {
                             next_item = None;
                             break;
                         }
-                        if nuk == user_k {
-                            if ts <= read_ts {
-                                continue;
-                            }
+                        if nuk == user_k && current_visible {
+                            continue;
                         }
                         next_item = Some((nk, nv));
                         break;
@@ -1298,51 +1178,168 @@ impl Transaction for FusionTransaction {
                 }
             }
 
-            if ts <= read_ts {
+            if current_visible {
                 last_user_key = Some(user_k.to_vec());
                 let (is_put, val) = FusionStorage::decode_value(&v);
-                if is_put {
-                    res.push((user_k.to_vec(), val.to_vec()));
-                    if res.len() >= safe_limit {
-                        break;
-                    }
+                if is_put && !visit(user_k, val) {
+                    break;
                 }
             }
         }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Transaction for FusionTransaction {
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // 1. Read-Your-Own-Writes
+        for (k, v) in self.write_buffer.iter().rev() {
+            if k == key {
+                if let Ok(_s) = std::str::from_utf8(key) {
+                    // if s.contains("9999999") {
+                    //    eprintln!("DEBUG: FusionTransaction::get HIT WriteBuffer. Key: {}, ValLen: {}, Val: {:?}", s, v.as_ref().map(|x| x.len()).unwrap_or(0), v);
+                    // }
+                }
+                return Ok(v.clone());
+            }
+        }
+
+        // 2. Scan Storage (Active + Immutable) for latest version <= read_ts
+        let search_key = FusionStorage::encode_key(key, self.read_ts);
+
+        // Helper to check a memtable
+        let check_mem = |mem: &MemTable| -> Option<Vec<u8>> {
+            // Range scan starting from (Key, MAX-read_ts)
+            // The first entry >= search_key
+            let entry = mem.map.range(search_key.clone()..).next();
+            if let Some(ent) = entry {
+                let (k, _ts) = FusionStorage::decode_key(ent.key());
+                if k == key {
+                    // Found valid version
+                    let (is_put, val) = FusionStorage::decode_value(ent.value());
+                    if is_put {
+                        return Some(val.to_vec());
+                    } else {
+                        return Some(Vec::new());
+                    } // Tombstone found, stop searching
+                }
+            }
+            None
+        };
+
+        // Check Active
+        {
+            let active = self.storage.active_memtable.read().unwrap();
+            if let Some(val) = check_mem(&active) {
+                if val.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(val));
+            }
+        }
+
+        // Check Immutable
+        {
+            let imm = self.storage.immutable_memtables.read().unwrap();
+            for mem in imm.iter().rev() {
+                if let Some(val) = check_mem(mem) {
+                    if val.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(val));
+                }
+            }
+        }
+
+        // Check SSTables
+        let sstables: Vec<Arc<SsTable>> = {
+            let guard = self.storage.sstables.read().unwrap();
+            guard.clone()
+        };
+
+        for sst in sstables.iter().rev() {
+            if let Ok(Some((k_bytes, v_bytes))) = sst.find_ge(&search_key).await {
+                let (k, _ts) = FusionStorage::decode_key(&k_bytes);
+                if k == key {
+                    let (is_put, val) = FusionStorage::decode_value(&v_bytes);
+                    if is_put {
+                        return Ok(Some(val.to_vec()));
+                    } else {
+                        return Ok(None);
+                    } // Tombstone found
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.write_buffer.push((key.to_vec(), Some(value.to_vec())));
+        Ok(())
+    }
+
+    async fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.write_buffer.push((key.to_vec(), None));
+        Ok(())
+    }
+
+    async fn scan_prefix(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(end) = FusionStorage::prefix_end(prefix) {
+            return self.scan_range(prefix, &end, limit).await;
+        }
+        Ok(Vec::new())
+    }
+
+    async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut res = Vec::with_capacity(safe_limit.min(4096));
+        self.for_each_visible_range(start, end, |user_k, val| {
+            res.push((user_k.to_vec(), val.to_vec()));
+            res.len() < safe_limit
+        })
+        .await?;
 
         Ok(res)
     }
 
     async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
-        // Optimized: reuse scan_range merge iterator logic but only count results
-        // This avoids HashMap allocation and is O(n log k) vs O(n) HashMap with high constant
-        let mut end = prefix.to_vec();
-        let mut found = false;
-        while let Some(last) = end.last_mut() {
-            if *last < 255 {
-                *last += 1;
-                found = true;
-                break;
-            }
-            end.pop();
-        }
-        if !found {
+        let Some(end) = FusionStorage::prefix_end(prefix) else {
             return Ok(0);
-        }
+        };
 
-        let results = self.scan_range(prefix, &end, None).await?;
-        Ok(results.len())
+        let mut count = 0;
+        self.for_each_visible_range(prefix, &end, |_user_k, _val| {
+            count += 1;
+            true
+        })
+        .await?;
+        Ok(count)
     }
 
     async fn first(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        // Revert to using scan_range(limit=1) which is optimized enough (and faster than complex lazy logic)
-        // scan_range already filters SSTables that don't overlap.
-        let res = self.scan_range(start, end, Some(1)).await?;
-        if res.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(res[0].clone()))
-        }
+        let mut first = None;
+        self.for_each_visible_range(start, end, |user_k, val| {
+            first = Some((user_k.to_vec(), val.to_vec()));
+            false
+        })
+        .await?;
+        Ok(first)
     }
 
     async fn last(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
@@ -1674,5 +1671,96 @@ impl Storage for FusionStorage {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_storage_dir(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("fusiondb_{}_{}", test_name, uuid::Uuid::new_v4()))
+    }
+
+    fn cleanup_storage_dir(path: &Path) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn fusion_count_prefix_matches_scan_prefix_after_overwrite_delete_and_write_buffer() {
+        let data_dir = unique_storage_dir("count_prefix");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:x:001", b"one").await.unwrap();
+            txn.put(b"data:x:002", b"two").await.unwrap();
+            txn.put(b"data:y:001", b"other").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:x:002", b"two-new").await.unwrap();
+            txn.delete(b"data:x:001").await.unwrap();
+            txn.put(b"data:x:003", b"three").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:x:004", b"four").await.unwrap();
+            txn.delete(b"data:x:002").await.unwrap();
+
+            let rows = txn.scan_prefix(b"data:x:", None).await.unwrap();
+            let count = txn.count_prefix(b"data:x:").await.unwrap();
+
+            assert_eq!(count, rows.len());
+            assert_eq!(count, 2);
+            assert_eq!(
+                rows.iter()
+                    .map(|(key, _)| key.as_slice())
+                    .collect::<Vec<_>>(),
+                vec![b"data:x:003".as_slice(), b"data:x:004".as_slice()]
+            );
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_first_uses_visible_range_with_write_buffer_shadowing() {
+        let data_dir = unique_storage_dir("first_visible");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:z:001", b"one").await.unwrap();
+            txn.put(b"data:z:002", b"two").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.delete(b"data:z:001").await.unwrap();
+            txn.put(b"data:z:000", b"zero").await.unwrap();
+
+            let first = txn.first(b"data:z:", b"data:z;").await.unwrap();
+            assert_eq!(first, Some((b"data:z:000".to_vec(), b"zero".to_vec())));
+        }
+
+        cleanup_storage_dir(&data_dir);
     }
 }

@@ -1,0 +1,20 @@
+{
+  "id": "TASK-003",
+  "title": "Non-materializing Memory count and bounded scans",
+  "description": "Optimize MemoryTransaction count_prefix, first, and scan_range(limit) so they can avoid building a full merged Vec when the caller only needs a count, first row, or limited prefix.",
+  "scope": [
+    "src/storage/memory.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve MemoryTransaction read-your-own-writes and tombstone behavior",
+    "Reuse a shared merge traversal to avoid semantic drift"
+  ],
+  "convergence_criteria": [
+    "MemoryTransaction::count_prefix no longer calls scan_prefix to count",
+    "MemoryTransaction::first no longer calls scan_range to take one row",
+    "MemoryTransaction::scan_range stops at limit",
+    "Memory storage tests pass"
+  ],
+  "status": "completed"
+}
