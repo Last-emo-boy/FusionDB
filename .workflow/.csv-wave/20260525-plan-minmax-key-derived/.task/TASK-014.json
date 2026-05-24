@@ -1,0 +1,20 @@
+{
+  "id": "TASK-014",
+  "title": "MIN/MAX primary-key key-derived value",
+  "description": "Use the data key suffix instead of decoding row values for no-filter MIN/MAX(primary key).",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Keep empty table behavior returning NULL",
+    "Preserve comparable integer ordering, including negative primary keys"
+  ],
+  "convergence_criteria": [
+    "MIN/MAX(pk) no longer decodes the row value for the aggregate result",
+    "Focused SQL integration test includes a negative primary key",
+    "Targeted test and cargo check pass"
+  ],
+  "status": "completed"
+}

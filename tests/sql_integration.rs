@@ -352,13 +352,13 @@ async fn test_select_min_max_primary_key() {
     .await;
     exec_ok(
         &executor,
-        "INSERT INTO nums VALUES (3, 'c'), (1, 'a'), (2, 'b')",
+        "INSERT INTO nums VALUES (3, 'c'), (-5, 'neg'), (1, 'a'), (2, 'b')",
     )
     .await;
 
     let (cols, rows) = query(&executor, "SELECT MIN(id), MAX(id) FROM nums").await;
     assert_eq!(cols, vec!["MIN(id)", "MAX(id)"]);
-    assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(3)]);
+    assert_eq!(rows[0], vec![Value::Integer(-5), Value::Integer(3)]);
     cleanup(&wal);
 }
 

@@ -1,0 +1,52 @@
+{
+  "session_id": "20260525-plan-minmax-key-derived",
+  "phase": "database-core-performance",
+  "goal": "Avoid row value decode for no-filter MIN/MAX primary-key aggregates.",
+  "scope": {
+    "include": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-013"
+      ]
+    },
+    {
+      "wave": 2,
+      "tasks": [
+        "TASK-014"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-013",
+      "title": "Restore primary-key value from data key",
+      "files": [
+        "src/execution/query.rs"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TASK-014",
+      "title": "MIN/MAX primary-key key-derived value",
+      "files": [
+        "src/execution/query.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_select_min_max_primary_key -- --nocapture",
+    "cargo check --lib"
+  ]
+}

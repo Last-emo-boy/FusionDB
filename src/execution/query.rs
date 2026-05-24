@@ -21,6 +21,23 @@ impl Executor {
         }
     }
 
+    fn primary_key_value_from_data_key(
+        data_key: &[u8],
+        prefix: &str,
+        column: &Column,
+    ) -> Option<Value> {
+        let key = std::str::from_utf8(data_key).ok()?;
+        let row_id = key.strip_prefix(prefix)?;
+
+        if matches!(column.data_type.as_str(), "INTEGER" | "BIGINT") {
+            crate::common::encoding::decode_i64_comparable(row_id)
+                .map(Value::Integer)
+                .or_else(|| Some(Value::String(row_id.to_string())))
+        } else {
+            Some(Value::String(row_id.to_string()))
+        }
+    }
+
     fn resolve_order_by_projection_index(
         &self,
         expr: &Expr,
@@ -315,10 +332,12 @@ impl Executor {
                                                                 txn.last(&min_key, &max_key).await?
                                                             };
 
-                                                            let val = if let Some((_, v)) = res {
-                                                                crate::common::encoding::RowDecoder::decode_column(&v, idx)
-                                                                    .unwrap_or(None)
-                                                                    .unwrap_or(Value::Null)
+                                                            let val = if let Some((key, _)) = res {
+                                                                let column = &schema.columns[idx];
+                                                                Self::primary_key_value_from_data_key(
+                                                                    &key, &prefix, column,
+                                                                )
+                                                                .unwrap_or(Value::Null)
                                                             } else {
                                                                 Value::Null
                                                             };

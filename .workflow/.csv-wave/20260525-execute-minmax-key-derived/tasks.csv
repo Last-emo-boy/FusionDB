@@ -1,0 +1,3 @@
+id,task_id,title,files,status,summary,error
+X1,TASK-013,Restore primary-key value from data key,"src/execution/query.rs",completed,"Added a helper for converting data key suffixes back into typed primary-key values.",
+X2,TASK-014,MIN/MAX primary-key key-derived value,"src/execution/query.rs;tests/sql_integration.rs",completed,"MIN/MAX(pk) now uses first/last key suffixes and avoids row value decoding.",

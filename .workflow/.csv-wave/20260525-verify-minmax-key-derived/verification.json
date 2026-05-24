@@ -1,0 +1,25 @@
+{
+  "session_id": "20260525-verify-minmax-key-derived",
+  "status": "passed",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_min_max_primary_key -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ]
+}

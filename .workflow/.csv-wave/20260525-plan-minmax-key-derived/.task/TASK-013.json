@@ -1,0 +1,19 @@
+{
+  "id": "TASK-013",
+  "title": "Restore primary-key value from data key",
+  "description": "Add a helper that derives the primary-key Value from a data key suffix using schema column type.",
+  "scope": [
+    "src/execution/query.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Decode INTEGER and BIGINT row ids with decode_i64_comparable",
+    "Keep string primary keys as the row-id suffix"
+  ],
+  "convergence_criteria": [
+    "Helper accepts the data key, data prefix, and primary-key column",
+    "Invalid or mismatched keys return None",
+    "cargo check passes"
+  ],
+  "status": "completed"
+}

@@ -1,0 +1,4 @@
+id,task_id,command,status,notes
+V1,TASK-013,cargo fmt --check,passed,Formatting check passed.
+V2,TASK-014,cargo test --test sql_integration test_select_min_max_primary_key -- --nocapture,passed,MIN/MAX(primary key) returns correct values including a negative key.
+V3,TASK-013;TASK-014,cargo check --lib,passed,Library type check passed.

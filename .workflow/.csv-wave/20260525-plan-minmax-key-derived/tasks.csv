@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,MIN/MAX fast path exploration,Inspect no-filter MIN/MAX primary-key fast path and storage first/last return values,performance,,,1,completed,"first/last returns the boundary data key and value; the primary-key aggregate only needs the key suffix.",
+E2,Primary-key encoding exploration,Confirm data key suffix and comparable integer primary-key encoding,correctness,,,1,completed,"Data keys use data:<table>:<row_id>; integer row_id values use encode_i64_comparable and can be decoded back.",
+P1,Plan generation,Generate TASKs for key-derived MIN/MAX primary-key aggregate values,planning,E1;E2,E1;E2,2,completed,"Plan TASK-013..014: add key-derived helper and use it for MIN/MAX(pk).",
