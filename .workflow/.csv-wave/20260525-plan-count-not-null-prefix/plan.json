@@ -1,0 +1,40 @@
+{
+  "session_id": "20260525-plan-count-not-null-prefix",
+  "phase": "database-core-performance",
+  "goal": "Avoid row decoding for COUNT(NOT NULL column) when a data-prefix row count is semantically equivalent.",
+  "scope": {
+    "include": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-028"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-028",
+      "title": "COUNT(NOT NULL column) prefix count fast path",
+      "files": [
+        "src/execution/query.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_select_count_not_null_column_uses_prefix_count -- --nocapture",
+    "cargo test --test sql_integration test_select_count_primary_key_uses_prefix_count -- --nocapture",
+    "cargo test --test sql_integration test_select_count_null_literal -- --nocapture",
+    "cargo check --lib"
+  ]
+}

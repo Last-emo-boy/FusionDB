@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-028,maestro-execute,"database-core-performance count not null prefix --method cli",2,completed,"COUNT(NOT NULL column) now reuses prefix-count aggregate fast path when eligible.","src/execution/query.rs;tests/sql_integration.rs",""

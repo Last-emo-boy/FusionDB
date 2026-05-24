@@ -21,11 +21,12 @@ impl Executor {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => {
                 !matches!(value.value, sqlparser::ast::Value::Null)
             }
-            _ => Self::primary_key_arg_index(arg, schema, allowed_qualifiers).is_some(),
+            _ => Self::column_arg_index(arg, schema, allowed_qualifiers)
+                .is_some_and(|idx| !schema.columns[idx].is_nullable),
         }
     }
 
-    fn primary_key_arg_index(
+    fn column_arg_index(
         arg: &FunctionArg,
         schema: &TableSchema,
         allowed_qualifiers: Option<&[String]>,
@@ -61,7 +62,16 @@ impl Executor {
         schema
             .columns
             .iter()
-            .position(|col| col.is_primary && col.name.eq_ignore_ascii_case(col_name))
+            .position(|col| col.name.eq_ignore_ascii_case(col_name))
+    }
+
+    fn primary_key_arg_index(
+        arg: &FunctionArg,
+        schema: &TableSchema,
+        allowed_qualifiers: Option<&[String]>,
+    ) -> Option<usize> {
+        Self::column_arg_index(arg, schema, allowed_qualifiers)
+            .filter(|idx| schema.columns[*idx].is_primary)
     }
 
     fn primary_key_value_from_data_key(

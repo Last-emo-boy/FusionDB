@@ -1,0 +1,14 @@
+{
+  "id": "TASK-028",
+  "title": "COUNT(NOT NULL column) prefix count fast path",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "summary": "Use prefix row counting for COUNT over non-nullable columns in eligible aggregate queries."
+}

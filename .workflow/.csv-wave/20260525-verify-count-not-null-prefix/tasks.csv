@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-028,maestro-verify,"database-core-performance count not null prefix",3,completed,"Formatting, NOT NULL count regression, primary-key count regression, NULL literal regression, and lib check passed.",".workflow/.csv-wave/20260525-verify-count-not-null-prefix/verification.json",""

@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-028,maestro-plan,"database-core-performance count not null prefix",1,completed,"COUNT(NOT NULL column) can use count_prefix in eligible unfiltered single-table aggregate queries.",".workflow/.csv-wave/20260525-plan-count-not-null-prefix/plan.json",""
