@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-031,maestro-execute,"database-core-performance qualified DML primary key lookup --method cli",2,completed,"Extended DML primary-key equality recognition to accept safe table/alias-qualified primary-key references.","src/execution/dml.rs;tests/sql_integration.rs",""

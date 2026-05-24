@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-031,completed,"Qualified DELETE/UPDATE primary-key equality predicates now use point lookup when the qualifier matches the target table or alias.","src/execution/dml.rs;tests/sql_integration.rs",""

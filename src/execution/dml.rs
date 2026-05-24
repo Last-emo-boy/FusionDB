@@ -14,6 +14,7 @@ impl Executor {
         selection: Option<&Expr>,
         schema: &TableSchema,
         params: &[Value],
+        allowed_qualifiers: &[String],
     ) -> Option<String> {
         let Expr::BinaryOp {
             left,
@@ -24,8 +25,29 @@ impl Executor {
             return None;
         };
 
-        let Expr::Identifier(ident) = left.as_ref() else {
-            return None;
+        let col_name = match left.as_ref() {
+            Expr::Identifier(ident) => &ident.value,
+            Expr::CompoundIdentifier(idents) => {
+                if idents.len() < 2 {
+                    return None;
+                }
+
+                let qualifier = idents[..idents.len() - 1]
+                    .iter()
+                    .map(|ident| ident.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+
+                if !allowed_qualifiers
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&qualifier))
+                {
+                    return None;
+                }
+
+                &idents.last()?.value
+            }
+            _ => return None,
         };
 
         let pk_idx = schema.get_primary_key_index()?;
@@ -36,7 +58,7 @@ impl Executor {
         let col_idx = schema
             .columns
             .iter()
-            .position(|col| col.name.eq_ignore_ascii_case(&ident.value))?;
+            .position(|col| col.name.eq_ignore_ascii_case(col_name))?;
         if col_idx != pk_idx {
             return None;
         }
@@ -49,6 +71,18 @@ impl Executor {
             Value::String(s) => Some(s),
             _ => None,
         }
+    }
+
+    fn primary_key_qualifiers(relation: &TableFactor) -> Vec<String> {
+        let mut qualifiers = Vec::new();
+        if let TableFactor::Table { name, alias, .. } = relation {
+            let table_name = name.to_string();
+            qualifiers.push(table_name);
+            if let Some(alias) = alias {
+                qualifiers.push(alias.name.value.clone());
+            }
+        }
+        qualifiers
     }
 
     pub(crate) async fn handle_insert(
@@ -460,8 +494,22 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
         let prefix = format!("data:{}:", table_name_str);
-        let target_row_id =
-            self.primary_key_row_id_from_eq_selection(delete.selection.as_ref(), &schema, params);
+        let allowed_qualifiers = match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables) => tables
+                .first()
+                .map(|table| Self::primary_key_qualifiers(&table.relation))
+                .unwrap_or_default(),
+            sqlparser::ast::FromTable::WithoutKeyword(tables) => tables
+                .first()
+                .map(|table| Self::primary_key_qualifiers(&table.relation))
+                .unwrap_or_default(),
+        };
+        let target_row_id = self.primary_key_row_id_from_eq_selection(
+            delete.selection.as_ref(),
+            &schema,
+            params,
+            &allowed_qualifiers,
+        );
 
         if delete.returning.is_none() {
             let no_secondary_indexes = schema
@@ -607,8 +655,13 @@ impl Executor {
         let prefix = format!("data:{}:", table_name_str);
 
         // Optimization: Check for Primary Key (Clustered Index) Update
-        let target_row_id =
-            self.primary_key_row_id_from_eq_selection(update.selection.as_ref(), &schema, params);
+        let allowed_qualifiers = Self::primary_key_qualifiers(relation);
+        let target_row_id = self.primary_key_row_id_from_eq_selection(
+            update.selection.as_ref(),
+            &schema,
+            params,
+            &allowed_qualifiers,
+        );
 
         let kv_pairs = if let Some(row_id) = target_row_id {
             // Point Lookup

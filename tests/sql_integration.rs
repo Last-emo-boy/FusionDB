@@ -705,6 +705,44 @@ async fn test_delete_primary_key_without_secondary_index_skips_row_decode() {
 }
 
 #[tokio::test]
+async fn test_delete_qualified_primary_key_without_secondary_index_skips_row_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE fast_del_q (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+
+    let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(2),
+        Value::String("payload".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"data:fast_del_q:8000000000000002", &row)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let msg = exec_ok(&executor, "DELETE FROM fast_del_q WHERE fast_del_q.id = 2").await;
+    assert!(msg.contains("Deleted 1"));
+    let (_, rows) = query(&executor, "SELECT * FROM fast_del_q").await;
+    assert_eq!(rows.len(), 0);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_delete_primary_key_updates_secondary_index() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -1245,6 +1283,54 @@ async fn test_update_invalidates_row_cache_for_index_lookup() {
     let (_, rows) = query(&executor, "SELECT * FROM users WHERE name = 'Bob'").await;
     assert_eq!(rows[0][2], Value::Integer(43));
     cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_update_qualified_primary_key_uses_point_lookup() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE upd_q (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO upd_q VALUES (2, 'Bob')").await;
+
+    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::String("Alice".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut corrupt_row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"data:upd_q:8000000000000001", &corrupt_row)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let msg = exec_ok(
+        &executor,
+        "UPDATE upd_q SET name = 'Robert' WHERE upd_q.id = 2",
+    )
+    .await;
+    assert!(msg.contains("Updated 1"));
+
+    let (cols, rows) = query(&executor, "SELECT id, name FROM upd_q WHERE id = 2").await;
+    assert_eq!(cols, vec!["id", "name"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(2), Value::String("Robert".to_string())]]
+    );
+    cleanup(&wal_path);
 }
 
 #[tokio::test]

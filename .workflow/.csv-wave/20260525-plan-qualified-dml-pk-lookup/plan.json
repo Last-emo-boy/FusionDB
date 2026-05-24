@@ -1,0 +1,39 @@
+{
+  "session_id": "20260525-plan-qualified-dml-pk-lookup",
+  "phase": "database-core-performance",
+  "goal": "Route DELETE/UPDATE predicates qualified as table.pk or alias.pk through the existing primary-key point lookup path safely.",
+  "scope": {
+    "include": [
+      "src/execution/dml.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-031"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-031",
+      "title": "Qualified DML primary-key point lookup",
+      "files": [
+        "src/execution/dml.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration qualified_primary_key -- --nocapture",
+    "cargo test --test sql_integration test_delete_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+    "cargo check --lib"
+  ]
+}

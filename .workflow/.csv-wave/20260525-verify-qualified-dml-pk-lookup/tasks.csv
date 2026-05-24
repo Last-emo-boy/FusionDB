@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-031,maestro-verify,"database-core-performance qualified DML primary key lookup",3,completed,"Targeted DML fast-path tests and library check passed.",".workflow/.csv-wave/20260525-verify-qualified-dml-pk-lookup/verification.json",""

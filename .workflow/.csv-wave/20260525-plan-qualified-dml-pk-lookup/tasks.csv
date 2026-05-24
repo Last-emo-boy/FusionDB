@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-031,maestro-plan,"database-core-performance qualified DML primary key lookup",1,completed,"DELETE/UPDATE table-qualified primary-key predicates can reuse the point lookup fast path when the qualifier matches the target table or alias.",".workflow/.csv-wave/20260525-plan-qualified-dml-pk-lookup/plan.json",""
