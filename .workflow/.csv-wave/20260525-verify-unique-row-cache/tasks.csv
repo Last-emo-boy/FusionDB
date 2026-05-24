@@ -1,0 +1,5 @@
+id,verification,status
+TASK-039,"cargo fmt --check",passed
+TASK-039,"cargo test --test sql_integration test_insert_unique_check_reuses_row_cache -- --nocapture",passed
+TASK-039,"cargo test --test sql_integration test_unique_constraint -- --nocapture",passed
+TASK-039,"cargo check --lib",passed

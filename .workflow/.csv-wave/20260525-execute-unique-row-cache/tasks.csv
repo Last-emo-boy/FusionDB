@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-039,"Use cached existing rows before decode_column in INSERT UNIQUE checks",completed,"src/execution/dml.rs;tests/sql_integration.rs"

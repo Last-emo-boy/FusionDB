@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-039,"Reuse row cache during UNIQUE constraint checks","src/execution/dml.rs;tests/sql_integration.rs",completed

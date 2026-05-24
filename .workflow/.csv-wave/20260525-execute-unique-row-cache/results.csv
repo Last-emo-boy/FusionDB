@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-039,completed,"INSERT UNIQUE checks now read cached existing row values before falling back to decode_column.",".workflow/.csv-wave/20260525-execute-unique-row-cache/tasks.csv",

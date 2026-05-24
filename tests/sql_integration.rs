@@ -2932,6 +2932,72 @@ async fn test_unique_constraint() {
 }
 
 #[tokio::test]
+async fn test_insert_unique_check_reuses_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE uq_cache (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uq_cache VALUES (1, 'alice@test.com', 'Alice')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM uq_cache WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::String("alice@test.com".to_string()),
+            Value::String("Alice".to_string())
+        ]]
+    );
+
+    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::String("alice@test.com".to_string()),
+        Value::String("Alice".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut corrupt_row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"data:uq_cache:8000000000000001", &corrupt_row)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let msg = exec_ok(
+        &executor,
+        "INSERT INTO uq_cache VALUES (2, 'bob@test.com', 'Bob')",
+    )
+    .await;
+    assert!(msg.contains("Inserted 1"));
+
+    let (_, rows) = query(&executor, "SELECT * FROM uq_cache WHERE id = 2").await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::String("bob@test.com".to_string()),
+            Value::String("Bob".to_string())
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_like_full_patterns() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -242,13 +242,28 @@ impl Executor {
                             // Scan existing rows for duplicate value
                             let prefix = format!("data:{}:", table_name_str);
                             let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
-                            for (_, v) in &existing {
-                                let existing_value =
+                            for (k, v) in &existing {
+                                let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
+                                    if let Some(row) = self.row_cache.get(key_str) {
+                                        monitor::inc_row_cache_hit();
+                                        row.get(idx).cloned().unwrap_or(Value::Null)
+                                    } else {
+                                        crate::common::encoding::RowDecoder::decode_column(v, idx)
+                                            .map_err(|e| {
+                                                FusionError::Execution(format!(
+                                                    "Decode error: {}",
+                                                    e
+                                                ))
+                                            })?
+                                            .unwrap_or(Value::Null)
+                                    }
+                                } else {
                                     crate::common::encoding::RowDecoder::decode_column(v, idx)
                                         .map_err(|e| {
                                             FusionError::Execution(format!("Decode error: {}", e))
                                         })?
-                                        .unwrap_or(Value::Null);
+                                        .unwrap_or(Value::Null)
+                                };
                                 if existing_value == row_values[idx] {
                                     return Err(FusionError::Execution(format!(
                                         "UNIQUE constraint violated for column '{}': duplicate value '{}'",
