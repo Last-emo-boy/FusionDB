@@ -1,0 +1,40 @@
+{
+  "task_id": "TASK-049",
+  "title": "Pre-resolve ORDER BY sort keys",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "exclusions": [
+    "dashboard/"
+  ],
+  "hypothesis": "ORDER BY sort comparators currently re-resolve projection ordinal, aliases, and projection expressions for every row comparison. Resolving each sort key once before sorting reduces repeated work during O(n log n) comparisons.",
+  "waves": [
+    {
+      "wave": 1,
+      "skill": "maestro-plan",
+      "status": "completed"
+    },
+    {
+      "wave": 2,
+      "skill": "maestro-execute",
+      "status": "completed"
+    },
+    {
+      "wave": 3,
+      "skill": "maestro-verify",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_select_order_by_asc -- --nocapture",
+    "cargo test --test sql_integration test_select_order_by_desc -- --nocapture",
+    "cargo test --test sql_integration test_select_order_by_alias -- --nocapture",
+    "cargo test --test sql_integration test_select_order_by_ordinal -- --nocapture",
+    "cargo test --test sql_integration test_multi_column_order_by -- --nocapture",
+    "cargo test --test sql_integration test_join_projection_pushdown_with_group_by -- --nocapture",
+    "cargo check --lib"
+  ]
+}

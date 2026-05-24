@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-049,"Verify ORDER BY sort-key pre-resolution",completed,"src/execution/query.rs;tests/sql_integration.rs"

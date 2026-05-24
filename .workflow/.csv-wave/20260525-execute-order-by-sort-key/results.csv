@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-049,completed,"ORDER BY now resolves projection/alias/ordinal sort key sources once before sorting, reducing comparator work.",".workflow/.csv-wave/20260525-execute-order-by-sort-key/tasks.csv",

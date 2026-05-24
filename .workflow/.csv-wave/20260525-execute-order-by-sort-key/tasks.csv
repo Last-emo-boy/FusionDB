@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-049,"Pre-resolve ORDER BY sort key sources before row sorting",completed,"src/execution/query.rs;tests/sql_integration.rs"

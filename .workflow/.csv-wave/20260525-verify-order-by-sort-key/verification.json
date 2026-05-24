@@ -1,0 +1,43 @@
+{
+  "task_id": "TASK-049",
+  "status": "passed",
+  "verified_at": "2026-05-25T07:55:18.0008022+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_order_by_asc -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_order_by_desc -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_order_by_alias -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_order_by_ordinal -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_multi_column_order_by -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_join_projection_pushdown_with_group_by -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ],
+  "constraints": [
+    "Only database core was changed.",
+    "dashboard/ was not modified."
+  ]
+}

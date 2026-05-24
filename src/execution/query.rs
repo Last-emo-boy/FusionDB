@@ -10,6 +10,28 @@ use std::collections::HashSet;
 
 use super::{AggregateAccumulator, Executor, QueryResult};
 
+enum ProjectionOrderValueSource<'a> {
+    RowIndex(usize),
+    Expr {
+        expr: &'a Expr,
+        fallback_index: Option<usize>,
+    },
+}
+
+enum SortOrderValueSource<'a> {
+    RowIndex(usize),
+    Projection {
+        source: ProjectionOrderValueSource<'a>,
+        fallback_expr: &'a Expr,
+    },
+    Expr(&'a Expr),
+}
+
+struct SortOrderKey<'a> {
+    source: SortOrderValueSource<'a>,
+    asc: bool,
+}
+
 impl Executor {
     fn count_prefix_eligible_arg(
         arg: &FunctionArg,
@@ -134,15 +156,12 @@ impl Executor {
             })
     }
 
-    fn evaluate_projection_order_value(
+    fn resolve_projection_order_value_source<'a>(
         &self,
         expr: &Expr,
-        projection: &[SelectItem],
+        projection: &'a [SelectItem],
         columns: &[String],
-        row: &[Value],
-        schema: &TableSchema,
-        params: &[Value],
-    ) -> Option<Value> {
+    ) -> Option<ProjectionOrderValueSource<'a>> {
         if let Expr::Value(sqlparser::ast::ValueWithSpan {
             value: sqlparser::ast::Value::Number(n, _),
             ..
@@ -157,12 +176,12 @@ impl Executor {
                 SelectItem::UnnamedExpr(proj_expr)
                 | SelectItem::ExprWithAlias {
                     expr: proj_expr, ..
-                } => self
-                    .evaluate_value(proj_expr, row, schema, params)
-                    .ok()
-                    .or_else(|| row.get(index).cloned()),
+                } => Some(ProjectionOrderValueSource::Expr {
+                    expr: proj_expr,
+                    fallback_index: Some(index),
+                }),
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                    row.get(index).cloned()
+                    Some(ProjectionOrderValueSource::RowIndex(index))
                 }
             });
         }
@@ -170,19 +189,113 @@ impl Executor {
         projection
             .iter()
             .find_map(|item| match item {
-                SelectItem::UnnamedExpr(proj_expr) if proj_expr == expr => self
-                    .evaluate_value(proj_expr, row, schema, params)
-                    .ok(),
+                SelectItem::UnnamedExpr(proj_expr) if proj_expr == expr => {
+                    Some(ProjectionOrderValueSource::Expr {
+                        expr: proj_expr,
+                        fallback_index: None,
+                    })
+                }
                 SelectItem::ExprWithAlias {
                     expr: proj_expr,
                     alias,
                 } if proj_expr == expr
                     || matches!(expr, Expr::Identifier(ident) if alias.value.eq_ignore_ascii_case(&ident.value)) =>
                 {
-                    self.evaluate_value(proj_expr, row, schema, params).ok()
+                    Some(ProjectionOrderValueSource::Expr {
+                        expr: proj_expr,
+                        fallback_index: None,
+                    })
                 }
                 _ => None,
             })
+    }
+
+    fn evaluate_projection_order_value_source(
+        &self,
+        source: &ProjectionOrderValueSource<'_>,
+        row: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Option<Value> {
+        match source {
+            ProjectionOrderValueSource::RowIndex(index) => row.get(*index).cloned(),
+            ProjectionOrderValueSource::Expr {
+                expr,
+                fallback_index,
+            } => self
+                .evaluate_value(expr, row, schema, params)
+                .ok()
+                .or_else(|| fallback_index.and_then(|index| row.get(index).cloned())),
+        }
+    }
+
+    fn resolve_order_value_source<'a>(
+        &self,
+        expr: &'a Expr,
+        projection: &'a [SelectItem],
+        columns: &[String],
+        rows_are_projected: bool,
+    ) -> SortOrderValueSource<'a> {
+        if rows_are_projected {
+            if let Some(index) = self.resolve_order_by_projection_index(expr, projection, columns) {
+                return SortOrderValueSource::RowIndex(index);
+            }
+        }
+
+        if let Some(source) = self.resolve_projection_order_value_source(expr, projection, columns)
+        {
+            SortOrderValueSource::Projection {
+                source,
+                fallback_expr: expr,
+            }
+        } else {
+            SortOrderValueSource::Expr(expr)
+        }
+    }
+
+    fn compare_order_value_source(
+        &self,
+        source: &SortOrderValueSource<'_>,
+        left: &[Value],
+        right: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Ordering {
+        match source {
+            SortOrderValueSource::RowIndex(index) => {
+                let val_a = left.get(*index).cloned().unwrap_or(Value::Null);
+                let val_b = right.get(*index).cloned().unwrap_or(Value::Null);
+                self.compare_for_sort(&val_a, &val_b)
+            }
+            SortOrderValueSource::Projection {
+                source,
+                fallback_expr,
+            } => {
+                if let Some((val_a, val_b)) = self
+                    .evaluate_projection_order_value_source(source, left, schema, params)
+                    .zip(self.evaluate_projection_order_value_source(source, right, schema, params))
+                {
+                    self.compare_for_sort(&val_a, &val_b)
+                } else {
+                    let val_a = self
+                        .evaluate_value(fallback_expr, left, schema, params)
+                        .unwrap_or(Value::Null);
+                    let val_b = self
+                        .evaluate_value(fallback_expr, right, schema, params)
+                        .unwrap_or(Value::Null);
+                    self.compare_for_sort(&val_a, &val_b)
+                }
+            }
+            SortOrderValueSource::Expr(expr) => {
+                let val_a = self
+                    .evaluate_value(expr, left, schema, params)
+                    .unwrap_or(Value::Null);
+                let val_b = self
+                    .evaluate_value(expr, right, schema, params)
+                    .unwrap_or(Value::Null);
+                self.compare_for_sort(&val_a, &val_b)
+            }
+        }
     }
 
     pub(crate) async fn handle_query(
@@ -780,67 +893,30 @@ impl Executor {
                         sqlparser::ast::GroupByExpr::Expressions(ref group_exprs, _)
                             if !group_exprs.is_empty()
                     );
+                    let sort_keys: Vec<SortOrderKey<'_>> = exprs
+                        .iter()
+                        .map(|order_expr| SortOrderKey {
+                            source: self.resolve_order_value_source(
+                                &order_expr.expr,
+                                projection,
+                                &columns,
+                                rows_are_projected,
+                            ),
+                            asc: order_expr.options.asc.unwrap_or(true),
+                        })
+                        .collect();
+
                     rows.sort_by(|a, b| {
-                        for order_expr in exprs {
-                            if rows_are_projected {
-                                if let Some(index) = self.resolve_order_by_projection_index(
-                                    &order_expr.expr,
-                                    projection,
-                                    &columns,
-                                ) {
-                                    let val_a = a.get(index).cloned().unwrap_or(Value::Null);
-                                    let val_b = b.get(index).cloned().unwrap_or(Value::Null);
-                                    let ordering = self.compare_for_sort(&val_a, &val_b);
-                                    if ordering != Ordering::Equal {
-                                        return if order_expr.options.asc.unwrap_or(true) {
-                                            ordering
-                                        } else {
-                                            ordering.reverse()
-                                        };
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            if let Some((val_a, val_b)) = self
-                                .evaluate_projection_order_value(
-                                    &order_expr.expr,
-                                    projection,
-                                    &columns,
-                                    a,
-                                    &schema,
-                                    params,
-                                )
-                                .zip(self.evaluate_projection_order_value(
-                                    &order_expr.expr,
-                                    projection,
-                                    &columns,
-                                    b,
-                                    &schema,
-                                    params,
-                                ))
-                            {
-                                let ordering = self.compare_for_sort(&val_a, &val_b);
-                                if ordering != Ordering::Equal {
-                                    return if order_expr.options.asc.unwrap_or(true) {
-                                        ordering
-                                    } else {
-                                        ordering.reverse()
-                                    };
-                                }
-                                continue;
-                            }
-
-                            let val_a = self
-                                .evaluate_value(&order_expr.expr, a, &schema, params)
-                                .unwrap_or(Value::Null);
-                            let val_b = self
-                                .evaluate_value(&order_expr.expr, b, &schema, params)
-                                .unwrap_or(Value::Null);
-
-                            let ordering = self.compare_for_sort(&val_a, &val_b);
+                        for sort_key in &sort_keys {
+                            let ordering = self.compare_order_value_source(
+                                &sort_key.source,
+                                a,
+                                b,
+                                &schema,
+                                params,
+                            );
                             if ordering != Ordering::Equal {
-                                return if order_expr.options.asc.unwrap_or(true) {
+                                return if sort_key.asc {
                                     ordering
                                 } else {
                                     ordering.reverse()

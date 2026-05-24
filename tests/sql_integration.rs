@@ -639,6 +639,60 @@ async fn test_select_order_by_desc() {
 }
 
 #[tokio::test]
+async fn test_select_order_by_alias() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE alias_sort (id INTEGER PRIMARY KEY, val INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO alias_sort VALUES (1, 10), (2, 30), (3, 20)",
+    )
+    .await;
+    let (cols, rows) = query(
+        &executor,
+        "SELECT val * 2 AS doubled FROM alias_sort ORDER BY doubled DESC",
+    )
+    .await;
+    assert_eq!(cols, vec!["doubled"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(60)],
+            vec![Value::Integer(40)],
+            vec![Value::Integer(20)]
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_select_order_by_ordinal() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE ordinal_sort (id INTEGER PRIMARY KEY, val INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO ordinal_sort VALUES (1, 10), (2, 30), (3, 20)",
+    )
+    .await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, val FROM ordinal_sort ORDER BY 2 DESC",
+    )
+    .await;
+    assert_eq!(rows[0], vec![Value::Integer(2), Value::Integer(30)]);
+    assert_eq!(rows[1], vec![Value::Integer(3), Value::Integer(20)]);
+    assert_eq!(rows[2], vec![Value::Integer(1), Value::Integer(10)]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_projection() {
     let (executor, wal) = setup().await;
     exec_ok(
