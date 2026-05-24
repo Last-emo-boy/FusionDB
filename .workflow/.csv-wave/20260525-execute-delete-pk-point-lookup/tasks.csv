@@ -1,0 +1,3 @@
+id,task_id,title,files,status,summary,error
+X1,TASK-015,Shared DML primary-key row-id helper,"src/execution/dml.rs",completed,"Extracted first-column primary-key equality predicate to row-id conversion and reused it from UPDATE.",
+X2,TASK-016,DELETE primary-key point lookup,"src/execution/dml.rs;tests/sql_integration.rs",completed,"DELETE now fetches a single storage row when the predicate targets the first primary key and keeps index cleanup covered.",

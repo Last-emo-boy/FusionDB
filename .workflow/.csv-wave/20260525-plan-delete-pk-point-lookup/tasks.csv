@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,DML primary-key lookup exploration,Compare UPDATE and DELETE handling for primary-key equality predicates,performance,,,1,completed,"UPDATE used point lookup for first-column primary-key equality; DELETE always scanned the full table.",
+E2,DELETE correctness exploration,Identify DELETE side effects that must remain intact under point lookup,correctness,,,1,completed,"DELETE must still decode the matched row for predicate confirmation, secondary index cleanup, cache invalidation, and RETURNING.",
+P1,Plan generation,Generate TASKs for shared DML row-id helper and DELETE point lookup,planning,E1;E2,E1;E2,2,completed,"Plan TASK-015..016: extract primary-key row-id helper and use it for DELETE point lookup.",

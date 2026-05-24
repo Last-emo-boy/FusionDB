@@ -439,6 +439,29 @@ async fn test_delete_with_where() {
 }
 
 #[tokio::test]
+async fn test_delete_primary_key_updates_secondary_index() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "CREATE INDEX idx_users_name ON users (name)").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+    )
+    .await;
+
+    let msg = exec_ok(&executor, "DELETE FROM users WHERE id = 2").await;
+    assert!(msg.contains("Deleted 1"));
+
+    let (_, rows) = query(&executor, "SELECT * FROM users WHERE name = 'Bob'").await;
+    assert_eq!(rows.len(), 0);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_delete_all() {
     let (executor, wal) = setup().await;
     exec_ok(

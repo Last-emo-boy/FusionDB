@@ -1,0 +1,20 @@
+{
+  "id": "TASK-016",
+  "title": "DELETE primary-key point lookup",
+  "description": "Use the shared row-id helper so DELETE with a first-column primary-key equality predicate fetches at most one row.",
+  "scope": [
+    "src/execution/dml.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve DELETE RETURNING behavior",
+    "Preserve secondary index cleanup for the deleted row"
+  ],
+  "convergence_criteria": [
+    "DELETE ... WHERE pk = literal uses txn.get instead of full scan when eligible",
+    "Existing DELETE WHERE integration test passes",
+    "A secondary-index cleanup regression test passes"
+  ],
+  "status": "completed"
+}

@@ -1,0 +1,19 @@
+{
+  "id": "TASK-015",
+  "title": "Shared DML primary-key row-id helper",
+  "description": "Extract DML predicate handling that converts first-column primary-key equality predicates into storage row ids.",
+  "scope": [
+    "src/execution/dml.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Only enable for first-column primary keys, matching existing storage key layout",
+    "Preserve fallback behavior for complex predicates and non-primary columns"
+  ],
+  "convergence_criteria": [
+    "UPDATE uses the helper instead of local predicate parsing",
+    "Helper supports integer comparable encoding and string row ids",
+    "cargo check passes"
+  ],
+  "status": "completed"
+}

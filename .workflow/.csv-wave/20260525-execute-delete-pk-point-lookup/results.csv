@@ -1,0 +1,3 @@
+id,task_id,status,files_changed,result,error
+X1,TASK-015,completed,"src/execution/dml.rs","DML primary-key row-id derivation is shared and guarded to first-column primary keys.",
+X2,TASK-016,completed,"src/execution/dml.rs;tests/sql_integration.rs","DELETE primary-key equality avoids full table scans and preserves secondary index cleanup.",

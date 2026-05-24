@@ -9,6 +9,48 @@ use std::collections::HashSet;
 use super::{Executor, QueryResult};
 
 impl Executor {
+    fn primary_key_row_id_from_eq_selection(
+        &self,
+        selection: Option<&Expr>,
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Option<String> {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = selection?
+        else {
+            return None;
+        };
+
+        let Expr::Identifier(ident) = left.as_ref() else {
+            return None;
+        };
+
+        let pk_idx = schema.get_primary_key_index()?;
+        if pk_idx != 0 {
+            return None;
+        }
+
+        let col_idx = schema
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(&ident.value))?;
+        if col_idx != pk_idx {
+            return None;
+        }
+
+        match self
+            .evaluate_value(right, &[], schema, params)
+            .unwrap_or(Value::Null)
+        {
+            Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(i)),
+            Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
     pub(crate) async fn handle_insert(
         &self,
         table_name: String,
@@ -415,7 +457,18 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
         let prefix = format!("data:{}:", table_name_str);
-        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let kv_pairs = if let Some(row_id) =
+            self.primary_key_row_id_from_eq_selection(delete.selection.as_ref(), &schema, params)
+        {
+            let key = format!("{}{}", prefix, row_id);
+            if let Some(v) = txn.get(key.as_bytes()).await? {
+                vec![(key.into_bytes(), v)]
+            } else {
+                vec![]
+            }
+        } else {
+            txn.scan_prefix(prefix.as_bytes(), None).await?
+        };
 
         let mut deleted_count = 0;
         let mut deleted_rows: Vec<Vec<Value>> = Vec::new();
@@ -512,32 +565,8 @@ impl Executor {
         let prefix = format!("data:{}:", table_name_str);
 
         // Optimization: Check for Primary Key (Clustered Index) Update
-        let mut target_row_id: Option<String> = None;
-        if let Some(sel) = &update.selection {
-            if let Expr::BinaryOp {
-                left,
-                op: BinaryOperator::Eq,
-                right,
-            } = sel
-            {
-                let is_pk = if let Expr::Identifier(ident) = left.as_ref() {
-                    schema.get_column_index(&ident.value) == Some(0)
-                } else {
-                    false
-                };
-
-                if is_pk {
-                    let val = self
-                        .evaluate_value(right, &[], &schema, params)
-                        .unwrap_or(Value::Null);
-                    if let Value::Integer(i) = val {
-                        target_row_id = Some(crate::common::encoding::encode_i64_comparable(i));
-                    } else if let Value::String(s) = val {
-                        target_row_id = Some(s);
-                    }
-                }
-            }
-        }
+        let target_row_id =
+            self.primary_key_row_id_from_eq_selection(update.selection.as_ref(), &schema, params);
 
         let kv_pairs = if let Some(row_id) = target_row_id {
             // Point Lookup

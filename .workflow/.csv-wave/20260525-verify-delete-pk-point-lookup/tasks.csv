@@ -1,0 +1,5 @@
+id,task_id,command,status,notes
+V1,TASK-015,cargo fmt --check,passed,Formatting check passed.
+V2,TASK-016,cargo test --test sql_integration test_delete_with_where -- --nocapture,passed,Primary-key DELETE still deletes one matching row.
+V3,TASK-016,cargo test --test sql_integration test_delete_primary_key_updates_secondary_index -- --nocapture,passed,Secondary index lookup no longer returns the deleted row.
+V4,TASK-015;TASK-016,cargo check --lib,passed,Library type check passed.
