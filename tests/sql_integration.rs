@@ -439,6 +439,44 @@ async fn test_delete_with_where() {
 }
 
 #[tokio::test]
+async fn test_delete_primary_key_without_secondary_index_skips_row_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE fast_del (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+
+    let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(2),
+        Value::String("payload".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"data:fast_del:8000000000000002", &row)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let msg = exec_ok(&executor, "DELETE FROM fast_del WHERE id = 2").await;
+    assert!(msg.contains("Deleted 1"));
+    let (_, rows) = query(&executor, "SELECT * FROM fast_del").await;
+    assert_eq!(rows.len(), 0);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_delete_primary_key_updates_secondary_index() {
     let (executor, wal) = setup().await;
     exec_ok(

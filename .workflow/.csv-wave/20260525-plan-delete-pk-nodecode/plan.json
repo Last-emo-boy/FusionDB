@@ -1,0 +1,39 @@
+{
+  "session_id": "20260525-plan-delete-pk-nodecode",
+  "phase": "database-core-performance",
+  "goal": "Avoid full-row decoding for primary-key point DELETE when row values are unnecessary.",
+  "scope": {
+    "include": [
+      "src/execution/dml.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-023"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-023",
+      "title": "Primary-key DELETE no-decode fast path",
+      "files": [
+        "src/execution/dml.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_delete_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+    "cargo test --test sql_integration test_delete_primary_key_updates_secondary_index -- --nocapture",
+    "cargo check --lib"
+  ]
+}

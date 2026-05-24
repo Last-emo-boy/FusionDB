@@ -1,0 +1,2 @@
+id,title,wave,status,files,summary,error
+TASK-023,Primary-key DELETE no-decode fast path,1,completed,"src/execution/dml.rs;tests/sql_integration.rs","Primary-key point DELETE skips row decode in no-secondary-index, no-RETURNING cases.", ""

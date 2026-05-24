@@ -1,0 +1,3 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,DELETE decode exploration,Inspect DELETE point lookup path and index cleanup requirements,performance,,,1,completed,"Primary-key point DELETE without RETURNING and without secondary indexes only needs the data key.",
+P1,Plan generation,Generate TASK for no-decode primary-key DELETE fast path,planning,E1,E1,2,completed,"Plan TASK-023: skip row decode in the conservative no-secondary-index point-delete case.",

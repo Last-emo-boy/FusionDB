@@ -458,9 +458,33 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
         let prefix = format!("data:{}:", table_name_str);
-        let kv_pairs = if let Some(row_id) =
-            self.primary_key_row_id_from_eq_selection(delete.selection.as_ref(), &schema, params)
-        {
+        let target_row_id =
+            self.primary_key_row_id_from_eq_selection(delete.selection.as_ref(), &schema, params);
+
+        if delete.returning.is_none() {
+            if let Some(row_id) = &target_row_id {
+                let no_secondary_indexes = schema
+                    .columns
+                    .iter()
+                    .all(|col| !col.is_indexed || col.is_primary);
+                if no_secondary_indexes {
+                    let key = format!("{}{}", prefix, row_id);
+                    if txn.get(key.as_bytes()).await?.is_some() {
+                        txn.delete(key.as_bytes()).await?;
+                        self.row_cache.invalidate(&key);
+                        return Ok(QueryResult::Success {
+                            message: "Deleted 1 rows".to_string(),
+                        });
+                    }
+
+                    return Ok(QueryResult::Success {
+                        message: "Deleted 0 rows".to_string(),
+                    });
+                }
+            }
+        }
+
+        let kv_pairs = if let Some(row_id) = target_row_id {
             let key = format!("{}{}", prefix, row_id);
             if let Some(v) = txn.get(key.as_bytes()).await? {
                 vec![(key.into_bytes(), v)]

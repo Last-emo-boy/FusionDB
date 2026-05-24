@@ -1,0 +1,5 @@
+id,command,status,notes
+V1,cargo fmt --check,passed,"formatting clean"
+V2,cargo test --test sql_integration test_delete_primary_key_without_secondary_index_skips_row_decode -- --nocapture,passed,"covers no-decode primary-key delete"
+V3,cargo test --test sql_integration test_delete_primary_key_updates_secondary_index -- --nocapture,passed,"covers secondary-index cleanup fallback"
+V4,cargo check --lib,passed,"library type check clean"

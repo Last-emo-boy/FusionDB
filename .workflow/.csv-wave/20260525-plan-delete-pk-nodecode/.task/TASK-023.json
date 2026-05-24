@@ -1,0 +1,16 @@
+{
+  "id": "TASK-023",
+  "title": "Primary-key DELETE no-decode fast path",
+  "status": "completed",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/dml.rs",
+    "tests/sql_integration.rs"
+  ],
+  "summary": "Added a conservative fast path for `DELETE ... WHERE primary_key = ...` that deletes the data key without decoding the row when no `RETURNING` clause and no secondary indexes are present.",
+  "risk": "Tables with non-primary indexes or RETURNING still use the existing full decode path.",
+  "verification": [
+    "cargo test --test sql_integration test_delete_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+    "cargo test --test sql_integration test_delete_primary_key_updates_secondary_index -- --nocapture"
+  ]
+}
