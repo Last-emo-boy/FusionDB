@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,Zero-column projection exploration,Trace projection_hint Some(vec![]) through scan_single_table,performance,,,1,completed,"Empty projection hints were folded into None, causing full-row decode for constant projections and COUNT(1).",
+E2,Scan decode branch exploration,Find repeated projection-aware decode branches in PK range/index/full scan paths,implementation,,,1,completed,"Range, small index, streamed index and full scan paths each had partial/full decode branching.",
+P1,Plan generation,Generate TASKs for preserving zero-column scan state and centralized decode behavior,planning,E1;E2,E1;E2,2,completed,"Plan TASK-009..010: keep Some([]) as a row-existence-only scan and route decode through a helper.",

@@ -1,0 +1,3 @@
+id,task_id,status,files_changed,result,error
+X1,TASK-009,completed,"src/execution/scan.rs","scan_single_table can distinguish full-row scans from zero-column row-existence scans.",
+X2,TASK-010,completed,"src/execution/scan.rs;tests/sql_integration.rs","Zero-column queries skip row decode while preserving SQL results.",

@@ -1,0 +1,19 @@
+{
+  "id": "TASK-009",
+  "title": "Preserve zero-column projection hints",
+  "description": "Keep empty projection hints distinct from full-row scans so queries with no table-column dependencies can skip row decoding.",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Do not treat empty projection hints as primary-key-only projections",
+    "Preserve full-row fallback when requested columns cannot be resolved"
+  ],
+  "convergence_criteria": [
+    "projection_indices can be Some(Vec::new()) when projection is empty",
+    "zero-column projection does not enable key_only_scan",
+    "cargo check passes"
+  ],
+  "status": "completed"
+}

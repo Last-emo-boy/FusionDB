@@ -276,6 +276,53 @@ async fn test_select_count_star() {
 }
 
 #[tokio::test]
+async fn test_select_constant_projection_from_table() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO nums VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "SELECT 1 FROM nums").await;
+    assert_eq!(cols, vec!["1"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(1)]
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_select_count_literal() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO nums VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "SELECT COUNT(1) FROM nums").await;
+    assert_eq!(cols, vec!["COUNT(1)"]);
+    assert_eq!(rows[0][0], Value::Integer(3));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_min_max_primary_key() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -1,0 +1,53 @@
+{
+  "session_id": "20260525-plan-zero-column-scan",
+  "phase": "database-core-performance",
+  "goal": "Skip row decoding for scans whose projection requires no table columns.",
+  "scope": {
+    "include": [
+      "src/execution/scan.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-009"
+      ]
+    },
+    {
+      "wave": 2,
+      "tasks": [
+        "TASK-010"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-009",
+      "title": "Preserve zero-column projection hints",
+      "files": [
+        "src/execution/scan.rs"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TASK-010",
+      "title": "Zero-column scan decode bypass",
+      "files": [
+        "src/execution/scan.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_select_constant_projection_from_table -- --nocapture",
+    "cargo test --test sql_integration test_select_count_literal -- --nocapture",
+    "cargo check --lib"
+  ]
+}

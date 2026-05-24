@@ -1,0 +1,3 @@
+id,task_id,title,files,status,summary,error
+X1,TASK-009,Preserve zero-column projection hints,"src/execution/scan.rs",completed,"Empty projection hints now remain Some([]) and are not treated as key-only primary-key projections.",
+X2,TASK-010,Zero-column scan decode bypass,"src/execution/scan.rs;tests/sql_integration.rs",completed,"Projection-aware decode now returns empty rows for zero-column scans and tests cover constant projection and COUNT(1).",

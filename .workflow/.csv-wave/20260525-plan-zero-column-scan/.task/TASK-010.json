@@ -1,0 +1,20 @@
+{
+  "id": "TASK-010",
+  "title": "Zero-column scan decode bypass",
+  "description": "Route projection-aware row decode through a helper that returns an empty row for zero-column scans.",
+  "scope": [
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve partial decode behavior for non-empty projections",
+    "Preserve full-row decode and cache behavior when projection_indices is None"
+  ],
+  "convergence_criteria": [
+    "scan paths use a shared projection-aware decode helper",
+    "zero-column scans return Vec::new() rows before final projection evaluation",
+    "SELECT 1 FROM table and SELECT COUNT(1) FROM table integration tests pass"
+  ],
+  "status": "completed"
+}

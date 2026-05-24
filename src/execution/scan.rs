@@ -501,6 +501,17 @@ impl Executor {
         row
     }
 
+    fn decode_row_for_projection(
+        data: &[u8],
+        projection_indices: Option<&[usize]>,
+    ) -> bincode::Result<Vec<Value>> {
+        match projection_indices {
+            Some(indices) if indices.is_empty() => Ok(Vec::new()),
+            Some(indices) => crate::common::encoding::RowDecoder::decode_partial(data, indices),
+            None => crate::common::encoding::RowDecoder::decode(data),
+        }
+    }
+
     async fn fetch_full_row_by_id(
         &self,
         table_name: &str,
@@ -1570,14 +1581,17 @@ impl Executor {
                         indices.push(idx);
                     }
                 }
-                if indices.is_empty() {
-                    None
-                } else {
+                if cols.is_empty() || !indices.is_empty() {
                     Some(indices)
+                } else {
+                    None
                 }
             } else {
                 None
             };
+            let zero_column_projection = projection_indices
+                .as_ref()
+                .is_some_and(|indices| indices.is_empty());
 
             // Determine if we can do Key-Only Scan (Projection Pushdown Optimization)
             let mut key_only_scan = false;
@@ -1594,12 +1608,13 @@ impl Executor {
 
             if let Some(pk_idx) = pk_index {
                 let projection_is_pk_only = if let Some(proj) = projection {
-                    proj.iter().all(|name| {
-                        self.resolve_column_index(name, &schema)
-                            .ok()
-                            .map(|idx| idx == pk_idx)
-                            .unwrap_or(false)
-                    })
+                    !proj.is_empty()
+                        && proj.iter().all(|name| {
+                            self.resolve_column_index(name, &schema)
+                                .ok()
+                                .map(|idx| idx == pk_idx)
+                                .unwrap_or(false)
+                        })
                 } else {
                     false
                 };
@@ -1888,37 +1903,29 @@ impl Executor {
                                     selection_fully_applied = true;
                                     let kv_pairs = txn.scan_range(&start, &end, limit).await?;
                                     for (k, v) in kv_pairs {
-                                        let row = if key_only_scan {
-                                            let k_str = String::from_utf8_lossy(&k);
-                                            let prefix = format!("data:{}:", table_name);
-                                            if let Some(pk_str) = k_str.strip_prefix(&prefix) {
-                                                Self::primary_key_row_from_id(
-                                                    &schema, pk_index, pk_str,
-                                                )
+                                        let row =
+                                            if key_only_scan {
+                                                let k_str = String::from_utf8_lossy(&k);
+                                                let prefix = format!("data:{}:", table_name);
+                                                if let Some(pk_str) = k_str.strip_prefix(&prefix) {
+                                                    Self::primary_key_row_from_id(
+                                                        &schema, pk_index, pk_str,
+                                                    )
+                                                } else {
+                                                    continue;
+                                                }
                                             } else {
-                                                continue;
-                                            }
-                                        } else {
-                                            if let Some(indices) = &projection_indices {
-                                                crate::common::encoding::RowDecoder::decode_partial(
-                                                    &v, indices,
+                                                Self::decode_row_for_projection(
+                                                    &v,
+                                                    projection_indices.as_deref(),
                                                 )
                                                 .map_err(|e| {
                                                     FusionError::Execution(format!(
-                                                        "Data partial deserialization error: {}",
+                                                        "Data deserialization error: {}",
                                                         e
                                                     ))
                                                 })?
-                                            } else {
-                                                crate::common::encoding::RowDecoder::decode(&v)
-                                                    .map_err(|e| {
-                                                        FusionError::Execution(format!(
-                                                            "Data deserialization error: {}",
-                                                            e
-                                                        ))
-                                                    })?
-                                            }
-                                        };
+                                            };
                                         rows.push(row);
                                         if let Some(l) = limit {
                                             if rows.len() >= l {
@@ -1977,29 +1984,16 @@ impl Executor {
                                         txn.get(data_key.as_bytes()).await?
                                     {
                                         monitor::inc_row_read();
-                                        let row: Vec<Value> =
-                                            if let Some(indices) = &projection_indices {
-                                                crate::common::encoding::RowDecoder::decode_partial(
-                                                    &data_bytes,
-                                                    indices,
-                                                )
-                                                .map_err(|e| {
-                                                    FusionError::Execution(format!(
-                                                        "Data partial deserialization error: {}",
-                                                        e
-                                                    ))
-                                                })?
-                                            } else {
-                                                crate::common::encoding::RowDecoder::decode(
-                                                    &data_bytes,
-                                                )
-                                                .map_err(|e| {
-                                                    FusionError::Execution(format!(
-                                                        "Data deserialization error: {}",
-                                                        e
-                                                    ))
-                                                })?
-                                            };
+                                        let row: Vec<Value> = Self::decode_row_for_projection(
+                                            &data_bytes,
+                                            projection_indices.as_deref(),
+                                        )
+                                        .map_err(|e| {
+                                            FusionError::Execution(format!(
+                                                "Data deserialization error: {}",
+                                                e
+                                            ))
+                                        })?;
                                         if projection_indices.is_none() {
                                             self.row_cache.insert(data_key, row.clone());
                                         }
@@ -2033,37 +2027,50 @@ impl Executor {
                                     .map(|row_id| {
                                         let table_name = table_name_for_stream.clone();
                                         let schema_cols = schema_cols.clone();
-                                        let projection_indices = projection_indices_for_stream.clone();
+                                        let projection_indices =
+                                            projection_indices_for_stream.clone();
                                         let executor = executor_for_stream;
 
                                         async move {
-                                        let data_key = format!("data:{}:{}", table_name, row_id);
+                                            let data_key =
+                                                format!("data:{}:{}", table_name, row_id);
 
-                                        if let Some(row) = executor.row_cache.get(&data_key) {
-                                            return Ok::<_, FusionError>(Some((row_id, row, true, false, false)));
-                                        }
+                                            if let Some(row) = executor.row_cache.get(&data_key) {
+                                                return Ok::<_, FusionError>(Some((
+                                                    row_id, row, true, false, false,
+                                                )));
+                                            }
 
-                                        if key_only_scan {
-                                            let schema = TableSchema::new(table_name.clone(), schema_cols);
-                                            let r = Self::primary_key_row_from_id(&schema, pk_index, &row_id);
-                                            return Ok(Some((row_id, r, false, false, false)));
-                                        }
+                                            if key_only_scan {
+                                                let schema = TableSchema::new(
+                                                    table_name.clone(),
+                                                    schema_cols,
+                                                );
+                                                let r = Self::primary_key_row_from_id(
+                                                    &schema, pk_index, &row_id,
+                                                );
+                                                return Ok(Some((row_id, r, false, false, false)));
+                                            }
 
-                                        if let Some(data_bytes) = txn_ref.get(data_key.as_bytes()).await? {
-                                            let (row, cacheable): (Vec<Value>, bool) = if let Some(indices) = &projection_indices {
-                                                crate::common::encoding::RowDecoder::decode_partial(&data_bytes, indices).map_err(|e| {
-                                                    FusionError::Execution(format!("Data partial deserialization error: {}", e))
-                                                }).map(|row| (row, false))?
+                                            if let Some(data_bytes) =
+                                                txn_ref.get(data_key.as_bytes()).await?
+                                            {
+                                                let cacheable = projection_indices.is_none();
+                                                let row = Self::decode_row_for_projection(
+                                                    &data_bytes,
+                                                    projection_indices.as_deref(),
+                                                )
+                                                .map_err(|e| {
+                                                    FusionError::Execution(format!(
+                                                        "Data deserialization error: {}",
+                                                        e
+                                                    ))
+                                                })?;
+                                                Ok(Some((row_id, row, false, cacheable, true)))
                                             } else {
-                                                crate::common::encoding::RowDecoder::decode(&data_bytes).map_err(|e| {
-                                                    FusionError::Execution(format!("Data deserialization error: {}", e))
-                                                }).map(|row| (row, true))?
-                                            };
-                                            Ok(Some((row_id, row, false, cacheable, true)))
-                                        } else {
-                                            Ok(None)
+                                                Ok(None)
+                                            }
                                         }
-                                    }
                                     })
                                     .buffer_unordered(128);
 
@@ -2131,12 +2138,10 @@ impl Executor {
                         } else {
                             None
                         }
+                    } else if zero_column_projection {
+                        Some(Vec::new())
                     } else {
-                        if let Some(indices) = &projection_indices {
-                            crate::common::encoding::RowDecoder::decode_partial(&v, indices).ok()
-                        } else {
-                            crate::common::encoding::RowDecoder::decode(&v).ok()
-                        }
+                        Self::decode_row_for_projection(&v, projection_indices.as_deref()).ok()
                     };
 
                     if let Some(row) = row_res {
