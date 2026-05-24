@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-045,"Reuse row cache in scan_table_base","src/execution/scan.rs;tests/sql_integration.rs",completed

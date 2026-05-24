@@ -1,0 +1,5 @@
+id,verification,status
+TASK-045,"cargo fmt --check",passed
+TASK-045,"cargo test --test sql_integration test_join_base_scan_reuses_row_cache -- --nocapture",passed
+TASK-045,"cargo test --test sql_integration test_inner_join -- --nocapture",passed
+TASK-045,"cargo check --lib",passed

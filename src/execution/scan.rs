@@ -38,11 +38,21 @@ impl Executor {
                 let prefix = format!("data:{}:", table_name);
                 let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
                 let mut rows = Vec::with_capacity(kv_pairs.len());
-                for (_, v) in kv_pairs {
-                    let row: Vec<Value> =
+                for (k, v) in kv_pairs {
+                    let row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
+                        if let Some(row) = self.row_cache.get(key_str) {
+                            monitor::inc_row_cache_hit();
+                            row
+                        } else {
+                            crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
+                                FusionError::Execution(format!("Data deserialization error: {}", e))
+                            })?
+                        }
+                    } else {
                         crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
                             FusionError::Execution(format!("Data deserialization error: {}", e))
-                        })?;
+                        })?
+                    };
                     rows.push(row);
                 }
                 return Ok((schema, rows));

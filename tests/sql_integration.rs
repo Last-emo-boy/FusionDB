@@ -1290,6 +1290,87 @@ async fn test_inner_join() {
 }
 
 #[tokio::test]
+async fn test_join_base_scan_reuses_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE join_cache_users (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE join_cache_orders (id INTEGER PRIMARY KEY, user_id INTEGER, product TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO join_cache_users VALUES (1, 'Alice'), (2, 'Bob')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO join_cache_orders VALUES (1, 1, 'Widget'), (2, 2, 'Gadget')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM join_cache_users").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::String("Alice".to_string())],
+            vec![Value::Integer(2), Value::String("Bob".to_string())]
+        ]
+    );
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, name) in [(1_i64, "Alice"), (2_i64, "Bob")] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(name.to_string()),
+            ]);
+            let corrupt_col_idx = 1usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+
+            let key = format!(
+                "data:join_cache_users:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT * FROM join_cache_users JOIN join_cache_orders ON join_cache_users.id = join_cache_orders.user_id",
+    )
+    .await;
+    assert_eq!(
+        cols,
+        vec![
+            "join_cache_users.id",
+            "join_cache_users.name",
+            "join_cache_orders.id",
+            "join_cache_orders.user_id",
+            "join_cache_orders.product"
+        ]
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], Value::String("Alice".to_string()));
+    assert_eq!(rows[1][1], Value::String("Bob".to_string()));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_three_table_join_with_alias_projection() {
     let (executor, wal) = setup().await;
     exec_ok(

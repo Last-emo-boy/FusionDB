@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-045,"Use cached full rows before RowDecoder::decode in scan_table_base",completed,"src/execution/scan.rs;tests/sql_integration.rs"

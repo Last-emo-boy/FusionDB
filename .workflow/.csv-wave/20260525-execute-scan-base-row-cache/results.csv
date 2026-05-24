@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-045,completed,"scan_table_base now reuses cached full rows before falling back to row decode.",".workflow/.csv-wave/20260525-execute-scan-base-row-cache/tasks.csv",
