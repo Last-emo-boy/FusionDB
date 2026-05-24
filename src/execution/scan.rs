@@ -1987,14 +1987,12 @@ impl Executor {
                                 return Ok((schema, vec![]));
                             }
 
-                            if projection_indices.is_none() {
-                                if let Some(row) = self.row_cache.get(&key) {
-                                    monitor::inc_row_cache_hit();
-                                    if self.evaluate_expr(sel, &row, &schema, params)? {
-                                        return Ok((schema, vec![row]));
-                                    }
-                                    return Ok((schema, vec![]));
+                            if let Some(row) = self.row_cache.get(&key) {
+                                monitor::inc_row_cache_hit();
+                                if self.evaluate_expr(sel, &row, &schema, params)? {
+                                    return Ok((schema, vec![row]));
                                 }
+                                return Ok((schema, vec![]));
                             }
 
                             if let Some(v) = txn.get(key.as_bytes()).await? {
