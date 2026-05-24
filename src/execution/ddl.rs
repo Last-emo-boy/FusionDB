@@ -392,13 +392,16 @@ impl Executor {
             let parts: Vec<&str> = std::str::from_utf8(&k).unwrap().split(':').collect();
             let row_id = parts.last().unwrap();
 
-            let row: Vec<Value> = crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
-                FusionError::Execution(format!("Data deserialization error: {}", e))
-            })?;
-            let val = &row[col_idx];
+            let val =
+                crate::common::encoding::RowDecoder::decode_column(&v, col_idx).map_err(|e| {
+                    FusionError::Execution(format!("Data deserialization error: {}", e))
+                })?;
+            let Some(val) = val else {
+                continue;
+            };
 
             if index_type == IndexType::FTS {
-                if let Value::String(text) = val {
+                if let Value::String(text) = &val {
                     let tokens = Self::tokenize(text);
                     let unique_tokens: HashSet<String> = tokens.into_iter().collect();
                     for token in unique_tokens {
@@ -408,13 +411,13 @@ impl Executor {
                     }
                 }
             } else if index_type == IndexType::HNSW {
-                if let Value::Vector(vec) = val {
+                if let Value::Vector(vec) = &val {
                     let idx_name = format!("hnsw_{}_{}", table_name_str, col_name);
                     self.vector_index
                         .insert(&idx_name, row_id.to_string(), vec.clone())?;
                 }
             } else {
-                let val_str = match val {
+                let val_str = match &val {
                     Value::Integer(i) => i.to_string(),
                     Value::String(s) => s.clone(),
                     Value::Boolean(b) => b.to_string(),

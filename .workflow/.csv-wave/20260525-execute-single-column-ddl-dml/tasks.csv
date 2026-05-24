@@ -1,0 +1,3 @@
+id,task_id,title,files,status,summary,error
+X1,TASK-017,Single-column UNIQUE duplicate checks,"src/execution/dml.rs",completed,"Replaced full-row decode in UNIQUE duplicate scan with decode_column for the checked column.",
+X2,TASK-018,Single-column CREATE INDEX backfill,"src/execution/ddl.rs",completed,"Replaced full-row decode during index backfill with decode_column for the indexed column.",

@@ -1,0 +1,29 @@
+{
+  "session_id": "20260525-verify-single-column-ddl-dml",
+  "status": "passed",
+  "scope": [
+    "src/execution/dml.rs",
+    "src/execution/ddl.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_unique_constraint -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_create_btree_index -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ]
+}

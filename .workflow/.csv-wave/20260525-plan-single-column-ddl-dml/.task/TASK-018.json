@@ -1,0 +1,19 @@
+{
+  "id": "TASK-018",
+  "title": "Single-column CREATE INDEX backfill",
+  "description": "Use RowDecoder::decode_column when CREATE INDEX backfills index entries from existing table rows.",
+  "scope": [
+    "src/execution/ddl.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve BTree, FTS, and HNSW index entry behavior",
+    "Skip rows where the indexed column cannot be decoded"
+  ],
+  "convergence_criteria": [
+    "CREATE INDEX backfill no longer decodes full rows",
+    "BTree index creation test passes",
+    "cargo check passes"
+  ],
+  "status": "completed"
+}

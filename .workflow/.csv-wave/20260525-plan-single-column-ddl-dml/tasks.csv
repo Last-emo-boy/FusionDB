@@ -1,0 +1,4 @@
+id,title,description,exploration_focus,deps,context_from,wave,status,findings,error
+E1,UNIQUE decode exploration,Inspect INSERT UNIQUE duplicate checks for row decode scope,performance,,,1,completed,"UNIQUE duplicate checks only compare one target column but decoded entire existing rows.",
+E2,CREATE INDEX decode exploration,Inspect CREATE INDEX table backfill for row decode scope,performance,,,1,completed,"Index backfill only needs the indexed column value but decoded entire rows before building index entries.",
+P1,Plan generation,Generate TASKs for single-column DDL/DML decode reuse,planning,E1;E2,E1;E2,2,completed,"Plan TASK-017..018: use RowDecoder::decode_column in UNIQUE checks and CREATE INDEX backfill.",

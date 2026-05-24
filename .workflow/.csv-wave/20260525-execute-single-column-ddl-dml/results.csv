@@ -1,0 +1,3 @@
+id,task_id,status,files_changed,result,error
+X1,TASK-017,completed,"src/execution/dml.rs","UNIQUE duplicate detection now avoids decoding unused columns.",
+X2,TASK-018,completed,"src/execution/ddl.rs","CREATE INDEX backfill now avoids decoding unused columns.",

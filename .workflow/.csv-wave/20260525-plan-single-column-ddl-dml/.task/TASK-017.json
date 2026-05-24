@@ -1,0 +1,19 @@
+{
+  "id": "TASK-017",
+  "title": "Single-column UNIQUE duplicate checks",
+  "description": "Use RowDecoder::decode_column when checking existing rows for non-primary UNIQUE constraint duplicates.",
+  "scope": [
+    "src/execution/dml.rs"
+  ],
+  "constraints": [
+    "Do not modify dashboard/",
+    "Preserve SQL behavior that NULL UNIQUE values are allowed",
+    "Preserve duplicate error message semantics"
+  ],
+  "convergence_criteria": [
+    "UNIQUE checks no longer decode full existing rows",
+    "Missing target columns are treated as NULL",
+    "Focused UNIQUE integration test passes"
+  ],
+  "status": "completed"
+}

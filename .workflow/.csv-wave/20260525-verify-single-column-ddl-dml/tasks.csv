@@ -1,0 +1,5 @@
+id,task_id,command,status,notes
+V1,TASK-017,cargo fmt --check,passed,Formatting check passed.
+V2,TASK-017,cargo test --test sql_integration test_unique_constraint -- --nocapture,passed,UNIQUE duplicate and NULL behavior preserved.
+V3,TASK-018,cargo test --test sql_integration test_create_btree_index -- --nocapture,passed,BTree index backfill remains functional.
+V4,TASK-017;TASK-018,cargo check --lib,passed,Library type check passed.

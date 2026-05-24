@@ -172,12 +172,13 @@ impl Executor {
                             let prefix = format!("data:{}:", table_name_str);
                             let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
                             for (_, v) in &existing {
-                                let existing_row: Vec<Value> =
-                                    crate::common::encoding::RowDecoder::decode(v).map_err(
-                                        |e| FusionError::Execution(format!("Decode error: {}", e)),
-                                    )?;
-                                if idx < existing_row.len() && existing_row[idx] == row_values[idx]
-                                {
+                                let existing_value =
+                                    crate::common::encoding::RowDecoder::decode_column(v, idx)
+                                        .map_err(|e| {
+                                            FusionError::Execution(format!("Decode error: {}", e))
+                                        })?
+                                        .unwrap_or(Value::Null);
+                                if existing_value == row_values[idx] {
                                     return Err(FusionError::Execution(format!(
                                         "UNIQUE constraint violated for column '{}': duplicate value '{}'",
                                         col.name, crate::common::encoding::encode_key(&row_values[idx])

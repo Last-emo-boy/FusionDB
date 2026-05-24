@@ -1,0 +1,52 @@
+{
+  "session_id": "20260525-plan-single-column-ddl-dml",
+  "phase": "database-core-performance",
+  "goal": "Avoid full-row decoding in DDL/DML paths that only inspect one column.",
+  "scope": {
+    "include": [
+      "src/execution/dml.rs",
+      "src/execution/ddl.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-017"
+      ]
+    },
+    {
+      "wave": 2,
+      "tasks": [
+        "TASK-018"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-017",
+      "title": "Single-column UNIQUE duplicate checks",
+      "files": [
+        "src/execution/dml.rs"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TASK-018",
+      "title": "Single-column CREATE INDEX backfill",
+      "files": [
+        "src/execution/ddl.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_unique_constraint -- --nocapture",
+    "cargo test --test sql_integration test_create_btree_index -- --nocapture",
+    "cargo check --lib"
+  ]
+}
