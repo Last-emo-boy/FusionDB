@@ -1,0 +1,14 @@
+{
+  "id": "TASK-027",
+  "title": "Qualified MIN/MAX primary-key bounds fast path",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "summary": "Use data-key boundary lookups for qualified and alias-qualified MIN/MAX(primary_key) in eligible aggregate queries."
+}

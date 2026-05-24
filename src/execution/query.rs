@@ -11,27 +11,57 @@ use std::collections::HashSet;
 use super::{AggregateAccumulator, Executor, QueryResult};
 
 impl Executor {
-    fn count_prefix_eligible_arg(arg: &FunctionArg, schema: &TableSchema) -> bool {
+    fn count_prefix_eligible_arg(
+        arg: &FunctionArg,
+        schema: &TableSchema,
+        allowed_qualifiers: Option<&[String]>,
+    ) -> bool {
         match arg {
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => true,
             FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => {
                 !matches!(value.value, sqlparser::ast::Value::Null)
             }
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => schema
-                .columns
-                .iter()
-                .any(|col| col.is_primary && col.name.eq_ignore_ascii_case(&ident.value)),
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(idents))) => {
-                let Some(ident) = idents.last() else {
-                    return false;
-                };
-                schema
-                    .columns
-                    .iter()
-                    .any(|col| col.is_primary && col.name.eq_ignore_ascii_case(&ident.value))
-            }
-            _ => false,
+            _ => Self::primary_key_arg_index(arg, schema, allowed_qualifiers).is_some(),
         }
+    }
+
+    fn primary_key_arg_index(
+        arg: &FunctionArg,
+        schema: &TableSchema,
+        allowed_qualifiers: Option<&[String]>,
+    ) -> Option<usize> {
+        let col_name = match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+                ident.value.as_str()
+            }
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(idents))) => {
+                let qualifier = idents
+                    .iter()
+                    .take(idents.len().saturating_sub(1))
+                    .map(|ident| ident.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+
+                if allowed_qualifiers
+                    .map(|qualifiers| {
+                        !qualifiers
+                            .iter()
+                            .any(|allowed| allowed.eq_ignore_ascii_case(&qualifier))
+                    })
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+
+                idents.last()?.value.as_str()
+            }
+            _ => return None,
+        };
+
+        schema
+            .columns
+            .iter()
+            .position(|col| col.is_primary && col.name.eq_ignore_ascii_case(col_name))
     }
 
     fn primary_key_value_from_data_key(
@@ -271,8 +301,12 @@ impl Executor {
                 let mut col_names = Vec::new();
 
                 if let Some(table) = select.from.first() {
-                    if let TableFactor::Table { name, .. } = &table.relation {
+                    if let TableFactor::Table { name, alias, .. } = &table.relation {
                         let table_name_str = name.to_string();
+                        let mut aggregate_qualifiers = vec![table_name_str.clone()];
+                        if let Some(alias) = alias {
+                            aggregate_qualifiers.push(alias.name.value.clone());
+                        }
                         let schema_key = format!("schema:{}", table_name_str);
                         if let Ok(Some(schema_bytes)) = txn.get(schema_key.as_bytes()).await {
                             if let Ok(schema) = bincode::deserialize::<TableSchema>(&schema_bytes) {
@@ -295,6 +329,7 @@ impl Executor {
                                                     && Self::count_prefix_eligible_arg(
                                                         &args.args[0],
                                                         &schema,
+                                                        Some(&aggregate_qualifiers),
                                                     )
                                                 {
                                                     let prefix =
@@ -309,59 +344,36 @@ impl Executor {
                                         } else if func_name == "MAX" || func_name == "MIN" {
                                             if let FunctionArguments::List(args) = &func.args {
                                                 if args.args.len() == 1 {
-                                                    if let FunctionArg::Unnamed(
-                                                        FunctionArgExpr::Expr(Expr::Identifier(
-                                                            ident,
-                                                        )),
-                                                    ) = &args.args[0]
-                                                    {
-                                                        let mut pk_idx = None;
-                                                        for (i, col) in
-                                                            schema.columns.iter().enumerate()
-                                                        {
-                                                            if col
-                                                                .name
-                                                                .eq_ignore_ascii_case(&ident.value)
-                                                            {
-                                                                if col.is_primary {
-                                                                    pk_idx = Some(i);
-                                                                }
-                                                                break;
-                                                            }
-                                                        }
+                                                    if let Some(idx) = Self::primary_key_arg_index(
+                                                        &args.args[0],
+                                                        &schema,
+                                                        Some(&aggregate_qualifiers),
+                                                    ) {
+                                                        let prefix =
+                                                            format!("data:{}:", table_name_str);
+                                                        let min_key = prefix.as_bytes().to_vec();
+                                                        let mut max_key =
+                                                            prefix.as_bytes().to_vec();
+                                                        max_key.push(0xFF);
 
-                                                        if let Some(idx) = pk_idx {
-                                                            let prefix =
-                                                                format!("data:{}:", table_name_str);
-                                                            let min_key =
-                                                                prefix.as_bytes().to_vec();
-                                                            let mut max_key =
-                                                                prefix.as_bytes().to_vec();
-                                                            max_key.push(0xFF);
+                                                        let res = if func_name == "MIN" {
+                                                            txn.first(&min_key, &max_key).await?
+                                                        } else {
+                                                            txn.last(&min_key, &max_key).await?
+                                                        };
 
-                                                            let res = if func_name == "MIN" {
-                                                                txn.first(&min_key, &max_key)
-                                                                    .await?
-                                                            } else {
-                                                                txn.last(&min_key, &max_key).await?
-                                                            };
-
-                                                            let val = if let Some((key, _)) = res {
-                                                                let column = &schema.columns[idx];
-                                                                Self::primary_key_value_from_data_key(
-                                                                    &key, &prefix, column,
-                                                                )
-                                                                .unwrap_or(Value::Null)
-                                                            } else {
-                                                                Value::Null
-                                                            };
-                                                            result_row.push(val);
-                                                            col_names.push(format!(
-                                                                "{}({})",
-                                                                func_name, ident.value
-                                                            ));
-                                                            item_handled = true;
-                                                        }
+                                                        let val = if let Some((key, _)) = res {
+                                                            let column = &schema.columns[idx];
+                                                            Self::primary_key_value_from_data_key(
+                                                                &key, &prefix, column,
+                                                            )
+                                                            .unwrap_or(Value::Null)
+                                                        } else {
+                                                            Value::Null
+                                                        };
+                                                        result_row.push(val);
+                                                        col_names.push(format!("{}", func));
+                                                        item_handled = true;
                                                     }
                                                 }
                                             }

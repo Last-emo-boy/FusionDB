@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-027,maestro-execute,"database-core-performance qualified minmax primary key bounds --method cli",2,completed,"Qualified MIN/MAX(primary_key) now uses data-key boundary lookups when eligible.","src/execution/query.rs;tests/sql_integration.rs",""

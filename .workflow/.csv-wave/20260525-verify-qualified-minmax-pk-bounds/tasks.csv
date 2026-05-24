@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-027,maestro-verify,"database-core-performance qualified minmax primary key bounds",3,completed,"Formatting, qualified MIN/MAX regression, existing MIN/MAX regression, COUNT(primary_key) regression, and lib check passed.",".workflow/.csv-wave/20260525-verify-qualified-minmax-pk-bounds/verification.json",""

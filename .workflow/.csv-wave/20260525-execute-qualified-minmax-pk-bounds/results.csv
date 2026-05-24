@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-027,completed,"Qualified MIN/MAX(primary_key) now avoids row decoding in eligible unfiltered aggregate queries.","src/execution/query.rs;tests/sql_integration.rs",""

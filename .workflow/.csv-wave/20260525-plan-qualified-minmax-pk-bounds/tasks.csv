@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-027,maestro-plan,"database-core-performance qualified minmax primary key bounds",1,completed,"Qualified MIN/MAX(primary_key) can reuse key-bound aggregate fast paths with table/alias qualifier checks.",".workflow/.csv-wave/20260525-plan-qualified-minmax-pk-bounds/plan.json",""
