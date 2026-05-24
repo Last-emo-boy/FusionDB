@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-030,maestro-verify,"database-core-performance full scan row cache",3,completed,"Formatting, full-scan cache reuse regression, INSERT invalidation regression, and lib check passed.",".workflow/.csv-wave/20260525-verify-full-scan-row-cache/verification.json",""

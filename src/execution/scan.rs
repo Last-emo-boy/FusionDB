@@ -2222,6 +2222,21 @@ impl Executor {
                         }
                     } else if zero_column_projection {
                         Some(Vec::new())
+                    } else if projection_indices.is_none() {
+                        match std::str::from_utf8(&k) {
+                            Ok(key_str) => {
+                                if let Some(row) = self.row_cache.get(key_str) {
+                                    monitor::inc_row_cache_hit();
+                                    Some(row)
+                                } else {
+                                    Self::decode_row_for_projection(&v, None).ok().map(|row| {
+                                        self.row_cache.insert(key_str.to_string(), row.clone());
+                                        row
+                                    })
+                                }
+                            }
+                            Err(_) => Self::decode_row_for_projection(&v, None).ok(),
+                        }
                     } else {
                         Self::decode_row_for_projection(&v, projection_indices.as_deref()).ok()
                     };

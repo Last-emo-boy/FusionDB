@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-030,completed,"Repeated full-row table scans now avoid repeated row decoding through row_cache reuse.","src/execution/scan.rs;src/execution/dml.rs;tests/sql_integration.rs",""

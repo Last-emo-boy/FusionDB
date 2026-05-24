@@ -1,0 +1,15 @@
+{
+  "id": "TASK-030",
+  "title": "Full-row table scan row-cache reuse",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "scope": [
+    "src/execution/scan.rs",
+    "src/execution/dml.rs",
+    "tests/sql_integration.rs"
+  ],
+  "excluded": [
+    "dashboard/"
+  ],
+  "summary": "Reuse row_cache for full-row table scans and invalidate cached rows on INSERT overwrites."
+}

@@ -1,0 +1,41 @@
+{
+  "session_id": "20260525-plan-full-scan-row-cache",
+  "phase": "database-core-performance",
+  "goal": "Avoid repeated full-row decoding on repeated full-table scans by reusing row_cache safely.",
+  "scope": {
+    "include": [
+      "src/execution/scan.rs",
+      "src/execution/dml.rs",
+      "tests/sql_integration.rs"
+    ],
+    "exclude": [
+      "dashboard/"
+    ]
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-030"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-030",
+      "title": "Full-row table scan row-cache reuse",
+      "files": [
+        "src/execution/scan.rs",
+        "src/execution/dml.rs",
+        "tests/sql_integration.rs"
+      ],
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_full_table_scan_reuses_row_cache -- --nocapture",
+    "cargo test --test sql_integration test_insert_overwrite_invalidates_full_scan_row_cache -- --nocapture",
+    "cargo check --lib"
+  ]
+}

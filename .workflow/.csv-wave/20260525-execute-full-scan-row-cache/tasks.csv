@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-030,maestro-execute,"database-core-performance full scan row cache --method cli",2,completed,"Full-row table scans now reuse row_cache without caching projected rows.","src/execution/scan.rs;src/execution/dml.rs;tests/sql_integration.rs",""

@@ -154,6 +154,81 @@ async fn test_select_all() {
 }
 
 #[tokio::test]
+async fn test_full_table_scan_reuses_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE full_scan_cache (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO full_scan_cache VALUES (1, 'Alice')").await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM full_scan_cache").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+    );
+
+    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::String("Alice".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut corrupt_row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let key = format!(
+            "data:full_scan_cache:{}",
+            fusiondb::common::encoding::encode_i64_comparable(1)
+        );
+        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(&executor, "SELECT * FROM full_scan_cache").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_insert_overwrite_invalidates_full_scan_row_cache() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE full_scan_insert_cache (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO full_scan_insert_cache VALUES (1, 'Alice')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM full_scan_insert_cache").await;
+    assert_eq!(rows[0][1], Value::String("Alice".to_string()));
+
+    exec_ok(
+        &executor,
+        "INSERT INTO full_scan_insert_cache VALUES (1, 'Bob')",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT * FROM full_scan_insert_cache").await;
+    assert_eq!(rows[0][1], Value::String("Bob".to_string()));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_with_where_eq() {
     let (executor, wal) = setup().await;
     exec_ok(

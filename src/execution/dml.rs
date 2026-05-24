@@ -271,6 +271,7 @@ impl Executor {
 
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
+                    self.row_cache.invalidate(&key);
                     monitor::inc_row_write();
 
                     // Update Cache

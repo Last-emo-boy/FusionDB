@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+TASK-030,maestro-plan,"database-core-performance full scan row cache",1,completed,"Full-row table scans can safely reuse row_cache after cache invalidation gaps were closed.",".workflow/.csv-wave/20260525-plan-full-scan-row-cache/plan.json",""
