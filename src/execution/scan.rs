@@ -650,6 +650,14 @@ impl Executor {
         }
     }
 
+    fn row_id_from_key(key: &[u8]) -> Option<&str> {
+        std::str::from_utf8(key)
+            .ok()?
+            .rsplit(':')
+            .next()
+            .filter(|row_id| !row_id.is_empty())
+    }
+
     fn primary_key_row_from_id(
         schema: &TableSchema,
         pk_index: Option<usize>,
@@ -742,11 +750,10 @@ impl Executor {
         let mut rows = Vec::new();
 
         for (key, _) in index_entries {
-            let parts: Vec<&str> = std::str::from_utf8(&key).unwrap().split(':').collect();
-            let Some(row_id) = parts.last() else {
+            let Some(row_id) = Self::row_id_from_key(&key) else {
                 continue;
             };
-            if !seen_row_ids.insert((*row_id).to_string()) {
+            if !seen_row_ids.insert(row_id.to_string()) {
                 continue;
             }
             if let Some(row) = self.fetch_full_row_by_id(table_name, row_id, txn).await? {
@@ -1327,10 +1334,9 @@ impl Executor {
 
                                 let mut row_ids = HashSet::new();
                                 for (k, _) in index_entries {
-                                    let parts: Vec<&str> =
-                                        std::str::from_utf8(&k).unwrap().split(':').collect();
-                                    let row_id = parts.last().unwrap();
-                                    row_ids.insert(row_id.to_string());
+                                    if let Some(row_id) = Self::row_id_from_key(&k) {
+                                        row_ids.insert(row_id.to_string());
+                                    }
                                 }
                                 return Ok(Some(IndexScanPlan {
                                     row_ids,
@@ -1384,12 +1390,10 @@ impl Executor {
 
                                             let mut current_token_row_ids = HashSet::new();
                                             for (k, _) in index_entries {
-                                                let parts: Vec<&str> = std::str::from_utf8(&k)
-                                                    .unwrap()
-                                                    .split(':')
-                                                    .collect();
-                                                let row_id = parts.last().unwrap();
-                                                current_token_row_ids.insert(row_id.to_string());
+                                                if let Some(row_id) = Self::row_id_from_key(&k) {
+                                                    current_token_row_ids
+                                                        .insert(row_id.to_string());
+                                                }
                                             }
 
                                             if let Some(candidates) = candidate_row_ids {
@@ -1467,9 +1471,7 @@ impl Executor {
                                     let kv =
                                         txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
                                     for (k, _) in kv {
-                                        let parts: Vec<&str> =
-                                            std::str::from_utf8(&k).unwrap().split(':').collect();
-                                        if let Some(row_id) = parts.last() {
+                                        if let Some(row_id) = Self::row_id_from_key(&k) {
                                             all_row_ids.insert(row_id.to_string());
                                         }
                                     }
@@ -1507,11 +1509,7 @@ impl Executor {
                                         let kv =
                                             txn.scan_prefix(key_prefix.as_bytes(), limit).await?;
                                         for (k, _) in kv {
-                                            let parts: Vec<&str> = std::str::from_utf8(&k)
-                                                .unwrap()
-                                                .split(':')
-                                                .collect();
-                                            if let Some(row_id) = parts.last() {
+                                            if let Some(row_id) = Self::row_id_from_key(&k) {
                                                 all_row_ids.insert(row_id.to_string());
                                             }
                                         }
@@ -1523,11 +1521,7 @@ impl Executor {
                                         let kv =
                                             txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
                                         for (k, _) in kv {
-                                            let parts: Vec<&str> = std::str::from_utf8(&k)
-                                                .unwrap()
-                                                .split(':')
-                                                .collect();
-                                            if let Some(row_id) = parts.last() {
+                                            if let Some(row_id) = Self::row_id_from_key(&k) {
                                                 all_row_ids.insert(row_id.to_string());
                                             }
                                         }
@@ -1616,9 +1610,7 @@ impl Executor {
                                     .await?;
                                 let mut row_ids = HashSet::new();
                                 for (k, _) in kv {
-                                    let parts: Vec<&str> =
-                                        std::str::from_utf8(&k).unwrap().split(':').collect();
-                                    if let Some(row_id) = parts.last() {
+                                    if let Some(row_id) = Self::row_id_from_key(&k) {
                                         row_ids.insert(row_id.to_string());
                                     }
                                 }

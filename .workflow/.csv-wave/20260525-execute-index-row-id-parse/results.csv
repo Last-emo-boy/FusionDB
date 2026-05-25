@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-050,completed,"Index scan row-id extraction now uses rsplit(':').next() via a shared helper instead of split(':').collect().",".workflow/.csv-wave/20260525-execute-index-row-id-parse/tasks.csv",

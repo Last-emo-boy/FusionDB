@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-050,"Verify index row-id parse optimization",completed,"src/execution/scan.rs"

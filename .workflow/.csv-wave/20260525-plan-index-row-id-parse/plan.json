@@ -1,0 +1,40 @@
+{
+  "task_id": "TASK-050",
+  "title": "Avoid Vec allocation when extracting row ids from index keys",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "exclusions": [
+    "dashboard/"
+  ],
+  "hypothesis": "Index scan hot paths only need the final row-id segment from index/data keys; replacing split(':').collect() with rsplit(':').next() avoids per-entry Vec allocation.",
+  "waves": [
+    {
+      "wave": 1,
+      "skill": "maestro-plan",
+      "status": "completed"
+    },
+    {
+      "wave": 2,
+      "skill": "maestro-execute",
+      "status": "completed"
+    },
+    {
+      "wave": 3,
+      "skill": "maestro-verify",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_integration test_create_btree_index -- --nocapture",
+    "cargo test --test sql_integration test_inner_join_with_left_filter_and_indexed_right_probe -- --nocapture",
+    "cargo test --test sql_integration test_inner_join_multi_key_uses_indexed_probe_column -- --nocapture",
+    "cargo test --test sql_integration test_primary_key_range_reuses_row_cache -- --nocapture",
+    "cargo test --test sql_integration test_like_pattern -- --nocapture",
+    "cargo test --test sql_integration test_like_full_patterns -- --nocapture",
+    "cargo test --test sql_integration test_ilike -- --nocapture",
+    "cargo check --lib"
+  ]
+}
