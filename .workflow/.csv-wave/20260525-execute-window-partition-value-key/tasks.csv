@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-066,"Optimize window partition keys",completed,"src/execution/query.rs"

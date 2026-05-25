@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-066,"Verify window partition value keys",completed,"src/execution/query.rs"

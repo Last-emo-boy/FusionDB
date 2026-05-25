@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-066,completed,"Replaced debug string window partition keys with direct Vec<Value> HashMap keys and grouped rows in one pass.",".workflow/.csv-wave/20260525-verify-window-partition-value-key/verification.json",""

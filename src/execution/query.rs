@@ -6,7 +6,7 @@ use sqlparser::ast::{
     OrderByKind, SelectItem, SetExpr, TableFactor,
 };
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::{AggregateAccumulator, Executor, QueryResult};
 
@@ -1269,31 +1269,22 @@ impl Executor {
             return vec![];
         }
 
-        // Build partition keys for each row
-        let partition_keys: Vec<Vec<Value>> = rows
-            .iter()
-            .map(|row| {
-                spec.partition_by
-                    .iter()
-                    .map(|e| {
-                        self.evaluate_value(e, row, schema, params)
-                            .unwrap_or(Value::Null)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // Group row indices by partition key
-        let mut partitions: std::collections::HashMap<String, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (i, pk) in partition_keys.iter().enumerate() {
-            let key = format!("{:?}", pk);
-            partitions.entry(key).or_default().push(i);
+        let mut partitions: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            let partition_key: Vec<Value> = spec
+                .partition_by
+                .iter()
+                .map(|e| {
+                    self.evaluate_value(e, row, schema, params)
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            partitions.entry(partition_key).or_default().push(i);
         }
 
         let mut result = vec![Value::Null; rows.len()];
 
-        for (_pk_key, indices) in &partitions {
+        for indices in partitions.values() {
             // Sort indices within partition by ORDER BY
             let mut sorted_indices: Vec<usize> = indices.clone();
             if !spec.order_by.is_empty() {

@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-066",
+  "title": "Optimize window partition keys",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve window function partitioning and ordering semantics"
+  ],
+  "rationale": "Window function execution first collected every row partition key into a Vec and then formatted each key with format!(\"{:?}\", pk) before grouping. Value vectors are already hashable and can be used directly as partition keys.",
+  "steps": [
+    "Group row indices directly while evaluating each partition key",
+    "Use HashMap<Vec<Value>, Vec<usize>> instead of debug string keys",
+    "Remove the intermediate partition_keys allocation",
+    "Run existing window function integration regressions"
+  ],
+  "expected_impact": "Avoids an intermediate partition key vector and per-row debug string allocation during window function evaluation."
+}
