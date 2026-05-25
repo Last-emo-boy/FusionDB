@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-067,completed,"Updated InvertedIndex document insertion to maintain avg_doc_length incrementally and added focused unit coverage.",".workflow/.csv-wave/20260525-verify-inverted-index-avg-length/verification.json",""

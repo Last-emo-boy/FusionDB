@@ -48,7 +48,7 @@ impl InvertedIndex {
         let tokens = self.tokenize(text);
         let doc_len = tokens.len() as u32;
 
-        let mut term_freqs = HashMap::new();
+        let mut term_freqs = HashMap::with_capacity(tokens.len());
         for token in tokens {
             *term_freqs.entry(token).or_insert(0) += 1;
         }
@@ -60,12 +60,12 @@ impl InvertedIndex {
                 .push((doc_id.clone(), freq));
         }
 
-        self.doc_lengths.insert(doc_id, doc_len);
+        let replaced_doc_len = self.doc_lengths.insert(doc_id, doc_len).unwrap_or(0);
+        let total_len = self.avg_doc_length as f64 * self.total_docs as f64
+            - replaced_doc_len as f64
+            + doc_len as f64;
         self.total_docs += 1;
-
-        // Update avg length (simplified)
-        let total_len: u32 = self.doc_lengths.values().sum();
-        self.avg_doc_length = total_len as f32 / self.total_docs as f32;
+        self.avg_doc_length = (total_len / self.total_docs as f64) as f32;
     }
 
     fn tokenize(&self, text: &str) -> Vec<String> {
@@ -106,5 +106,35 @@ impl InvertedIndex {
         let mut result: Vec<_> = scores.into_iter().collect();
         result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InvertedIndex;
+
+    #[test]
+    fn add_document_updates_average_length_incrementally() {
+        let mut index = InvertedIndex::new();
+
+        index.add_document("doc1".to_string(), "quick brown fox");
+        index.add_document("doc2".to_string(), "quick fox");
+
+        assert_eq!(index.total_docs, 2);
+        assert_eq!(index.doc_lengths.get("doc1"), Some(&3));
+        assert_eq!(index.doc_lengths.get("doc2"), Some(&2));
+        assert!((index.avg_doc_length - 2.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn add_document_preserves_existing_duplicate_doc_id_average_semantics() {
+        let mut index = InvertedIndex::new();
+
+        index.add_document("doc1".to_string(), "one two three");
+        index.add_document("doc1".to_string(), "one two");
+
+        assert_eq!(index.total_docs, 2);
+        assert_eq!(index.doc_lengths.get("doc1"), Some(&2));
+        assert!((index.avg_doc_length - 1.0).abs() < f32::EPSILON);
     }
 }

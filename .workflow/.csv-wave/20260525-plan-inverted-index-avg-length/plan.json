@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-067",
+  "title": "Optimize inverted index average length update",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/inverted_index.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve BM25 scoring inputs and serialized index shape"
+  ],
+  "rationale": "InvertedIndex::add_document recalculated avg_doc_length by summing every stored document length after each inserted document. The previous average and document count are enough to update the average incrementally without changing the persisted struct layout.",
+  "steps": [
+    "Pre-size term frequency HashMap from token count",
+    "Replace full doc_lengths sum with an incremental total length calculation",
+    "Add unit tests for average length updates and duplicate doc_id compatibility",
+    "Run inverted index and FTS integration regressions"
+  ],
+  "expected_impact": "Avoids O(n) document length scans during each inverted-index document insertion, improving FTS index build/update paths."
+}

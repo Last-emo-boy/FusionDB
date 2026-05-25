@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-067,"Optimize inverted index average length update",completed,"src/storage/inverted_index.rs"
