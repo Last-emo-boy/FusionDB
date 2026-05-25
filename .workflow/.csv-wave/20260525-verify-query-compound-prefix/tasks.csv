@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-056,"Verify query compound identifier prefix optimization",completed,"src/execution/query.rs"

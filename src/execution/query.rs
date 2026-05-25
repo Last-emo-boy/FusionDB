@@ -33,6 +33,26 @@ struct SortOrderKey<'a> {
 }
 
 impl Executor {
+    fn compound_identifier_prefix(idents: &[sqlparser::ast::Ident]) -> String {
+        let prefix_len = idents.len().saturating_sub(1);
+        let capacity = idents
+            .iter()
+            .take(prefix_len)
+            .map(|ident| ident.value.len())
+            .sum::<usize>()
+            + prefix_len.saturating_sub(1);
+        let mut prefix = String::with_capacity(capacity);
+
+        for (index, ident) in idents.iter().take(prefix_len).enumerate() {
+            if index > 0 {
+                prefix.push('.');
+            }
+            prefix.push_str(&ident.value);
+        }
+
+        prefix
+    }
+
     fn count_prefix_eligible_arg(
         arg: &FunctionArg,
         schema: &TableSchema,
@@ -58,12 +78,7 @@ impl Executor {
                 ident.value.as_str()
             }
             FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(idents))) => {
-                let qualifier = idents
-                    .iter()
-                    .take(idents.len().saturating_sub(1))
-                    .map(|ident| ident.value.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".");
+                let qualifier = Self::compound_identifier_prefix(idents);
 
                 if allowed_qualifiers
                     .map(|qualifiers| {

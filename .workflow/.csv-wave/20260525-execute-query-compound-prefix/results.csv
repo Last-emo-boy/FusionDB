@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-056,completed,"query.rs COUNT fast-path qualifier parsing now builds compound identifier prefixes directly into a pre-sized String.",".workflow/.csv-wave/20260525-execute-query-compound-prefix/tasks.csv",

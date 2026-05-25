@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-056,"Build query compound identifier prefixes without temporary Vec allocation",completed,"src/execution/query.rs"
