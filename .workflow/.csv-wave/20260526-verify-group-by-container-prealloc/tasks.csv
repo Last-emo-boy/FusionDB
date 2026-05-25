@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-092-verify,"$maestro-verify verify group by aggregate and string aggregation behavior","group by verification"

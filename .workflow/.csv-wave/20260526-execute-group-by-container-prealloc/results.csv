@@ -1,0 +1,3 @@
+id,status,artifact,summary
+TASK-092-plan,completed,.workflow/.csv-wave/20260526-plan-group-by-container-prealloc/plan.json,"Planned low-risk GROUP BY container allocation optimization."
+TASK-092-execute,completed,src/execution/query.rs,"Added capacity hints for aggregate list, group map, group keys, grouped rows, aggregate maps, and grouped projection rows."

@@ -835,7 +835,9 @@ impl Executor {
 
             if let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by {
                 if !group_exprs.is_empty() {
-                    let mut aggregates: Vec<(Expr, String)> = Vec::new();
+                    let mut aggregates: Vec<(Expr, String)> = Vec::with_capacity(
+                        select.projection.len() + usize::from(select.having.is_some()),
+                    );
 
                     for item in &select.projection {
                         match item {
@@ -855,10 +857,10 @@ impl Executor {
                     let mut groups: std::collections::HashMap<
                         Vec<Value>,
                         Vec<AggregateAccumulator>,
-                    > = std::collections::HashMap::new();
+                    > = std::collections::HashMap::with_capacity(rows.len());
 
                     for row in rows {
-                        let mut group_key = Vec::new();
+                        let mut group_key = Vec::with_capacity(group_exprs.len());
                         for expr in group_exprs {
                             let val = self
                                 .evaluate_value(expr, &row, &schema, params)
@@ -899,10 +901,11 @@ impl Executor {
                         }
                     }
 
-                    let mut grouped_rows = Vec::new();
+                    let mut grouped_rows = Vec::with_capacity(groups.len());
 
                     for (group_key, accs) in groups {
-                        let mut agg_map = std::collections::HashMap::new();
+                        let mut agg_map =
+                            std::collections::HashMap::with_capacity(aggregates.len());
                         for (i, (expr, _)) in aggregates.iter().enumerate() {
                             agg_map.insert(expr.clone(), accs[i].finalize());
                         }
@@ -930,7 +933,7 @@ impl Executor {
                             }
                         }
 
-                        let mut new_row = Vec::new();
+                        let mut new_row = Vec::with_capacity(select.projection.len());
 
                         for item in &select.projection {
                             let val = match item {

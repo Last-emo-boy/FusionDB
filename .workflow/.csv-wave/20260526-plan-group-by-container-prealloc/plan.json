@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-092",
+  "title": "Optimize GROUP BY container preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve GROUP BY, HAVING, aggregate, and projection semantics"
+  ],
+  "rationale": "The GROUP BY aggregate path has stable upper bounds for aggregate expression count, input rows, group-key width, output group count, per-group aggregate map size, and projection width. Preallocating these containers reduces allocator growth during grouped aggregation.",
+  "steps": [
+    "Preallocate aggregate expression storage from projection and HAVING bounds",
+    "Preallocate group map from input row count",
+    "Preallocate group keys from GROUP BY expression count",
+    "Preallocate grouped output rows and per-group aggregate maps",
+    "Preallocate final grouped projection rows"
+  ],
+  "expected_impact": "Reduces allocation churn in grouped aggregate execution without changing query results."
+}
