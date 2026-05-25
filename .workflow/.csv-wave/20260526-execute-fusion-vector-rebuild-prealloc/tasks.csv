@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-117,Preallocate Fusion vector rebuild containers,completed,src/storage/fusion.rs

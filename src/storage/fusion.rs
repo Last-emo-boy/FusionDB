@@ -490,7 +490,7 @@ impl FusionStorage {
             if let Ok(key_str) = std::str::from_utf8(&k) {
                 if let Some(table_name) = key_str.strip_prefix(prefix) {
                     if let Ok(schema) = bincode::deserialize::<crate::catalog::TableSchema>(&v) {
-                        let mut hnsw_cols = Vec::new();
+                        let mut hnsw_cols = Vec::with_capacity(schema.columns.len());
                         for (idx, col) in schema.columns.iter().enumerate() {
                             if col.is_indexed && col.index_type == crate::catalog::IndexType::HNSW {
                                 let idx_name = format!("hnsw_{}_{}", table_name, col.name);
@@ -507,7 +507,7 @@ impl FusionStorage {
                         if let Ok(data_pairs) = txn.scan_prefix(data_prefix.as_bytes(), None).await
                         {
                             let mut batches: HashMap<String, Vec<(String, Vec<f32>)>> =
-                                HashMap::new();
+                                HashMap::with_capacity(hnsw_cols.len());
 
                             for (dk, dv) in data_pairs {
                                 let Some(row_id) = std::str::from_utf8(&dk)

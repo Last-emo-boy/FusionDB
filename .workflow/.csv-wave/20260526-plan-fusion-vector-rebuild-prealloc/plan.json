@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-117",
+  "created_at": "2026-05-26T06:35:49+08:00",
+  "phase": "database-core-performance",
+  "target": "src/storage/fusion.rs",
+  "goal": "Avoid avoidable container growth while rebuilding Fusion HNSW vector indexes.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to vector index rebuild or row decoding"
+  ],
+  "implementation": [
+    "Preallocate HNSW column collection from schema column count.",
+    "Preallocate rebuild batch map from discovered HNSW column count."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --lib fusion_rebuild_vector_index_decodes_only_hnsw_columns -- --nocapture"
+  ]
+}

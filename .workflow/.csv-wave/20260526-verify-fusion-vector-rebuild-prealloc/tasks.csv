@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-117,Verify Fusion vector rebuild behavior,completed,.workflow/.csv-wave/20260526-verify-fusion-vector-rebuild-prealloc/verification.json

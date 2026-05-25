@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-117,completed,Changed Fusion vector index rebuild containers to preallocate by schema and HNSW column counts,src/storage/fusion.rs,
