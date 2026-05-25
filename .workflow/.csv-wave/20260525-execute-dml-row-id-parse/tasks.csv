@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-051,"Avoid Vec allocation while extracting row ids in DML index maintenance",completed,"src/execution/dml.rs"

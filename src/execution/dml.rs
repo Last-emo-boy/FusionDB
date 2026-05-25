@@ -9,6 +9,14 @@ use std::collections::HashSet;
 use super::{Executor, QueryResult};
 
 impl Executor {
+    fn row_id_from_data_key(key: &[u8]) -> Result<&str> {
+        std::str::from_utf8(key)
+            .ok()
+            .and_then(|key| key.rsplit(':').next())
+            .filter(|row_id| !row_id.is_empty())
+            .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))
+    }
+
     fn primary_key_row_id_from_eq_selection(
         &self,
         selection: Option<&Expr>,
@@ -650,8 +658,7 @@ impl Executor {
                     self.row_cache.invalidate(key_str);
                 }
 
-                let parts: Vec<&str> = std::str::from_utf8(&k).unwrap().split(':').collect();
-                let row_id = parts.last().unwrap();
+                let row_id = Self::row_id_from_data_key(&k)?;
 
                 for (idx, col) in schema.columns.iter().enumerate() {
                     if col.is_indexed {
@@ -821,8 +828,7 @@ impl Executor {
                     self.row_cache.invalidate(key_str);
                 }
 
-                let parts: Vec<&str> = std::str::from_utf8(&k).unwrap().split(':').collect();
-                let row_id = parts.last().unwrap();
+                let row_id = Self::row_id_from_data_key(&k)?;
 
                 for (idx, col) in schema.columns.iter().enumerate() {
                     if col.is_indexed {

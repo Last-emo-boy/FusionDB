@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-051,completed,"DELETE and UPDATE index maintenance now extract row ids from data keys via rsplit(':').next() instead of split(':').collect().",".workflow/.csv-wave/20260525-execute-dml-row-id-parse/tasks.csv",

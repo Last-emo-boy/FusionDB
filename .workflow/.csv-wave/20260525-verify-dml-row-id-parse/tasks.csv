@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-051,"Verify DML row-id parse optimization",completed,"src/execution/dml.rs"
