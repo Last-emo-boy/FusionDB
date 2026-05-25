@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-090-plan,$maestro-plan "plan indexed join probe container preallocation optimization",join-probe-container-prealloc
+TASK-090-execute,$maestro-execute "preallocate distinct probe keys result rows and probe cache from known join bounds",join-probe-container-prealloc

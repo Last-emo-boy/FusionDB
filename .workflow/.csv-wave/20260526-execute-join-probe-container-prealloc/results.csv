@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-090-plan,completed,"Planned indexed join probe container preallocation optimization for src/execution/scan.rs",".workflow/.csv-wave/20260526-plan-join-probe-container-prealloc/plan.json"
+TASK-090-execute,completed,"Preallocated distinct probe key HashSet, probed rows Vec, and probe cache HashMap from known join bounds.","src/execution/scan.rs"

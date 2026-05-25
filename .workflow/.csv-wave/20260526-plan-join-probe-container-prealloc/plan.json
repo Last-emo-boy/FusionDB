@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-090",
+  "title": "Optimize indexed join probe container preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve indexed join probe, LIMIT, and left join semantics"
+  ],
+  "rationale": "The indexed join probe path has clear upper bounds for distinct probe keys, probe cache entries, and probed result rows. Preallocating these containers reduces HashSet, HashMap, and Vec growth during indexed joins.",
+  "steps": [
+    "Preallocate distinct probe keys from left row count",
+    "Preallocate probed result rows from min(left row count, limit)",
+    "Preallocate probe cache from distinct probe key count",
+    "Verify indexed join probe and left join behavior"
+  ],
+  "expected_impact": "Reduces allocation churn in indexed join probe execution without changing join semantics."
+}

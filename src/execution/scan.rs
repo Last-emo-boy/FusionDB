@@ -1009,7 +1009,7 @@ impl Executor {
                             probe_schema,
                         )
                     {
-                        let mut distinct_probe_keys = HashSet::new();
+                        let mut distinct_probe_keys = HashSet::with_capacity(left_rows.len());
                         for left_row in &left_rows {
                             distinct_probe_keys.insert(left_row[probe_left_idx].clone());
                         }
@@ -1021,8 +1021,11 @@ impl Executor {
                         ) {
                             monitor::inc_plan();
                             let right_table_name = right_table_name.unwrap();
-                            let mut probed_rows = Vec::new();
-                            let mut probe_cache: HashMap<Value, Vec<Vec<Value>>> = HashMap::new();
+                            let probed_capacity =
+                                limit.map_or(left_rows.len(), |value| left_rows.len().min(value));
+                            let mut probed_rows = Vec::with_capacity(probed_capacity);
+                            let mut probe_cache: HashMap<Value, Vec<Vec<Value>>> =
+                                HashMap::with_capacity(distinct_probe_keys.len());
 
                             for left_row in &left_rows {
                                 let probe_key = left_row[probe_left_idx].clone();
