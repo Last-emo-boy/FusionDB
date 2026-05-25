@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-074","completed","BM25 tokenization now avoids whole-input lowercase plus per-token replace, preserving whitespace token boundaries and punctuation cleanup behavior.","src/storage/inverted_index.rs","passed",""

@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-074",
+  "title": "Optimize BM25 tokenizer cleanup",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/inverted_index.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve existing whitespace-based BM25 token semantics"
+  ],
+  "rationale": "The BM25 tokenizer lowercased the entire input and then allocated another cleaned String for each whitespace token with replace. Cleaning each raw token in one pass avoids the whole-input lowercase allocation and removes punctuation while preserving the previous token boundaries.",
+  "steps": [
+    "Rewrite InvertedIndex::tokenize to scan each whitespace token directly",
+    "Lowercase and retain only alphanumeric characters while building each token",
+    "Filter empty punctuation-only tokens without an extra pass",
+    "Add focused unit coverage for punctuation removal and lowercase behavior"
+  ],
+  "expected_impact": "Reduces intermediate string allocation during BM25 document indexing and query tokenization."
+}

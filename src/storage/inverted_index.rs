@@ -70,10 +70,23 @@ impl InvertedIndex {
     }
 
     fn tokenize(&self, text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split_whitespace()
-            .map(|s| s.replace(|c: char| !c.is_alphanumeric(), ""))
-            .filter(|s| !s.is_empty())
+        text.split_whitespace()
+            .filter_map(|raw_token| {
+                let mut token = String::with_capacity(raw_token.len());
+                for c in raw_token.chars() {
+                    for lower in c.to_lowercase() {
+                        if lower.is_alphanumeric() {
+                            token.push(lower);
+                        }
+                    }
+                }
+
+                if token.is_empty() {
+                    None
+                } else {
+                    Some(token)
+                }
+            })
             .collect()
     }
 
@@ -159,6 +172,15 @@ mod tests {
         assert_eq!(index.total_docs, 2);
         assert_eq!(index.doc_lengths.get("doc1"), Some(&2));
         assert!((index.avg_doc_length - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tokenize_lowercases_and_removes_punctuation_within_whitespace_tokens() {
+        let index = InvertedIndex::new();
+
+        let tokens = index.tokenize("Quick, QUICK! co-op ...");
+
+        assert_eq!(tokens, vec!["quick", "quick", "coop"]);
     }
 
     #[test]
