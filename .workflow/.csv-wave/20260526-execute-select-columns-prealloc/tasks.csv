@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-108,Preallocate SELECT output column names,completed,src/execution/query.rs

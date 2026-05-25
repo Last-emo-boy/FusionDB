@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-108,completed,Changed SELECT output column names vector to preallocate by projection count,src/execution/query.rs,

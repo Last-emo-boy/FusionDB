@@ -1,0 +1,31 @@
+{
+  "task_id": "TASK-108",
+  "status": "passed",
+  "verified_at": "2026-05-26T05:03:39+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_projection -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_constant_projection_from_table -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_count_star -- --nocapture",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Validation used CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0.",
+    "The covered tests exercise normal projection names, constant projection names, and COUNT(*) output naming."
+  ]
+}

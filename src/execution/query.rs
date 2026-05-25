@@ -785,7 +785,7 @@ impl Executor {
                 });
             };
 
-            let mut columns = Vec::new();
+            let mut columns = Vec::with_capacity(select.projection.len());
             let mut is_count_star = false;
 
             if is_wildcard {
