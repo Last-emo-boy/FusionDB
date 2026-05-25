@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-112,completed,Changed scan projection index vector to preallocate by requested projection column count,src/execution/scan.rs,

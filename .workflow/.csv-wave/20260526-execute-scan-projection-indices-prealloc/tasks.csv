@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-112,Preallocate scan projection indices,completed,src/execution/scan.rs

@@ -1824,7 +1824,7 @@ impl Executor {
 
             // Calculate Projection Indices (Case Insensitive)
             let projection_indices = if let Some(cols) = projection {
-                let mut indices = Vec::new();
+                let mut indices = Vec::with_capacity(cols.len());
                 for name in cols {
                     let mut found = None;
                     for (i, col) in schema.columns.iter().enumerate() {

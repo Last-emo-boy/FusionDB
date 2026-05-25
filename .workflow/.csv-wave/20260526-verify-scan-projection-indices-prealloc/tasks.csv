@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-112,Verify scan projection behavior,completed,.workflow/.csv-wave/20260526-verify-scan-projection-indices-prealloc/verification.json
