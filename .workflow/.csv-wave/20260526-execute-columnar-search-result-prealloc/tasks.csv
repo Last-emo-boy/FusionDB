@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-098-plan,"$maestro-plan plan columnar vector search result preallocation optimization","columnar search planning"
+TASK-098-execute,"$maestro-execute preallocate columnar vector search output rows from retained score count","columnar search execution"

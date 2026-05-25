@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-098",
+  "title": "Optimize columnar vector search result preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/columnar.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve columnar vector search distance, limit, and ordering semantics"
+  ],
+  "rationale": "Columnar vector search truncates and sorts scored candidates before building the returned rows. At that point the final result count is known, so preallocating the output vector avoids growth during result materialization.",
+  "steps": [
+    "Replace final iterator collect with explicit output vector construction",
+    "Preallocate output rows from retained scored candidate count",
+    "Keep distance calculation, limit trimming, and sorting unchanged",
+    "Verify columnar vector search and hybrid zero-limit behavior"
+  ],
+  "expected_impact": "Reduces allocation churn during columnar vector search result materialization without changing result order."
+}

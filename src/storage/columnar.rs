@@ -64,11 +64,11 @@ impl ColumnarVectorStore {
         }
         scores.sort_by(distance_order);
 
-        scores
-            .iter()
-            .take(limit)
-            .map(|(score, idx)| (self.ids.value(*idx).to_string(), score.sqrt()))
-            .collect()
+        let mut results = Vec::with_capacity(scores.len());
+        for (score, idx) in scores {
+            results.push((self.ids.value(idx).to_string(), score.sqrt()));
+        }
+        results
     }
 }
 

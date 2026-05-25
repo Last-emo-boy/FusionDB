@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-098-verify,"$maestro-verify verify columnar vector search sorting and hybrid zero limit behavior","columnar search verification"
