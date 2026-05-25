@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-093-plan,"$maestro-plan plan non-group projection result preallocation optimization","projection planning"
+TASK-093-execute,"$maestro-execute preallocate projected result rows and per-row projection vectors from known bounds","projection execution"

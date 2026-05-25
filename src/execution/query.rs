@@ -1127,9 +1127,9 @@ impl Executor {
             {
                 rows
             } else {
-                let mut projected_rows = Vec::new();
+                let mut projected_rows = Vec::with_capacity(rows.len());
                 for (row_idx, row) in rows.iter().enumerate() {
-                    let mut new_row = Vec::new();
+                    let mut new_row = Vec::with_capacity(select.projection.len());
                     for (col_idx, item) in select.projection.iter().enumerate() {
                         // Check if this column has pre-computed window function results
                         if let Some(Some(ref wvals)) = window_results.get(col_idx) {

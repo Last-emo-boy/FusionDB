@@ -1,0 +1,20 @@
+{
+  "task_id": "TASK-093",
+  "title": "Optimize projection result preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve non-GROUP BY projection, expression, and window projection semantics"
+  ],
+  "rationale": "The non-GROUP BY projection path knows both the input row count and projection width before building projected rows. Preallocating the outer result vector and per-row projection vector reduces allocator growth during SELECT projection.",
+  "steps": [
+    "Preallocate projected_rows from input row count",
+    "Preallocate each projected row from projection item count",
+    "Verify normal, constant, expression, and window projection behavior"
+  ],
+  "expected_impact": "Reduces allocation churn in SELECT projection without changing result values or ordering."
+}
