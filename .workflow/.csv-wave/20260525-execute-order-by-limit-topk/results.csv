@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-079","completed","ORDER BY queries with finite LIMIT now sort only the returned window candidate set; ORDER BY no longer receives premature scan limit pushdown.","src/execution/query.rs;tests/sql_integration.rs","passed",""

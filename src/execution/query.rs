@@ -327,6 +327,70 @@ impl Executor {
         }
     }
 
+    fn compare_sort_order_keys(
+        &self,
+        sort_keys: &[SortOrderKey<'_>],
+        left: &[Value],
+        right: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Ordering {
+        for sort_key in sort_keys {
+            let ordering =
+                self.compare_order_value_source(&sort_key.source, left, right, schema, params);
+            if ordering != Ordering::Equal {
+                return if sort_key.asc {
+                    ordering
+                } else {
+                    ordering.reverse()
+                };
+            }
+        }
+
+        Ordering::Equal
+    }
+
+    fn sort_rows_by_order_keys(
+        &self,
+        rows: &mut Vec<Vec<Value>>,
+        sort_keys: &[SortOrderKey<'_>],
+        schema: &TableSchema,
+        params: &[Value],
+        limit_window: Option<usize>,
+    ) {
+        if let Some(window) = limit_window {
+            if window == 0 {
+                rows.clear();
+                return;
+            }
+
+            if window < rows.len() {
+                let mut indexed_rows: Vec<(usize, Vec<Value>)> =
+                    std::mem::take(rows).into_iter().enumerate().collect();
+
+                let compare_indexed = |left: &(usize, Vec<Value>), right: &(usize, Vec<Value>)| {
+                    let ordering =
+                        self.compare_sort_order_keys(sort_keys, &left.1, &right.1, schema, params);
+                    if ordering == Ordering::Equal {
+                        left.0.cmp(&right.0)
+                    } else {
+                        ordering
+                    }
+                };
+
+                let _ = indexed_rows.select_nth_unstable_by(window, compare_indexed);
+                indexed_rows.truncate(window);
+                indexed_rows.sort_by(compare_indexed);
+                *rows = indexed_rows.into_iter().map(|(_, row)| row).collect();
+                return;
+            }
+        }
+
+        rows.sort_by(|left, right| {
+            self.compare_sort_order_keys(sort_keys, left, right, schema, params)
+        });
+    }
+
     pub(crate) async fn handle_query(
         &self,
         query: &sqlparser::ast::Query,
@@ -550,7 +614,7 @@ impl Executor {
                 }
             }
 
-            let push_down_limit = if is_group_by_none {
+            let push_down_limit = if is_group_by_none && query.order_by.is_none() {
                 limit.map(|l| l + offset)
             } else {
                 None
@@ -935,25 +999,20 @@ impl Executor {
                         })
                         .collect();
 
-                    rows.sort_by(|a, b| {
-                        for sort_key in &sort_keys {
-                            let ordering = self.compare_order_value_source(
-                                &sort_key.source,
-                                a,
-                                b,
-                                &schema,
-                                params,
-                            );
-                            if ordering != Ordering::Equal {
-                                return if sort_key.asc {
-                                    ordering
-                                } else {
-                                    ordering.reverse()
-                                };
-                            }
+                    let limit_window = limit.map(|value| {
+                        if value == 0 {
+                            0
+                        } else {
+                            offset.saturating_add(value)
                         }
-                        Ordering::Equal
                     });
+                    self.sort_rows_by_order_keys(
+                        &mut rows,
+                        &sort_keys,
+                        &schema,
+                        params,
+                        limit_window,
+                    );
                 }
             }
 

@@ -1,0 +1,23 @@
+{
+  "task_id": "TASK-079",
+  "title": "Optimize ORDER BY limit window sorting",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve ORDER BY, LIMIT, and OFFSET query semantics"
+  ],
+  "rationale": "Query execution fully sorted all rows for ORDER BY and only later applied OFFSET/LIMIT. When LIMIT is finite, retaining only OFFSET + LIMIT candidates before final ordering reduces sort work while keeping the returned window unchanged. The task also fixes the unsafe scan limit pushdown for ORDER BY queries so sorting sees the full candidate set.",
+  "steps": [
+    "Extract a reusable ORDER BY row comparator",
+    "Use select_nth_unstable_by to retain OFFSET + LIMIT candidates for finite LIMIT queries",
+    "Preserve stable tie behavior with original row indices in the top-k selection path",
+    "Disable scan limit pushdown when ORDER BY is present",
+    "Add SQL integration coverage for ORDER BY with LIMIT and OFFSET"
+  ],
+  "expected_impact": "Reduces ORDER BY sorting work for limited result windows while preserving query correctness."
+}
