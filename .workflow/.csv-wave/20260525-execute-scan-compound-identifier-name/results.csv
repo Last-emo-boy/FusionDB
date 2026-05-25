@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-055,completed,"scan.rs now builds compound identifier names directly into a pre-sized String for scan/index/join planning.",".workflow/.csv-wave/20260525-execute-scan-compound-identifier-name/tasks.csv",

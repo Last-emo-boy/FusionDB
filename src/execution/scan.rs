@@ -276,15 +276,24 @@ impl Executor {
     fn column_name_from_expr(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
-            Expr::CompoundIdentifier(idents) => Some(
-                idents
-                    .iter()
-                    .map(|ident| ident.value.clone())
-                    .collect::<Vec<_>>()
-                    .join("."),
-            ),
+            Expr::CompoundIdentifier(idents) => Some(Self::scan_compound_identifier_name(idents)),
             _ => None,
         }
+    }
+
+    fn scan_compound_identifier_name(idents: &[sqlparser::ast::Ident]) -> String {
+        let capacity = idents.iter().map(|ident| ident.value.len()).sum::<usize>()
+            + idents.len().saturating_sub(1);
+        let mut name = String::with_capacity(capacity);
+
+        for (index, ident) in idents.iter().enumerate() {
+            if index > 0 {
+                name.push('.');
+            }
+            name.push_str(&ident.value);
+        }
+
+        name
     }
 
     fn resolve_schema_column_index(&self, expr: &Expr, schema: &TableSchema) -> Option<usize> {

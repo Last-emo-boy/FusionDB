@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-055,"Build scan compound identifier names without temporary Vec allocation",completed,"src/execution/scan.rs"
