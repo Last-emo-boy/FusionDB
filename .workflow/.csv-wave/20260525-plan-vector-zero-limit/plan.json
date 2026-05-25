@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-076",
+  "title": "Optimize vector zero-limit search",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/vector_index.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve missing-index and dimension mismatch errors"
+  ],
+  "rationale": "VectorIndex::search with k = 0 returned no rows but still proceeded to lazy HNSW build and search after dimension validation. A zero-limit fast path avoids unnecessary index work while keeping validation behavior for existing error cases.",
+  "steps": [
+    "Return Ok(empty) for k = 0 after the index exists and query dimension is validated",
+    "Keep missing index errors unchanged",
+    "Keep dimension mismatch errors unchanged",
+    "Add focused unit coverage that zero-limit search skips lazy build but still validates dimension"
+  ],
+  "expected_impact": "Avoids unnecessary HNSW lazy build/search work for callers that request zero vector results."
+}

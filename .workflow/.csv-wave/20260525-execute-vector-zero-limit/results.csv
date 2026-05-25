@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-076","completed","VectorIndex::search now returns immediately for k = 0 after validation, avoiding unnecessary HNSW rebuild/search work.","src/storage/vector_index.rs","passed",""

@@ -180,6 +180,10 @@ impl VectorIndex {
                 )));
             }
 
+            if k == 0 {
+                return Ok(vec![]);
+            }
+
             wrapper.ensure_built()?;
 
             if let Some(index) = &wrapper.index {
@@ -280,5 +284,25 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "a");
         assert!(results[0].1 < 0.001);
+    }
+
+    #[test]
+    fn search_zero_limit_skips_lazy_build_but_validates_dimension() {
+        let index = VectorIndex::new();
+        index.create_index("default");
+        index
+            .insert("default", "a".to_string(), vec![1.0, 0.0])
+            .unwrap();
+
+        let results = index.search("default", &[1.0, 0.0], 0).unwrap();
+        assert!(results.is_empty());
+
+        let wrapper_lock = index.indexes.read().get("default").cloned().unwrap();
+        let wrapper = wrapper_lock.read();
+        assert!(wrapper.dirty);
+        assert!(wrapper.index.is_none());
+        drop(wrapper);
+
+        assert!(index.search("default", &[1.0], 0).is_err());
     }
 }
