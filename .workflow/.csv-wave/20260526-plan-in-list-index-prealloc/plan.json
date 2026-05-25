@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-088",
+  "title": "Optimize IN list index scan allocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve primary-key and secondary-index IN list semantics"
+  ],
+  "rationale": "The IN list index scan path collects row ids from a known list length and, for secondary indexes, from already materialized scan_prefix candidates. Preallocating the row id HashSet from those counts reduces rehash and allocation churn.",
+  "steps": [
+    "Preallocate IN list row id set from IN list length",
+    "Reserve secondary-index candidate count after each scan_prefix",
+    "Add a secondary-index IN list integration assertion",
+    "Verify primary and secondary index IN list behavior"
+  ],
+  "expected_impact": "Reduces allocation churn in indexed IN list scans without changing scan semantics."
+}

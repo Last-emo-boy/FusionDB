@@ -1508,7 +1508,7 @@ impl Executor {
                     {
                         let col = &schema.columns[col_idx];
                         if col.is_indexed {
-                            let mut all_row_ids = HashSet::new();
+                            let mut all_row_ids = HashSet::with_capacity(list.len());
                             for item in list {
                                 let val = self
                                     .evaluate_value(item, &[], schema, params)
@@ -1535,6 +1535,7 @@ impl Executor {
                                     );
                                     let kv =
                                         txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
+                                    all_row_ids.reserve(kv.len());
                                     for (k, _) in kv {
                                         if let Some(row_id) = Self::row_id_from_key(&k) {
                                             all_row_ids.insert(row_id.to_string());

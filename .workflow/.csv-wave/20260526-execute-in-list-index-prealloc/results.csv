@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-088-plan,completed,"Planned IN list index scan preallocation optimization for src/execution/scan.rs",".workflow/.csv-wave/20260526-plan-in-list-index-prealloc/plan.json"
+TASK-088-execute,completed,"Preallocated the IN list row id HashSet from list length, reserved secondary-index candidate counts, and added secondary-index IN test coverage.","src/execution/scan.rs; tests/sql_integration.rs"

@@ -1003,6 +1003,13 @@ async fn test_select_in_list() {
     .await;
     let (_, rows) = query(&executor, "SELECT * FROM users WHERE id IN (1, 3)").await;
     assert_eq!(rows.len(), 2);
+    exec_ok(&executor, "CREATE INDEX idx_users_in_name ON users (name)").await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM users WHERE name IN ('Alice', 'Charlie') ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
     cleanup(&wal);
 }
 

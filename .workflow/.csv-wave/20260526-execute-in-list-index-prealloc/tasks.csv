@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-088-plan,$maestro-plan "plan IN list index scan row id preallocation optimization",in-list-index-prealloc
+TASK-088-execute,$maestro-execute "preallocate IN list index scan row id HashSet from list and candidate counts",in-list-index-prealloc
