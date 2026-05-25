@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-101-verify,"$maestro-verify verify multi-row insert column-list insert insert returning and column-count errors","insert verification"

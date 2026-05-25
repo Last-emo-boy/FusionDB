@@ -1,0 +1,74 @@
+{
+  "session_id": "maestro-20260526-034416",
+  "source": "maestro",
+  "created_at": "2026-05-26T03:44:16+08:00",
+  "updated_at": "2026-05-26T03:44:16+08:00",
+  "intent": "TASK-101 optimize database core INSERT VALUES allocation",
+  "task_type": "performance",
+  "chain_name": "database-core-performance",
+  "phase": "database-core-performance",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "auto",
+  "cli_tool": "codex",
+  "lifecycle_position": "continue-iteration",
+  "target": "src/execution/dml.rs",
+  "context": {
+    "issue_id": null,
+    "milestone_num": null,
+    "spec_session_id": null,
+    "scratch_dir": null,
+    "plan_dir": ".workflow/.csv-wave/20260526-plan-insert-values-prealloc",
+    "analysis_dir": null,
+    "brainstorm_dir": null
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-execute-insert-values-prealloc/results.csv"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-verify-insert-values-prealloc/verification.json"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "plan INSERT VALUES allocation optimization",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T03:44:16+08:00",
+      "completed_at": "2026-05-26T03:44:16+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "preallocate explicit column mapping raw values and RETURNING insert rows",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T03:44:16+08:00",
+      "completed_at": "2026-05-26T03:44:16+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "verify multi-row insert column-list insert insert returning and column-count errors",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T03:44:16+08:00",
+      "completed_at": "2026-05-26T03:44:16+08:00",
+      "error": null,
+      "wave_n": 2
+    }
+  ],
+  "current_step": 2,
+  "status": "completed"
+}

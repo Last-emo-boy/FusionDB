@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-101",
+  "title": "Optimize INSERT VALUES preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/dml.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve INSERT VALUES, explicit column-list, ON CONFLICT, and RETURNING semantics"
+  ],
+  "rationale": "The INSERT VALUES path knows explicit column count, VALUES row count, and per-row expression count before building its intermediate vectors. Preallocating these containers reduces allocation growth during bulk INSERT VALUES execution.",
+  "steps": [
+    "Preallocate explicit column mapping from the supplied column count",
+    "Reserve inserted_rows from VALUES row count when RETURNING is present",
+    "Preallocate raw_values from each VALUES row expression count",
+    "Verify multi-row insert, column-list insert, INSERT RETURNING, and mismatch errors"
+  ],
+  "expected_impact": "Reduces allocation churn in INSERT VALUES execution without changing inserted rows, constraints, indexes, or returned rows."
+}

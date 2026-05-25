@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-101-plan,"$maestro-plan plan INSERT VALUES allocation optimization","insert planning"
+TASK-101-execute,"$maestro-execute preallocate explicit column mapping raw values and RETURNING insert rows","insert execution"

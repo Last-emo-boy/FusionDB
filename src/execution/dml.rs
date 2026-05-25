@@ -165,7 +165,7 @@ impl Executor {
 
         // Build column index mapping if explicit column list provided
         let col_mapping: Option<Vec<usize>> = if !columns.is_empty() {
-            let mut mapping = Vec::new();
+            let mut mapping = Vec::with_capacity(columns.len());
             for col_ident in columns {
                 let col_name = col_ident.value.clone();
                 let idx = schema
@@ -189,9 +189,12 @@ impl Executor {
 
         if let Some(query) = source {
             if let SetExpr::Values(values) = &query.body.as_ref() {
+                if returning.is_some() {
+                    inserted_rows.reserve(values.rows.len());
+                }
                 let mut count = 0;
                 for row in &values.rows {
-                    let mut raw_values = Vec::new();
+                    let mut raw_values = Vec::with_capacity(row.len());
                     for expr in row.iter() {
                         let val = self
                             .evaluate_value(expr, &[], &schema, params)
