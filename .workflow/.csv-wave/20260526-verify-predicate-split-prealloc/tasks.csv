@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-109,Verify predicate split behavior,completed,.workflow/.csv-wave/20260526-verify-predicate-split-prealloc/verification.json

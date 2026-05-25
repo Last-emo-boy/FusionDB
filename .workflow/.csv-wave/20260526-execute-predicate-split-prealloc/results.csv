@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-109,completed,Changed predicate split helpers to preallocate local and remaining vectors by predicate count,src/execution/scan.rs,

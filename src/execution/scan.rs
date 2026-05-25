@@ -226,8 +226,9 @@ impl Executor {
         predicates: &mut Vec<Expr>,
         relation_names: &HashSet<String>,
     ) -> Option<Expr> {
-        let mut local = Vec::new();
-        let mut remaining = Vec::new();
+        let predicate_count = predicates.len();
+        let mut local = Vec::with_capacity(predicate_count);
+        let mut remaining = Vec::with_capacity(predicate_count);
 
         for predicate in predicates.drain(..) {
             if self.predicate_uses_only_relations(&predicate, relation_names) {
@@ -258,8 +259,9 @@ impl Executor {
         predicates: &mut Vec<Expr>,
         schema: &TableSchema,
     ) -> Option<Expr> {
-        let mut local = Vec::new();
-        let mut remaining = Vec::new();
+        let predicate_count = predicates.len();
+        let mut local = Vec::with_capacity(predicate_count);
+        let mut remaining = Vec::with_capacity(predicate_count);
 
         for predicate in predicates.drain(..) {
             if self.predicate_uses_only_schema(&predicate, schema) {

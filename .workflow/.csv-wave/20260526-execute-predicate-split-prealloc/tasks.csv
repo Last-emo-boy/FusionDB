@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-109,Preallocate predicate split vectors,completed,src/execution/scan.rs
