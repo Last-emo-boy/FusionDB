@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-077","completed","Hybrid RRF search now avoids sorting all fused candidates when limit is smaller than the fused result set, while still returning top-k rows ordered by score.","src/storage/fusion.rs","passed",""

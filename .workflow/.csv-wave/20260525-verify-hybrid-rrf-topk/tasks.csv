@@ -1,0 +1,2 @@
+id,title,scope,verification_commands,status,notes
+"TASK-077","Verify hybrid RRF top-k search","src/storage/fusion.rs","cargo fmt --check; cargo check --lib; cargo test --lib storage::fusion -- --nocapture","passed","Validation used CARGO_TARGET_DIR=C:\Users\ES&E\AppData\Local\Temp\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0."

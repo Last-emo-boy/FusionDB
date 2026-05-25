@@ -1,9 +1,9 @@
 {
   "workflow_name": "FusionDB",
   "created_at": "2026-05-25T01:15:27.4681925+08:00",
-  "updated_at": "2026-05-25T22:58:20+08:00",
+  "updated_at": "2026-05-25T23:31:09+08:00",
   "current_phase": "database-core-performance",
-  "current_session": ".workflow/.maestro/maestro-20260525-225820",
+  "current_session": ".workflow/.maestro/maestro-20260525-233109",
   "constraints": [
     "Only iterate database core; do not modify dashboard/"
   ],
@@ -645,6 +645,16 @@
     },
     {
       "path": ".workflow/.csv-wave/20260525-verify-vector-zero-limit/verification.json",
+      "type": "verification",
+      "status": "passed"
+    },
+    {
+      "path": ".workflow/.maestro/maestro-20260525-233109/status.json",
+      "type": "maestro-session",
+      "status": "completed"
+    },
+    {
+      "path": ".workflow/.csv-wave/20260525-verify-hybrid-rrf-topk/verification.json",
       "type": "verification",
       "status": "passed"
     }

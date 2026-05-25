@@ -347,6 +347,10 @@ impl FusionStorage {
         vector_query: &[f32],
         limit: usize,
     ) -> Vec<(String, f32)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
         // 1. Get results from both sources
         let text_results = self.bm25_search(text_query, limit * 2); // Get more candidates
         let vector_results = self.vector_search(vector_query, limit * 2);
@@ -367,9 +371,13 @@ impl FusionStorage {
         }
 
         let mut final_results: Vec<_> = rrf_scores.into_iter().collect();
-        final_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        if final_results.len() > limit {
+            let _ = final_results.select_nth_unstable_by(limit, rrf_score_order);
+            final_results.truncate(limit);
+        }
+        final_results.sort_by(rrf_score_order);
 
-        final_results.into_iter().take(limit).collect()
+        final_results
     }
 
     // MVCC Key Encoding: Key + (MAX - TS)
@@ -1677,6 +1685,10 @@ impl Storage for FusionStorage {
     }
 }
 
+fn rrf_score_order(a: &(String, f32), b: &(String, f32)) -> CmpOrdering {
+    b.1.partial_cmp(&a.1).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1687,6 +1699,57 @@ mod tests {
 
     fn cleanup_storage_dir(path: &Path) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_limited_results_are_sorted_by_rrf_score() {
+        let data_dir = unique_storage_dir("hybrid_topk");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        storage.update_inverted_index("doc1".to_string(), "apple apple apple apple");
+        storage.update_inverted_index("doc2".to_string(), "apple apple");
+        storage.update_inverted_index("doc3".to_string(), "banana");
+        storage.update_columnar_store(
+            vec!["doc1".to_string(), "doc2".to_string(), "doc3".to_string()],
+            vec![
+                vec![0.0, 0.0, 0.0],
+                vec![1.0, 0.0, 0.0],
+                vec![9.0, 0.0, 0.0],
+            ],
+        );
+
+        let results = storage.hybrid_search("apple", &[0.0, 0.0, 0.0], 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "doc1");
+        assert_eq!(results[1].0, "doc2");
+        assert!(results[0].1 >= results[1].1);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_zero_limit_skips_work() {
+        let data_dir = unique_storage_dir("hybrid_zero_limit");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        assert!(storage
+            .hybrid_search("apple", &[0.0, 0.0, 0.0], 0)
+            .is_empty());
+
+        cleanup_storage_dir(&data_dir);
     }
 
     #[tokio::test]

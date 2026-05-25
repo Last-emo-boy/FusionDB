@@ -1,0 +1,74 @@
+{
+  "session_id": "maestro-20260525-233109",
+  "source": "maestro",
+  "created_at": "2026-05-25T23:31:09+08:00",
+  "updated_at": "2026-05-25T23:31:09+08:00",
+  "intent": "TASK-077 optimize database core hybrid RRF top-k search",
+  "task_type": "performance",
+  "chain_name": "database-core-performance",
+  "phase": "database-core-performance",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "auto",
+  "cli_tool": "codex",
+  "lifecycle_position": "continue-iteration",
+  "target": "src/storage/fusion.rs",
+  "context": {
+    "issue_id": null,
+    "milestone_num": null,
+    "spec_session_id": null,
+    "scratch_dir": null,
+    "plan_dir": ".workflow/.csv-wave/20260525-plan-hybrid-rrf-topk",
+    "analysis_dir": null,
+    "brainstorm_dir": null
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260525-execute-hybrid-rrf-topk/results.csv"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260525-verify-hybrid-rrf-topk/verification.json"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "plan hybrid RRF top-k search optimization",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T23:31:09+08:00",
+      "completed_at": "2026-05-25T23:31:09+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "replace full hybrid RRF result sort with limited top-k partition",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T23:31:09+08:00",
+      "completed_at": "2026-05-25T23:31:09+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "verify hybrid RRF top-k ordering and storage regressions",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T23:31:09+08:00",
+      "completed_at": "2026-05-25T23:31:09+08:00",
+      "error": null,
+      "wave_n": 2
+    }
+  ],
+  "current_step": 2,
+  "status": "completed"
+}

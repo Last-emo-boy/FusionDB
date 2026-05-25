@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-077",
+  "title": "Optimize hybrid RRF top-k search",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve descending RRF score result ordering"
+  ],
+  "rationale": "FusionStorage::hybrid_search fused BM25 and vector results into a score map, fully sorted all fused candidates, and only then returned the requested limit. A limit-aware top-k partition avoids ordering candidates that will not be returned while preserving final output order.",
+  "steps": [
+    "Add a zero-limit fast path",
+    "Use select_nth_unstable_by to keep only the top RRF candidates",
+    "Sort only the retained top-k candidate window",
+    "Add storage tests for bounded ordering and zero-limit behavior"
+  ],
+  "expected_impact": "Reduces hybrid search sorting work for small result limits."
+}
