@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-103,completed,Changed primary_key_qualifiers to allocate capacity for table name and alias candidates,src/execution/dml.rs,

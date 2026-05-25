@@ -132,7 +132,7 @@ impl Executor {
     }
 
     fn primary_key_qualifiers(relation: &TableFactor) -> Vec<String> {
-        let mut qualifiers = Vec::new();
+        let mut qualifiers = Vec::with_capacity(2);
         if let TableFactor::Table { name, alias, .. } = relation {
             let table_name = name.to_string();
             qualifiers.push(table_name);

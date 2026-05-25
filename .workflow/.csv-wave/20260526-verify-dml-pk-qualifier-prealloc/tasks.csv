@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-103,Verify qualified DML primary key lookup behavior,completed,.workflow/.csv-wave/20260526-verify-dml-pk-qualifier-prealloc/verification.json

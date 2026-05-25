@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-103,Preallocate DML primary key qualifier candidates,completed,src/execution/dml.rs

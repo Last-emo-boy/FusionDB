@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-103",
+  "created_at": "2026-05-26T04:03:05+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/dml.rs",
+  "goal": "Avoid a tiny growable allocation path when DML resolves qualified primary key predicates.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to qualified primary key matching"
+  ],
+  "implementation": [
+    "Preallocate the qualifier vector for the only two candidates: table name and alias."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_update_qualified_primary_key_uses_point_lookup -- --nocapture",
+    "cargo test --test sql_integration test_delete_qualified_primary_key_without_secondary_index_skips_row_decode -- --nocapture"
+  ]
+}
