@@ -11,6 +11,21 @@ use std::collections::HashSet;
 use super::{Executor, QueryResult};
 
 impl Executor {
+    fn compound_identifier_name(idents: &[sqlparser::ast::Ident]) -> String {
+        let capacity = idents.iter().map(|ident| ident.value.len()).sum::<usize>()
+            + idents.len().saturating_sub(1);
+        let mut name = String::with_capacity(capacity);
+
+        for (index, ident) in idents.iter().enumerate() {
+            if index > 0 {
+                name.push('.');
+            }
+            name.push_str(&ident.value);
+        }
+
+        name
+    }
+
     pub(crate) fn evaluate_expr(
         &self,
         expr: &Expr,
@@ -243,11 +258,7 @@ impl Executor {
                 Ok(row[idx].clone())
             }
             Expr::CompoundIdentifier(idents) => {
-                let col_name = idents
-                    .iter()
-                    .map(|i| i.value.clone())
-                    .collect::<Vec<_>>()
-                    .join(".");
+                let col_name = Self::compound_identifier_name(idents);
                 let idx = self.resolve_column_index(&col_name, schema)?;
                 Ok(row[idx].clone())
             }
@@ -1260,13 +1271,7 @@ impl Executor {
                 cols.insert(ident.value.clone());
             }
             Expr::CompoundIdentifier(idents) => {
-                cols.insert(
-                    idents
-                        .iter()
-                        .map(|ident| ident.value.clone())
-                        .collect::<Vec<_>>()
-                        .join("."),
-                );
+                cols.insert(Self::compound_identifier_name(idents));
             }
             Expr::BinaryOp { left, right, .. } => {
                 self.extract_columns_from_expr(left, cols);

@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-054,completed,"Compound identifier names are now built directly into a pre-sized String in expression evaluation and column extraction.",".workflow/.csv-wave/20260525-execute-compound-identifier-name/tasks.csv",
