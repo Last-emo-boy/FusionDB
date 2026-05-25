@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-053,completed,"RowEncoder::encode now appends values with bincode::serialize_into, avoiding per-column temporary byte vectors.",".workflow/.csv-wave/20260525-execute-row-encoder-serialize-into/tasks.csv",

@@ -1,0 +1,38 @@
+{
+  "task_id": "TASK-053",
+  "title": "Serialize row values directly into the output buffer",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/common/encoding.rs"
+  ],
+  "exclusions": [
+    "dashboard/"
+  ],
+  "hypothesis": "After single-buffer row encoding, RowEncoder::encode still allocates a temporary Vec for each column through bincode::serialize. Using bincode::serialize_into appends each value directly into the final row buffer and avoids per-column byte-vector allocation.",
+  "waves": [
+    {
+      "wave": 1,
+      "skill": "maestro-plan",
+      "status": "completed"
+    },
+    {
+      "wave": 2,
+      "skill": "maestro-execute",
+      "status": "completed"
+    },
+    {
+      "wave": 3,
+      "skill": "maestro-verify",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test encoding --lib -- --nocapture",
+    "cargo test --test sql_integration test_insert -- --nocapture",
+    "cargo test --test sql_integration test_update_single_row -- --nocapture",
+    "cargo test --test sql_integration test_update_invalidates_row_cache_for_index_lookup -- --nocapture",
+    "cargo test --test sql_integration test_create_btree_index -- --nocapture",
+    "cargo check --lib"
+  ]
+}

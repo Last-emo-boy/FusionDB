@@ -175,8 +175,7 @@ impl RowEncoder {
             let off_pos = 2 + idx * 4;
             result[off_pos..off_pos + 4].copy_from_slice(&abs_offset.to_le_bytes());
 
-            let bytes = bincode::serialize(val).unwrap_or_default();
-            result.extend_from_slice(&bytes);
+            let _ = bincode::serialize_into(&mut result, val);
         }
 
         result

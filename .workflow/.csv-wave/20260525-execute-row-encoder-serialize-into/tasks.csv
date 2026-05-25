@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-053,"Serialize RowEncoder values directly into the output buffer",completed,"src/common/encoding.rs"

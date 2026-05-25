@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-053,"Verify direct row-value serialization",completed,"src/common/encoding.rs"
