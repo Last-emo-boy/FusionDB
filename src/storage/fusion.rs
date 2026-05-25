@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 
 const TS_SIZE: usize = 8;
 const COMPACTION_FANIN: usize = 4;
+const SSTABLE_BLOCK_BUFFER_CAPACITY: usize = 4096;
 
 // --- Data Structures ---
 
@@ -563,7 +564,7 @@ impl FusionStorage {
                 // SSTable doesn't care about encoding, just bytes.
 
                 let mut block_count = 0;
-                let mut block_buffer = Vec::new();
+                let mut block_buffer = Vec::with_capacity(SSTABLE_BLOCK_BUFFER_CAPACITY);
                 let mut first_key = None;
 
                 for entry in mem.map.iter() {
@@ -586,7 +587,7 @@ impl FusionStorage {
                     block_buffer.extend_from_slice(val);
                     block_count += 1;
 
-                    if block_buffer.len() >= 4096 {
+                    if block_buffer.len() >= SSTABLE_BLOCK_BUFFER_CAPACITY {
                         if let Err(e) = builder
                             .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
                             .await
@@ -696,7 +697,7 @@ impl FusionStorage {
             }
         }
 
-        let mut block_buffer = Vec::new();
+        let mut block_buffer = Vec::with_capacity(SSTABLE_BLOCK_BUFFER_CAPACITY);
         let mut block_count = 0;
         let mut first_key = None;
         let mut last_base_key: Option<Vec<u8>> = None;
@@ -749,7 +750,7 @@ impl FusionStorage {
             block_buffer.extend_from_slice(&v);
             block_count += 1;
 
-            if block_buffer.len() >= 4096 {
+            if block_buffer.len() >= SSTABLE_BLOCK_BUFFER_CAPACITY {
                 if let Err(e) = builder
                     .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
                     .await
@@ -870,7 +871,7 @@ impl FusionStorage {
         let mut builder = SsTableBuilder::new(sst_path.clone());
 
         let mut block_count = 0;
-        let mut block_buffer = Vec::new();
+        let mut block_buffer = Vec::with_capacity(SSTABLE_BLOCK_BUFFER_CAPACITY);
         let mut first_key = None;
 
         for entry in mem.map.iter() {
@@ -889,7 +890,7 @@ impl FusionStorage {
             block_buffer.extend_from_slice(val);
             block_count += 1;
 
-            if block_buffer.len() >= 4096 {
+            if block_buffer.len() >= SSTABLE_BLOCK_BUFFER_CAPACITY {
                 if let Err(e) = builder
                     .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
                     .await

@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-116",
+  "created_at": "2026-05-26T06:23:06+08:00",
+  "phase": "database-core-performance",
+  "target": "src/storage/fusion.rs",
+  "goal": "Avoid avoidable vector growth while building SSTable blocks in Fusion storage.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to SSTable flush, compaction, or shutdown flushing"
+  ],
+  "implementation": [
+    "Introduce a single SSTABLE_BLOCK_BUFFER_CAPACITY constant for the 4096-byte block flush threshold.",
+    "Preallocate flush, compaction, and shutdown block buffers from that threshold."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --lib fusion_last_reads_visible_key_from_sstable -- --nocapture",
+    "cargo test --lib fusion_count_prefix_matches_scan_prefix_after_overwrite_delete_and_write_buffer -- --nocapture"
+  ]
+}

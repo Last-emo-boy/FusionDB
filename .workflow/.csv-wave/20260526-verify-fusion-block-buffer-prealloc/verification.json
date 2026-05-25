@@ -1,0 +1,27 @@
+{
+  "task_id": "TASK-116",
+  "status": "passed",
+  "verified_at": "2026-05-26T06:28:10+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --lib fusion_last_reads_visible_key_from_sstable -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --lib fusion_count_prefix_matches_scan_prefix_after_overwrite_delete_and_write_buffer -- --nocapture",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Validation used CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0.",
+    "The covered tests exercise SSTable flush reads and visible range behavior through scan_prefix and count_prefix."
+  ]
+}
