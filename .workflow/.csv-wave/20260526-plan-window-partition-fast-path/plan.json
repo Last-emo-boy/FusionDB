@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-091",
+  "title": "Optimize window partition construction",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve window function ordering, partition, and default-value semantics"
+  ],
+  "rationale": "Window functions without PARTITION BY currently build an identical empty partition key for every row before processing a single partition. Adding a no-partition fast path avoids per-row empty key allocation, while preallocating partition maps and keys reduces growth in partitioned windows.",
+  "steps": [
+    "Use a direct all-row partition when PARTITION BY is empty",
+    "Preallocate the partition map from row count for partitioned windows",
+    "Preallocate each partition key from partition expression count",
+    "Verify partitioned and unpartitioned window functions"
+  ],
+  "expected_impact": "Reduces allocation churn in window function execution without changing result order or function semantics."
+}

@@ -1362,22 +1362,27 @@ impl Executor {
             return vec![];
         }
 
-        let mut partitions: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
-        for (i, row) in rows.iter().enumerate() {
-            let partition_key: Vec<Value> = spec
-                .partition_by
-                .iter()
-                .map(|e| {
-                    self.evaluate_value(e, row, schema, params)
-                        .unwrap_or(Value::Null)
-                })
-                .collect();
-            partitions.entry(partition_key).or_default().push(i);
-        }
+        let partitions: Vec<Vec<usize>> = if spec.partition_by.is_empty() {
+            vec![(0..rows.len()).collect()]
+        } else {
+            let mut partitions: HashMap<Vec<Value>, Vec<usize>> =
+                HashMap::with_capacity(rows.len());
+            for (i, row) in rows.iter().enumerate() {
+                let mut partition_key = Vec::with_capacity(spec.partition_by.len());
+                for expr in &spec.partition_by {
+                    partition_key.push(
+                        self.evaluate_value(expr, row, schema, params)
+                            .unwrap_or(Value::Null),
+                    );
+                }
+                partitions.entry(partition_key).or_default().push(i);
+            }
+            partitions.into_values().collect()
+        };
 
         let mut result = vec![Value::Null; rows.len()];
 
-        for indices in partitions.values() {
+        for indices in &partitions {
             // Sort indices within partition by ORDER BY
             let mut sorted_indices: Vec<usize> = indices.clone();
             if !spec.order_by.is_empty() {

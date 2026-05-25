@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-091-plan,"$maestro-plan plan window partition construction optimization","window partition planning"
+TASK-091-execute,"$maestro-execute add no-partition fast path and preallocate partition keys for window functions","window partition execution"
