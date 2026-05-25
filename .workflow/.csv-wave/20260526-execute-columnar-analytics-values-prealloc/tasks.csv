@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-099-plan,"$maestro-plan plan columnar analytics values preallocation optimization","columnar analytics planning"
+TASK-099-execute,"$maestro-execute preallocate Arrow column value buffers from row count","columnar analytics execution"

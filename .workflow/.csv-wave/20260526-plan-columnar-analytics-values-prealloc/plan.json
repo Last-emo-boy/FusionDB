@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-099",
+  "title": "Optimize columnar analytics value preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/columnar_analytics.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve Arrow RecordBatch conversion and vectorized aggregate semantics"
+  ],
+  "rationale": "rows_to_record_batch builds one Arrow value vector per projected column and already knows the row count. Preallocating these value vectors avoids growth while converting row-oriented results into Arrow arrays.",
+  "steps": [
+    "Replace iterator collect for Int64 column values with preallocated push",
+    "Replace iterator collect for Float64 column values with preallocated push",
+    "Replace iterator collect for Utf8 column values with preallocated push",
+    "Verify RecordBatch conversion and vectorized aggregate helpers"
+  ],
+  "expected_impact": "Reduces allocation churn during columnar analytics batch construction without changing Arrow array contents."
+}

@@ -39,55 +39,49 @@ pub fn rows_to_record_batch(columns: &[String], rows: &[Vec<Value>]) -> Option<R
 
         if is_int {
             fields.push(Field::new(col_name, DataType::Int64, true));
-            let values: Vec<Option<i64>> = rows
-                .iter()
-                .map(|row| {
-                    if col_idx < row.len() {
-                        match &row[col_idx] {
-                            Value::Integer(i) => Some(*i),
-                            _ => None,
-                        }
-                    } else {
-                        None
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                values.push(if col_idx < row.len() {
+                    match &row[col_idx] {
+                        Value::Integer(i) => Some(*i),
+                        _ => None,
                     }
-                })
-                .collect();
+                } else {
+                    None
+                });
+            }
             arrays.push(Arc::new(Int64Array::from(values)));
         } else if is_float {
             fields.push(Field::new(col_name, DataType::Float64, true));
-            let values: Vec<Option<f64>> = rows
-                .iter()
-                .map(|row| {
-                    if col_idx < row.len() {
-                        match &row[col_idx] {
-                            Value::Float(f) => Some(*f),
-                            Value::Integer(i) => Some(*i as f64),
-                            _ => None,
-                        }
-                    } else {
-                        None
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                values.push(if col_idx < row.len() {
+                    match &row[col_idx] {
+                        Value::Float(f) => Some(*f),
+                        Value::Integer(i) => Some(*i as f64),
+                        _ => None,
                     }
-                })
-                .collect();
+                } else {
+                    None
+                });
+            }
             arrays.push(Arc::new(Float64Array::from(values)));
         } else {
             fields.push(Field::new(col_name, DataType::Utf8, true));
-            let values: Vec<Option<String>> = rows
-                .iter()
-                .map(|row| {
-                    if col_idx < row.len() {
-                        match &row[col_idx] {
-                            Value::String(s) => Some(s.clone()),
-                            Value::Integer(i) => Some(i.to_string()),
-                            Value::Float(f) => Some(f.to_string()),
-                            Value::Null => None,
-                            other => Some(format!("{:?}", other)),
-                        }
-                    } else {
-                        None
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                values.push(if col_idx < row.len() {
+                    match &row[col_idx] {
+                        Value::String(s) => Some(s.clone()),
+                        Value::Integer(i) => Some(i.to_string()),
+                        Value::Float(f) => Some(f.to_string()),
+                        Value::Null => None,
+                        other => Some(format!("{:?}", other)),
                     }
-                })
-                .collect();
+                } else {
+                    None
+                });
+            }
             arrays.push(Arc::new(StringArray::from(values)));
         }
     }
