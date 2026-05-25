@@ -1,0 +1,27 @@
+{
+  "task_id": "TASK-089",
+  "status": "passed",
+  "verified_at": "2026-05-26T01:50:11+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test storage::fusion::tests::hybrid_search_limited_results_are_sorted_by_rrf_score --lib -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test storage::fusion::tests::hybrid_search_zero_limit_skips_work --lib -- --nocapture",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Validation used CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0.",
+    "The covered paths exercise normal hybrid search ranking and zero-limit behavior."
+  ]
+}

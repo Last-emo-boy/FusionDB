@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-089-plan,completed,"Planned hybrid RRF score map preallocation optimization for src/storage/fusion.rs",".workflow/.csv-wave/20260526-plan-hybrid-rrf-map-prealloc/plan.json"
+TASK-089-execute,completed,"Changed hybrid_search to initialize the RRF score HashMap with text_results.len() + vector_results.len() capacity.","src/storage/fusion.rs"

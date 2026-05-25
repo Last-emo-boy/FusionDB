@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-089-plan,$maestro-plan "plan hybrid RRF score HashMap preallocation optimization",hybrid-rrf-map-prealloc
+TASK-089-execute,$maestro-execute "preallocate hybrid RRF score map from text and vector candidate counts",hybrid-rrf-map-prealloc

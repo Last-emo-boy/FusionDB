@@ -1,0 +1,20 @@
+{
+  "task_id": "TASK-089",
+  "title": "Optimize hybrid RRF score map preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve hybrid search RRF scoring and ordering semantics"
+  ],
+  "rationale": "Hybrid search merges BM25 and vector candidates into an RRF score HashMap. The candidate counts are already known, so preallocating the map reduces rehash and allocation churn during score accumulation.",
+  "steps": [
+    "Compute score map capacity from text and vector candidate counts",
+    "Use HashMap::with_capacity before RRF accumulation",
+    "Verify hybrid result ordering and zero-limit behavior"
+  ],
+  "expected_impact": "Reduces allocation churn during hybrid search candidate fusion without changing scoring semantics."
+}

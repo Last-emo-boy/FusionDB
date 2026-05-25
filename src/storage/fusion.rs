@@ -358,7 +358,8 @@ impl FusionStorage {
         // 2. RRF Fusion
         // Score = 1 / (k + rank)
         let k = 60.0;
-        let mut rrf_scores: HashMap<String, f32> = HashMap::new();
+        let mut rrf_scores =
+            HashMap::with_capacity(text_results.len().saturating_add(vector_results.len()));
 
         for (rank, (id, _score)) in text_results.iter().enumerate() {
             let s = 1.0 / (k + rank as f32 + 1.0);
