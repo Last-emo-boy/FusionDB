@@ -194,6 +194,7 @@ impl FusionStorage {
                 }
                 files.sort_by_key(|k| k.0);
 
+                sstables_vec.reserve(files.len());
                 for (id, path) in files {
                     if let Ok(sst) = SsTable::open(path, id, block_cache.clone()).await {
                         sstables_vec.push(Arc::new(sst));

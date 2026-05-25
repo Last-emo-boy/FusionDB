@@ -1,0 +1,4 @@
+id,check,command,status
+TASK-118,format,"cargo fmt --check",passed
+TASK-118,compile,"cargo check --lib",passed
+TASK-118,test,"cargo test --lib fusion_last_reads_visible_key_from_sstable -- --nocapture",passed

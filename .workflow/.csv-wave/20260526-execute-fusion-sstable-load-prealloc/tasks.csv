@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-118,"Reserve Fusion SSTable load vector capacity from discovered file count","src/storage/fusion.rs",completed

@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-118",
+  "created_at": "2026-05-26T06:53:59+08:00",
+  "phase": "database-core-performance",
+  "target": "src/storage/fusion.rs",
+  "goal": "Avoid avoidable vector growth while loading existing Fusion SSTables at startup.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to SSTable discovery, ordering, or opening"
+  ],
+  "implementation": [
+    "Reuse the discovered SSTable file count as a capacity hint for the loaded SSTable vector.",
+    "Keep file sorting and best-effort SSTable open behavior unchanged."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --lib fusion_last_reads_visible_key_from_sstable -- --nocapture"
+  ]
+}

@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+TASK-118,completed,"Added capacity reservation before opening discovered SSTable files.","src/storage/fusion.rs"

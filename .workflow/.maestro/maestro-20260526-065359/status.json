@@ -1,0 +1,74 @@
+{
+  "session_id": "maestro-20260526-065359",
+  "source": "maestro",
+  "created_at": "2026-05-26T06:53:59+08:00",
+  "updated_at": "2026-05-26T06:53:59+08:00",
+  "intent": "TASK-118 optimize database core Fusion SSTable load allocation",
+  "task_type": "performance",
+  "chain_name": "database-core-performance",
+  "phase": "database-core-performance",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "auto",
+  "cli_tool": "codex",
+  "lifecycle_position": "continue-iteration",
+  "target": "src/storage/fusion.rs",
+  "context": {
+    "issue_id": null,
+    "milestone_num": null,
+    "spec_session_id": null,
+    "scratch_dir": null,
+    "plan_dir": ".workflow/.csv-wave/20260526-plan-fusion-sstable-load-prealloc",
+    "analysis_dir": null,
+    "brainstorm_dir": null
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-execute-fusion-sstable-load-prealloc/results.csv"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-verify-fusion-sstable-load-prealloc/verification.json"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "plan Fusion SSTable startup load preallocation optimization",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T06:53:59+08:00",
+      "completed_at": "2026-05-26T06:53:59+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "reserve loaded SSTable vector capacity from discovered SSTable file count",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T06:53:59+08:00",
+      "completed_at": "2026-05-26T06:53:59+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "verify Fusion SSTable read path behavior",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T06:53:59+08:00",
+      "completed_at": "2026-05-26T06:53:59+08:00",
+      "error": null,
+      "wave_n": 2
+    }
+  ],
+  "current_step": 2,
+  "status": "completed"
+}
