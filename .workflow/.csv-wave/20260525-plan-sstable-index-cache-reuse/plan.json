@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-064",
+  "title": "Reuse SSTable index cache",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/sstable.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve SSTable lookup and iterator semantics"
+  ],
+  "rationale": "SsTable already builds cached index_keys and index_offsets when opening a table. find_ge, read_block, and new_iterator rebuilt or collected equivalent index data during hot lookup and scan paths, adding allocation and cloning overhead.",
+  "steps": [
+    "Use cached index_keys to locate the start block for find_ge",
+    "Use cached index_offsets for block length calculations",
+    "Share cached index_offsets with SsTableIterator instead of cloning a new Vec",
+    "Run storage-focused regressions"
+  ],
+  "expected_impact": "Reduces repeated allocation and cloning in SSTable point lookup, range lookup, and iterator initialization paths."
+}

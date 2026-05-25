@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-064,completed,"Reused cached SSTable index_keys and index_offsets for lookup, block reads, and iterator setup.",".workflow/.csv-wave/20260525-verify-sstable-index-cache-reuse/verification.json",""

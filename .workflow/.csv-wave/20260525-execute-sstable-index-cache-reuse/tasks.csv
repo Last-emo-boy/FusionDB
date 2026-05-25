@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-064,"Reuse SSTable index cache",completed,"src/storage/sstable.rs"

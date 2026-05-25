@@ -132,36 +132,31 @@ impl SsTable {
     }
 
     pub async fn find_ge(&self, search_key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        // Identify start block
-        let start_entry = self.index.range(..=search_key.to_vec()).next_back();
-        let start_key_owned = start_entry.map(|(k, _)| k.clone());
+        if self.index_offsets.is_empty() {
+            return Ok(None);
+        }
 
-        let block_iter = if let Some(k) = &start_key_owned {
-            self.index.range::<Vec<u8>, _>(k..)
-        } else {
-            self.index.range::<Vec<u8>, _>(..)
+        let start_idx = match self
+            .index_keys
+            .binary_search_by(|key| key.as_slice().cmp(search_key))
+        {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
         };
 
-        // We need next offset to calculate size
-        // Collect blocks to iterate
-        let blocks: Vec<(&Vec<u8>, &u64)> = block_iter.collect();
+        for i in start_idx..self.index_offsets.len() {
+            let offset = self.index_offsets[i];
 
-        for i in 0..blocks.len() {
-            let offset = *blocks[i].1;
-
-            // Determine Block Length
-            let next_offset = if i + 1 < blocks.len() {
-                *blocks[i + 1].1
+            let next_offset = if i + 1 < self.index_offsets.len() {
+                self.index_offsets[i + 1]
             } else {
-                self.file_len // End of Data
+                self.file_len
             };
             let block_len = (next_offset - offset) as usize;
 
-            // Check Cache
             let block_data = if let Some(data) = self.block_cache.get(&(self.id, offset)) {
                 data
             } else {
-                // Read from file
                 let mut file = tokio::fs::File::open(&self.path).await?;
                 file.seek(SeekFrom::Start(offset)).await?;
                 let mut buf = vec![0u8; block_len];
@@ -170,10 +165,8 @@ impl SsTable {
                 buf
             };
 
-            // Verify CRC32 checksum (last 4 bytes of block)
             let block_data = Self::verify_block_crc(&block_data)?;
 
-            // Parse Block
             let mut cursor = std::io::Cursor::new(block_data);
 
             let mut count_buf = [0u8; 4];
@@ -243,17 +236,11 @@ impl SsTable {
             return Ok(data);
         }
 
-        // Find block length
-        let _idx_keys: Vec<&Vec<u8>> = self.index.keys().collect();
-        let idx_offsets: Vec<&u64> = self.index.values().collect();
-
         let mut next_offset = self.file_len;
 
-        // Linear scan to find next offset? BTreeMap is sorted by key, not necessarily offset (though usually is).
-        // Let's assume offsets are sorted.
-        if let Ok(idx) = idx_offsets.binary_search(&&offset) {
-            if idx + 1 < idx_offsets.len() {
-                next_offset = *idx_offsets[idx + 1];
+        if let Ok(idx) = self.index_offsets.binary_search(&offset) {
+            if idx + 1 < self.index_offsets.len() {
+                next_offset = self.index_offsets[idx + 1];
             }
         }
 
@@ -268,11 +255,8 @@ impl SsTable {
     }
 
     pub async fn new_iterator(&self, start_key: Option<&[u8]>) -> Result<SsTableIterator> {
-        let index_keys: Vec<Vec<u8>> = self.index.keys().cloned().collect();
-        let index_offsets: Vec<u64> = self.index.values().cloned().collect();
-
         let start_idx = if let Some(key) = start_key {
-            match index_keys.binary_search_by(|k| k.as_slice().cmp(key)) {
+            match self.index_keys.binary_search_by(|k| k.as_slice().cmp(key)) {
                 Ok(idx) => idx,
                 Err(idx) => idx.saturating_sub(1),
             }
@@ -284,8 +268,7 @@ impl SsTable {
             path: self.path.clone(),
             block_cache: self.block_cache.clone(),
             sst_id: self.id,
-            index_keys,
-            index_offsets,
+            index_offsets: self.index_offsets.clone(),
             file_len: self.file_len,
             current_block_idx: start_idx,
             current_block_entries: std::collections::VecDeque::new(),
@@ -301,9 +284,7 @@ pub struct SsTableIterator {
     path: PathBuf,
     block_cache: Arc<Cache<(u64, u64), Vec<u8>>>,
     sst_id: u64,
-    #[allow(dead_code)]
-    index_keys: Vec<Vec<u8>>,
-    index_offsets: Vec<u64>,
+    index_offsets: Arc<Vec<u64>>,
     file_len: u64,
     current_block_idx: usize,
     current_block_entries: std::collections::VecDeque<(Vec<u8>, Vec<u8>)>,
