@@ -1,0 +1,20 @@
+{
+  "task_id": "TASK-081",
+  "title": "Optimize row deduplication lookup",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve DISTINCT and set operation deduplication order"
+  ],
+  "rationale": "Executor::deduplicate_rows checked HashSet::contains before HashSet::insert for each row. Using the boolean result of insert avoids a second hash table lookup while preserving first-seen row order.",
+  "steps": [
+    "Replace contains plus insert with a single HashSet::insert call",
+    "Keep pushing the original row only when insert reports it is newly seen",
+    "Verify SELECT DISTINCT and UNION behavior"
+  ],
+  "expected_impact": "Reduces hash table lookups in DISTINCT and set operation deduplication paths."
+}

@@ -1,0 +1,2 @@
+id,title,scope,verification_commands,status,notes
+"TASK-081","Verify row deduplication lookup","src/execution/query.rs","cargo fmt --check; cargo check --lib; cargo test --test sql_integration test_select_distinct -- --nocapture; cargo test --test sql_integration test_union -- --nocapture","passed","Validation used CARGO_TARGET_DIR=C:\Users\ES&E\AppData\Local\Temp\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0."

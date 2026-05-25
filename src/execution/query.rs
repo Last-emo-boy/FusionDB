@@ -38,8 +38,7 @@ impl Executor {
         let mut unique_rows = Vec::with_capacity(rows.len());
 
         for row in rows {
-            if !seen.contains(&row) {
-                seen.insert(row.clone());
+            if seen.insert(row.clone()) {
                 unique_rows.push(row);
             }
         }

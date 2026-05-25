@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-081","completed","Row deduplication now uses one HashSet insert operation per candidate row instead of contains plus insert.","src/execution/query.rs","passed",""
