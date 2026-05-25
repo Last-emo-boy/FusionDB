@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-063,"Optimize set operation row keys",completed,"src/execution/query.rs"

@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-063,completed,"Replaced debug-string row keys with direct Vec<Value> HashSet keys for DISTINCT and set operations.",".workflow/.csv-wave/20260525-verify-set-operation-row-keys/verification.json",""

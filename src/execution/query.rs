@@ -33,6 +33,20 @@ struct SortOrderKey<'a> {
 }
 
 impl Executor {
+    fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut unique_rows = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            if !seen.contains(&row) {
+                seen.insert(row.clone());
+                unique_rows.push(row);
+            }
+        }
+
+        unique_rows
+    }
+
     fn compound_identifier_prefix(idents: &[sqlparser::ast::Ident]) -> String {
         let prefix_len = idents.len().saturating_sub(1);
         let capacity = idents
@@ -1079,15 +1093,7 @@ impl Executor {
 
             // Apply DISTINCT
             let final_rows = if select.distinct.is_some() {
-                let mut seen = HashSet::new();
-                let mut unique_rows = Vec::new();
-                for row in final_rows {
-                    let key = format!("{:?}", row);
-                    if seen.insert(key) {
-                        unique_rows.push(row);
-                    }
-                }
-                unique_rows
+                Self::deduplicate_rows(final_rows)
             } else {
                 final_rows
             };
@@ -1149,19 +1155,17 @@ impl Executor {
                     all_rows
                 }
                 SetOperator::Intersect => {
-                    let right_set: HashSet<String> =
-                        right_rows.iter().map(|r| format!("{:?}", r)).collect();
+                    let right_set: HashSet<Vec<Value>> = right_rows.into_iter().collect();
                     left_rows
                         .into_iter()
-                        .filter(|r| right_set.contains(&format!("{:?}", r)))
+                        .filter(|row| right_set.contains(row))
                         .collect()
                 }
                 SetOperator::Except => {
-                    let right_set: HashSet<String> =
-                        right_rows.iter().map(|r| format!("{:?}", r)).collect();
+                    let right_set: HashSet<Vec<Value>> = right_rows.into_iter().collect();
                     left_rows
                         .into_iter()
-                        .filter(|r| !right_set.contains(&format!("{:?}", r)))
+                        .filter(|row| !right_set.contains(row))
                         .collect()
                 }
                 _ => {
@@ -1178,8 +1182,7 @@ impl Executor {
                 SetQuantifier::All | SetQuantifier::AllByName
             );
             if !is_all {
-                let mut seen = HashSet::new();
-                combined.retain(|row| seen.insert(format!("{:?}", row)));
+                combined = Self::deduplicate_rows(combined);
             }
 
             // Apply ORDER BY from the outer query

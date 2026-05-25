@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-063",
+  "title": "Optimize set operation row keys",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve DISTINCT, UNION, INTERSECT, and EXCEPT row semantics"
+  ],
+  "rationale": "DISTINCT and set operations formatted full rows with format!(\"{:?}\", row) to build string keys. Value already implements Hash and Eq, so Vec<Value> can be used directly as the set key without serializing rows to debug strings.",
+  "steps": [
+    "Add a shared row deduplication helper using HashSet<Vec<Value>>",
+    "Reuse the helper for SELECT DISTINCT and set operation deduplication",
+    "Use HashSet<Vec<Value>> for INTERSECT and EXCEPT membership checks",
+    "Run focused DISTINCT and set operation regressions"
+  ],
+  "expected_impact": "Avoids repeated debug string allocation and formatting for row-level deduplication and membership checks."
+}

@@ -1,0 +1,7 @@
+id,check,status
+fmt,"cargo fmt --check",passed
+check_lib,"cargo check --lib",passed
+select_distinct,"cargo test --test sql_integration test_select_distinct -- --nocapture",passed
+union,"cargo test --test sql_integration test_union -- --nocapture",passed
+except,"cargo test --test sql_integration test_except -- --nocapture",passed
+intersect,"cargo test --test sql_integration test_intersect -- --nocapture",passed
