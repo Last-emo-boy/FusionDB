@@ -1,0 +1,5 @@
+id,check,status
+fmt,"cargo fmt --check",passed
+indexed_probe,"cargo test --test sql_integration test_inner_join_with_left_filter_and_indexed_right_probe -- --nocapture",passed
+multi_key_join,"cargo test --test sql_integration test_inner_join_multi_key_uses_indexed_probe_column -- --nocapture",passed
+check_lib,"cargo check --lib",passed

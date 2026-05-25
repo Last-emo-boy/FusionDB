@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-060",
+  "title": "Optimize join key allocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve indexed probe join and hash join matching semantics"
+  ],
+  "rationale": "Join key construction happens in inner join loops. Hash join still needs owned Vec<Value> keys, but indexed probe join can compare candidate rows directly without allocating temporary key vectors.",
+  "steps": [
+    "Preallocate row_key output using the known join key width",
+    "Add direct indexed row key comparison helper",
+    "Use direct comparison in indexed probe join candidate filtering",
+    "Run focused join regressions and cargo check"
+  ],
+  "expected_impact": "Reduces temporary allocation pressure in join matching, especially for indexed probe joins with multiple candidate rows."
+}

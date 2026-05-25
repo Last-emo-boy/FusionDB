@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-060,"Optimize join key allocation",completed,"src/execution/scan.rs"

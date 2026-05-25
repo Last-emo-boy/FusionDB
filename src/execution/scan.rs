@@ -507,7 +507,24 @@ impl Executor {
     }
 
     fn row_key(row: &[Value], indices: &[usize]) -> Vec<Value> {
-        indices.iter().map(|index| row[*index].clone()).collect()
+        let mut key = Vec::with_capacity(indices.len());
+        for index in indices {
+            key.push(row[*index].clone());
+        }
+        key
+    }
+
+    fn row_keys_equal(
+        left_row: &[Value],
+        left_indices: &[usize],
+        right_row: &[Value],
+        right_indices: &[usize],
+    ) -> bool {
+        left_indices.len() == right_indices.len()
+            && left_indices
+                .iter()
+                .zip(right_indices)
+                .all(|(left_index, right_index)| left_row[*left_index] == right_row[*right_index])
     }
 
     fn projection_matches_schema(
@@ -987,9 +1004,12 @@ impl Executor {
                                 let candidates = probe_cache.get(&probe_key).unwrap();
                                 let mut matched = false;
                                 for right_row in candidates {
-                                    let left_key = Self::row_key(left_row, &left_key_indices);
-                                    let right_key = Self::row_key(right_row, &right_key_indices);
-                                    if left_key != right_key {
+                                    if !Self::row_keys_equal(
+                                        left_row,
+                                        &left_key_indices,
+                                        right_row,
+                                        &right_key_indices,
+                                    ) {
                                         continue;
                                     }
 

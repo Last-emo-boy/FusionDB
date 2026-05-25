@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-060,completed,"Preallocated hash join row keys and replaced indexed probe candidate key allocation with direct indexed comparison.",".workflow/.csv-wave/20260525-verify-join-key-allocation/verification.json",""
