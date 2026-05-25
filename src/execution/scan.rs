@@ -890,7 +890,7 @@ impl Executor {
         expr: &Expr,
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>> {
-        let mut filtered = Vec::new();
+        let mut filtered = Vec::with_capacity(rows.len());
         for row in rows {
             if self.evaluate_expr(expr, &row, schema, params)? {
                 filtered.push(row);
@@ -1341,7 +1341,8 @@ impl Executor {
         if !pending_predicates.is_empty() {
             let remaining_selection = Self::combine_predicates(pending_predicates);
             if let Some(expr) = &remaining_selection {
-                let mut filtered_rows = Vec::new();
+                let capacity = limit.map_or(rows.len(), |value| rows.len().min(value));
+                let mut filtered_rows = Vec::with_capacity(capacity);
                 for row in rows {
                     if self.evaluate_expr(expr, &row, &schema, params)? {
                         filtered_rows.push(row);
@@ -2479,7 +2480,8 @@ impl Executor {
                         }
                     }
                 } else if !selection_fully_applied {
-                    let mut filtered_rows = Vec::new();
+                    let capacity = limit.map_or(rows.len(), |value| rows.len().min(value));
+                    let mut filtered_rows = Vec::with_capacity(capacity);
                     for row in rows {
                         if self.evaluate_expr(sel, &row, &schema, params)? {
                             filtered_rows.push(row);

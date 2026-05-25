@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-086-plan,completed,"Planned filter result Vec preallocation optimization for src/execution/scan.rs",".workflow/.csv-wave/20260526-plan-filter-result-prealloc/plan.json"
+TASK-086-execute,completed,"Changed filter result vectors to preallocate from input row counts and optional LIMIT bounds without changing predicate evaluation semantics.","src/execution/scan.rs"

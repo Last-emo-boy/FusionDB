@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-086",
+  "title": "Optimize filter result vector allocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve WHERE and join filter semantics"
+  ],
+  "rationale": "Several filtering paths build result vectors from known input row counts, and limited filters know the maximum number of accepted rows. Preallocating those result vectors reduces repeated Vec growth without changing filtering behavior.",
+  "steps": [
+    "Preallocate filter_rows_with_expr results from input row count",
+    "Preallocate pending join predicate filter results from min(input rows, limit)",
+    "Preallocate scan selection filter results from min(input rows, limit)",
+    "Verify WHERE and join filter behavior"
+  ],
+  "expected_impact": "Reduces allocation churn for WHERE filters, join-local filters, and late scan selection filters."
+}

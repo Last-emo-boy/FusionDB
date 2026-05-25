@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-086-plan,$maestro-plan "plan filter result Vec preallocation optimization",filter-result-prealloc
+TASK-086-execute,$maestro-execute "preallocate filter result vectors from input row count and limit",filter-result-prealloc
