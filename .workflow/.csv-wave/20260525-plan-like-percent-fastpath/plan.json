@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-070",
+  "title": "Optimize LIKE percent-only patterns",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/expr.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve LIKE and ILIKE wildcard semantics"
+  ],
+  "rationale": "LIKE patterns that only use percent wildcards do not need the generic character-vector backtracking matcher. They can be evaluated with starts_with, find/contains, and suffix checks directly on string slices.",
+  "steps": [
+    "Route patterns without '_' or '?' to a percent-only matcher",
+    "Support exact, prefix, suffix, contains, and multi-segment percent patterns without Vec<char> allocation",
+    "Keep complex wildcard patterns on the existing generic matcher",
+    "Add focused unit tests and run SQL LIKE/ILIKE regressions"
+  ],
+  "expected_impact": "Avoids text and pattern Vec<char> allocation for common LIKE patterns such as 'x%', '%x', and '%x%'."
+}

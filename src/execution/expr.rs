@@ -634,8 +634,8 @@ impl Executor {
     }
 
     pub(crate) fn like_match(text: &str, pattern: &str) -> bool {
-        if !pattern.contains('%') && !pattern.contains('_') && !pattern.contains('?') {
-            return text == pattern;
+        if !pattern.contains('_') && !pattern.contains('?') {
+            return Self::like_percent_only_match(text, pattern);
         }
         if let Some(prefix) = Self::like_fixed_prefix(pattern) {
             if prefix.len() == pattern.len() {
@@ -680,6 +680,46 @@ impl Executor {
         }
 
         p_idx == pattern_chars.len()
+    }
+
+    fn like_percent_only_match(text: &str, pattern: &str) -> bool {
+        if !pattern.contains('%') {
+            return text == pattern;
+        }
+
+        let mut remainder = text;
+        let mut parts = pattern
+            .split('%')
+            .filter(|part| !part.is_empty())
+            .peekable();
+        let Some(first) = parts.next() else {
+            return true;
+        };
+
+        if pattern.starts_with('%') {
+            let Some(index) = remainder.find(first) else {
+                return false;
+            };
+            remainder = &remainder[index + first.len()..];
+        } else {
+            if !remainder.starts_with(first) {
+                return false;
+            }
+            remainder = &remainder[first.len()..];
+        }
+
+        while let Some(part) = parts.next() {
+            let Some(index) = remainder.find(part) else {
+                return false;
+            };
+            remainder = &remainder[index + part.len()..];
+
+            if parts.peek().is_none() && !pattern.ends_with('%') {
+                return remainder.is_empty();
+            }
+        }
+
+        pattern.ends_with('%') || remainder.is_empty()
     }
 
     pub(crate) fn tokenize(text: &str) -> Vec<String> {
@@ -1530,5 +1570,26 @@ impl Executor {
             }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    #[test]
+    fn like_match_fast_percent_patterns() {
+        assert!(Executor::like_match("Alice", "Ali%"));
+        assert!(Executor::like_match("Alice", "%ce"));
+        assert!(Executor::like_match("Charlie", "%li%"));
+        assert!(Executor::like_match("alphabet soup", "a%bet%soup"));
+        assert!(!Executor::like_match("alphabet soup", "a%bet%soap"));
+    }
+
+    #[test]
+    fn like_match_wildcard_patterns_still_match() {
+        assert!(Executor::like_match("Bob", "Bo_"));
+        assert!(Executor::like_match("Bob", "B?b"));
+        assert!(!Executor::like_match("Bobby", "Bo_"));
     }
 }

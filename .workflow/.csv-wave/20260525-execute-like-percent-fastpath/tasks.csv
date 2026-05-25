@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-070,"Optimize LIKE percent-only patterns",completed,"src/execution/expr.rs"

@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-070,completed,"Added a percent-only LIKE matcher that avoids Vec<char> allocation and preserved generic wildcard handling.",".workflow/.csv-wave/20260525-verify-like-percent-fastpath/verification.json",""
