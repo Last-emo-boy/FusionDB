@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-083-plan,completed,"Planned trigram LIKE search bitmap intersection optimization for src/storage/trigram.rs",".workflow/.csv-wave/20260526-plan-trigram-smallest-bitmap/plan.json"
+TASK-083-execute,completed,"Collected trigram postings, intersected from the smallest RoaringTreemap, short-circuited empty postings, preallocated row key output, and added direct trigram tests.","src/storage/trigram.rs"

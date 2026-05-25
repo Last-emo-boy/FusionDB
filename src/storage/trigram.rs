@@ -83,34 +83,71 @@ impl TrigramIndex {
         let table_map = self.postings.get(table)?;
         let col_map = table_map.get(col)?;
 
-        // Find intersection of all trigrams
-        let mut result: Option<RoaringTreemap> = None;
-
-        for tg in grams {
-            if let Some(bm) = col_map.get(&tg) {
-                if let Some(res) = &mut result {
-                    *res &= bm;
-                } else {
-                    result = Some(bm.clone());
-                }
-            } else {
-                // If any trigram is missing, the result is empty (AND logic)
+        let mut bitmaps = Vec::with_capacity(grams.len());
+        for tg in &grams {
+            let Some(bitmap) = col_map.get(tg) else {
                 return Some(RoaringTreemap::new());
+            };
+            if bitmap.is_empty() {
+                return Some(RoaringTreemap::new());
+            }
+            bitmaps.push(bitmap);
+        }
+
+        bitmaps.sort_unstable_by_key(|bitmap| bitmap.len());
+        let mut bitmap_iter = bitmaps.into_iter();
+        let mut result = bitmap_iter.next()?.clone();
+        for bitmap in bitmap_iter {
+            result &= bitmap;
+            if result.is_empty() {
+                break;
             }
         }
 
-        result
+        Some(result)
     }
 
     pub fn map_ids_to_row_keys(&self, table: &str, ids: &RoaringTreemap) -> Vec<String> {
-        let mut out = Vec::new();
         if let Some(map) = self.id_map.get(table) {
+            let capacity = ids.len().min(map.len() as u64) as usize;
+            let mut out = Vec::with_capacity(capacity);
             for id in ids.iter() {
                 if let Some(s) = map.get(&id) {
                     out.push(s.clone());
                 }
             }
+            return out;
         }
-        out
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{trigrams_bytes, TrigramIndex};
+
+    #[test]
+    fn trigrams_bytes_deduplicates_sorted_keys() {
+        let grams = trigrams_bytes("aaaa");
+
+        assert_eq!(grams.len(), 1);
+    }
+
+    #[test]
+    fn search_intersects_trigram_postings_and_maps_row_keys() {
+        let mut index = TrigramIndex::new();
+        index.add_with_id_str("docs", "body", 1, "row-1", "xxabcdefyy");
+        index.add_with_id_str("docs", "body", 2, "row-2", "zzabczz");
+        index.add_with_id_str("docs", "body", 3, "row-3", "qqabcdefrr");
+
+        let ids = index.search("docs", "body", "%abcdef%").unwrap();
+        let mut row_keys = index.map_ids_to_row_keys("docs", &ids);
+        row_keys.sort();
+
+        assert_eq!(row_keys, vec!["row-1".to_string(), "row-3".to_string()]);
+        assert!(index
+            .search("docs", "body", "%missing%")
+            .unwrap()
+            .is_empty());
     }
 }

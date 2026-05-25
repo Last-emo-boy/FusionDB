@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-083",
+  "title": "Optimize trigram LIKE bitmap intersection",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/trigram.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve wildcard LIKE candidate semantics"
+  ],
+  "rationale": "Trigram wildcard LIKE search intersected postings in trigram order and row key mapping grew from an empty Vec. Starting from the smallest bitmap reduces intersection work, and preallocating output capacity avoids repeated Vec growth while mapping candidate row ids.",
+  "steps": [
+    "Collect trigram postings before intersection",
+    "Return empty bitmap immediately when a trigram is missing or has no postings",
+    "Sort postings by bitmap cardinality and intersect smallest first",
+    "Preallocate row key mapping output based on result cardinality",
+    "Add direct trigram unit tests and verify LIKE integration behavior"
+  ],
+  "expected_impact": "Reduces bitmap intersection work for multi-trigram wildcard LIKE queries and lowers allocation churn when mapping candidate ids to row keys."
+}

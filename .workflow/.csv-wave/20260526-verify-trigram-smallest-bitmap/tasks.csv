@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-083-verify,$maestro-verify "verify trigram LIKE bitmap intersection optimization",trigram-smallest-bitmap

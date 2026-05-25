@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-083-plan,$maestro-plan "plan trigram LIKE bitmap intersection optimization",trigram-smallest-bitmap
+TASK-083-execute,$maestro-execute "intersect trigram postings from smallest bitmap and preallocate row key mapping",trigram-smallest-bitmap
