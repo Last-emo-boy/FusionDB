@@ -5,7 +5,7 @@ use std::collections::HashSet;
 #[derive(Debug, Clone)]
 pub(crate) enum AggregateAccumulator {
     Count(i64),
-    CountDistinct(HashSet<String>),
+    CountDistinct(HashSet<Value>),
     Sum(f64, bool), // val, is_int
     Avg(f64, i64),  // sum, count
     Min(Option<Value>),
@@ -38,7 +38,7 @@ impl AggregateAccumulator {
             }
             AggregateAccumulator::CountDistinct(set) => {
                 if *val != Value::Null {
-                    set.insert(format!("{:?}", val));
+                    set.insert(val.clone());
                 }
             }
             AggregateAccumulator::Sum(sum, is_int) => match val {
@@ -139,6 +139,16 @@ mod tests {
         let mut acc = AggregateAccumulator::new("COUNT");
         acc.update(&Value::Integer(1));
         acc.update(&Value::Integer(2));
+        acc.update(&Value::Null);
+        assert_eq!(acc.finalize(), Value::Integer(2));
+    }
+
+    #[test]
+    fn test_count_distinct_accumulator() {
+        let mut acc = AggregateAccumulator::new("COUNT_DISTINCT");
+        acc.update(&Value::String("red".to_string()));
+        acc.update(&Value::String("blue".to_string()));
+        acc.update(&Value::String("red".to_string()));
         acc.update(&Value::Null);
         assert_eq!(acc.finalize(), Value::Integer(2));
     }

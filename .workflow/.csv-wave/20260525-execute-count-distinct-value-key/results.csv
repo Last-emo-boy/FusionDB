@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-065,completed,"Replaced COUNT DISTINCT debug string keys with direct Value HashSet keys and added a focused accumulator test.",".workflow/.csv-wave/20260525-verify-count-distinct-value-key/verification.json",""

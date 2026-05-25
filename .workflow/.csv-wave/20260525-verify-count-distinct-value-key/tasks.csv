@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-065,"Verify COUNT DISTINCT value keys",completed,"src/execution/aggregation.rs"

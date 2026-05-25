@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-065",
+  "title": "Optimize COUNT DISTINCT value keys",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/aggregation.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve COUNT(DISTINCT ...) semantics and NULL exclusion"
+  ],
+  "rationale": "COUNT(DISTINCT ...) formatted every non-null aggregate value with format!(\"{:?}\", val) before inserting into a HashSet. Value already implements Hash and Eq, so direct Value keys avoid debug string allocation while preserving typed distinctness.",
+  "steps": [
+    "Change CountDistinct storage from HashSet<String> to HashSet<Value>",
+    "Insert cloned non-null Values directly into the distinct set",
+    "Add a focused accumulator unit test for duplicate and NULL handling",
+    "Run aggregation and SQL COUNT DISTINCT regressions"
+  ],
+  "expected_impact": "Avoids per-row debug formatting and string allocation in COUNT(DISTINCT ...) aggregation paths."
+}
