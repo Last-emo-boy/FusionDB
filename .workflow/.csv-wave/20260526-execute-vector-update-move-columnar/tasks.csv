@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-084-plan,$maestro-plan "plan vector batch update ownership optimization",vector-update-move-columnar
+TASK-084-execute,$maestro-execute "move owned ids and vectors into columnar store after HNSW update",vector-update-move-columnar

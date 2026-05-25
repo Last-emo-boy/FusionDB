@@ -1,0 +1,20 @@
+{
+  "task_id": "TASK-084",
+  "title": "Optimize vector batch update ownership",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve HNSW and legacy columnar vector search behavior"
+  ],
+  "rationale": "FusionStorage::update_columnar_store cloned the full ids and vectors batches to build the legacy columnar store before separately cloning entries into HNSW. Updating HNSW from borrowed input first and then moving the owned batches into ColumnarVectorStore removes the full-batch clone for the legacy path.",
+  "steps": [
+    "Update HNSW from borrowed ids and vectors",
+    "Move owned ids and vectors into ColumnarVectorStore",
+    "Verify hybrid search and SQL HNSW ORDER BY behavior"
+  ],
+  "expected_impact": "Reduces allocation and clone work during batch vector store refreshes while preserving existing vector search semantics."
+}

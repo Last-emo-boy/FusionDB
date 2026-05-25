@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-084-verify,$maestro-verify "verify vector batch update ownership optimization",vector-update-move-columnar

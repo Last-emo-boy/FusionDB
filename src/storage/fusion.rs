@@ -310,15 +310,15 @@ impl FusionStorage {
     }
 
     pub fn update_columnar_store(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) {
-        // Legacy: Columnar Store
-        let store = ColumnarVectorStore::new(ids.clone(), vectors.clone(), 3);
-        let mut guard = self.columnar_store.write().unwrap();
-        *guard = Some(store);
-
         // New: HNSW Index
         for (id, vec) in ids.iter().zip(vectors.iter()) {
             let _ = self.vector_index.insert("default", id.clone(), vec.clone());
         }
+
+        // Legacy: Columnar Store
+        let store = ColumnarVectorStore::new(ids, vectors, 3);
+        let mut guard = self.columnar_store.write().unwrap();
+        *guard = Some(store);
     }
 
     // Update Inverted Index (Batch)

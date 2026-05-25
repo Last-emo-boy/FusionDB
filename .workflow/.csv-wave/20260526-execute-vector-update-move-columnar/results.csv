@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-084-plan,completed,"Planned vector batch update ownership optimization for src/storage/fusion.rs",".workflow/.csv-wave/20260526-plan-vector-update-move-columnar/plan.json"
+TASK-084-execute,completed,"Changed update_columnar_store to update HNSW from borrowed vectors, then move owned ids and vectors into ColumnarVectorStore instead of cloning both full batches first.","src/storage/fusion.rs"
