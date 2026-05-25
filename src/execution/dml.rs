@@ -641,7 +641,11 @@ impl Executor {
         };
 
         let mut deleted_count = 0;
-        let mut deleted_rows: Vec<Vec<Value>> = Vec::new();
+        let mut deleted_rows: Vec<Vec<Value>> = if delete.returning.is_some() {
+            Vec::with_capacity(kv_pairs.len())
+        } else {
+            Vec::new()
+        };
         for (k, v) in kv_pairs {
             let row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
                 if let Some(row) = self.row_cache.get(key_str) {
@@ -765,7 +769,11 @@ impl Executor {
         };
 
         let mut updated_count = 0;
-        let mut updated_rows: Vec<Vec<Value>> = Vec::new();
+        let mut updated_rows: Vec<Vec<Value>> = if update.returning.is_some() {
+            Vec::with_capacity(kv_pairs.len())
+        } else {
+            Vec::new()
+        };
         for (k, v) in kv_pairs {
             let mut row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
                 if let Some(row) = self.row_cache.get(key_str) {

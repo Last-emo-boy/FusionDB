@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-102-plan,"$maestro-plan plan UPDATE DELETE RETURNING row buffer preallocation optimization","update delete returning planning"
+TASK-102-execute,"$maestro-execute preallocate UPDATE and DELETE RETURNING row buffers from candidate row count","update delete returning execution"

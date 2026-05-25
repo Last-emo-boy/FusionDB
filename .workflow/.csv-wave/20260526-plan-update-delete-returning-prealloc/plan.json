@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-102",
+  "title": "Optimize UPDATE and DELETE RETURNING row preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/dml.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve UPDATE, DELETE, filtering, index maintenance, and RETURNING semantics"
+  ],
+  "rationale": "UPDATE and DELETE collect candidate key-value pairs before evaluating filters and RETURNING. When RETURNING is present, the candidate count is a safe upper bound for the returned rows, so preallocating the row buffers reduces Vec growth during write workloads.",
+  "steps": [
+    "Preallocate DELETE RETURNING rows from candidate key-value count",
+    "Preallocate UPDATE RETURNING rows from candidate key-value count",
+    "Leave non-RETURNING paths with empty row buffers",
+    "Verify UPDATE RETURNING, DELETE RETURNING, and no-match update behavior"
+  ],
+  "expected_impact": "Reduces allocation churn in UPDATE and DELETE RETURNING result collection without changing affected rows or returned values."
+}

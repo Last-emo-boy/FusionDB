@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-102-verify,"$maestro-verify verify UPDATE RETURNING DELETE RETURNING and no-match update behavior","update delete returning verification"
