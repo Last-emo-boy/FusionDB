@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-078",
+  "title": "Optimize vector candidate top-k sorting",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/vector_index.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve ascending distance result ordering"
+  ],
+  "rationale": "VectorIndex::search scored HNSW candidates, fully sorted all scored candidates, and then truncated to k. A top-k partition keeps only the nearest requested candidates before final ordering, reducing sorting work when oversampling returns more candidates than k.",
+  "steps": [
+    "Add a reusable vector distance comparator",
+    "Use select_nth_unstable_by to retain only the nearest k scored candidates",
+    "Sort only the retained top-k window before returning",
+    "Add unit coverage for limited vector search result ordering"
+  ],
+  "expected_impact": "Reduces vector search sorting work when HNSW oversampling returns more candidates than the requested result count."
+}

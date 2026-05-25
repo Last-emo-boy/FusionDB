@@ -3,6 +3,7 @@ use hora::core::ann_index::ANNIndex;
 use hora::index::hnsw_idx::HNSWIndex;
 use hora::index::hnsw_params::HNSWParams;
 use parking_lot::RwLock;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -202,9 +203,12 @@ impl VectorIndex {
                             .map(|vector| (id, euclidean_distance(query, vector)))
                     })
                     .collect();
-                // Sort by distance ascending (closest first)
-                scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                scored.truncate(k);
+                if scored.len() > k {
+                    let _ = scored.select_nth_unstable_by(k, vector_distance_order);
+                    scored.truncate(k);
+                }
+                // Sort retained candidates by distance ascending (closest first)
+                scored.sort_by(vector_distance_order);
                 Ok(scored)
             } else {
                 Ok(vec![])
@@ -224,6 +228,10 @@ fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
         .map(|(x, y)| (x - y) * (x - y))
         .sum::<f32>()
         .sqrt()
+}
+
+fn vector_distance_order(a: &(String, f32), b: &(String, f32)) -> Ordering {
+    a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
 }
 
 #[cfg(test)]
@@ -284,6 +292,29 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "a");
         assert!(results[0].1 < 0.001);
+    }
+
+    #[test]
+    fn search_limited_results_remain_sorted_by_distance() {
+        let index = VectorIndex::new();
+        index
+            .batch_insert(
+                "default",
+                vec![
+                    ("far".to_string(), vec![10.0, 0.0]),
+                    ("near".to_string(), vec![0.1, 0.0]),
+                    ("mid".to_string(), vec![2.0, 0.0]),
+                    ("edge".to_string(), vec![5.0, 0.0]),
+                ],
+            )
+            .unwrap();
+
+        let results = index.search("default", &[0.0, 0.0], 2).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "near");
+        assert_eq!(results[1].0, "mid");
+        assert!(results[0].1 <= results[1].1);
     }
 
     #[test]

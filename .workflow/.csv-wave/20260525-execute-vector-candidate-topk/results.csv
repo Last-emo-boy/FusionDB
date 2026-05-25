@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-078","completed","VectorIndex::search now avoids sorting all scored candidates when HNSW oversampling returns more candidates than k, while preserving ascending distance order.","src/storage/vector_index.rs","passed",""
