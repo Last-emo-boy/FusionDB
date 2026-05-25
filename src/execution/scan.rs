@@ -608,11 +608,11 @@ impl Executor {
             return None;
         };
 
-        let mut required = HashSet::new();
+        let mut required_indices = HashSet::new();
 
         for column in projected_columns {
             if let Ok(index) = self.resolve_column_index(column, schema) {
-                required.insert(schema.columns[index].name.to_ascii_lowercase());
+                required_indices.insert(index);
             }
         }
 
@@ -621,26 +621,27 @@ impl Executor {
             self.extract_columns_from_expr(predicate, &mut columns);
             for column in columns {
                 if let Ok(index) = self.resolve_column_index(&column, schema) {
-                    required.insert(schema.columns[index].name.to_ascii_lowercase());
+                    required_indices.insert(index);
                 }
             }
         }
 
         for column in join_column_refs {
             if let Ok(index) = self.resolve_column_index(column, schema) {
-                required.insert(schema.columns[index].name.to_ascii_lowercase());
+                required_indices.insert(index);
             }
         }
 
-        if required.is_empty() || required.len() >= schema.columns.len() {
+        if required_indices.is_empty() || required_indices.len() >= schema.columns.len() {
             return None;
         }
 
         let stage_projection: Vec<String> = schema
             .columns
             .iter()
-            .filter(|column| required.contains(&column.name.to_ascii_lowercase()))
-            .map(|column| column.name.clone())
+            .enumerate()
+            .filter(|(index, _)| required_indices.contains(index))
+            .map(|(_, column)| column.name.clone())
             .collect();
 
         if stage_projection.is_empty() || stage_projection.len() >= schema.columns.len() {

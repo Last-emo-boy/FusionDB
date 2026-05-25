@@ -1,0 +1,5 @@
+id,check,status
+fmt,"cargo fmt --check",passed
+check_lib,"cargo check --lib",passed
+join_group_projection,"cargo test --test sql_integration test_join_projection_pushdown_with_group_by -- --nocapture",passed
+join_alias_projection,"cargo test --test sql_integration test_three_table_join_with_alias_projection -- --nocapture",passed

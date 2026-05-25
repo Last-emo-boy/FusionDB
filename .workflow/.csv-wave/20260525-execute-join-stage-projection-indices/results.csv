@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-061,completed,"Replaced join stage projection lowercase column set with required schema indices.",".workflow/.csv-wave/20260525-verify-join-stage-projection-indices/verification.json",""

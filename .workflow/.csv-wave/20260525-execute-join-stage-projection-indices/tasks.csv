@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-061,"Optimize join stage projection required set",completed,"src/execution/scan.rs"

@@ -1,0 +1,20 @@
+{
+  "task_id": "TASK-061",
+  "title": "Optimize join stage projection required set",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve stage projection schema order and predicate coverage"
+  ],
+  "rationale": "build_stage_join_projection collected required columns as lowercased strings, then lowercased every schema column again during projection construction. The resolved column indices already identify the required columns.",
+  "steps": [
+    "Track required projection columns as schema indices",
+    "Preserve schema-order projection by filtering with required indices",
+    "Run focused join projection pushdown regressions and cargo check"
+  ],
+  "expected_impact": "Avoids repeated lowercase string allocation in join stage projection planning."
+}
