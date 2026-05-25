@@ -1404,7 +1404,7 @@ impl Executor {
                                 };
 
                                 if let Value::String(query_text) = match_val {
-                                    let tokens = Self::tokenize(&query_text);
+                                    let tokens = Self::tokenize_unique(&query_text);
                                     if !tokens.is_empty() {
                                         let mut candidate_row_ids: Option<HashSet<String>> = None;
 

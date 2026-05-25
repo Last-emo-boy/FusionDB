@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-072","completed","Added Executor::tokenize_unique and replaced FTS tokenize-plus-collect call sites; duplicate old FTS tokens now avoid repeated delete calls.","src/execution/ddl.rs;src/execution/dml.rs;src/execution/expr.rs;src/execution/scan.rs","passed",""

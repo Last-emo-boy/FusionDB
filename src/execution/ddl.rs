@@ -460,9 +460,7 @@ impl Executor {
 
             if index_type == IndexType::FTS {
                 if let Value::String(text) = &val {
-                    let tokens = Self::tokenize(text);
-                    let unique_tokens: HashSet<String> = tokens.into_iter().collect();
-                    for token in unique_tokens {
+                    for token in Self::tokenize_unique(text) {
                         let index_key =
                             format!("fts:{}:{}:{}:{}", table_name_str, col_name, token, row_id);
                         txn.put(index_key.as_bytes(), &[]).await?;

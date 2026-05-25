@@ -1,0 +1,24 @@
+{
+  "task_id": "TASK-072",
+  "title": "Optimize FTS token deduplication",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/ddl.rs",
+    "src/execution/dml.rs",
+    "src/execution/expr.rs",
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve FTS MATCH semantics"
+  ],
+  "rationale": "FTS index maintenance and MATCH evaluation repeatedly tokenized text into Vec<String> and then collected into HashSet<String>. A shared tokenize_unique helper performs tokenization and deduplication in one pass, avoiding the intermediate Vec allocation and redundant delete work for repeated old tokens.",
+  "steps": [
+    "Add Executor::tokenize_unique for lowercase alphanumeric token deduplication",
+    "Use the helper in FTS index backfill and DML index maintenance",
+    "Use the helper in non-indexed and indexed MATCH paths",
+    "Add focused unit coverage for duplicate token handling"
+  ],
+  "expected_impact": "Reduces intermediate allocations and repeated FTS index operations on text with duplicate terms."
+}

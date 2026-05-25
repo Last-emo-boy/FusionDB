@@ -126,7 +126,7 @@ impl Executor {
                 let val = &row[col_idx];
 
                 if let Value::String(text) = val {
-                    let text_tokens: HashSet<String> = Self::tokenize(text).into_iter().collect();
+                    let text_tokens = Self::tokenize_unique(text);
                     for term in search_terms {
                         if !text_tokens.contains(&term) {
                             return Ok(false);
@@ -731,6 +731,14 @@ impl Executor {
     }
 
     pub(crate) fn tokenize(text: &str) -> Vec<String> {
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    pub(crate) fn tokenize_unique(text: &str) -> HashSet<String> {
         text.to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| !s.is_empty())
@@ -1590,6 +1598,15 @@ mod tests {
         assert_eq!(Executor::placeholder_index("$1"), 1);
         assert_eq!(Executor::placeholder_index("2"), 2);
         assert_eq!(Executor::placeholder_index("$bad"), 0);
+    }
+
+    #[test]
+    fn tokenize_unique_deduplicates_tokens() {
+        let tokens = Executor::tokenize_unique("Quick quick, brown fox!");
+        assert_eq!(tokens.len(), 3);
+        assert!(tokens.contains("quick"));
+        assert!(tokens.contains("brown"));
+        assert!(tokens.contains("fox"));
     }
 
     #[test]

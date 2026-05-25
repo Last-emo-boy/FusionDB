@@ -435,10 +435,7 @@ impl Executor {
 
                             if col.index_type == IndexType::FTS {
                                 if let Value::String(text) = val {
-                                    let tokens = Self::tokenize(text);
-                                    let unique_tokens: HashSet<String> =
-                                        tokens.into_iter().collect();
-                                    for token in unique_tokens {
+                                    for token in Self::tokenize_unique(text) {
                                         let index_key = format!(
                                             "fts:{}:{}:{}:{}",
                                             table_name_str, col.name, token, row_id
@@ -679,9 +676,7 @@ impl Executor {
 
                         if col.index_type == IndexType::FTS {
                             if let Value::String(text) = val {
-                                let tokens = Self::tokenize(text);
-                                let unique_tokens: HashSet<String> = tokens.into_iter().collect();
-                                for token in unique_tokens {
+                                for token in Self::tokenize_unique(text) {
                                     let index_key = format!(
                                         "fts:{}:{}:{}:{}",
                                         table_name_str, col.name, token, row_id
@@ -851,8 +846,7 @@ impl Executor {
                         if old_val != new_val {
                             if col.index_type == IndexType::FTS {
                                 if let Value::String(text) = old_val {
-                                    let tokens = Self::tokenize(text);
-                                    for token in tokens {
+                                    for token in Self::tokenize_unique(text) {
                                         let index_key = format!(
                                             "fts:{}:{}:{}:{}",
                                             table_name_str, col.name, token, row_id
@@ -861,10 +855,7 @@ impl Executor {
                                     }
                                 }
                                 if let Value::String(text) = new_val {
-                                    let tokens = Self::tokenize(text);
-                                    let unique_tokens: HashSet<String> =
-                                        tokens.into_iter().collect();
-                                    for token in unique_tokens {
+                                    for token in Self::tokenize_unique(text) {
                                         let index_key = format!(
                                             "fts:{}:{}:{}:{}",
                                             table_name_str, col.name, token, row_id
