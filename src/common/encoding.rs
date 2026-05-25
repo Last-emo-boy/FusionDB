@@ -163,26 +163,22 @@ impl RowEncoder {
     pub fn encode(row: &[Value]) -> Vec<u8> {
         // Format: [Count: u16] [Offset1: u32] [Offset2: u32] ... [Data1] [Data2] ...
         let count = row.len() as u16;
-        let mut offsets = Vec::with_capacity(count as usize);
-        let mut data_buf = Vec::new();
 
-        for val in row {
-            offsets.push(data_buf.len() as u32);
-            let bytes = bincode::serialize(val).unwrap_or_default();
-            data_buf.extend_from_slice(&bytes);
-        }
-
-        // Calculate header size
-        // Count (2) + Offsets (4 * count)
-        let header_size = 2 + 4 * count as u32;
-
-        let mut result = Vec::with_capacity(header_size as usize + data_buf.len());
+        // Count (2) + offsets (4 * count)
+        let header_size = 2 + 4 * count as usize;
+        let mut result = Vec::with_capacity(header_size);
         result.extend_from_slice(&count.to_le_bytes());
-        for offset in offsets {
-            let abs_offset = header_size + offset;
-            result.extend_from_slice(&abs_offset.to_le_bytes());
+
+        result.resize(header_size, 0);
+        for (idx, val) in row.iter().enumerate() {
+            let abs_offset = result.len() as u32;
+            let off_pos = 2 + idx * 4;
+            result[off_pos..off_pos + 4].copy_from_slice(&abs_offset.to_le_bytes());
+
+            let bytes = bincode::serialize(val).unwrap_or_default();
+            result.extend_from_slice(&bytes);
         }
-        result.extend_from_slice(&data_buf);
+
         result
     }
 }

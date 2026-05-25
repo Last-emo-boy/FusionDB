@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-052,"Encode RowEncoder rows with a single output buffer",completed,"src/common/encoding.rs"

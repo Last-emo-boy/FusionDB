@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-052,completed,"RowEncoder::encode now reserves the header then writes offsets and serialized values into a single output buffer.",".workflow/.csv-wave/20260525-execute-row-encoder-single-buffer/tasks.csv",

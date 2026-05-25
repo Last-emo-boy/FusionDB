@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-052,"Verify single-buffer row encoding",completed,"src/common/encoding.rs"
