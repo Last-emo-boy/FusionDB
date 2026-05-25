@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-096",
+  "title": "Optimize vector search scored candidate preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/vector_index.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve HNSW search, exact distance reranking, limiting, and ordering semantics"
+  ],
+  "rationale": "Vector search already knows the number of HNSW candidate ids returned before exact-distance reranking. Preallocating the scored candidate vector from that count avoids Vec growth while retaining the same filtering and reranking behavior.",
+  "steps": [
+    "Replace iterator collect with explicit scored vector construction",
+    "Preallocate scored candidates from HNSW result count",
+    "Keep exact Euclidean distance reranking and limit trimming unchanged",
+    "Verify vector index unit behavior and SQL HNSW ordering behavior"
+  ],
+  "expected_impact": "Reduces allocation churn during vector search candidate reranking without changing result order or distances."
+}

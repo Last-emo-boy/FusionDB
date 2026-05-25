@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-096-verify,"$maestro-verify verify vector index search ordering and HNSW SQL behavior","vector search verification"

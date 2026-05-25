@@ -194,15 +194,12 @@ impl VectorIndex {
                 );
                 let results = index.search(query, candidate_count);
                 // Compute real Euclidean distances from stored vectors
-                let mut scored: Vec<(String, f32)> = results
-                    .into_iter()
-                    .filter_map(|id| {
-                        wrapper
-                            .vectors
-                            .get(&id)
-                            .map(|vector| (id, euclidean_distance(query, vector)))
-                    })
-                    .collect();
+                let mut scored = Vec::with_capacity(results.len());
+                for id in results {
+                    if let Some(vector) = wrapper.vectors.get(&id) {
+                        scored.push((id, euclidean_distance(query, vector)));
+                    }
+                }
                 if scored.len() > k {
                     let _ = scored.select_nth_unstable_by(k, vector_distance_order);
                     scored.truncate(k);

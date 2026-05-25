@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-096-plan,"$maestro-plan plan vector search scored result preallocation optimization","vector search planning"
+TASK-096-execute,"$maestro-execute preallocate vector search scored candidates from HNSW result count","vector search execution"
