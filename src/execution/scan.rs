@@ -632,7 +632,8 @@ impl Executor {
     }
 
     fn collect_join_column_references(&self, from: &[TableWithJoins]) -> HashSet<String> {
-        let mut columns = HashSet::new();
+        let join_count = from.iter().map(|table| table.joins.len()).sum::<usize>();
+        let mut columns = HashSet::with_capacity(join_count.saturating_mul(2));
 
         for table in from {
             for join in &table.joins {

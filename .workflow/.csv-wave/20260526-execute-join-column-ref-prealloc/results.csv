@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+TASK-119,completed,"Added a JOIN-count-based capacity hint before extracting JOIN column references.","src/execution/scan.rs"

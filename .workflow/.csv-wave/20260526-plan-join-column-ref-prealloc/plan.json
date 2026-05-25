@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-119",
+  "created_at": "2026-05-26T07:45:20+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/scan.rs",
+  "goal": "Avoid avoidable HashSet growth while collecting JOIN column references for projection planning.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to JOIN predicate extraction or projection behavior"
+  ],
+  "implementation": [
+    "Count JOIN clauses across the FROM list before collecting referenced columns.",
+    "Use the JOIN count as a conservative capacity hint for the column reference HashSet."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_three_table_join_with_alias_projection -- --nocapture",
+    "cargo test --test sql_integration test_join_projection_pushdown_with_group_by -- --nocapture"
+  ]
+}

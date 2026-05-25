@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-119,"Reserve JOIN column reference HashSet capacity from JOIN count","src/execution/scan.rs",completed
