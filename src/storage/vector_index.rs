@@ -142,6 +142,7 @@ impl VectorIndex {
 
         let wrapper_lock = self.get_or_create_wrapper(name);
         let mut wrapper = wrapper_lock.write();
+        wrapper.vectors.reserve(items.len());
 
         for (id, vector) in items {
             wrapper.upsert_vector(id, vector)?;

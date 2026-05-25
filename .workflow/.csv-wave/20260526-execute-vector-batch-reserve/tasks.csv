@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-097-plan,"$maestro-plan plan vector batch insert reserve optimization","vector batch planning"
+TASK-097-execute,"$maestro-execute reserve vector map capacity before batch insert","vector batch execution"

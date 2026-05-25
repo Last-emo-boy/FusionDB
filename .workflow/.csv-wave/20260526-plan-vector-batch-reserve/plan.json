@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-097",
+  "title": "Optimize vector batch insert capacity reserve",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/vector_index.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve vector dimension validation, upsert semantics, and HNSW build behavior"
+  ],
+  "rationale": "Vector batch insert knows the incoming item count before adding vectors to the per-index map. Reserving that capacity up front reduces HashMap growth during batch indexing while keeping existing per-vector validation and index build behavior unchanged.",
+  "steps": [
+    "Reserve the wrapper vector map by incoming batch size",
+    "Keep per-vector upsert validation unchanged",
+    "Keep final HNSW build unchanged",
+    "Verify vector index unit behavior and SQL HNSW behavior"
+  ],
+  "expected_impact": "Reduces allocation churn during vector batch insert without changing search results."
+}
