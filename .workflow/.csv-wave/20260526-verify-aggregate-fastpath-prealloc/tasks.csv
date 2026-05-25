@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-106,Verify aggregate fast path behavior,completed,.workflow/.csv-wave/20260526-verify-aggregate-fastpath-prealloc/verification.json

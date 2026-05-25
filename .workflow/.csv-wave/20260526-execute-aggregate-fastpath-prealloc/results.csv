@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-106,completed,Changed aggregate fast path containers to preallocate by projection count and qualifier bound,src/execution/query.rs,

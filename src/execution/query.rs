@@ -512,13 +512,14 @@ impl Executor {
             // Optimization: Aggregates on PK (COUNT(*), MIN(id), MAX(id))
             if !is_join && select.selection.is_none() && is_group_by_none {
                 let mut supported = true;
-                let mut result_row = Vec::new();
-                let mut col_names = Vec::new();
+                let mut result_row = Vec::with_capacity(select.projection.len());
+                let mut col_names = Vec::with_capacity(select.projection.len());
 
                 if let Some(table) = select.from.first() {
                     if let TableFactor::Table { name, alias, .. } = &table.relation {
                         let table_name_str = name.to_string();
-                        let mut aggregate_qualifiers = vec![table_name_str.clone()];
+                        let mut aggregate_qualifiers = Vec::with_capacity(2);
+                        aggregate_qualifiers.push(table_name_str.clone());
                         if let Some(alias) = alias {
                             aggregate_qualifiers.push(alias.name.value.clone());
                         }

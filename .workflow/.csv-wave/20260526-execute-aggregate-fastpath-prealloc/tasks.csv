@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-106,Preallocate aggregate fast path output and qualifier vectors,completed,src/execution/query.rs
