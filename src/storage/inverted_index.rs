@@ -1,5 +1,6 @@
 use crate::common::{FusionError, Result};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 // use std::sync::Arc;
@@ -77,6 +78,20 @@ impl InvertedIndex {
     }
 
     pub fn search_bm25(&self, query: &str, k1: f32, b: f32) -> Vec<(String, f32)> {
+        self.search_bm25_limited(query, k1, b, usize::MAX)
+    }
+
+    pub fn search_bm25_limited(
+        &self,
+        query: &str,
+        k1: f32,
+        b: f32,
+        limit: usize,
+    ) -> Vec<(String, f32)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
         let query_tokens = self.tokenize(query);
         let mut scores: HashMap<String, f32> = HashMap::new();
 
@@ -104,9 +119,17 @@ impl InvertedIndex {
         }
 
         let mut result: Vec<_> = scores.into_iter().collect();
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        if result.len() > limit {
+            let _ = result.select_nth_unstable_by(limit, bm25_score_order);
+            result.truncate(limit);
+        }
+        result.sort_by(bm25_score_order);
         result
     }
+}
+
+fn bm25_score_order(a: &(String, f32), b: &(String, f32)) -> Ordering {
+    b.1.partial_cmp(&a.1).unwrap()
 }
 
 #[cfg(test)]
@@ -136,5 +159,28 @@ mod tests {
         assert_eq!(index.total_docs, 2);
         assert_eq!(index.doc_lengths.get("doc1"), Some(&2));
         assert!((index.avg_doc_length - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_bm25_limited_matches_full_result_prefix() {
+        let mut index = InvertedIndex::new();
+
+        index.add_document("doc1".to_string(), "apple apple apple apple");
+        index.add_document("doc2".to_string(), "apple apple apple");
+        index.add_document("doc3".to_string(), "apple apple");
+        index.add_document("doc4".to_string(), "banana");
+
+        let full = index.search_bm25("apple", 1.2, 0.75);
+        let limited = index.search_bm25_limited("apple", 1.2, 0.75, 2);
+
+        assert_eq!(limited, full[..2]);
+    }
+
+    #[test]
+    fn search_bm25_limited_zero_skips_work() {
+        let mut index = InvertedIndex::new();
+        index.add_document("doc1".to_string(), "apple");
+
+        assert!(index.search_bm25_limited("apple", 1.2, 0.75, 0).is_empty());
     }
 }

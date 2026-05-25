@@ -1,0 +1,74 @@
+{
+  "session_id": "maestro-20260525-223843",
+  "source": "maestro",
+  "created_at": "2026-05-25T22:38:43+08:00",
+  "updated_at": "2026-05-25T22:38:43+08:00",
+  "intent": "TASK-073 optimize database core BM25 limited top-k search",
+  "task_type": "performance",
+  "chain_name": "database-core-performance",
+  "phase": "database-core-performance",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "auto",
+  "cli_tool": "codex",
+  "lifecycle_position": "continue-iteration",
+  "target": "src/storage/inverted_index.rs, src/storage/fusion.rs",
+  "context": {
+    "issue_id": null,
+    "milestone_num": null,
+    "spec_session_id": null,
+    "scratch_dir": null,
+    "plan_dir": ".workflow/.csv-wave/20260525-plan-bm25-limited-topk",
+    "analysis_dir": null,
+    "brainstorm_dir": null
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260525-execute-bm25-limited-topk/results.csv"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260525-verify-bm25-limited-topk/verification.json"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "plan BM25 limited top-k optimization",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T22:38:43+08:00",
+      "completed_at": "2026-05-25T22:38:43+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "add limited BM25 top-k search and route Fusion bm25_search through it",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T22:38:43+08:00",
+      "completed_at": "2026-05-25T22:38:43+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "verify BM25 top-k prefix and storage regressions",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T22:38:43+08:00",
+      "completed_at": "2026-05-25T22:38:43+08:00",
+      "error": null,
+      "wave_n": 2
+    }
+  ],
+  "current_step": 2,
+  "status": "completed"
+}

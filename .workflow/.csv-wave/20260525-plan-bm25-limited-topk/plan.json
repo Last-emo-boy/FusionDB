@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-073",
+  "title": "Optimize BM25 limited top-k search",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/inverted_index.rs",
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve full BM25 result ordering for existing callers"
+  ],
+  "rationale": "FusionStorage::bm25_search only returns the requested limit, but the underlying inverted index sorted all matching documents before Fusion truncated them. A limited top-k entry point keeps the full search_bm25 API intact while allowing limit-aware callers to avoid sorting the entire hit set.",
+  "steps": [
+    "Add InvertedIndex::search_bm25_limited with a zero-limit fast path",
+    "Use select_nth_unstable_by to retain only top-k candidates before final ordering",
+    "Route FusionStorage::bm25_search through the limited search entry point",
+    "Add unit coverage that limited results match the full result prefix"
+  ],
+  "expected_impact": "Reduces BM25 result sorting work for hybrid and direct BM25 callers that request a small candidate limit."
+}

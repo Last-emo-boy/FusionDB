@@ -337,8 +337,7 @@ impl FusionStorage {
     pub fn bm25_search(&self, query: &str, limit: usize) -> Vec<(String, f32)> {
         let guard = self.inverted_index.read().unwrap();
         // k1=1.2, b=0.75 are standard defaults
-        let results = guard.search_bm25(query, 1.2, 0.75);
-        results.into_iter().take(limit).collect()
+        guard.search_bm25_limited(query, 1.2, 0.75, limit)
     }
 
     // Hybrid Search: RRF (Reciprocal Rank Fusion)

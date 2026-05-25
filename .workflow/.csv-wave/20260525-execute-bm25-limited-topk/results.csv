@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-073","completed","Added a limit-aware BM25 path and preserved the full search_bm25 API by delegating it to the unlimited form.","src/storage/inverted_index.rs;src/storage/fusion.rs","passed",""
