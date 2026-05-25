@@ -1,0 +1,4 @@
+id,check,status
+fmt,"cargo fmt --check",passed
+check_lib,"cargo check --lib",passed
+storage_fusion,"cargo test --lib storage::fusion -- --nocapture",passed

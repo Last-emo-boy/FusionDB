@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-058,completed,"Replaced compaction candidate and candidate-id Vec allocations with fixed-size array storage.",".workflow/.csv-wave/20260525-verify-compaction-candidates-array/verification.json",""

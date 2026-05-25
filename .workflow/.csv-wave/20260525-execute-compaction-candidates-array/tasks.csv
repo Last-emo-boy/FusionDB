@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-058,"Optimize compaction candidate allocation",completed,"src/storage/fusion.rs"

@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 // 3. Columnar Vector Store (Integrated for Vector Search)
 
 const TS_SIZE: usize = 8;
+const COMPACTION_FANIN: usize = 4;
 
 // --- Data Structures ---
 
@@ -641,23 +642,22 @@ impl FusionStorage {
         }
     }
 
-    fn compaction_candidates(&self) -> Vec<Arc<SsTable>> {
+    fn compaction_candidates(&self) -> Option<[Arc<SsTable>; COMPACTION_FANIN]> {
         let sstables = self.sstables.read().unwrap();
-        if sstables.len() >= 4 {
-            sstables.iter().take(4).cloned().collect::<Vec<_>>()
-        } else {
-            Vec::new()
+        if sstables.len() < COMPACTION_FANIN {
+            return None;
         }
+
+        Some(std::array::from_fn(|index| Arc::clone(&sstables[index])))
     }
 
     async fn compact_once(&self) -> Result<bool> {
-        let candidates = self.compaction_candidates();
-        if candidates.is_empty() {
+        let Some(candidates) = self.compaction_candidates() else {
             return Ok(false);
-        }
+        };
 
         // Open iterators
-        let mut iterators = Vec::new();
+        let mut iterators = Vec::with_capacity(COMPACTION_FANIN);
         for sst in &candidates {
             match sst.new_iterator(None).await {
                 Ok(it) => iterators.push(it),
@@ -797,8 +797,8 @@ impl FusionStorage {
                 {
                     let mut sstables = self.sstables.write().unwrap();
                     // Remove old candidates (by ID)
-                    let old_ids: Vec<u64> = candidates.iter().map(|s| s.id).collect();
-                    sstables.retain(|s| !old_ids.contains(&s.id));
+                    let candidate_ids = candidates.each_ref().map(|candidate| candidate.id);
+                    sstables.retain(|s| !candidate_ids.contains(&s.id));
 
                     // Insert new SST (sorted by ID)
                     sstables.push(Arc::new(new_sst));

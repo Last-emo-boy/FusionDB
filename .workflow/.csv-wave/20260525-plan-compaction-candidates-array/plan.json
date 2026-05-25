@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-058",
+  "title": "Optimize compaction candidate allocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve compaction fan-in and candidate ordering"
+  ],
+  "rationale": "Compaction always selects four SSTables but allocated a Vec for candidates and another Vec for old candidate IDs.",
+  "steps": [
+    "Introduce a COMPACTION_FANIN constant",
+    "Return fixed-size candidate storage instead of heap-allocating a Vec",
+    "Use fixed candidate IDs when retaining live SSTables after compaction",
+    "Run storage fusion tests and cargo check"
+  ],
+  "expected_impact": "Reduces small heap allocations in the background compaction path while keeping the same four-SSTable fan-in behavior."
+}
