@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-111,Preallocate projection hint column sets,completed,src/execution/query.rs

@@ -632,7 +632,7 @@ impl Executor {
             let projection_hint: Option<Vec<String>> = if is_wildcard {
                 None
             } else {
-                let mut cols = HashSet::new();
+                let mut cols = HashSet::with_capacity(select.projection.len());
                 for item in &select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
@@ -685,7 +685,7 @@ impl Executor {
 
             // Recompute projection hint if subqueries were materialized
             let projection_hint = if materialized_selection.is_some() && !is_wildcard {
-                let mut cols = HashSet::new();
+                let mut cols = HashSet::with_capacity(select.projection.len());
                 for item in &select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {

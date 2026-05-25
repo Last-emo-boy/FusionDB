@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-111,completed,Changed projection hint column sets to preallocate by SELECT projection count,src/execution/query.rs,

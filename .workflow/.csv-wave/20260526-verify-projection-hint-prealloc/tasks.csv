@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-111,Verify projection hint behavior,completed,.workflow/.csv-wave/20260526-verify-projection-hint-prealloc/verification.json
