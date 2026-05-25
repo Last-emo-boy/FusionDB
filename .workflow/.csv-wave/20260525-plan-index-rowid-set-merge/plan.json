@@ -1,0 +1,23 @@
+{
+  "task_id": "TASK-062",
+  "title": "Optimize index row id set merging",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve index scan exactness and row id semantics"
+  ],
+  "rationale": "try_index_scan merged row id sets with intersection/union plus cloned collect, allocating new sets and cloning row ids. FTS token intersection also used the same pattern.",
+  "steps": [
+    "Reuse existing HashSet storage for FTS token intersections",
+    "Reuse the smaller existing HashSet for AND intersections",
+    "Extend an existing HashSet for OR unions",
+    "Mark FTS token-index plans exact so key-only projection does not re-evaluate MATCH on partial rows",
+    "Add a focused FTS multi-token regression"
+  ],
+  "expected_impact": "Reduces row id cloning and temporary HashSet allocation in index scan planning and fixes FTS index exactness for key-only projections."
+}

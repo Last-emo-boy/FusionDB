@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-062,completed,"Reused HashSet storage for FTS/AND/OR index row id merging and covered FTS multi-token exact index hits.",".workflow/.csv-wave/20260525-verify-index-rowid-set-merge/verification.json",""

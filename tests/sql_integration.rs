@@ -1836,6 +1836,36 @@ async fn test_create_btree_index() {
 }
 
 #[tokio::test]
+async fn test_fts_match_against_multi_token_intersects_index_hits() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO docs VALUES (1, 'quick brown fox'), (2, 'quick blue hare'), (3, 'slow brown fox')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_docs_body ON docs (body) USING FTS",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM docs WHERE MATCH(body) AGAINST('quick fox')",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_create_index_reuses_row_cache_for_backfill() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

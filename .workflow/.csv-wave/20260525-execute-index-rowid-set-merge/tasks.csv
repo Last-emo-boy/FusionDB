@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-062,"Optimize index row id set merging",completed,"src/execution/scan.rs;tests/sql_integration.rs"

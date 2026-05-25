@@ -1,0 +1,8 @@
+id,check,status
+fmt,"cargo fmt --check",passed
+check_lib,"cargo check --lib",passed
+fts_multi_token,"cargo test --test sql_integration test_fts_match_against_multi_token_intersects_index_hits -- --nocapture",passed
+where_and,"cargo test --test sql_integration test_where_and -- --nocapture",passed
+where_or,"cargo test --test sql_integration test_where_or -- --nocapture",passed
+btree_index,"cargo test --test sql_integration test_create_btree_index -- --nocapture",passed
+like_pattern,"cargo test --test sql_integration test_like_pattern -- --nocapture",passed

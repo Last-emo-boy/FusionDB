@@ -1425,13 +1425,11 @@ impl Executor {
                                                 }
                                             }
 
-                                            if let Some(candidates) = candidate_row_ids {
-                                                candidate_row_ids = Some(
-                                                    candidates
-                                                        .intersection(&current_token_row_ids)
-                                                        .cloned()
-                                                        .collect(),
-                                                );
+                                            if let Some(mut candidates) = candidate_row_ids {
+                                                candidates.retain(|row_id| {
+                                                    current_token_row_ids.contains(row_id)
+                                                });
+                                                candidate_row_ids = Some(candidates);
                                             } else {
                                                 candidate_row_ids = Some(current_token_row_ids);
                                             }
@@ -1439,7 +1437,7 @@ impl Executor {
                                             if candidate_row_ids.as_ref().unwrap().is_empty() {
                                                 return Ok(Some(IndexScanPlan {
                                                     row_ids: HashSet::new(),
-                                                    exact: false,
+                                                    exact: true,
                                                 }));
                                             }
                                         }
@@ -1449,7 +1447,7 @@ impl Executor {
                                         return Ok(candidate_row_ids.map(|row_ids| {
                                             IndexScanPlan {
                                                 row_ids,
-                                                exact: false,
+                                                exact: true,
                                             }
                                         }));
                                     }
@@ -1664,10 +1662,18 @@ impl Executor {
                         .await?;
 
                     match (left_res, right_res) {
-                        (Some(l), Some(r)) => {
+                        (Some(mut l), Some(mut r)) => {
                             // AND: intersect both index results for tighter filtering
+                            let row_ids = if l.row_ids.len() <= r.row_ids.len() {
+                                l.row_ids.retain(|row_id| r.row_ids.contains(row_id));
+                                l.row_ids
+                            } else {
+                                r.row_ids.retain(|row_id| l.row_ids.contains(row_id));
+                                r.row_ids
+                            };
+
                             return Ok(Some(IndexScanPlan {
-                                row_ids: l.row_ids.intersection(&r.row_ids).cloned().collect(),
+                                row_ids,
                                 exact: l.exact && r.exact,
                             }));
                         }
@@ -1693,9 +1699,10 @@ impl Executor {
                         .await?;
 
                     // OR: both sides must have index results to be useful
-                    if let (Some(l), Some(r)) = (left_res, right_res) {
+                    if let (Some(mut l), Some(r)) = (left_res, right_res) {
+                        l.row_ids.extend(r.row_ids);
                         return Ok(Some(IndexScanPlan {
-                            row_ids: l.row_ids.union(&r.row_ids).cloned().collect(),
+                            row_ids: l.row_ids,
                             exact: l.exact && r.exact,
                         }));
                     }
