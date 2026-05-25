@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-110,Preallocate JOIN key extraction vectors,completed,src/execution/scan.rs

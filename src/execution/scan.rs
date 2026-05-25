@@ -458,9 +458,10 @@ impl Executor {
         let mut predicates = Vec::new();
         Self::split_conjunctive_predicates(expr, &mut predicates);
 
-        let mut left_key_indices = Vec::new();
-        let mut right_key_indices = Vec::new();
-        let mut residual = Vec::new();
+        let predicate_count = predicates.len();
+        let mut left_key_indices = Vec::with_capacity(predicate_count);
+        let mut right_key_indices = Vec::with_capacity(predicate_count);
+        let mut residual = Vec::with_capacity(predicate_count);
 
         for predicate in predicates {
             let Expr::BinaryOp {

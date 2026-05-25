@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-110,completed,Changed JOIN key extraction vectors to preallocate by split ON predicate count,src/execution/scan.rs,
