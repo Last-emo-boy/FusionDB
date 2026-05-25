@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-068",
+  "title": "Reuse SSTable index cache in Fusion last",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve FusionTransaction::last visible-key semantics"
+  ],
+  "rationale": "FusionTransaction::last selected SSTable candidate blocks with BTreeMap range lookups and a temporary candidate vector. SsTable already caches sorted index_keys and index_offsets, so last() can use binary search over those cached vectors while still checking the current and previous candidate blocks.",
+  "steps": [
+    "Use cached SSTable index_keys to find the block start immediately before the range end",
+    "Use cached index_offsets for current and previous candidate block offsets",
+    "Avoid the temporary candidate_blocks Vec allocation",
+    "Add a storage test that flushes data to SSTable and calls last() directly"
+  ],
+  "expected_impact": "Reduces per-SSTable lookup overhead for MAX/last-style range queries over flushed data."
+}

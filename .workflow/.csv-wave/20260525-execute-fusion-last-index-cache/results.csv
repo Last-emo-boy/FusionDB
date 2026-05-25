@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-068,completed,"Replaced Fusion last() SSTable BTreeMap range lookup with cached index vector binary search and added an SSTable-backed last() regression.",".workflow/.csv-wave/20260525-verify-fusion-last-index-cache/verification.json",""

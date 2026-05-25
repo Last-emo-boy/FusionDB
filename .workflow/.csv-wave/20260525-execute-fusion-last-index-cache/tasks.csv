@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-068,"Reuse SSTable index cache in Fusion last",completed,"src/storage/fusion.rs"

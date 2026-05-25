@@ -1475,23 +1475,26 @@ impl Transaction for FusionTransaction {
             // 1. Block A: `range(..end_ik).next_back()` -> Starts < end_ik.
             // This is the primary candidate.
 
-            let mut candidates_blocks = Vec::new();
-
-            if let Some((blk_start_key, offset)) =
-                sst.index.range::<Vec<u8>, _>(..end_ik.clone()).next_back()
+            let candidate_idx = match sst
+                .index_keys
+                .binary_search_by(|key| key.as_slice().cmp(end_ik.as_slice()))
             {
-                candidates_blocks.push(*offset);
+                Ok(idx) | Err(idx) => idx.checked_sub(1),
+            };
 
-                // Also check previous block in case the last block only has keys >= end (unlikely given the query, but possible)
-                // Or if the last block is empty/filtered?
-                if let Some((_, prev_offset)) =
-                    sst.index.range::<Vec<u8>, _>(..blk_start_key).next_back()
-                {
-                    candidates_blocks.push(*prev_offset);
-                }
-            }
+            let Some(candidate_idx) = candidate_idx else {
+                continue;
+            };
 
-            for offset in candidates_blocks {
+            let current_offset = sst.index_offsets[candidate_idx];
+            let previous_offset = candidate_idx
+                .checked_sub(1)
+                .map(|idx| sst.index_offsets[idx]);
+
+            for offset in [Some(current_offset), previous_offset]
+                .into_iter()
+                .flatten()
+            {
                 if let Ok(block_data) = sst.read_block(offset).await {
                     // Iterate block
                     let mut cursor = std::io::Cursor::new(block_data);
@@ -1848,6 +1851,42 @@ mod tests {
 
             let first = txn.first(b"data:z:", b"data:z;").await.unwrap();
             assert_eq!(first, Some((b"data:z:000".to_vec(), b"zero".to_vec())));
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_last_reads_visible_key_from_sstable() {
+        let data_dir = unique_storage_dir("last_sstable");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            for id in 0..80 {
+                let key = format!("data:last:{id:03}");
+                let value = format!("value-{id:03}");
+                txn.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+
+        storage.create_snapshot_now().await.unwrap();
+        assert!(!storage.sstables.read().unwrap().is_empty());
+
+        {
+            let txn = storage.begin_transaction().await.unwrap();
+            let last = txn.last(b"data:last:", b"data:last;").await.unwrap();
+            assert_eq!(
+                last,
+                Some((b"data:last:079".to_vec(), b"value-079".to_vec()))
+            );
         }
 
         cleanup_storage_dir(&data_dir);

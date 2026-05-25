@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-068,"Verify Fusion last SSTable index cache",completed,"src/storage/fusion.rs"
