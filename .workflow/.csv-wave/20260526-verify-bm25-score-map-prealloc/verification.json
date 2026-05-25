@@ -1,0 +1,31 @@
+{
+  "task_id": "TASK-094",
+  "status": "passed",
+  "verified_at": "2026-05-26T02:48:33+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --lib storage::inverted_index -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_fts_match_against_multi_token_intersects_index_hits -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_parameter_placeholder_match_against -- --nocapture",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Validation used CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0.",
+    "The covered tests exercise BM25 unit behavior, limited result prefix behavior, zero-limit behavior, literal MATCH, and parameterized MATCH."
+  ]
+}

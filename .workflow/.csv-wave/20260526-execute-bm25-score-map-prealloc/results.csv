@@ -1,0 +1,3 @@
+id,status,artifact,summary
+TASK-094-plan,completed,.workflow/.csv-wave/20260526-plan-bm25-score-map-prealloc/plan.json,"Planned low-risk BM25 score map allocation optimization."
+TASK-094-execute,completed,src/storage/inverted_index.rs,"Collected matching posting lists before scoring and preallocated the score map from a capped posting bound."

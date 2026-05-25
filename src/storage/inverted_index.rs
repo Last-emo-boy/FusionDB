@@ -106,28 +106,38 @@ impl InvertedIndex {
         }
 
         let query_tokens = self.tokenize(query);
-        let mut scores: HashMap<String, f32> = HashMap::new();
+        let mut posting_lists = Vec::with_capacity(query_tokens.len());
+        let mut score_capacity = 0usize;
+        for term in &query_tokens {
+            if let Some(posting_list) = self.postings.get(term) {
+                score_capacity = score_capacity.saturating_add(posting_list.len());
+                posting_lists.push(posting_list);
+            }
+        }
 
-        for term in query_tokens {
-            if let Some(posting_list) = self.postings.get(&term) {
-                // Calculate IDF
-                let doc_freq = posting_list.len();
-                let idf = ((self.total_docs as f32 - doc_freq as f32 + 0.5)
-                    / (doc_freq as f32 + 0.5)
-                    + 1.0)
-                    .ln();
+        if posting_lists.is_empty() {
+            return Vec::new();
+        }
 
-                for (doc_id, freq) in posting_list {
-                    let doc_len = *self.doc_lengths.get(doc_id).unwrap_or(&0);
-                    let tf = *freq as f32;
+        let mut scores: HashMap<String, f32> =
+            HashMap::with_capacity(score_capacity.min(self.doc_lengths.len()));
 
-                    let numerator = tf * (k1 + 1.0);
-                    let denominator =
-                        tf + k1 * (1.0 - b + b * (doc_len as f32 / self.avg_doc_length));
+        for posting_list in posting_lists {
+            // Calculate IDF
+            let doc_freq = posting_list.len();
+            let idf = ((self.total_docs as f32 - doc_freq as f32 + 0.5) / (doc_freq as f32 + 0.5)
+                + 1.0)
+                .ln();
 
-                    let score = idf * (numerator / denominator);
-                    *scores.entry(doc_id.clone()).or_insert(0.0) += score;
-                }
+            for (doc_id, freq) in posting_list {
+                let doc_len = *self.doc_lengths.get(doc_id).unwrap_or(&0);
+                let tf = *freq as f32;
+
+                let numerator = tf * (k1 + 1.0);
+                let denominator = tf + k1 * (1.0 - b + b * (doc_len as f32 / self.avg_doc_length));
+
+                let score = idf * (numerator / denominator);
+                *scores.entry(doc_id.clone()).or_insert(0.0) += score;
             }
         }
 

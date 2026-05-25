@@ -1,0 +1,74 @@
+{
+  "session_id": "maestro-20260526-024833",
+  "source": "maestro",
+  "created_at": "2026-05-26T02:48:33+08:00",
+  "updated_at": "2026-05-26T02:48:33+08:00",
+  "intent": "TASK-094 optimize database core BM25 score map allocation",
+  "task_type": "performance",
+  "chain_name": "database-core-performance",
+  "phase": "database-core-performance",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "auto",
+  "cli_tool": "codex",
+  "lifecycle_position": "continue-iteration",
+  "target": "src/storage/inverted_index.rs",
+  "context": {
+    "issue_id": null,
+    "milestone_num": null,
+    "spec_session_id": null,
+    "scratch_dir": null,
+    "plan_dir": ".workflow/.csv-wave/20260526-plan-bm25-score-map-prealloc",
+    "analysis_dir": null,
+    "brainstorm_dir": null
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-execute-bm25-score-map-prealloc/results.csv"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-verify-bm25-score-map-prealloc/verification.json"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "plan BM25 score map preallocation optimization",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T02:48:33+08:00",
+      "completed_at": "2026-05-26T02:48:33+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "precollect matching posting lists and preallocate BM25 score map",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T02:48:33+08:00",
+      "completed_at": "2026-05-26T02:48:33+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "verify inverted index scoring and MATCH AGAINST behavior",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T02:48:33+08:00",
+      "completed_at": "2026-05-26T02:48:33+08:00",
+      "error": null,
+      "wave_n": 2
+    }
+  ],
+  "current_step": 2,
+  "status": "completed"
+}

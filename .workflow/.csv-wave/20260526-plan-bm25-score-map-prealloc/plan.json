@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-094",
+  "title": "Optimize BM25 score map preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/inverted_index.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve BM25 scoring, result limiting, and ordering semantics"
+  ],
+  "rationale": "BM25 search accumulates scores into a document-id map after scanning posting lists for query terms. Collecting the matching posting lists first gives a safe capacity bound for the score map, reducing rehash growth during MATCH queries.",
+  "steps": [
+    "Collect matching posting lists for query tokens",
+    "Return early when no query token has postings",
+    "Preallocate the score map from the summed posting-list length capped by known document count",
+    "Reuse collected posting lists for unchanged BM25 scoring"
+  ],
+  "expected_impact": "Reduces allocation churn in full-text MATCH searches without changing score calculation or result ordering."
+}
