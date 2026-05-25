@@ -1,6 +1,7 @@
 use crate::common::{FusionError, Result};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -73,8 +74,18 @@ impl TrigramIndex {
 
     pub fn search(&self, table: &str, col: &str, pattern: &str) -> Option<RoaringTreemap> {
         // Pattern processing: remove % and _
-        let clean_pattern: String = pattern.chars().filter(|c| *c != '%' && *c != '_').collect();
-        let grams = trigrams_bytes(&clean_pattern);
+        let clean_pattern = if pattern.as_bytes().iter().any(|b| matches!(b, b'%' | b'_')) {
+            let mut clean = String::with_capacity(pattern.len());
+            for c in pattern.chars() {
+                if c != '%' && c != '_' {
+                    clean.push(c);
+                }
+            }
+            Cow::Owned(clean)
+        } else {
+            Cow::Borrowed(pattern)
+        };
+        let grams = trigrams_bytes(clean_pattern.as_ref());
 
         if grams.is_empty() {
             return None; // Pattern too short or empty

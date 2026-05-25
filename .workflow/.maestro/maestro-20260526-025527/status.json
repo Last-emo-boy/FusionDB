@@ -1,0 +1,74 @@
+{
+  "session_id": "maestro-20260526-025527",
+  "source": "maestro",
+  "created_at": "2026-05-26T02:55:27+08:00",
+  "updated_at": "2026-05-26T02:55:27+08:00",
+  "intent": "TASK-095 optimize database core trigram pattern cleaning",
+  "task_type": "performance",
+  "chain_name": "database-core-performance",
+  "phase": "database-core-performance",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "auto",
+  "cli_tool": "codex",
+  "lifecycle_position": "continue-iteration",
+  "target": "src/storage/trigram.rs",
+  "context": {
+    "issue_id": null,
+    "milestone_num": null,
+    "spec_session_id": null,
+    "scratch_dir": null,
+    "plan_dir": ".workflow/.csv-wave/20260526-plan-trigram-pattern-clean-fast-path",
+    "analysis_dir": null,
+    "brainstorm_dir": null
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-execute-trigram-pattern-clean-fast-path/results.csv"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-verify-trigram-pattern-clean-fast-path/verification.json"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "plan trigram pattern cleaning fast path optimization",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T02:55:27+08:00",
+      "completed_at": "2026-05-26T02:55:27+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "avoid LIKE pattern cleaning allocation when no wildcard is present",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T02:55:27+08:00",
+      "completed_at": "2026-05-26T02:55:27+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "verify trigram search LIKE and ILIKE behavior",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T02:55:27+08:00",
+      "completed_at": "2026-05-26T02:55:27+08:00",
+      "error": null,
+      "wave_n": 2
+    }
+  ],
+  "current_step": 2,
+  "status": "completed"
+}

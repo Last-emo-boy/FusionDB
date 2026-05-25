@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-095-plan,"$maestro-plan plan trigram pattern cleaning fast path optimization","trigram planning"
+TASK-095-execute,"$maestro-execute avoid LIKE pattern cleaning allocation when no wildcard is present","trigram execution"

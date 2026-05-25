@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-095",
+  "title": "Optimize trigram pattern cleaning fast path",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/trigram.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve trigram LIKE and ILIKE candidate search semantics"
+  ],
+  "rationale": "Trigram search cleans LIKE patterns by removing '%' and '_' into a new String for every lookup. Patterns without wildcards can reuse the original pattern slice, while wildcard patterns can clean into a preallocated String.",
+  "steps": [
+    "Detect LIKE wildcard bytes before allocating a cleaned pattern",
+    "Borrow the original pattern when no wildcard is present",
+    "Preallocate cleaned pattern storage when wildcards are present",
+    "Verify trigram unit behavior and LIKE/ILIKE integration behavior"
+  ],
+  "expected_impact": "Reduces allocation churn in trigram-backed pattern lookup without changing candidate bitmaps."
+}
