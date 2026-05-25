@@ -397,7 +397,8 @@ impl Executor {
         params: &[Value],
     ) -> Result<QueryResult> {
         // Materialize CTEs (WITH ... AS) as temporary tables in the transaction
-        let mut cte_names: Vec<String> = Vec::new();
+        let mut cte_names: Vec<String> =
+            Vec::with_capacity(query.with.as_ref().map_or(0, |with| with.cte_tables.len()));
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
                 let cte_name = cte.alias.name.value.clone();
@@ -406,7 +407,8 @@ impl Executor {
                     use crate::catalog::{Column, IndexType, TableSchema};
 
                     // Build schema: synthetic _rowid PK + CTE columns
-                    let mut cols = vec![Column {
+                    let mut cols = Vec::with_capacity(columns.len() + 1);
+                    cols.push(Column {
                         name: "_rowid".to_string(),
                         data_type: "INTEGER".to_string(),
                         is_primary: true,
@@ -416,7 +418,7 @@ impl Executor {
                         is_nullable: false,
                         is_unique: true,
                         check_expr: None,
-                    }];
+                    });
                     cols.extend(columns.iter().map(|c| Column {
                         name: c.clone(),
                         data_type: "TEXT".to_string(),
@@ -436,7 +438,8 @@ impl Executor {
 
                     for (i, row) in rows.iter().enumerate() {
                         // Prepend synthetic _rowid to each row
-                        let mut full_row = vec![Value::Integer(i as i64)];
+                        let mut full_row = Vec::with_capacity(row.len() + 1);
+                        full_row.push(Value::Integer(i as i64));
                         full_row.extend(row.iter().cloned());
                         let pk_str = crate::common::encoding::encode_i64_comparable(i as i64);
                         let key = format!("data:{}:{}", cte_name, pk_str);

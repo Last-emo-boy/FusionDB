@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-107,completed,Changed CTE materialization vectors to preallocate from CTE count and row widths,src/execution/query.rs,

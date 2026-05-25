@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-107,Verify CTE materialization behavior,completed,.workflow/.csv-wave/20260526-verify-cte-materialization-prealloc/verification.json

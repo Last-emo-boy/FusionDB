@@ -1,0 +1,23 @@
+{
+  "task_id": "TASK-107",
+  "created_at": "2026-05-26T04:47:42+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/query.rs",
+  "goal": "Avoid avoidable vector growth during CTE materialization.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to WITH query materialization or cleanup"
+  ],
+  "implementation": [
+    "Preallocate CTE cleanup name storage from the number of CTE tables.",
+    "Preallocate temporary schema columns from result column count plus synthetic _rowid.",
+    "Preallocate each materialized CTE row from source row width plus synthetic _rowid."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_cte_basic -- --nocapture",
+    "cargo test --test sql_integration test_cte_multiple -- --nocapture"
+  ]
+}
