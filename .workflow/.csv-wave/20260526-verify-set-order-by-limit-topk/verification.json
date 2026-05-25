@@ -1,0 +1,31 @@
+{
+  "task_id": "TASK-080",
+  "status": "passed",
+  "verified_at": "2026-05-26T00:06:07+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_union -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_except -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_intersect -- --nocapture",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Validation used CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0.",
+    "The new SQL integration test covers UNION ALL ORDER BY with LIMIT and OFFSET."
+  ]
+}

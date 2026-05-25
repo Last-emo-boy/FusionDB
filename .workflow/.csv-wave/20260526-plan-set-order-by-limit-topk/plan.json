@@ -1,0 +1,23 @@
+{
+  "task_id": "TASK-080",
+  "title": "Optimize set operation ORDER BY limit sorting",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve UNION/INTERSECT/EXCEPT ORDER BY, LIMIT, and OFFSET semantics"
+  ],
+  "rationale": "The set operation path fully sorted outer ORDER BY results before applying LIMIT/OFFSET. When LIMIT is finite, retaining only OFFSET + LIMIT candidates before final ordering reduces sort work while preserving the returned window.",
+  "steps": [
+    "Parse set operation outer LIMIT/OFFSET before sorting",
+    "Use select_nth_unstable_by to retain OFFSET + LIMIT candidates for finite windows",
+    "Preserve stable tie behavior with original row indices in the top-k selection path",
+    "Apply LIMIT/OFFSET after final ordering of the retained window",
+    "Add SQL integration coverage for UNION ALL ORDER BY with LIMIT and OFFSET"
+  ],
+  "expected_impact": "Reduces set operation outer ORDER BY sorting work for limited result windows."
+}

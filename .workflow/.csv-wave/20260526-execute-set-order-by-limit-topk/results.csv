@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-080","completed","Set operation outer ORDER BY with finite LIMIT now sorts only the retained OFFSET + LIMIT candidate window before final slicing.","src/execution/query.rs;tests/sql_integration.rs","passed",""

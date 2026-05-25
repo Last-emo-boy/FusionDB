@@ -1244,10 +1244,34 @@ impl Executor {
                 combined = Self::deduplicate_rows(combined);
             }
 
+            let (set_offset, set_limit) =
+                if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
+                    let off = offset
+                        .as_ref()
+                        .and_then(|os| match &os.value {
+                            Expr::Value(sqlparser::ast::ValueWithSpan {
+                                value: sqlparser::ast::Value::Number(n, _),
+                                ..
+                            }) => n.parse::<usize>().ok(),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let lim = limit.as_ref().and_then(|e| match e {
+                        Expr::Value(sqlparser::ast::ValueWithSpan {
+                            value: sqlparser::ast::Value::Number(n, _),
+                            ..
+                        }) => n.parse::<usize>().ok(),
+                        _ => None,
+                    });
+                    (off, lim)
+                } else {
+                    (0, None)
+                };
+
             // Apply ORDER BY from the outer query
             if let Some(order_by) = &query.order_by {
                 if let OrderByKind::Expressions(order_exprs) = &order_by.kind {
-                    combined.sort_by(|a, b| {
+                    let compare_combined = |a: &(usize, Vec<Value>), b: &(usize, Vec<Value>)| {
                         for oe in order_exprs {
                             let idx = match &oe.expr {
                                 Expr::Value(sqlparser::ast::ValueWithSpan {
@@ -1260,8 +1284,8 @@ impl Executor {
                                     .unwrap_or(0),
                                 _ => 0,
                             };
-                            let va = a.get(idx).unwrap_or(&Value::Null);
-                            let vb = b.get(idx).unwrap_or(&Value::Null);
+                            let va = a.1.get(idx).unwrap_or(&Value::Null);
+                            let vb = b.1.get(idx).unwrap_or(&Value::Null);
                             let cmp = self.compare_for_sort(va, vb);
                             if cmp != Ordering::Equal {
                                 return if oe.options.asc.unwrap_or(true) {
@@ -1271,34 +1295,45 @@ impl Executor {
                                 };
                             }
                         }
-                        Ordering::Equal
-                    });
+                        a.0.cmp(&b.0)
+                    };
+
+                    if let Some(limit) = set_limit {
+                        let window = if limit == 0 {
+                            0
+                        } else {
+                            set_offset.saturating_add(limit)
+                        };
+                        if window == 0 {
+                            combined.clear();
+                        } else if window < combined.len() {
+                            let mut indexed_rows: Vec<(usize, Vec<Value>)> =
+                                combined.into_iter().enumerate().collect();
+                            let _ = indexed_rows.select_nth_unstable_by(window, compare_combined);
+                            indexed_rows.truncate(window);
+                            indexed_rows.sort_by(compare_combined);
+                            combined = indexed_rows.into_iter().map(|(_, row)| row).collect();
+                        } else {
+                            let mut indexed_rows: Vec<(usize, Vec<Value>)> =
+                                combined.into_iter().enumerate().collect();
+                            indexed_rows.sort_by(compare_combined);
+                            combined = indexed_rows.into_iter().map(|(_, row)| row).collect();
+                        }
+                    } else {
+                        let mut indexed_rows: Vec<(usize, Vec<Value>)> =
+                            combined.into_iter().enumerate().collect();
+                        indexed_rows.sort_by(compare_combined);
+                        combined = indexed_rows.into_iter().map(|(_, row)| row).collect();
+                    }
                 }
             }
 
             // Apply LIMIT/OFFSET from the outer query
-            if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
-                let off = offset
-                    .as_ref()
-                    .and_then(|os| match &os.value {
-                        Expr::Value(sqlparser::ast::ValueWithSpan {
-                            value: sqlparser::ast::Value::Number(n, _),
-                            ..
-                        }) => n.parse::<usize>().ok(),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let lim = limit.as_ref().and_then(|e| match e {
-                    Expr::Value(sqlparser::ast::ValueWithSpan {
-                        value: sqlparser::ast::Value::Number(n, _),
-                        ..
-                    }) => n.parse::<usize>().ok(),
-                    _ => None,
-                });
-                combined = if let Some(l) = lim {
-                    combined.into_iter().skip(off).take(l).collect()
+            if query.limit_clause.is_some() {
+                combined = if let Some(limit) = set_limit {
+                    combined.into_iter().skip(set_offset).take(limit).collect()
                 } else {
-                    combined.into_iter().skip(off).collect()
+                    combined.into_iter().skip(set_offset).collect()
                 };
             }
 
