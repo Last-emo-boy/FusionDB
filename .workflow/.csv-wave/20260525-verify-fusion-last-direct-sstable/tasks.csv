@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-069,"Verify Fusion last direct SSTable traversal",completed,"src/storage/fusion.rs"

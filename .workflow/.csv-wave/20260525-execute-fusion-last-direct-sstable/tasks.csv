@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-069,"Directly traverse overlapping SSTables in Fusion last",completed,"src/storage/fusion.rs"

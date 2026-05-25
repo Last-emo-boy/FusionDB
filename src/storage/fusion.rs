@@ -1398,8 +1398,6 @@ impl Transaction for FusionTransaction {
 
         let sstables = self.storage.sstables.read().unwrap().clone();
 
-        // Filter SSTables that overlap with range
-        let mut relevant_ssts = Vec::new();
         for sst in sstables.iter() {
             // Check if SSTable overlaps with [start, end)
             // SST range: [first_key, last_key] (Internal Keys)
@@ -1423,27 +1421,25 @@ impl Transaction for FusionTransaction {
             // We should process SSTables that have the largest `last_key` first?
             // Not necessarily, `last_key` is just the bound.
 
-            // We just collect all candidates.
+            // We process overlapping candidates directly.
             let sst_min = &sst.meta.first_key;
             let sst_max = &sst.meta.last_key;
 
-            if sst_max.as_slice() >= start_ik.as_slice() && sst_min.as_slice() < end_ik.as_slice() {
-                relevant_ssts.push(sst.clone());
+            if sst_max.as_slice() < start_ik.as_slice() || sst_min.as_slice() >= end_ik.as_slice() {
+                continue;
             }
-        }
 
-        // For each relevant SSTable, we want to find the largest key < end.
-        // Optimization: If `sst.last_key` < end, then `sst.last_key` is a candidate!
-        // But `sst.last_key` might be a tombstone or older version.
-        // We still need to check validity.
-        // BUT, we can iterate *that specific block* where `last_key` resides.
+            // For each relevant SSTable, we want to find the largest key < end.
+            // Optimization: If `sst.last_key` < end, then `sst.last_key` is a candidate!
+            // But `sst.last_key` might be a tombstone or older version.
+            // We still need to check validity.
+            // BUT, we can iterate *that specific block* where `last_key` resides.
 
-        // To be safe and correct without full reverse iterator:
-        // We iterate RELEVANT SSTables.
-        // But we can optimize:
-        // If we find a key `K` in MemTable, we only care about SSTables where `last_key > K`.
+            // To be safe and correct without full reverse iterator:
+            // We iterate relevant SSTables.
+            // But we can optimize:
+            // If we find a key `K` in MemTable, we only care about SSTables where `last_key > K`.
 
-        for sst in relevant_ssts {
             // Read the block containing the largest key <= end_ik
             // We use `index` to find the offset.
             // `index` maps StartKey -> Offset.

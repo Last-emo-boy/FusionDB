@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-069,completed,"Removed the temporary relevant_ssts vector from Fusion last() and processed overlapping SSTables directly.",".workflow/.csv-wave/20260525-verify-fusion-last-direct-sstable/verification.json",""

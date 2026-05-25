@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-069",
+  "title": "Directly traverse overlapping SSTables in Fusion last",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve FusionTransaction::last visible-key semantics"
+  ],
+  "rationale": "FusionTransaction::last first collected overlapping SSTables into a temporary Vec, cloning each Arc<SsTable>, and then iterated that list. The SSTable list is already snapshotted before the loop, so overlap checks can skip non-matching SSTables and process matching ones directly.",
+  "steps": [
+    "Remove the relevant_ssts temporary Vec",
+    "Invert the overlap predicate into a continue guard",
+    "Process overlapping SSTables directly from the sstables snapshot",
+    "Run Fusion storage and SQL MIN/MAX regressions"
+  ],
+  "expected_impact": "Avoids per-call temporary SSTable list allocation and Arc cloning in last()/MAX range queries."
+}
