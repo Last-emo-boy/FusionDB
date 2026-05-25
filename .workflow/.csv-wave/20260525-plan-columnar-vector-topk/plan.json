@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-075",
+  "title": "Optimize columnar vector top-k search",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/storage/columnar.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve ascending distance result ordering"
+  ],
+  "rationale": "ColumnarVectorStore::search computed every distance and fully sorted all rows before returning the requested limit, despite the existing comment noting partial sort would be better. A top-k partition reduces sorting work for small limits while preserving returned result order.",
+  "steps": [
+    "Add a zero-limit fast path",
+    "Use select_nth_unstable_by to keep only the nearest limit candidates",
+    "Sort only the retained top-k candidate window",
+    "Add unit coverage for ordering and zero-limit behavior"
+  ],
+  "expected_impact": "Reduces vector search sorting work from full result ordering to bounded top-k ordering when callers request small limits."
+}

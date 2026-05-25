@@ -1,0 +1,2 @@
+id,status,findings,files_modified,tests_passed,error
+"TASK-075","completed","Columnar vector search now avoids sorting all rows when limit is smaller than the result set, while still returning top-k rows ordered by distance.","src/storage/columnar.rs","passed",""
