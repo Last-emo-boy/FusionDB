@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-082-plan,completed,"Planned indexed join probe cache hit optimization for src/execution/scan.rs",".workflow/.csv-wave/20260526-plan-join-probe-cache-hit/plan.json"
+TASK-082-execute,completed,"Added append_join_probe_matches helper and split cache hit/miss handling so cached probe keys use a single HashMap::get while misses fetch and cache candidates after processing.","src/execution/scan.rs"

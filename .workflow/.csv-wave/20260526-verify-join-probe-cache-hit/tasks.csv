@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-082-verify,$maestro-verify "verify indexed join probe cache hit path",join-probe-cache-hit

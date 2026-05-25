@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-082",
+  "title": "Optimize indexed join probe cache hit path",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve indexed join probe, residual predicate, LIMIT, and left join semantics"
+  ],
+  "rationale": "The indexed join probe loop used a HashMap contains/get pattern for cached probe keys. Splitting hit and miss paths lets repeated probe keys reuse the result of a single HashMap::get and keeps async fetch work limited to misses.",
+  "steps": [
+    "Extract shared join probe candidate materialization into a synchronous helper",
+    "Use a single HashMap::get on cache hits",
+    "Fetch, filter, process, and then cache candidates on misses",
+    "Verify indexed join probe and left join behavior"
+  ],
+  "expected_impact": "Reduces hash table work for repeated indexed join probe keys and removes repeated joined-row construction code in the probe path."
+}

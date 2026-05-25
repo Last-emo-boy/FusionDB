@@ -527,6 +527,51 @@ impl Executor {
                 .all(|(left_index, right_index)| left_row[*left_index] == right_row[*right_index])
     }
 
+    fn append_join_probe_matches(
+        &self,
+        left_row: &[Value],
+        candidates: &[Vec<Value>],
+        left_key_indices: &[usize],
+        right_key_indices: &[usize],
+        residual_expr: &Option<Expr>,
+        new_schema: &TableSchema,
+        params: &[Value],
+        is_left_outer: bool,
+        right_width: usize,
+        limit: Option<usize>,
+        probed_rows: &mut Vec<Vec<Value>>,
+    ) -> Result<bool> {
+        let mut matched = false;
+        for right_row in candidates {
+            if !Self::row_keys_equal(left_row, left_key_indices, right_row, right_key_indices) {
+                continue;
+            }
+
+            let mut joined_row = Vec::with_capacity(left_row.len() + right_row.len());
+            joined_row.extend_from_slice(left_row);
+            joined_row.extend_from_slice(right_row);
+            if let Some(residual) = residual_expr {
+                if !self.evaluate_expr(residual, &joined_row, new_schema, params)? {
+                    continue;
+                }
+            }
+            matched = true;
+            probed_rows.push(joined_row);
+            if limit.is_some_and(|value| probed_rows.len() >= value) {
+                return Ok(true);
+            }
+        }
+
+        if !matched && is_left_outer {
+            let mut joined_row = Vec::with_capacity(left_row.len() + right_width);
+            joined_row.extend_from_slice(left_row);
+            joined_row.extend(vec![Value::Null; right_width]);
+            probed_rows.push(joined_row);
+        }
+
+        Ok(limit.is_some_and(|value| probed_rows.len() >= value))
+    }
+
     fn projection_matches_schema(
         &self,
         projection: &Option<Vec<String>>,
@@ -981,66 +1026,57 @@ impl Executor {
 
                             for left_row in &left_rows {
                                 let probe_key = left_row[probe_left_idx].clone();
-                                if !probe_cache.contains_key(&probe_key) {
-                                    let mut candidates = self
-                                        .fetch_rows_by_join_key(
-                                            &right_table_name,
-                                            probe_schema,
-                                            probe_right_idx,
-                                            &probe_key,
-                                            txn,
-                                        )
-                                        .await?;
-                                    if let Some(selection) = &right_selection {
-                                        candidates = self.filter_rows_with_expr(
-                                            candidates,
-                                            probe_schema,
-                                            selection,
-                                            params,
-                                        )?;
-                                    }
-                                    probe_cache.insert(probe_key.clone(), candidates);
-                                }
-
-                                let candidates = probe_cache.get(&probe_key).unwrap();
-                                let mut matched = false;
-                                for right_row in candidates {
-                                    if !Self::row_keys_equal(
+                                if let Some(candidates) = probe_cache.get(&probe_key) {
+                                    if self.append_join_probe_matches(
                                         left_row,
+                                        candidates,
                                         &left_key_indices,
-                                        right_row,
                                         &right_key_indices,
-                                    ) {
-                                        continue;
-                                    }
-
-                                    let mut joined_row = left_row.clone();
-                                    joined_row.extend(right_row.clone());
-                                    if let Some(residual) = &residual_expr {
-                                        if !self.evaluate_expr(
-                                            residual,
-                                            &joined_row,
-                                            &new_schema,
-                                            params,
-                                        )? {
-                                            continue;
-                                        }
-                                    }
-                                    matched = true;
-                                    probed_rows.push(joined_row);
-                                    if limit.is_some_and(|value| probed_rows.len() >= value) {
+                                        &residual_expr,
+                                        &new_schema,
+                                        params,
+                                        is_left_outer,
+                                        right_schema.columns.len(),
+                                        limit,
+                                        &mut probed_rows,
+                                    )? {
                                         break;
                                     }
+                                    continue;
                                 }
 
-                                if !matched && is_left_outer {
-                                    let mut joined_row = left_row.clone();
-                                    joined_row
-                                        .extend(vec![Value::Null; right_schema.columns.len()]);
-                                    probed_rows.push(joined_row);
+                                let mut candidates = self
+                                    .fetch_rows_by_join_key(
+                                        &right_table_name,
+                                        probe_schema,
+                                        probe_right_idx,
+                                        &probe_key,
+                                        txn,
+                                    )
+                                    .await?;
+                                if let Some(selection) = &right_selection {
+                                    candidates = self.filter_rows_with_expr(
+                                        candidates,
+                                        probe_schema,
+                                        selection,
+                                        params,
+                                    )?;
                                 }
-
-                                if limit.is_some_and(|value| probed_rows.len() >= value) {
+                                let reached_limit = self.append_join_probe_matches(
+                                    left_row,
+                                    &candidates,
+                                    &left_key_indices,
+                                    &right_key_indices,
+                                    &residual_expr,
+                                    &new_schema,
+                                    params,
+                                    is_left_outer,
+                                    right_schema.columns.len(),
+                                    limit,
+                                    &mut probed_rows,
+                                )?;
+                                probe_cache.insert(probe_key, candidates);
+                                if reached_limit {
                                     break;
                                 }
                             }
