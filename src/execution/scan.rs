@@ -195,6 +195,26 @@ impl Executor {
         }
     }
 
+    fn conjunctive_predicate_count(expr: &Expr) -> usize {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } = expr
+        {
+            Self::conjunctive_predicate_count(left)
+                .saturating_add(Self::conjunctive_predicate_count(right))
+        } else {
+            1
+        }
+    }
+
+    fn collect_conjunctive_predicates(expr: &Expr) -> Vec<Expr> {
+        let mut predicates = Vec::with_capacity(Self::conjunctive_predicate_count(expr));
+        Self::split_conjunctive_predicates(expr, &mut predicates);
+        predicates
+    }
+
     fn combine_predicates(predicates: Vec<Expr>) -> Option<Expr> {
         let mut iter = predicates.into_iter();
         let first = iter.next()?;
@@ -455,8 +475,7 @@ impl Executor {
         left_schema: &TableSchema,
         right_schema: &TableSchema,
     ) -> Option<(Vec<usize>, Vec<usize>, Option<Expr>)> {
-        let mut predicates = Vec::new();
-        Self::split_conjunctive_predicates(expr, &mut predicates);
+        let predicates = Self::collect_conjunctive_predicates(expr);
 
         let predicate_count = predicates.len();
         let mut left_key_indices = Vec::with_capacity(predicate_count);
@@ -938,11 +957,12 @@ impl Executor {
     ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
         let right_relation_names = self.relation_names(relation);
         let mut left_rows = left_rows;
-        let mut join_predicates = Vec::new();
-
-        if let Some(on_expr) = join_operator.and_then(Self::join_constraint_expr) {
-            Self::split_conjunctive_predicates(on_expr, &mut join_predicates);
-        }
+        let mut join_predicates =
+            if let Some(on_expr) = join_operator.and_then(Self::join_constraint_expr) {
+                Self::collect_conjunctive_predicates(on_expr)
+            } else {
+                Vec::new()
+            };
 
         if let Some(left_local) = self.take_schema_predicate(&mut join_predicates, &left_schema) {
             left_rows = self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
@@ -1250,11 +1270,12 @@ impl Executor {
         limit: Option<usize>,
     ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
         let first = &from[0];
-        let mut pending_predicates = Vec::new();
         let join_column_refs = self.collect_join_column_references(from);
-        if let Some(expr) = selection {
-            Self::split_conjunctive_predicates(expr, &mut pending_predicates);
-        }
+        let mut pending_predicates = if let Some(expr) = selection {
+            Self::collect_conjunctive_predicates(expr)
+        } else {
+            Vec::new()
+        };
 
         let first_relation_names = self.relation_names(&first.relation);
         let first_selection =

@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-120,"Reserve conjunctive predicate Vec capacity from AND leaf count","src/execution/scan.rs",completed

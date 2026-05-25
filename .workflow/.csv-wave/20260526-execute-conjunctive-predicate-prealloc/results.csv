@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+TASK-120,completed,"Added preallocated conjunctive predicate collection for WHERE and JOIN predicate splitting.","src/execution/scan.rs"
