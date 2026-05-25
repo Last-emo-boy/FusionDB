@@ -955,7 +955,8 @@ impl FusionTransaction {
         let start_ik = FusionStorage::encode_key(start, u64::MAX);
 
         // 1. Snapshot MemTables (Cheap Clone)
-        let mut mem_tables = Vec::new();
+        let mut mem_tables =
+            Vec::with_capacity(self.storage.immutable_memtables.read().unwrap().len() + 1);
         {
             let active = self.storage.active_memtable.read().unwrap();
             mem_tables.push(active.clone());
@@ -1006,7 +1007,7 @@ impl FusionTransaction {
             fbtree_holders.push(guard.clone());
         }
 
-        let mut mem_iters: Vec<BoxedIter> = Vec::new();
+        let mut mem_iters: Vec<BoxedIter> = Vec::with_capacity(mem_tables.len());
 
         // 2. Create Iterators
         for (i, mem) in mem_tables.iter().enumerate() {

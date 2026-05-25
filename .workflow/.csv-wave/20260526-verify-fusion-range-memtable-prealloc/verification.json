@@ -1,0 +1,27 @@
+{
+  "task_id": "TASK-115",
+  "status": "passed",
+  "verified_at": "2026-05-26T06:16:48+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --lib fusion_count_prefix_matches_scan_prefix_after_overwrite_delete_and_write_buffer -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --lib fusion_first_uses_visible_range_with_write_buffer_shadowing -- --nocapture",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Validation used CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0.",
+    "The covered tests exercise Fusion visible range merge behavior for scan_prefix, count_prefix, first, and write-buffer shadowing."
+  ]
+}

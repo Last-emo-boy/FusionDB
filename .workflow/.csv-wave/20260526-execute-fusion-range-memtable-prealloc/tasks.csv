@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-115,Preallocate Fusion visible range memtable containers,completed,src/storage/fusion.rs

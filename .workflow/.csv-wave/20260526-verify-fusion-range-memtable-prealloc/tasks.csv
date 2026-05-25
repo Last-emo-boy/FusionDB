@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-115,Verify Fusion visible range behavior,completed,.workflow/.csv-wave/20260526-verify-fusion-range-memtable-prealloc/verification.json

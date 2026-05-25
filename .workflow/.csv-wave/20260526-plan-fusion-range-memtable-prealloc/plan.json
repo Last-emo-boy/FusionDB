@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-115",
+  "created_at": "2026-05-26T06:13:08+08:00",
+  "phase": "database-core-performance",
+  "target": "src/storage/fusion.rs",
+  "goal": "Avoid avoidable vector growth while preparing Fusion visible range memtable sources.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to MVCC visible range merge behavior"
+  ],
+  "implementation": [
+    "Preallocate memtable snapshot storage from immutable memtable count plus the active memtable.",
+    "Preallocate memtable iterator storage from the collected memtable count."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --lib fusion_count_prefix_matches_scan_prefix_after_overwrite_delete_and_write_buffer -- --nocapture",
+    "cargo test --lib fusion_first_uses_visible_range_with_write_buffer_shadowing -- --nocapture"
+  ]
+}
