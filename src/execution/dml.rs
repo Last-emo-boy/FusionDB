@@ -949,8 +949,8 @@ impl Executor {
         schema: &TableSchema,
     ) -> Result<QueryResult> {
         use sqlparser::ast::SelectItem;
-        let mut col_names = Vec::new();
-        let mut result_rows = Vec::new();
+        let mut col_names = Vec::with_capacity(ret_items.len());
+        let mut result_rows = Vec::with_capacity(rows.len());
 
         // Build column names from RETURNING items
         let is_wildcard = ret_items
@@ -968,7 +968,7 @@ impl Executor {
                 }
             }
             for row in rows {
-                let mut result_row = Vec::new();
+                let mut result_row = Vec::with_capacity(ret_items.len());
                 for item in ret_items {
                     let expr = match item {
                         SelectItem::UnnamedExpr(e) => e,

@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-100",
+  "title": "Optimize RETURNING result preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/dml.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve INSERT, UPDATE, and DELETE RETURNING result semantics"
+  ],
+  "rationale": "The DML RETURNING result builder knows the RETURNING item count and affected row count before materializing the result. Preallocating column names, result rows, and per-row projection vectors reduces allocation growth during RETURNING-heavy write workloads.",
+  "steps": [
+    "Preallocate RETURNING column names from RETURNING item count",
+    "Preallocate returned rows from affected row count",
+    "Preallocate each projected RETURNING row from RETURNING item count",
+    "Verify INSERT, UPDATE, and DELETE RETURNING behavior"
+  ],
+  "expected_impact": "Reduces allocation churn in DML RETURNING result construction without changing returned columns or values."
+}

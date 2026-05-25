@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-100-verify,"$maestro-verify verify INSERT UPDATE DELETE RETURNING behavior","returning verification"
