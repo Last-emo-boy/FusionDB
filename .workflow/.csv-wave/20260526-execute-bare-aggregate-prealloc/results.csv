@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-105,completed,Changed bare aggregate collection to preallocate by SELECT projection count,src/execution/query.rs,

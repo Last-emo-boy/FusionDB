@@ -1036,7 +1036,8 @@ impl Executor {
             // Detect bare aggregates (e.g. SELECT COUNT(DISTINCT x), SUM(y) FROM t — no GROUP BY)
             let is_group_by_empty = matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty());
             if is_group_by_empty && !is_wildcard {
-                let mut bare_aggs: Vec<(Expr, String)> = Vec::new();
+                let mut bare_aggs: Vec<(Expr, String)> =
+                    Vec::with_capacity(select.projection.len());
                 for item in &select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {

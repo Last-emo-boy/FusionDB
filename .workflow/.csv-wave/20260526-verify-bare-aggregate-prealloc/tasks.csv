@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-105,Verify bare aggregate behavior,completed,.workflow/.csv-wave/20260526-verify-bare-aggregate-prealloc/verification.json
