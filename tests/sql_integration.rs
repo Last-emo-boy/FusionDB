@@ -1866,6 +1866,87 @@ async fn test_fts_match_against_multi_token_intersects_index_hits() {
 }
 
 #[tokio::test]
+async fn test_parameter_placeholder_select_filter() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE placeholder_filter (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO placeholder_filter VALUES (1, 'Alice'), (2, 'Bob')",
+    )
+    .await;
+
+    let stmts = executor
+        .prepare("SELECT name FROM placeholder_filter WHERE id = $1")
+        .unwrap();
+    let mut txn = storage.begin_transaction().await.unwrap();
+    let result = executor
+        .execute_in_transaction_with_params(&stmts[0], txn.as_mut(), &[Value::Integer(2)])
+        .await
+        .unwrap();
+
+    if let QueryResult::Select { columns, rows } = result {
+        assert_eq!(columns, vec!["name"]);
+        assert_eq!(rows, vec![vec![Value::String("Bob".to_string())]]);
+    } else {
+        panic!("Expected Select result from parameterized query");
+    }
+
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_parameter_placeholder_match_against() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE placeholder_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO placeholder_docs VALUES (1, 'quick brown fox'), (2, 'quick blue hare'), (3, 'slow brown fox')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_placeholder_docs_body ON placeholder_docs (body) USING FTS",
+    )
+    .await;
+
+    let stmts = executor
+        .prepare("SELECT id FROM placeholder_docs WHERE MATCH(body) AGAINST($1)")
+        .unwrap();
+    let mut txn = storage.begin_transaction().await.unwrap();
+    let result = executor
+        .execute_in_transaction_with_params(
+            &stmts[0],
+            txn.as_mut(),
+            &[Value::String("quick fox".to_string())],
+        )
+        .await
+        .unwrap();
+
+    if let QueryResult::Select { columns, rows } = result {
+        assert_eq!(columns, vec!["id"]);
+        assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+    } else {
+        panic!("Expected Select result from parameterized MATCH query");
+    }
+
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_create_index_reuses_row_cache_for_backfill() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

@@ -11,6 +11,14 @@ use std::collections::HashSet;
 use super::{Executor, QueryResult};
 
 impl Executor {
+    pub(crate) fn placeholder_index(placeholder: &str) -> usize {
+        placeholder
+            .strip_prefix('$')
+            .unwrap_or(placeholder)
+            .parse::<usize>()
+            .unwrap_or(0)
+    }
+
     fn compound_identifier_name(idents: &[sqlparser::ast::Ident]) -> String {
         let capacity = idents.iter().map(|ident| ident.value.len()).sum::<usize>()
             + idents.len().saturating_sub(1);
@@ -82,7 +90,7 @@ impl Executor {
                 let search_terms = if let SqlValue::SingleQuotedString(s) = match_value {
                     Self::tokenize(s)
                 } else if let SqlValue::Placeholder(p) = match_value {
-                    let idx = p.replace("$", "").parse::<usize>().unwrap_or(0);
+                    let idx = Self::placeholder_index(p);
                     if idx > 0 && idx <= params.len() {
                         if let Value::String(s) = &params[idx - 1] {
                             Self::tokenize(s)
@@ -308,7 +316,7 @@ impl Executor {
             }
             Expr::Value(v) => {
                 if let SqlValue::Placeholder(p) = &v.value {
-                    let idx = p.replace("$", "").parse::<usize>().unwrap_or(0);
+                    let idx = Self::placeholder_index(p);
                     if idx > 0 && idx <= params.len() {
                         Ok(params[idx - 1].clone())
                     } else {
@@ -1576,6 +1584,13 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::Executor;
+
+    #[test]
+    fn placeholder_index_parses_dollar_parameters() {
+        assert_eq!(Executor::placeholder_index("$1"), 1);
+        assert_eq!(Executor::placeholder_index("2"), 2);
+        assert_eq!(Executor::placeholder_index("$bad"), 0);
+    }
 
     #[test]
     fn like_match_fast_percent_patterns() {

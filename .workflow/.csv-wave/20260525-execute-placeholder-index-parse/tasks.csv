@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-071,"Optimize placeholder index parsing",completed,"src/execution/expr.rs;src/execution/scan.rs;tests/sql_integration.rs"

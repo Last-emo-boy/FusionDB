@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-071,completed,"Replaced placeholder replace allocation with shared strip_prefix parsing and added parameterized SQL regressions.",".workflow/.csv-wave/20260525-verify-placeholder-index-parse/verification.json",""

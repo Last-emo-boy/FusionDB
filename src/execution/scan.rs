@@ -1393,7 +1393,7 @@ impl Executor {
                                 {
                                     Value::String(s.clone())
                                 } else if let SqlValue::Placeholder(p) = match_value {
-                                    let idx = p.replace("$", "").parse::<usize>().unwrap_or(0);
+                                    let idx = Self::placeholder_index(p);
                                     if idx > 0 && idx <= params.len() {
                                         params[idx - 1].clone()
                                     } else {

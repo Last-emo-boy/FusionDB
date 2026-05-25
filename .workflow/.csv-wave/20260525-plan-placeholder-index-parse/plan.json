@@ -1,0 +1,23 @@
+{
+  "task_id": "TASK-071",
+  "title": "Optimize placeholder index parsing",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/expr.rs",
+    "src/execution/scan.rs",
+    "tests/sql_integration.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve parameter placeholder behavior"
+  ],
+  "rationale": "Execution paths parsed placeholders such as $1 with p.replace(\"$\", \"\").parse(), allocating a temporary String for each parameter evaluation. A shared strip_prefix-based helper parses the index without allocation and keeps existing invalid-placeholder behavior.",
+  "steps": [
+    "Add Executor::placeholder_index using strip_prefix('$')",
+    "Use the helper in expression evaluation and FTS indexed MATCH scanning",
+    "Add a focused unit test for placeholder parsing",
+    "Add SQL integration coverage for WHERE id = $1 and MATCH(body) AGAINST($1)"
+  ],
+  "expected_impact": "Avoids temporary String allocation in parameterized expression and FTS query evaluation paths."
+}
