@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-113",
+  "created_at": "2026-05-26T05:52:35+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/scan.rs",
+  "goal": "Avoid avoidable vector growth while constructing JOIN output rows.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to hash JOIN, nested-loop JOIN, or LEFT JOIN output rows"
+  ],
+  "implementation": [
+    "Precompute final JOIN row width once from left and right schema widths.",
+    "Build hash JOIN and unmatched LEFT JOIN rows with Vec::with_capacity(row_width)."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_inner_join -- --nocapture",
+    "cargo test --test sql_integration test_left_join -- --nocapture"
+  ]
+}

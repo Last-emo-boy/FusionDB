@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-113,Preallocate JOIN output rows,completed,src/execution/scan.rs

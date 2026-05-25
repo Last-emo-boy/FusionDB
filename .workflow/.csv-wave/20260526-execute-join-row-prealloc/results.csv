@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-113,completed,Changed JOIN output row construction to preallocate by final joined row width,src/execution/scan.rs,

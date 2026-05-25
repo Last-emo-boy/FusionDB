@@ -1094,6 +1094,7 @@ impl Executor {
             }
         }
 
+        let row_width = left_schema.columns.len() + right_schema.columns.len();
         let mut new_rows = Vec::new();
         let mut hash_join_executed = false;
 
@@ -1122,8 +1123,9 @@ impl Executor {
                             let mut matched = false;
                             if let Some(matches) = hash_map.get(&key) {
                                 for right_row in matches {
-                                    let mut joined_row = left_row.clone();
-                                    joined_row.extend((*right_row).clone());
+                                    let mut joined_row = Vec::with_capacity(row_width);
+                                    joined_row.extend_from_slice(left_row);
+                                    joined_row.extend_from_slice(right_row);
                                     if let Some(residual) = &residual_expr {
                                         if !self.evaluate_expr(
                                             residual,
@@ -1143,8 +1145,11 @@ impl Executor {
                             }
 
                             if !matched && is_left_outer {
-                                let mut joined_row = left_row.clone();
-                                joined_row.extend(vec![Value::Null; right_schema.columns.len()]);
+                                let mut joined_row = Vec::with_capacity(row_width);
+                                joined_row.extend_from_slice(left_row);
+                                for _ in 0..right_schema.columns.len() {
+                                    joined_row.push(Value::Null);
+                                }
                                 new_rows.push(joined_row);
                             }
 
@@ -1164,8 +1169,9 @@ impl Executor {
                             let key = Self::row_key(right_row, &right_key_indices);
                             if let Some(matches) = hash_map.get(&key) {
                                 for left_row in matches {
-                                    let mut joined_row = (*left_row).clone();
-                                    joined_row.extend(right_row.clone());
+                                    let mut joined_row = Vec::with_capacity(row_width);
+                                    joined_row.extend_from_slice(left_row);
+                                    joined_row.extend_from_slice(right_row);
                                     if let Some(residual) = &residual_expr {
                                         if !self.evaluate_expr(
                                             residual,
@@ -1193,7 +1199,6 @@ impl Executor {
         }
 
         if !hash_join_executed {
-            let row_width = left_schema.columns.len() + right_schema.columns.len();
             for left_row in &left_rows {
                 let mut matched = false;
                 for right_row in &right_rows {
@@ -1217,8 +1222,11 @@ impl Executor {
                 }
 
                 if !matched && is_left_outer {
-                    let mut joined_row = left_row.clone();
-                    joined_row.extend(vec![Value::Null; right_schema.columns.len()]);
+                    let mut joined_row = Vec::with_capacity(row_width);
+                    joined_row.extend_from_slice(left_row);
+                    for _ in 0..right_schema.columns.len() {
+                        joined_row.push(Value::Null);
+                    }
                     new_rows.push(joined_row);
                 }
 

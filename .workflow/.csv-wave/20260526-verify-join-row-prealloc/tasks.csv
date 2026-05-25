@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-113,Verify JOIN row construction behavior,completed,.workflow/.csv-wave/20260526-verify-join-row-prealloc/verification.json
