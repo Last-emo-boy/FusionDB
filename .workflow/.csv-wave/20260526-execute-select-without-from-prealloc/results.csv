@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-104,completed,Changed no-FROM SELECT result containers to preallocate by projection count,src/execution/query.rs,

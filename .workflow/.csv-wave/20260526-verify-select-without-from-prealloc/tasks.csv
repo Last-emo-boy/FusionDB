@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-104,Verify SELECT without FROM expression behavior,completed,.workflow/.csv-wave/20260526-verify-select-without-from-prealloc/verification.json

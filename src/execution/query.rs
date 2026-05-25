@@ -754,8 +754,8 @@ impl Executor {
                 // No FROM clause: evaluate expressions directly (e.g., SELECT 1, SELECT 'hello')
                 let empty_schema = TableSchema::new("".to_string(), vec![]);
                 let empty_row: Vec<Value> = vec![];
-                let mut col_names = Vec::new();
-                let mut result_row = Vec::new();
+                let mut col_names = Vec::with_capacity(select.projection.len());
+                let mut result_row = Vec::with_capacity(select.projection.len());
                 for item in &select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {

@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-104,Preallocate SELECT without FROM output vectors,completed,src/execution/query.rs
