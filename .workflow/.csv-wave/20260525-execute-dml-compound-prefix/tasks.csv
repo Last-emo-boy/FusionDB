@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-057,"Optimize DML compound primary-key prefix handling",completed,"src/execution/dml.rs"

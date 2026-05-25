@@ -1,0 +1,30 @@
+{
+  "task_id": "TASK-057",
+  "status": "passed",
+  "verified_at": "2026-05-25T20:09:31+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_update_qualified_primary_key_uses_point_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_delete_qualified_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_update_commuted_primary_key_uses_point_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Validation used CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0."
+  ]
+}

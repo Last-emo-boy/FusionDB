@@ -1,0 +1,6 @@
+id,check,status
+fmt,"cargo fmt --check",passed
+update_qualified,"cargo test --test sql_integration test_update_qualified_primary_key_uses_point_lookup -- --nocapture",passed
+delete_qualified,"cargo test --test sql_integration test_delete_qualified_primary_key_without_secondary_index_skips_row_decode -- --nocapture",passed
+update_commuted,"cargo test --test sql_integration test_update_commuted_primary_key_uses_point_lookup -- --nocapture",passed
+check_lib,"cargo check --lib",passed

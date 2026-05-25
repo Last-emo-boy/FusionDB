@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-057,completed,"Replaced DML qualifier Vec join with direct String construction and reused the matched primary-key column name.",".workflow/.csv-wave/20260525-verify-dml-compound-prefix/verification.json",""

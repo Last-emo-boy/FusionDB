@@ -31,21 +31,18 @@ impl Executor {
             return None;
         }
 
-        let (pk_expr, value_expr) = if self
-            .primary_key_column_name(left.as_ref(), schema, allowed_qualifiers)
-            .is_some()
+        let (col_name, value_expr) = if let Some(col_name) =
+            self.primary_key_column_name(left.as_ref(), schema, allowed_qualifiers)
         {
-            (left.as_ref(), right.as_ref())
-        } else if self
-            .primary_key_column_name(right.as_ref(), schema, allowed_qualifiers)
-            .is_some()
+            (col_name, right.as_ref())
+        } else if let Some(col_name) =
+            self.primary_key_column_name(right.as_ref(), schema, allowed_qualifiers)
         {
-            (right.as_ref(), left.as_ref())
+            (col_name, left.as_ref())
         } else {
             return None;
         };
 
-        let col_name = self.primary_key_column_name(pk_expr, schema, allowed_qualifiers)?;
         let mut value_columns = HashSet::new();
         self.extract_columns_from_expr(value_expr, &mut value_columns);
         if !value_columns.is_empty() {
@@ -75,6 +72,26 @@ impl Executor {
         }
     }
 
+    fn dml_compound_identifier_prefix(idents: &[sqlparser::ast::Ident]) -> String {
+        let prefix_len = idents.len().saturating_sub(1);
+        let capacity = idents
+            .iter()
+            .take(prefix_len)
+            .map(|ident| ident.value.len())
+            .sum::<usize>()
+            + prefix_len.saturating_sub(1);
+        let mut qualifier = String::with_capacity(capacity);
+
+        for (index, ident) in idents.iter().take(prefix_len).enumerate() {
+            if index > 0 {
+                qualifier.push('.');
+            }
+            qualifier.push_str(&ident.value);
+        }
+
+        qualifier
+    }
+
     fn primary_key_column_name<'a>(
         &self,
         expr: &'a Expr,
@@ -88,11 +105,7 @@ impl Executor {
                     return None;
                 }
 
-                let qualifier = idents[..idents.len() - 1]
-                    .iter()
-                    .map(|ident| ident.value.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".");
+                let qualifier = Self::dml_compound_identifier_prefix(idents);
 
                 if !allowed_qualifiers
                     .iter()

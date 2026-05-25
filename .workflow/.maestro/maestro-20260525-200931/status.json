@@ -1,0 +1,74 @@
+{
+  "session_id": "maestro-20260525-200931",
+  "source": "maestro",
+  "created_at": "2026-05-25T20:09:31+08:00",
+  "updated_at": "2026-05-25T20:09:31+08:00",
+  "intent": "TASK-057 optimize database core DML compound primary-key prefix handling",
+  "task_type": "performance",
+  "chain_name": "database-core-performance",
+  "phase": "database-core-performance",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "auto",
+  "cli_tool": "codex",
+  "lifecycle_position": "continue-iteration",
+  "target": "src/execution/dml.rs",
+  "context": {
+    "issue_id": null,
+    "milestone_num": null,
+    "spec_session_id": null,
+    "scratch_dir": null,
+    "plan_dir": ".workflow/.csv-wave/20260525-plan-dml-compound-prefix",
+    "analysis_dir": null,
+    "brainstorm_dir": null
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260525-execute-dml-compound-prefix/results.csv"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260525-verify-dml-compound-prefix/verification.json"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "plan DML compound identifier prefix optimization",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T20:09:31+08:00",
+      "completed_at": "2026-05-25T20:09:31+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "implement DML primary-key lookup allocation cleanup",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T20:09:31+08:00",
+      "completed_at": "2026-05-25T20:09:31+08:00",
+      "error": null,
+      "wave_n": 1
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "verify DML qualified and commuted primary-key point lookup behavior",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-25T20:09:31+08:00",
+      "completed_at": "2026-05-25T20:09:31+08:00",
+      "error": null,
+      "wave_n": 2
+    }
+  ],
+  "current_step": 2,
+  "status": "completed"
+}

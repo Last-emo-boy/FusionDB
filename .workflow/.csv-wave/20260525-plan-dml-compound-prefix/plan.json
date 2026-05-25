@@ -1,0 +1,20 @@
+{
+  "task_id": "TASK-057",
+  "title": "Optimize DML compound primary-key prefix handling",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/dml.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve qualified and commuted primary-key point lookup semantics"
+  ],
+  "rationale": "primary_key_column_name allocated a temporary Vec before joining qualifier parts and primary_key_row_id_from_eq_selection re-ran the same primary-key detection after a match.",
+  "steps": [
+    "Replace Vec plus join with direct preallocated String construction for compound identifier qualifiers",
+    "Carry the matched primary-key column name forward instead of resolving the same expression again",
+    "Run focused DML primary-key lookup regression tests and cargo check"
+  ],
+  "expected_impact": "Reduces small allocations and duplicate schema/qualifier work in DML primary-key point lookup detection."
+}
