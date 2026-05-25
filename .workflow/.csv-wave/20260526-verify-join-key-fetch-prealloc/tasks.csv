@@ -1,0 +1,2 @@
+id,skill_call,topic
+TASK-085-verify,$maestro-verify "verify indexed join key fetch preallocation",join-key-fetch-prealloc

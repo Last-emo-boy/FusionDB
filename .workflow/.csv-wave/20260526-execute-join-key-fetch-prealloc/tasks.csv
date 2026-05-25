@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-085-plan,$maestro-plan "plan indexed join key fetch preallocation optimization",join-key-fetch-prealloc
+TASK-085-execute,$maestro-execute "preallocate join key fetch row id set and rows vector from index entry count",join-key-fetch-prealloc

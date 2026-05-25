@@ -1,0 +1,20 @@
+{
+  "task_id": "TASK-085",
+  "title": "Optimize indexed join key fetch preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve indexed join probe semantics"
+  ],
+  "rationale": "fetch_rows_by_join_key already has the scanned index entry count before deduplicating row ids and fetching rows. Using that count to preallocate the HashSet and result Vec reduces rehash and reallocation work for indexed join probes.",
+  "steps": [
+    "Use index_entries.len() to preallocate seen_row_ids",
+    "Use index_entries.len() to preallocate fetched rows",
+    "Verify indexed join probe and baseline inner join behavior"
+  ],
+  "expected_impact": "Reduces allocation churn in indexed join probe fetches, especially when an indexed join key has multiple matching index entries."
+}

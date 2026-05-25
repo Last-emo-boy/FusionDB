@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-085-plan,completed,"Planned indexed join key fetch preallocation optimization for src/execution/scan.rs",".workflow/.csv-wave/20260526-plan-join-key-fetch-prealloc/plan.json"
+TASK-085-execute,completed,"Changed fetch_rows_by_join_key to preallocate seen_row_ids and rows from index_entries.len().","src/execution/scan.rs"

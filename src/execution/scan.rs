@@ -817,8 +817,8 @@ impl Executor {
 
         let index_prefix = format!("index:{}:{}:{}:", table_name, column.name, value_str);
         let index_entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
-        let mut seen_row_ids = HashSet::new();
-        let mut rows = Vec::new();
+        let mut seen_row_ids = HashSet::with_capacity(index_entries.len());
+        let mut rows = Vec::with_capacity(index_entries.len());
 
         for (key, _) in index_entries {
             let Some(row_id) = Self::row_id_from_key(&key) else {
