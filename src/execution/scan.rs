@@ -1398,7 +1398,7 @@ impl Executor {
                                 let index_entries =
                                     txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
 
-                                let mut row_ids = HashSet::new();
+                                let mut row_ids = HashSet::with_capacity(index_entries.len());
                                 for (k, _) in index_entries {
                                     if let Some(row_id) = Self::row_id_from_key(&k) {
                                         row_ids.insert(row_id.to_string());
@@ -1454,7 +1454,8 @@ impl Executor {
                                                 .scan_prefix(index_prefix.as_bytes(), None)
                                                 .await?;
 
-                                            let mut current_token_row_ids = HashSet::new();
+                                            let mut current_token_row_ids =
+                                                HashSet::with_capacity(index_entries.len());
                                             for (k, _) in index_entries {
                                                 if let Some(row_id) = Self::row_id_from_key(&k) {
                                                     current_token_row_ids
@@ -1572,6 +1573,7 @@ impl Executor {
                                         let key_prefix = format!("data:{}:{}", table_name, prefix);
                                         let kv =
                                             txn.scan_prefix(key_prefix.as_bytes(), limit).await?;
+                                        all_row_ids.reserve(kv.len());
                                         for (k, _) in kv {
                                             if let Some(row_id) = Self::row_id_from_key(&k) {
                                                 all_row_ids.insert(row_id.to_string());
@@ -1584,6 +1586,7 @@ impl Executor {
                                         );
                                         let kv =
                                             txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
+                                        all_row_ids.reserve(kv.len());
                                         for (k, _) in kv {
                                             if let Some(row_id) = Self::row_id_from_key(&k) {
                                                 all_row_ids.insert(row_id.to_string());
@@ -1615,7 +1618,7 @@ impl Executor {
                                         let row_keys =
                                             idx_guard.map_ids_to_row_keys(table_name, &ids);
                                         if !row_keys.is_empty() {
-                                            let mut set = HashSet::new();
+                                            let mut set = HashSet::with_capacity(row_keys.len());
                                             for s in row_keys {
                                                 set.insert(s);
                                             }

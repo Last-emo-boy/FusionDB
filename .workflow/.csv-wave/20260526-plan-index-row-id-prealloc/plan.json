@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-087",
+  "title": "Optimize index row id collection preallocation",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve BTree, FTS, LIKE, and trigram index scan semantics"
+  ],
+  "rationale": "Index scan paths often collect row ids from already materialized candidate lists. Preallocating HashSet capacity from those candidate counts reduces rehash and allocation churn without changing row id extraction or filtering semantics.",
+  "steps": [
+    "Preallocate BTree equality row id set from index entry count",
+    "Preallocate FTS token row id sets from token posting counts",
+    "Reserve LIKE prefix row id set capacity from scanned candidate counts",
+    "Preallocate trigram row key set from row key count",
+    "Verify BTree index, FTS, parameterized MATCH, and LIKE behavior"
+  ],
+  "expected_impact": "Reduces allocation churn when index-backed scans collect row ids from candidate lists."
+}

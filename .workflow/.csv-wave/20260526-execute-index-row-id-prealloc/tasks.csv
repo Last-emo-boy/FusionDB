@@ -1,0 +1,3 @@
+id,skill_call,topic
+TASK-087-plan,$maestro-plan "plan index row id HashSet preallocation optimization",index-row-id-prealloc
+TASK-087-execute,$maestro-execute "preallocate BTree FTS LIKE and trigram row id HashSets from candidate counts",index-row-id-prealloc

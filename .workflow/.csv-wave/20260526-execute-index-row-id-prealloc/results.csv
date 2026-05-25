@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-087-plan,completed,"Planned index row id collection preallocation optimization for src/execution/scan.rs",".workflow/.csv-wave/20260526-plan-index-row-id-prealloc/plan.json"
+TASK-087-execute,completed,"Preallocated BTree equality, FTS token, LIKE prefix, and trigram row id HashSets from known candidate counts.","src/execution/scan.rs"
