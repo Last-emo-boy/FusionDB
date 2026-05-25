@@ -1,0 +1,20 @@
+{
+  "task_id": "TASK-059",
+  "title": "Optimize join projection row construction",
+  "phase": "database-core-performance",
+  "scope": [
+    "src/execution/scan.rs"
+  ],
+  "constraints": [
+    "Only iterate database core",
+    "Do not modify dashboard/",
+    "Preserve join projection output order and schema"
+  ],
+  "rationale": "project_join_rows used iterator collect for every projected row after join execution. The projected width is already known, so explicit preallocation avoids per-row growth uncertainty and iterator collection overhead.",
+  "steps": [
+    "Keep existing projection index resolution and projected schema construction",
+    "Replace per-row iterator collect with a preallocated projected row Vec",
+    "Run focused join projection regressions and cargo check"
+  ],
+  "expected_impact": "Reduces small allocation overhead in join result projection for queries that select a subset of joined columns."
+}

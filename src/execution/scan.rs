@@ -551,15 +551,14 @@ impl Executor {
             projected_columns.push(schema.columns[index].clone());
         }
 
-        let projected_rows = rows
-            .into_iter()
-            .map(|row| {
-                projection_indices
-                    .iter()
-                    .map(|index| row[*index].clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let mut projected_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut projected_row = Vec::with_capacity(projection_indices.len());
+            for index in &projection_indices {
+                projected_row.push(row[*index].clone());
+            }
+            projected_rows.push(projected_row);
+        }
 
         Ok((
             TableSchema::new(schema.name.clone(), projected_columns),

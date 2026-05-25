@@ -1,0 +1,2 @@
+id,status,summary,artifacts,error
+TASK-059,completed,"Replaced per-row projection iterator collect with explicit preallocated row construction.",".workflow/.csv-wave/20260525-verify-join-projection-rows/verification.json",""

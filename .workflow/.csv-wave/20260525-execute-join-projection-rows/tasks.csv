@@ -1,0 +1,2 @@
+id,task,status,files
+TASK-059,"Optimize join projection row construction",completed,"src/execution/scan.rs"
