@@ -1,0 +1,2 @@
+id,task,status,artifacts
+TASK-114,Preallocate relation name set,completed,src/execution/scan.rs

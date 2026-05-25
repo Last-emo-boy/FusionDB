@@ -171,7 +171,7 @@ impl Executor {
     }
 
     pub(crate) fn relation_names(&self, relation: &TableFactor) -> HashSet<String> {
-        let mut names = HashSet::new();
+        let mut names = HashSet::with_capacity(2);
         if let TableFactor::Table { name, alias, .. } = relation {
             names.insert(name.to_string());
             if let Some(alias) = alias {

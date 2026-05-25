@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-114",
+  "created_at": "2026-05-26T06:02:24+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/scan.rs",
+  "goal": "Avoid avoidable HashSet growth while collecting relation names for predicate routing.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to table name or alias handling"
+  ],
+  "implementation": [
+    "Preallocate relation name storage for the only two candidates: table name and alias."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_three_table_join_with_alias_projection -- --nocapture",
+    "cargo test --test sql_integration test_inner_join_multi_key_uses_indexed_probe_column -- --nocapture"
+  ]
+}
