@@ -1,0 +1,20 @@
+{
+  "session_id": "20260526-plan-decouple-009-ddl-modules",
+  "task_id": "DECOUPLE-009",
+  "title": "Extract DDL show/explain/index/table/view modules",
+  "status": "completed",
+  "created_at": "2026-05-26T22:05:00+08:00",
+  "problem": "ddl.rs combined SHOW/DESCRIBE, EXPLAIN, index DDL, table DDL, and view DDL handlers.",
+  "approach": [
+    "Move src/execution/ddl.rs to src/execution/ddl/mod.rs.",
+    "Extract SHOW/DESCRIBE handlers into show.rs.",
+    "Extract EXPLAIN planner helpers into explain.rs.",
+    "Extract CREATE/DROP INDEX into index.rs.",
+    "Extract table CREATE/DROP/TRUNCATE/ALTER into table.rs.",
+    "Extract view CREATE/DROP into view.rs."
+  ],
+  "risk_controls": [
+    "Keep Executor handler method names stable.",
+    "Run cargo check --lib and focused show/explain/index integration tests."
+  ]
+}

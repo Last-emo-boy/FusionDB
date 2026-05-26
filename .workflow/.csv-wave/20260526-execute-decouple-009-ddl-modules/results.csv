@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-009,completed,"Split DDL handlers into show, explain, index, table, and view submodules while preserving Executor APIs.","src/execution/ddl/mod.rs;src/execution/ddl/show.rs;src/execution/ddl/explain.rs;src/execution/ddl/index.rs;src/execution/ddl/table.rs;src/execution/ddl/view.rs"
