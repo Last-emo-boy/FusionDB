@@ -86,6 +86,61 @@ struct GroupAggregatePlan<'a> {
 }
 
 impl Executor {
+    fn count_distinct_projection<'a>(
+        projection: &'a [SelectItem],
+        schema: &TableSchema,
+        allowed_qualifiers: Option<&[String]>,
+    ) -> Option<(usize, String)> {
+        let [item] = projection else {
+            return None;
+        };
+
+        let (expr, column_name) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, format!("{}", expr)),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.clone()),
+            _ => return None,
+        };
+
+        let Expr::Function(func) = expr else {
+            return None;
+        };
+        if !func.name.to_string().eq_ignore_ascii_case("COUNT") {
+            return None;
+        }
+
+        let FunctionArguments::List(args) = &func.args else {
+            return None;
+        };
+        if args.duplicate_treatment != Some(DuplicateTreatment::Distinct) || args.args.len() != 1 {
+            return None;
+        }
+
+        Self::column_arg_index(&args.args[0], schema, allowed_qualifiers)
+            .map(|index| (index, column_name))
+    }
+
+    async fn count_distinct_column_scan(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        txn: &mut dyn Transaction,
+    ) -> Result<i64> {
+        let prefix = format!("data:{}:", table_name);
+        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
+
+        for (_, data) in kv_pairs {
+            let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+            if value != Value::Null {
+                seen.insert(value);
+            }
+        }
+
+        Ok(seen.len() as i64)
+    }
+
     fn order_limit_column_name(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -800,7 +855,8 @@ impl Executor {
             // Push down limit only if no ORDER BY and no GROUP BY (simplified)
             let is_group_by_none = matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty());
 
-            // Optimization: Aggregates on PK (COUNT(*), MIN(id), MAX(id))
+            // Optimization: Aggregates on PK (COUNT(*), MIN(id), MAX(id)) and
+            // single-column COUNT(DISTINCT col) without materializing full rows.
             if !is_join && select.selection.is_none() && is_group_by_none {
                 let mut supported = true;
                 let mut result_row = Vec::with_capacity(select.projection.len());
@@ -817,6 +873,26 @@ impl Executor {
                         let schema_key = format!("schema:{}", table_name_str);
                         if let Ok(Some(schema_bytes)) = txn.get(schema_key.as_bytes()).await {
                             if let Ok(schema) = bincode::deserialize::<TableSchema>(&schema_bytes) {
+                                if let Some((column_index, column_name)) =
+                                    Self::count_distinct_projection(
+                                        &select.projection,
+                                        &schema,
+                                        Some(&aggregate_qualifiers),
+                                    )
+                                {
+                                    let count = self
+                                        .count_distinct_column_scan(
+                                            &table_name_str,
+                                            column_index,
+                                            txn,
+                                        )
+                                        .await?;
+                                    return Ok(QueryResult::Select {
+                                        columns: vec![column_name],
+                                        rows: vec![vec![Value::Integer(count)]],
+                                    });
+                                }
+
                                 for proj_item in &select.projection {
                                     let expr = match proj_item {
                                         SelectItem::UnnamedExpr(expr) => Some(expr),

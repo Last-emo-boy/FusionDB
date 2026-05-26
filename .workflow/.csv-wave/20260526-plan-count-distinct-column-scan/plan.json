@@ -1,0 +1,22 @@
+{
+  "session_id": "20260526-plan-count-distinct-column-scan",
+  "task_id": "TASK-129",
+  "title": "Plan COUNT(DISTINCT column) direct scan fast path",
+  "status": "completed",
+  "created_at": "2026-05-26T13:43:28+08:00",
+  "problem": "Bare COUNT(DISTINCT single_column) queries still materialize full rows and run through generic aggregate accumulation, making the benchmark query Unique active users slower than necessary.",
+  "approach": [
+    "Detect simple SELECT COUNT(DISTINCT column) without JOIN, WHERE, or GROUP BY during the existing aggregate fast-path phase.",
+    "Resolve the target column once from schema and scan only that column using RowDecoder::decode_column.",
+    "Count non-NULL distinct values directly in a HashSet<Value> and return the aggregate result without materializing full rows."
+  ],
+  "expected_impact": [
+    "Improve benchmark Unique active users.",
+    "Keep generic COUNT(DISTINCT expression) semantics on the existing path."
+  ],
+  "risk_controls": [
+    "Limit fast path to a single column argument.",
+    "Preserve alias output column names.",
+    "Add SQL integration coverage for NULL handling and alias projection."
+  ]
+}

@@ -3360,6 +3360,32 @@ async fn test_count_distinct() {
 }
 
 #[tokio::test]
+async fn test_count_distinct_fast_path_ignores_null_with_alias() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE visits (id INTEGER PRIMARY KEY, user_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO visits VALUES (1, 10), (2, 20), (3, 10), (4, NULL), (5, 30)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT COUNT(DISTINCT user_id) AS active_users FROM visits",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["active_users"]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], fusiondb::common::Value::Integer(3));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_insert_select() {
     let (executor, wal) = setup().await;
     exec_ok(
