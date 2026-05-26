@@ -4,6 +4,7 @@ use fusiondb::server::pg_server;
 use fusiondb::storage::memory::MemoryStorage;
 use fusiondb::storage::Storage;
 use std::sync::Arc;
+use tokio_postgres::types::Type;
 use tokio_postgres::NoTls;
 
 #[tokio::test]
@@ -108,19 +109,81 @@ async fn test_pg_protocol_extended_query() {
     // Test: Extended query with parameters using execute()
     let rows = client
         .query("SELECT * FROM ext_test WHERE id = $1", &[&1i64])
-        .await;
+        .await
+        .expect("extended parameterized query should succeed");
+    assert_eq!(rows.len(), 1, "Expected one row for parameterized query");
+    assert_eq!(rows[0].get::<_, i32>("id"), 1);
+    assert_eq!(rows[0].get::<_, String>("val"), "hello");
 
-    // This may fail if extended query param handling isn't fully wired.
-    // We just verify no panic/crash for now.
-    match rows {
-        Ok(rows) => {
-            assert!(!rows.is_empty(), "Expected rows for parameterized query");
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
+async fn test_pg_protocol_prepare_reports_columns_and_params() {
+    let wal_path = format!("test_pg_prepare_{}.wal", std::process::id());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let executor = Arc::new(Executor::new(storage.clone()));
+    let port = 19993;
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect to server");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
         }
-        Err(e) => {
-            // Extended query might not fully work yet — log but don't fail hard
-            eprintln!("Extended query returned error (may be expected): {}", e);
-        }
-    }
+    });
+
+    client
+        .simple_query("CREATE TABLE meta_test (id INTEGER PRIMARY KEY, val TEXT, score FLOAT)")
+        .await
+        .expect("Failed to create table");
+    client
+        .simple_query("INSERT INTO meta_test VALUES (1, 'hello', 1.5), (2, 'world', 2.5)")
+        .await
+        .expect("Failed to insert");
+
+    let statement = client
+        .prepare("SELECT id, val, score FROM meta_test WHERE id = $1")
+        .await
+        .expect("prepare should return metadata");
+
+    assert_eq!(statement.params(), &[Type::INT8]);
+    assert_eq!(statement.columns().len(), 3);
+    assert_eq!(statement.columns()[0].name(), "id");
+    assert_eq!(statement.columns()[0].type_(), &Type::INT4);
+    assert_eq!(statement.columns()[1].name(), "val");
+    assert_eq!(statement.columns()[1].type_(), &Type::TEXT);
+    assert_eq!(statement.columns()[2].name(), "score");
+    assert_eq!(statement.columns()[2].type_(), &Type::FLOAT8);
+
+    let typed_statement = client
+        .prepare_typed("SELECT id, val FROM meta_test WHERE id = $1", &[Type::INT8])
+        .await
+        .expect("prepare_typed should preserve client parameter type");
+    assert_eq!(typed_statement.params(), &[Type::INT8]);
+
+    let rows = client
+        .query(&typed_statement, &[&2i64])
+        .await
+        .expect("typed prepared query should execute");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("id"), 2);
+    assert_eq!(rows[0].get::<_, String>("val"), "world");
 
     let _ = std::fs::remove_file(&wal_path);
 }
