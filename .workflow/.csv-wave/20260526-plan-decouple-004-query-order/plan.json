@@ -1,0 +1,17 @@
+{
+  "session_id": "20260526-plan-decouple-004-query-order",
+  "task_id": "DECOUPLE-004",
+  "title": "Extract query ORDER BY helpers",
+  "status": "completed",
+  "created_at": "2026-05-26T20:25:00+08:00",
+  "problem": "ORDER BY source resolution, sort comparison, and PK ORDER LIMIT pushdown logic were embedded in query/mod.rs.",
+  "approach": [
+    "Create src/execution/query/order.rs.",
+    "Move SortOrderKey and ORDER BY helper methods into the new submodule.",
+    "Keep Executor method call sites stable in query/mod.rs."
+  ],
+  "risk_controls": [
+    "Do not alter sort semantics.",
+    "Run cargo check --lib and order_by SQL integration tests."
+  ]
+}

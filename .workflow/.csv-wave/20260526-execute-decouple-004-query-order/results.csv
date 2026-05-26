@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-004,completed,"Extracted ORDER BY and sort helper implementation into query/order.rs while keeping call sites stable.","src/execution/query/mod.rs;src/execution/query/order.rs"
