@@ -1,0 +1,2 @@
+id,title,status,findings,files_modified,tests_passed,error
+TASK-143,Single-column DISTINCT with simple WHERE column scan,completed,"Added optional predicate support to distinct_column_scan; simple WHERE predicates now keep DISTINCT on column-level decoding while complex predicates fall back.","src/execution/query.rs;tests/sql_integration.rs","cargo fmt; select_distinct; select_count; bare_aggregate; count_distinct",

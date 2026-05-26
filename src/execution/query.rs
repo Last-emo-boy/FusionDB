@@ -663,6 +663,7 @@ impl Executor {
         &self,
         table_name: &str,
         column_index: usize,
+        predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         let prefix = format!("data:{}:", table_name);
@@ -671,6 +672,18 @@ impl Executor {
         let mut rows = Vec::new();
 
         for (_, data) in kv_pairs {
+            if let Some(predicate) = predicate {
+                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
+                    &data,
+                    predicate.column_index,
+                )
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+                if !predicate.matches(&predicate_value) {
+                    continue;
+                }
+            }
+
             let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
                 .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
                 .unwrap_or(Value::Null);
@@ -1745,7 +1758,6 @@ impl Executor {
 
             if !is_join
                 && select.distinct.is_some()
-                && select.selection.is_none()
                 && select.having.is_none()
                 && is_group_by_none
                 && query.order_by.is_none()
@@ -1767,13 +1779,25 @@ impl Executor {
                         if let Some((column_index, column_name)) =
                             Self::single_column_distinct_projection(&select.projection, &schema)
                         {
-                            let rows = self
-                                .distinct_column_scan(&table_name_str, column_index, txn)
-                                .await?;
-                            return Ok(QueryResult::Select {
-                                columns: vec![column_name],
-                                rows,
-                            });
+                            let predicate = if let Some(selection) = select.selection.as_ref() {
+                                self.simple_column_predicate_scan_plan(selection, &schema, params)
+                            } else {
+                                None
+                            };
+                            if select.selection.is_none() || predicate.is_some() {
+                                let rows = self
+                                    .distinct_column_scan(
+                                        &table_name_str,
+                                        column_index,
+                                        predicate.as_ref(),
+                                        txn,
+                                    )
+                                    .await?;
+                                return Ok(QueryResult::Select {
+                                    columns: vec![column_name],
+                                    rows,
+                                });
+                            }
                         }
                     }
                 }

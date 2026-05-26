@@ -3230,6 +3230,70 @@ async fn test_select_distinct_fast_path_preserves_null_and_alias() {
 }
 
 #[tokio::test]
+async fn test_select_distinct_with_simple_where_uses_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE distinct_visits (id INTEGER PRIMARY KEY, status TEXT, city TEXT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, status, city) in [
+            (1_i64, "active", Some("Paris")),
+            (2, "active", Some("Rome")),
+            (3, "archived", Some("Berlin")),
+            (4, "active", Some("Paris")),
+            (5, "active", None),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(status.to_string()),
+                city.map(|value| Value::String(value.to_string()))
+                    .unwrap_or(Value::Null),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:distinct_visits:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT DISTINCT city AS place FROM distinct_visits WHERE status = 'active'",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["place"]);
+    assert_eq!(rows.len(), 3);
+    assert!(rows
+        .iter()
+        .any(|row| row[0] == Value::String("Paris".to_string())));
+    assert!(rows
+        .iter()
+        .any(|row| row[0] == Value::String("Rome".to_string())));
+    assert!(rows.iter().any(|row| row[0] == Value::Null));
+    assert!(!rows
+        .iter()
+        .any(|row| row[0] == Value::String("Berlin".to_string())));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_alter_table_add_column() {
     let (executor, wal) = setup().await;
     exec_ok(
