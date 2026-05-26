@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-001,completed,"Mechanically moved query.rs into query/mod.rs with no semantic extraction.","src/execution/query/mod.rs"

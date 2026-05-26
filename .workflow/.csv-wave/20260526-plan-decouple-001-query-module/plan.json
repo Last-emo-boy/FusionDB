@@ -1,0 +1,17 @@
+{
+  "session_id": "20260526-plan-decouple-001-query-module",
+  "task_id": "DECOUPLE-001",
+  "title": "Convert query.rs to query/mod.rs",
+  "status": "completed",
+  "created_at": "2026-05-26T19:20:00+08:00",
+  "problem": "src/execution/query.rs is one of the largest database-core files and blocks further query submodule extraction.",
+  "approach": [
+    "Create src/execution/query/ as a module directory.",
+    "Move src/execution/query.rs to src/execution/query/mod.rs without semantic edits.",
+    "Keep src/execution/mod.rs using mod query; so call sites remain unchanged."
+  ],
+  "risk_controls": [
+    "No helper extraction in this task.",
+    "Run cargo check --lib and show-related SQL integration tests."
+  ]
+}
