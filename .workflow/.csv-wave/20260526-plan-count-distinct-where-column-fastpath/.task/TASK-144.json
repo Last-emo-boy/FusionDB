@@ -1,0 +1,32 @@
+{
+  "id": "TASK-144",
+  "title": "COUNT(DISTINCT column) with simple WHERE column scan",
+  "status": "completed",
+  "files": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "description": "Route COUNT(DISTINCT column) with a simple column predicate through column-level decoding so it avoids full-row materialization.",
+  "scope": {
+    "included": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "excluded": [
+      "dashboard",
+      "ui"
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "count_distinct_column_scan accepts an optional ColumnPredicateScanPlan",
+      "COUNT(DISTINCT column) WHERE simple predicate uses the fast path",
+      "tests prove unused corrupt columns are not decoded"
+    ]
+  },
+  "execution_directives": [
+    "Use E:\\\\Playground\\\\FusionDB\\\\target as CARGO_TARGET_DIR",
+    "Keep dashboard/UI untouched",
+    "Stage only files produced by TASK-144"
+  ]
+}

@@ -1,0 +1,2 @@
+id,title,status,findings,files_modified,tests_passed,error
+TASK-144,COUNT(DISTINCT column) with simple WHERE column scan,completed,"Added optional predicate support to count_distinct_column_scan; simple WHERE predicates now keep COUNT(DISTINCT) on column-level decoding while complex predicates fall back.","src/execution/query.rs;tests/sql_integration.rs","cargo fmt; count_distinct; select_count; select_distinct; bare_aggregate",

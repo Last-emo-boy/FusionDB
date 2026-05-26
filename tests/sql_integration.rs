@@ -3907,6 +3907,59 @@ async fn test_count_distinct_fast_path_ignores_null_with_alias() {
 }
 
 #[tokio::test]
+async fn test_count_distinct_with_simple_where_uses_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE filtered_visits (id INTEGER PRIMARY KEY, status TEXT, user_id INTEGER, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, status, user_id) in [
+            (1_i64, "active", Some(10_i64)),
+            (2, "active", Some(20)),
+            (3, "archived", Some(30)),
+            (4, "active", Some(10)),
+            (5, "active", None),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(status.to_string()),
+                user_id.map(Value::Integer).unwrap_or(Value::Null),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:filtered_visits:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT COUNT(DISTINCT user_id) AS active_users FROM filtered_visits WHERE status = 'active'",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["active_users"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_insert_select() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -1,0 +1,37 @@
+{
+  "session": "20260526-verify-count-distinct-where-column-fastpath",
+  "created_at": "2026-05-26T18:35:00+08:00",
+  "task_id": "TASK-144",
+  "status": "passed",
+  "checks": [
+    {
+      "name": "Format",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo fmt -- src/execution/query.rs tests/sql_integration.rs",
+      "status": "passed"
+    },
+    {
+      "name": "COUNT DISTINCT fast path tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test count_distinct --test sql_integration",
+      "status": "passed",
+      "details": "5 passed"
+    },
+    {
+      "name": "COUNT fast path regression tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_count --test sql_integration",
+      "status": "passed",
+      "details": "7 passed"
+    },
+    {
+      "name": "DISTINCT fast path regression tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_distinct --test sql_integration",
+      "status": "passed",
+      "details": "3 passed"
+    },
+    {
+      "name": "Bare aggregate regression tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test bare_aggregate --test sql_integration",
+      "status": "passed",
+      "details": "2 passed"
+    }
+  ]
+}

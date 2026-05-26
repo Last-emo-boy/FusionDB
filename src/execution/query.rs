@@ -590,6 +590,7 @@ impl Executor {
         &self,
         table_name: &str,
         column_index: usize,
+        predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<i64> {
         let prefix = format!("data:{}:", table_name);
@@ -597,6 +598,18 @@ impl Executor {
         let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
 
         for (_, data) in kv_pairs {
+            if let Some(predicate) = predicate {
+                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
+                    &data,
+                    predicate.column_index,
+                )
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+                if !predicate.matches(&predicate_value) {
+                    continue;
+                }
+            }
+
             let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
                 .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
                 .unwrap_or(Value::Null);
@@ -1854,6 +1867,32 @@ impl Executor {
                                     rows: vec![result_row],
                                 });
                             }
+
+                            if let (Some((column_index, column_name)), Some(predicate)) = (
+                                Self::count_distinct_projection(
+                                    &select.projection,
+                                    &schema,
+                                    Some(&aggregate_qualifiers),
+                                ),
+                                select.selection.as_ref().and_then(|selection| {
+                                    self.simple_column_predicate_scan_plan(
+                                        selection, &schema, params,
+                                    )
+                                }),
+                            ) {
+                                let count = self
+                                    .count_distinct_column_scan(
+                                        &table_name_str,
+                                        column_index,
+                                        Some(&predicate),
+                                        txn,
+                                    )
+                                    .await?;
+                                return Ok(QueryResult::Select {
+                                    columns: vec![column_name],
+                                    rows: vec![vec![Value::Integer(count)]],
+                                });
+                            }
                         }
                     }
                 }
@@ -1886,6 +1925,7 @@ impl Executor {
                                         .count_distinct_column_scan(
                                             &table_name_str,
                                             column_index,
+                                            None,
                                             txn,
                                         )
                                         .await?;
