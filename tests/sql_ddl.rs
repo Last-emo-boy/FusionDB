@@ -1,0 +1,417 @@
+use fusiondb::common::Value;
+use fusiondb::execution::Executor;
+use fusiondb::storage::memory::MemoryStorage;
+use fusiondb::storage::Storage;
+use std::sync::Arc;
+
+#[path = "sql/common.rs"]
+mod common;
+use common::{cleanup, exec_ok, query, setup};
+
+#[tokio::test]
+async fn test_create_table() {
+    let (executor, wal) = setup().await;
+    let msg = exec_ok(
+        &executor,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    assert!(msg.contains("created"));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_create_table_and_show_tables() {
+    let (executor, wal) = setup().await;
+    exec_ok(&executor, "CREATE TABLE t1 (id INTEGER PRIMARY KEY)").await;
+    exec_ok(&executor, "CREATE TABLE t2 (id INTEGER PRIMARY KEY)").await;
+    let (cols, rows) = query(&executor, "SHOW TABLES").await;
+    assert_eq!(cols, vec!["Table"]);
+    assert_eq!(rows.len(), 2);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_describe_table() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)",
+    )
+    .await;
+    let (cols, rows) = query(&executor, "EXPLAIN items").await;
+    assert_eq!(cols, vec!["Field", "Type", "Key", "Index"]);
+    assert_eq!(rows.len(), 3);
+    // First column should be primary
+    if let Value::String(key) = &rows[0][2] {
+        assert_eq!(key, "PRI");
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_drop_table() {
+    let (executor, wal) = setup().await;
+    exec_ok(&executor, "CREATE TABLE temp (id INTEGER PRIMARY KEY)").await;
+    exec_ok(&executor, "DROP TABLE temp").await;
+    let (_, rows) = query(&executor, "SHOW TABLES").await;
+    assert_eq!(rows.len(), 0);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_drop_table_invalidates_row_cache() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE drop_cache_stale (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO drop_cache_stale VALUES (1, 'Alice')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM drop_cache_stale WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+    );
+
+    exec_ok(&executor, "DROP TABLE drop_cache_stale").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE drop_cache_stale (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM drop_cache_stale WHERE id = 1").await;
+    assert_eq!(rows.len(), 0);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_drop_table_if_exists() {
+    let (executor, wal) = setup().await;
+    let msg = exec_ok(&executor, "DROP TABLE IF EXISTS nonexistent").await;
+    assert!(msg.contains("Dropped 0"));
+    cleanup(&wal);
+}
+
+// ==================== INSERT Tests ====================
+
+#[tokio::test]
+async fn test_explain() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    let (cols, rows) = query(&executor, "EXPLAIN SELECT * FROM users WHERE id = 1").await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Primary Key Lookup"));
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_commuted_primary_key_lookup() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_pk_commuted (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT * FROM explain_pk_commuted WHERE 1 = id",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Primary Key Lookup"));
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_commuted_btree_index_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_idx_commuted (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_explain_idx_commuted_name ON explain_idx_commuted (name)",
+    )
+    .await;
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT * FROM explain_idx_commuted WHERE 'Bob' = name",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan"));
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_commuted_primary_key_range_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_range_commuted (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT * FROM explain_range_commuted WHERE 1 < id",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Primary Key Range Scan"));
+    }
+    cleanup(&wal);
+}
+
+// ==================== Edge Case Tests ====================
+
+#[tokio::test]
+async fn test_alter_table_add_column() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO items VALUES (1, 'apple')").await;
+    exec_ok(&executor, "ALTER TABLE items ADD COLUMN price INTEGER").await;
+    // Existing row should still be queryable (new column = NULL for old rows)
+    let (cols, _) = query(&executor, "SELECT * FROM items").await;
+    assert_eq!(cols.len(), 3);
+    assert_eq!(cols[2], "price");
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_alter_table_drop_column() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO people VALUES (1, 'Alice', 30), (2, 'Bob', 25)",
+    )
+    .await;
+    exec_ok(&executor, "ALTER TABLE people DROP COLUMN age").await;
+    let (cols, rows) = query(&executor, "SELECT * FROM people").await;
+    assert_eq!(cols, vec!["id", "name"]);
+    assert_eq!(rows.len(), 2);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_alter_table_drop_column_reuses_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE drop_cache (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO drop_cache VALUES (1, 'Alice', 30), (2, 'Bob', 25)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM drop_cache").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::String("Alice".to_string()),
+                Value::Integer(30)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("Bob".to_string()),
+                Value::Integer(25)
+            ]
+        ]
+    );
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, name, age) in [(1_i64, "Alice", 30_i64), (2_i64, "Bob", 25_i64)] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(name.to_string()),
+                Value::Integer(age),
+            ]);
+            let corrupt_col_idx = 1usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+
+            let key = format!(
+                "data:drop_cache:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    exec_ok(&executor, "ALTER TABLE drop_cache DROP COLUMN age").await;
+
+    let (cols, rows) = query(&executor, "SELECT * FROM drop_cache").await;
+    assert_eq!(cols, vec!["id", "name"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::String("Alice".to_string())],
+            vec![Value::Integer(2), Value::String("Bob".to_string())]
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_alter_table_rename_column() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, old_name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ALTER TABLE t1 RENAME COLUMN old_name TO new_name",
+    )
+    .await;
+    let (cols, _) = query(&executor, "SELECT * FROM t1").await;
+    assert!(cols.contains(&"new_name".to_string()));
+    assert!(!cols.contains(&"old_name".to_string()));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_show_create_table() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT, weight FLOAT)",
+    )
+    .await;
+    let (cols, rows) = query(&executor, "SHOW CREATE TABLE widgets").await;
+    assert_eq!(cols, vec!["Table", "Create Table"]);
+    assert_eq!(rows.len(), 1);
+    let ddl = match &rows[0][1] {
+        fusiondb::common::Value::String(s) => s.clone(),
+        _ => panic!("expected string"),
+    };
+    assert!(ddl.contains("CREATE TABLE widgets"));
+    assert!(ddl.contains("id INTEGER PRIMARY KEY"));
+    assert!(ddl.contains("name TEXT"));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_truncate_table() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE trunc_test (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO trunc_test VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_test").await;
+    assert_eq!(rows.len(), 3);
+    exec_ok(&executor, "TRUNCATE TABLE trunc_test").await;
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_test").await;
+    assert_eq!(rows.len(), 0);
+    // Table still exists, can insert again
+    exec_ok(&executor, "INSERT INTO trunc_test VALUES (10, 'new')").await;
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_test").await;
+    assert_eq!(rows.len(), 1);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_truncate_table_invalidates_row_cache() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE trunc_cache_stale (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO trunc_cache_stale VALUES (1, 'Alice')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_cache_stale WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+    );
+
+    exec_ok(&executor, "TRUNCATE TABLE trunc_cache_stale").await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_cache_stale WHERE id = 1").await;
+    assert_eq!(rows.len(), 0);
+
+    exec_ok(&executor, "INSERT INTO trunc_cache_stale VALUES (1, 'Bob')").await;
+    let (_, rows) = query(&executor, "SELECT * FROM trunc_cache_stale WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Bob".to_string())]]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_create_table_if_not_exists() {
+    let (executor, wal) = setup().await;
+    exec_ok(&executor, "CREATE TABLE dup_test (id INTEGER PRIMARY KEY)").await;
+    // Should not error with IF NOT EXISTS
+    exec_ok(
+        &executor,
+        "CREATE TABLE IF NOT EXISTS dup_test (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    // Without IF NOT EXISTS, should error
+    let stmts = executor
+        .prepare("CREATE TABLE dup_test (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let result = executor.execute(&stmts[0]).await;
+    assert!(result.is_err());
+    cleanup(&wal);
+}

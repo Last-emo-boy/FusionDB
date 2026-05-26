@@ -1,0 +1,33 @@
+{
+  "session_id": "20260526-plan-decouple-011-sql-tests",
+  "task_id": "DECOUPLE-011",
+  "title": "Split SQL integration tests by feature area",
+  "status": "completed",
+  "created_at": "2026-05-26T20:55:00+08:00",
+  "problem": "tests/sql_integration.rs contained 181 tokio tests across DDL, DML, SELECT, aggregation, join, index/cache, set/subquery, expressions, windows, views/constraints, returning/upsert/vector/RBAC, making focused iteration slow and difficult to review.",
+  "approach": [
+    "Extract tests into topic-specific integration test targets under tests/sql_*.rs.",
+    "Keep tests/sql/common.rs as the shared setup/query/exec helper module.",
+    "Shrink tests/sql_integration.rs to a smoke target so existing cargo test --test sql_integration workflows continue to work.",
+    "Verify all original test names are present exactly once across the topic targets."
+  ],
+  "targets": {
+    "tests/sql_ddl.rs": 18,
+    "tests/sql_select.rs": 26,
+    "tests/sql_dml.rs": 20,
+    "tests/sql_group_aggregate.rs": 33,
+    "tests/sql_join.rs": 9,
+    "tests/sql_index_cache.rs": 20,
+    "tests/sql_set_subquery.rs": 11,
+    "tests/sql_expr_functions.rs": 16,
+    "tests/sql_window.rs": 4,
+    "tests/sql_view_show_constraints.rs": 12,
+    "tests/sql_returning_upsert_vector_rbac.rs": 12,
+    "tests/sql_integration.rs": 1
+  },
+  "risk_controls": [
+    "Do not alter database implementation or dashboard/ui files.",
+    "Compare test names from HEAD:tests/sql_integration.rs against new topic targets for missing, extra, or duplicate tests.",
+    "Run cargo check --lib and every new SQL integration test target."
+  ]
+}

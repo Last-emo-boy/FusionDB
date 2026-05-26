@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-011,completed,"Split the monolithic SQL integration target into focused topic targets while preserving a smoke sql_integration target.","tests/sql_integration.rs;tests/sql_ddl.rs;tests/sql_select.rs;tests/sql_dml.rs;tests/sql_group_aggregate.rs;tests/sql_join.rs;tests/sql_index_cache.rs;tests/sql_set_subquery.rs;tests/sql_expr_functions.rs;tests/sql_window.rs;tests/sql_view_show_constraints.rs;tests/sql_returning_upsert_vector_rbac.rs"

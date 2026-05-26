@@ -1,0 +1,91 @@
+{
+  "task_id": "DECOUPLE-011",
+  "status": "passed",
+  "verified_at": "2026-05-26T20:55:00+08:00",
+  "environment": {
+    "CARGO_TARGET_DIR": "E:\\Playground\\FusionDB\\target",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "coverage_check": {
+    "original_sql_integration_tests": 181,
+    "moved_topic_tests": 181,
+    "smoke_tests": 1,
+    "missing": 0,
+    "extra": 0,
+    "duplicates": 0
+  },
+  "checks": [
+    {
+      "command": "cargo fmt -- tests/sql_integration.rs tests/sql_*.rs",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_ddl",
+      "status": "passed",
+      "notes": "Ran 18 tests."
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed",
+      "notes": "Ran 26 tests."
+    },
+    {
+      "command": "cargo test --test sql_dml",
+      "status": "passed",
+      "notes": "Ran 20 tests."
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed",
+      "notes": "Ran 9 tests."
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed",
+      "notes": "Ran 33 tests."
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed",
+      "notes": "Ran 20 tests."
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed",
+      "notes": "Ran 11 tests."
+    },
+    {
+      "command": "cargo test --test sql_expr_functions",
+      "status": "passed",
+      "notes": "Ran 16 tests."
+    },
+    {
+      "command": "cargo test --test sql_window",
+      "status": "passed",
+      "notes": "Ran 4 tests."
+    },
+    {
+      "command": "cargo test --test sql_view_show_constraints",
+      "status": "passed",
+      "notes": "Ran 12 tests."
+    },
+    {
+      "command": "cargo test --test sql_returning_upsert_vector_rbac",
+      "status": "passed",
+      "notes": "Ran 12 tests."
+    },
+    {
+      "command": "cargo test --test sql_integration",
+      "status": "passed",
+      "notes": "Ran 1 smoke test."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
