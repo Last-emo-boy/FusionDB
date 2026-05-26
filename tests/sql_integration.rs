@@ -3990,6 +3990,115 @@ async fn test_bare_min_max_with_simple_where_column_scan() {
 }
 
 #[tokio::test]
+async fn test_bare_string_agg_column_scan_uses_only_aggregate_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT, note TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, name) in [(1_i64, "Alice"), (2, "Bob"), (3, "Carol")] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(name.to_string()),
+                Value::String(format!("note-{}", id)),
+            ]);
+            let corrupt_col_idx = 2usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:names:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(&executor, "SELECT STRING_AGG(name) AS all_names FROM names").await;
+
+    assert_eq!(cols, vec!["all_names"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(names) = &rows[0][0] {
+        assert!(names.contains("Alice"));
+        assert!(names.contains("Bob"));
+        assert!(names.contains("Carol"));
+    } else {
+        panic!("STRING_AGG should return a string for non-empty input");
+    }
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_bare_group_concat_with_simple_where_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, status TEXT, name TEXT, note TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, status, name) in [
+            (1_i64, "active", "Alice"),
+            (2, "archived", "Bob"),
+            (3, "active", "Carol"),
+            (4, "active", "Dave"),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(status.to_string()),
+                Value::String(name.to_string()),
+                Value::String(format!("note-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:events:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT GROUP_CONCAT(name) AS active_names FROM events WHERE status = 'active'",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["active_names"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(names) = &rows[0][0] {
+        assert!(names.contains("Alice"));
+        assert!(!names.contains("Bob"));
+        assert!(names.contains("Carol"));
+        assert!(names.contains("Dave"));
+    } else {
+        panic!("GROUP_CONCAT should return a string for non-empty input");
+    }
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_bare_aggregate_sum_multiply_expr() {
     let (executor, wal) = setup().await;
     exec_ok(

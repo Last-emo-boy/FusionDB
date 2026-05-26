@@ -1,0 +1,32 @@
+{
+  "id": "TASK-141",
+  "title": "Bare STRING_AGG/GROUP_CONCAT ordinary-column scan fast path",
+  "status": "completed",
+  "files": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "description": "Route bare STRING_AGG(column) and GROUP_CONCAT(column) through the simple column aggregate scan path so ordinary rows do not need full-row materialization.",
+  "scope": {
+    "included": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "excluded": [
+      "dashboard",
+      "ui"
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "ColumnAggregateKind includes StringAgg",
+      "simple_column_aggregate_projection accepts STRING_AGG and GROUP_CONCAT",
+      "tests prove unused corrupt columns are not decoded"
+    ]
+  },
+  "execution_directives": [
+    "Use E:\\\\Playground\\\\FusionDB\\\\target as CARGO_TARGET_DIR",
+    "Keep dashboard/UI untouched",
+    "Stage only files produced by TASK-141"
+  ]
+}

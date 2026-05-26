@@ -1,0 +1,43 @@
+{
+  "session": "20260526-verify-bare-string-agg-column-fastpath",
+  "created_at": "2026-05-26T17:40:00+08:00",
+  "task_id": "TASK-141",
+  "status": "passed",
+  "checks": [
+    {
+      "name": "Format",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo fmt -- src/execution/query.rs tests/sql_integration.rs",
+      "status": "passed"
+    },
+    {
+      "name": "Bare STRING_AGG column scan",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test bare_string --test sql_integration",
+      "status": "passed",
+      "details": "1 passed"
+    },
+    {
+      "name": "GROUP_CONCAT tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test group_concat --test sql_integration",
+      "status": "passed",
+      "details": "2 passed"
+    },
+    {
+      "name": "STRING_AGG tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test string_agg --test sql_integration",
+      "status": "passed",
+      "details": "3 passed"
+    },
+    {
+      "name": "Bare SUM/AVG regression tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test bare_sum_avg --test sql_integration",
+      "status": "passed",
+      "details": "2 passed"
+    },
+    {
+      "name": "Bare aggregate regression tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test bare_aggregate --test sql_integration",
+      "status": "passed",
+      "details": "2 passed"
+    }
+  ]
+}

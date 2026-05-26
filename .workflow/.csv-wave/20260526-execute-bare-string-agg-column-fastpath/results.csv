@@ -1,0 +1,2 @@
+id,title,status,findings,files_modified,tests_passed,error
+TASK-141,Bare STRING_AGG/GROUP_CONCAT ordinary-column scan fast path,completed,"Added StringAgg to bare column aggregate state and projection detection; added corrupt-unused-column tests for bare STRING_AGG and GROUP_CONCAT with WHERE.","src/execution/query.rs;tests/sql_integration.rs","cargo fmt; bare_string; group_concat; string_agg; bare_sum_avg; bare_aggregate",

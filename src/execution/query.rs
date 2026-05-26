@@ -16,6 +16,7 @@ enum ColumnAggregateKind {
     Avg,
     Min,
     Max,
+    StringAgg,
 }
 
 struct ColumnAggregateScanPlan {
@@ -51,6 +52,7 @@ struct ColumnAggregateState {
     is_int: bool,
     min: Option<Value>,
     max: Option<Value>,
+    strings: Vec<String>,
 }
 
 impl ColumnAggregateState {
@@ -62,6 +64,7 @@ impl ColumnAggregateState {
             is_int: true,
             min: None,
             max: None,
+            strings: Vec::new(),
         }
     }
 
@@ -103,6 +106,14 @@ impl ColumnAggregateState {
                     self.max = Some(value);
                 }
             }
+            ColumnAggregateKind::StringAgg => match value {
+                Value::String(value) => self.strings.push(value),
+                Value::Integer(value) => self.strings.push(value.to_string()),
+                Value::Float(value) => self.strings.push(value.to_string()),
+                Value::Boolean(value) => self.strings.push(value.to_string()),
+                Value::Null => {}
+                _ => {}
+            },
         }
     }
 
@@ -124,6 +135,13 @@ impl ColumnAggregateState {
             }
             ColumnAggregateKind::Min => self.min.clone().unwrap_or(Value::Null),
             ColumnAggregateKind::Max => self.max.clone().unwrap_or(Value::Null),
+            ColumnAggregateKind::StringAgg => {
+                if self.strings.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(self.strings.join(","))
+                }
+            }
         }
     }
 }
@@ -379,6 +397,7 @@ impl Executor {
                 "AVG" => ColumnAggregateKind::Avg,
                 "MIN" => ColumnAggregateKind::Min,
                 "MAX" => ColumnAggregateKind::Max,
+                "STRING_AGG" | "GROUP_CONCAT" => ColumnAggregateKind::StringAgg,
                 _ => return None,
             };
 
