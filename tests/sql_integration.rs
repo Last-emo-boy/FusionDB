@@ -1387,6 +1387,37 @@ async fn test_group_by_count() {
 }
 
 #[tokio::test]
+async fn test_group_by_count_fast_path_preserves_null_and_alias() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE visits (id INTEGER PRIMARY KEY, city TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO visits VALUES (1, 'Paris'), (2, 'Rome'), (3, 'Paris'), (4, NULL)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT city AS place, COUNT(*) AS visits FROM visits GROUP BY city",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["place", "visits"]);
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| {
+        row[0] == Value::String("Paris".to_string()) && row[1] == Value::Integer(2)
+    }));
+    assert!(rows
+        .iter()
+        .any(|row| row[0] == Value::Null && row[1] == Value::Integer(1)));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_group_by_sum() {
     let (executor, wal) = setup().await;
     exec_ok(

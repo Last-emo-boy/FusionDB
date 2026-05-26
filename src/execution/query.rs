@@ -215,6 +215,95 @@ impl Executor {
         Ok(rows)
     }
 
+    fn simple_group_by_count_projection(
+        projection: &[SelectItem],
+        group_exprs: &[Expr],
+        schema: &TableSchema,
+    ) -> Option<(usize, String, String)> {
+        if projection.len() != 2 || group_exprs.len() != 1 {
+            return None;
+        }
+
+        let group_column_name = Self::order_limit_column_name(&group_exprs[0])?;
+        let group_column_index = schema
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(&group_column_name))?;
+
+        let output_group_name = match &projection[0] {
+            SelectItem::UnnamedExpr(expr) if expr == &group_exprs[0] => match expr {
+                Expr::Identifier(ident) => ident.value.clone(),
+                Expr::CompoundIdentifier(_) => schema.columns[group_column_index].name.clone(),
+                _ => return None,
+            },
+            SelectItem::ExprWithAlias { expr, alias } if expr == &group_exprs[0] => {
+                alias.value.clone()
+            }
+            _ => return None,
+        };
+
+        let count_name = match &projection[1] {
+            SelectItem::UnnamedExpr(Expr::Function(func)) => {
+                if !Self::is_simple_count_star(func) {
+                    return None;
+                }
+                format!("{}", func)
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::Function(func),
+                alias,
+            } => {
+                if !Self::is_simple_count_star(func) {
+                    return None;
+                }
+                alias.value.clone()
+            }
+            _ => return None,
+        };
+
+        Some((group_column_index, output_group_name, count_name))
+    }
+
+    fn is_simple_count_star(func: &sqlparser::ast::Function) -> bool {
+        if !func.name.to_string().eq_ignore_ascii_case("COUNT") {
+            return false;
+        }
+
+        let FunctionArguments::List(args) = &func.args else {
+            return false;
+        };
+
+        args.duplicate_treatment != Some(DuplicateTreatment::Distinct)
+            && args.args.len() == 1
+            && matches!(
+                args.args[0],
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+            )
+    }
+
+    async fn group_by_count_column_scan(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<Vec<Value>>> {
+        let prefix = format!("data:{}:", table_name);
+        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let mut counts: HashMap<Value, i64> = HashMap::with_capacity(kv_pairs.len().min(4096));
+
+        for (_, data) in kv_pairs {
+            let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+            *counts.entry(value).or_insert(0) += 1;
+        }
+
+        Ok(counts
+            .into_iter()
+            .map(|(value, count)| vec![value, Value::Integer(count)])
+            .collect())
+    }
+
     fn order_limit_column_name(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -1083,6 +1172,52 @@ impl Executor {
                                     return Ok(QueryResult::Select {
                                         columns: col_names,
                                         rows: vec![result_row],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !is_join
+                && select.selection.is_none()
+                && select.having.is_none()
+                && query.order_by.is_none()
+                && query.limit_clause.is_none()
+                && select.from.len() == 1
+                && select.from[0].joins.is_empty()
+            {
+                if let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by {
+                    if !group_exprs.is_empty() {
+                        if let TableFactor::Table { name, .. } = &select.from[0].relation {
+                            let table_name_str = name.to_string();
+                            let schema_key = format!("schema:{}", table_name_str);
+                            if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
+                                let schema: TableSchema = bincode::deserialize(&schema_bytes)
+                                    .map_err(|e| {
+                                        FusionError::Execution(format!(
+                                            "Schema deserialization error: {}",
+                                            e
+                                        ))
+                                    })?;
+                                if let Some((group_column_index, group_name, count_name)) =
+                                    Self::simple_group_by_count_projection(
+                                        &select.projection,
+                                        group_exprs,
+                                        &schema,
+                                    )
+                                {
+                                    let rows = self
+                                        .group_by_count_column_scan(
+                                            &table_name_str,
+                                            group_column_index,
+                                            txn,
+                                        )
+                                        .await?;
+                                    return Ok(QueryResult::Select {
+                                        columns: vec![group_name, count_name],
+                                        rows,
                                     });
                                 }
                             }

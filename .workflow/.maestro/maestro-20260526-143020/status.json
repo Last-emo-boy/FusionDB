@@ -1,0 +1,20 @@
+{
+  "session_id": "maestro-20260526-143020",
+  "task_id": "TASK-131",
+  "title": "Optimize single-column GROUP BY COUNT scan",
+  "status": "completed",
+  "started_at": "2026-05-26T14:30:20+08:00",
+  "completed_at": "2026-05-26T14:42:00+08:00",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "non_goals": [
+    "dashboard/ui changes",
+    "JOIN + GROUP BY fusion",
+    "GROUP BY with WHERE, HAVING, ORDER BY, or LIMIT",
+    "SUM/AVG/MIN/MAX group aggregation"
+  ],
+  "verification": ".workflow/.csv-wave/20260526-verify-group-count-column-scan/verification.json",
+  "benchmark_report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task131-group-count-medium-20260526-143020\\benchmark_report_medium.json"
+}

@@ -1,0 +1,22 @@
+{
+  "session_id": "20260526-plan-group-count-column-scan",
+  "task_id": "TASK-131",
+  "title": "Plan single-column GROUP BY COUNT direct scan",
+  "status": "completed",
+  "created_at": "2026-05-26T14:30:20+08:00",
+  "problem": "Simple SELECT column, COUNT(*) FROM table GROUP BY column still materializes full rows and runs generic GROUP BY aggregation despite only needing one decoded column and integer counters.",
+  "approach": [
+    "Detect one-table, one-column GROUP BY COUNT(*) queries without WHERE, JOIN, HAVING, ORDER BY, LIMIT, or OFFSET.",
+    "Resolve the grouping column once against the schema.",
+    "Scan rows and decode only the grouping column with RowDecoder::decode_column.",
+    "Maintain HashMap<Value, i64> counters and return grouped rows directly."
+  ],
+  "expected_impact": [
+    "Improve benchmark GROUP BY category.",
+    "Improve benchmark High-card GROUP BY."
+  ],
+  "risk_controls": [
+    "Keep grouped SUM/AVG and GROUP BY with HAVING/ORDER BY on the generic path.",
+    "Add SQL integration coverage for alias and NULL grouping semantics."
+  ]
+}

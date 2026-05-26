@@ -1,0 +1,47 @@
+{
+  "session_id": "20260526-verify-group-count-column-scan",
+  "task_id": "TASK-131",
+  "title": "Verify single-column GROUP BY COUNT direct scan",
+  "status": "passed",
+  "verified_at": "2026-05-26T14:42:00+08:00",
+  "commands": [
+    {
+      "command": "cargo test --test sql_integration group_by -- --nocapture",
+      "status": "passed",
+      "tests": "5 passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release",
+      "status": "passed"
+    },
+    {
+      "command": "BENCH_SCALE=medium python benchmark.py",
+      "status": "passed",
+      "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task131-group-count-medium-20260526-143020\\benchmark_report_medium.json"
+    }
+  ],
+  "benchmark": {
+    "scale": "medium",
+    "rows_loaded": 50555,
+    "load_time_ms": 782.0,
+    "key_results_ms": {
+      "GROUP BY category": 6.18,
+      "High-card GROUP BY": 3.77,
+      "Revenue by status": 6.34,
+      "DISTINCT": 7.38,
+      "Revenue by category": 29.74
+    },
+    "baseline_notes": [
+      "TASK-130 medium reported GROUP BY category at 11.66ms and High-card GROUP BY at 5.41ms.",
+      "TASK-131 medium measured GROUP BY category at 6.18ms and High-card GROUP BY at 3.77ms."
+    ]
+  }
+}
