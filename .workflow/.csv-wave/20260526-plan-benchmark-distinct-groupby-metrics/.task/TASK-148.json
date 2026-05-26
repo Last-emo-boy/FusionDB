@@ -1,0 +1,31 @@
+{
+  "id": "TASK-148",
+  "title": "Benchmark DISTINCT ORDER and GROUP BY WHERE fast paths",
+  "status": "completed",
+  "files": [
+    "benchmark.py"
+  ],
+  "description": "Add benchmark metrics that track the latest DISTINCT ORDER/LIMIT and filtered GROUP BY column-scan optimizations.",
+  "scope": {
+    "included": [
+      "benchmark.py"
+    ],
+    "excluded": [
+      "dashboard",
+      "ui",
+      "database execution semantics"
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "benchmark.py Part 9 includes DISTINCT ORDER LIMIT",
+      "benchmark.py Part 9 includes GROUP BY COUNT WHERE",
+      "benchmark.py Part 9 includes GROUP BY SUM WHERE"
+    ]
+  },
+  "execution_directives": [
+    "Use E:\\\\Playground\\\\FusionDB\\\\target as CARGO_TARGET_DIR for Rust verification",
+    "Keep dashboard/UI untouched",
+    "Stage only files produced by TASK-148"
+  ]
+}

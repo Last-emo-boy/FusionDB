@@ -1,0 +1,25 @@
+{
+  "session": "20260526-verify-benchmark-distinct-groupby-metrics",
+  "created_at": "2026-05-26T19:35:00+08:00",
+  "task_id": "TASK-148",
+  "status": "passed",
+  "checks": [
+    {
+      "name": "Python syntax",
+      "command": "python -m py_compile benchmark.py",
+      "status": "passed"
+    },
+    {
+      "name": "DISTINCT fast path tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_distinct --test sql_integration",
+      "status": "passed",
+      "details": "4 passed"
+    },
+    {
+      "name": "GROUP BY fast path tests",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test group_by --test sql_integration",
+      "status": "passed",
+      "details": "15 passed"
+    }
+  ]
+}

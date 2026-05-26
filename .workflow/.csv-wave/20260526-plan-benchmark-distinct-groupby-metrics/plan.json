@@ -1,0 +1,30 @@
+{
+  "session": "20260526-plan-benchmark-distinct-groupby-metrics",
+  "created_at": "2026-05-26T19:35:00+08:00",
+  "objective": "Extend benchmark coverage for DISTINCT ORDER/LIMIT and filtered GROUP BY column-scan fast paths.",
+  "scope": [
+    "benchmark.py"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database execution semantics"
+  ],
+  "tasks": [
+    {
+      "id": "TASK-148",
+      "title": "Benchmark DISTINCT ORDER and GROUP BY WHERE fast paths",
+      "status": "planned",
+      "expected_changes": [
+        "Add benchmark metrics for DISTINCT ORDER BY LIMIT.",
+        "Add benchmark metrics for filtered GROUP BY COUNT and SUM workloads.",
+        "Reuse existing benchmark setup tables."
+      ]
+    }
+  ],
+  "verification_plan": [
+    "python -m py_compile benchmark.py",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_distinct --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test group_by --test sql_integration"
+  ]
+}

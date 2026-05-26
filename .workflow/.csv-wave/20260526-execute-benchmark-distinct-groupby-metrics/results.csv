@@ -1,0 +1,2 @@
+id,title,status,findings,files_modified,tests_passed,error
+TASK-148,Benchmark DISTINCT ORDER and GROUP BY WHERE fast paths,completed,"Extended benchmark Part 9 with DISTINCT ORDER LIMIT plus filtered GROUP BY COUNT/SUM workloads using existing setup data.","benchmark.py","py_compile; select_distinct; group_by",

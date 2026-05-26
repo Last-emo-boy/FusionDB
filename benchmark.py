@@ -761,9 +761,12 @@ def part9_column_scan_fast_paths() -> List[BenchResult]:
     R.append(bench("Bare COUNT with WHERE", "SELECT COUNT(category) FROM bench WHERE val >= 500", cat=cat))
     R.append(bench("COUNT DISTINCT WHERE", "SELECT COUNT(DISTINCT user_id) FROM events WHERE event_type = 'click'", cat=cat))
     R.append(bench("DISTINCT with WHERE", "SELECT DISTINCT category FROM bench WHERE val >= 500", cat=cat))
+    R.append(bench("DISTINCT ORDER LIMIT", "SELECT DISTINCT category FROM bench ORDER BY category LIMIT 5", cat=cat))
     R.append(bench("Bare MIN/MAX numeric", "SELECT MIN(amount), MAX(amount) FROM bench", cat=cat))
     R.append(bench("Bare STRING_AGG", "SELECT STRING_AGG(category) FROM bench WHERE val < 5", cat=cat))
     R.append(bench("Bare GROUP_CONCAT", "SELECT GROUP_CONCAT(category) FROM bench WHERE val < 5", cat=cat))
+    R.append(bench("GROUP BY COUNT WHERE", "SELECT event_type, COUNT(*) FROM events WHERE ts > 1700000000 + 86400*23 GROUP BY event_type", cat=cat))
+    R.append(bench("GROUP BY SUM WHERE", "SELECT status, SUM(total), COUNT(*) FROM orders WHERE status != 'cancelled' GROUP BY status", cat=cat))
 
     return R
 
