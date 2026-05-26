@@ -1,0 +1,60 @@
+{
+  "session": "20260527-execute-benchprod-050-benchmark-stability",
+  "created_at": "2026-05-27T06:58:00+08:00",
+  "objective": "Add benchmark stability reporting so performance tasks can distinguish real regressions from run-to-run noise.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/bench_stability.py",
+    "E:/Playground/FusionDB-bench/README.md",
+    "E:/Playground/FusionDB-bench/runs/stability_benchprod050_production_medium_latest5_20260527",
+    "E:/Playground/FusionDB-bench/runs/stability_benchprod050_full_medium_exact3_final_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-050-benchmark-stability/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-050-benchmark-stability/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-050-benchmark-stability/.task/BENCHPROD-050.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database code changes",
+    "external benchmark installation"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-050",
+      "title": "Benchmark stability and noise report",
+      "status": "completed",
+      "expected_changes": [
+        "Add a reusable benchmark stability analyzer for multiple matrix_summary.json reports.",
+        "Report sample count, median, mean, stdev, CV, min/max spread, errors, and unstable case rankings.",
+        "Support production subset filters and exact full-matrix suite matching.",
+        "Update benchmark README with stability workflow commands.",
+        "Validate with existing medium benchmark artifacts."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "python bench_stability.py --help",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_stability.py --scale medium --load-mode insert --suite tpcc,memtier,tsbs,ldbc,chbench --latest 5 --run-name stability_benchprod050_production_medium_latest5_20260527",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/stability_benchprod050_production_medium_latest5_20260527/bench_stability_summary.md",
+      "reports": 5,
+      "unstable_suites": 3,
+      "unstable_cases": 6
+    },
+    {
+      "command": "python bench_stability.py --scale medium --load-mode insert --suite ycsb,tpcc,tpch,search,memtier,tsbs,ldbc,ann,chbench --exact-suites --latest 3 --run-name stability_benchprod050_full_medium_exact3_final_20260527",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/stability_benchprod050_full_medium_exact3_final_20260527/bench_stability_summary.md",
+      "reports": 3,
+      "unstable_suites": 3,
+      "unstable_cases": 11
+    },
+    {
+      "command": "python -m py_compile bench_stability.py bench_trend.py fusiondb_matrix.py fusiondb_bench.py external_smoke.py external_bootstrap.py",
+      "status": "passed"
+    }
+  ]
+}

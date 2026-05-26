@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-050",
+  "title": "Benchmark stability and noise report",
+  "status": "completed",
+  "created_at": "2026-05-27T06:58:00+08:00",
+  "completed_at": "2026-05-27T06:58:00+08:00",
+  "scope": "benchmark harness and workflow evidence only",
+  "bench_repo_commit": null,
+  "results": {
+    "production_medium_latest5": {
+      "reports": 5,
+      "suites": 5,
+      "cases": 20,
+      "unstable_suites": 3,
+      "unstable_cases": 6,
+      "artifact": "E:/Playground/FusionDB-bench/runs/stability_benchprod050_production_medium_latest5_20260527/bench_stability_summary.md"
+    },
+    "full_medium_exact3": {
+      "reports": 3,
+      "suites": 9,
+      "cases": 39,
+      "unstable_suites": 3,
+      "unstable_cases": 11,
+      "artifact": "E:/Playground/FusionDB-bench/runs/stability_benchprod050_full_medium_exact3_final_20260527/bench_stability_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "BENCHPROD-051: Add a matrix repeater command that runs N full matrices and immediately emits stability/trend reports.",
+    "BENCHPROD-048: Revisit LDBC tag popularity using stability reports as the gate.",
+    "BENCHPROD-049: Configure native pgbench or BenchBase artifact under E:/Playground and add external smoke evidence."
+  ]
+}
