@@ -1,0 +1,21 @@
+{
+  "session_id": "maestro-20260526-130038",
+  "task_id": "TASK-128",
+  "title": "Bare aggregate argument fast path",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "started_at": "2026-05-26T13:00:38+08:00",
+  "completed_at": "2026-05-26T13:00:45+08:00",
+  "constraints": [
+    "Only iterate database core; do not modify dashboard/"
+  ],
+  "artifacts": [
+    ".workflow/.csv-wave/20260526-plan-bare-aggregate-fastpath/plan.json",
+    ".workflow/.csv-wave/20260526-execute-bare-aggregate-fastpath/tasks.csv",
+    ".workflow/.csv-wave/20260526-execute-bare-aggregate-fastpath/results.csv",
+    ".workflow/.csv-wave/20260526-execute-bare-aggregate-fastpath/context.md",
+    ".workflow/.csv-wave/20260526-verify-bare-aggregate-fastpath/verification.json",
+    ".workflow/.csv-wave/20260526-verify-bare-aggregate-fastpath/context.md"
+  ],
+  "summary": "Reused the compiled aggregate argument sources for bare aggregates so SUM, AVG, COUNT(DISTINCT), and multiplication aggregate arguments avoid repeated generic expression evaluation."
+}

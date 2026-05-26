@@ -1,0 +1,54 @@
+{
+  "session_id": "20260526-verify-bare-aggregate-fastpath",
+  "task_id": "TASK-128",
+  "title": "Verify bare aggregate argument fast path",
+  "status": "passed",
+  "verified_at": "2026-05-26T13:00:45+08:00",
+  "commands": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration aggregate -- --nocapture",
+      "status": "passed",
+      "tests": "2 passed"
+    },
+    {
+      "command": "cargo test --test sql_integration count_distinct -- --nocapture",
+      "status": "passed",
+      "tests": "1 passed"
+    },
+    {
+      "command": "cargo build --release",
+      "status": "passed"
+    },
+    {
+      "command": "BENCH_SCALE=medium python benchmark.py",
+      "status": "passed",
+      "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task128-bareagg-medium-20260526-130038\\benchmark_report_medium.json"
+    }
+  ],
+  "benchmark": {
+    "scale": "medium",
+    "rows_loaded": 50555,
+    "load_time_ms": 690.0,
+    "key_results_ms": {
+      "SUM(amount)": 10.44,
+      "Total revenue": 5.99,
+      "Revenue by category": 25.42,
+      "Best sellers (qty)": 11.61,
+      "Unique active users": 7.91,
+      "High-card GROUP BY": 5.43,
+      "COUNT all events": 2.74
+    },
+    "baseline_notes": [
+      "TASK-127 medium reported Unique active users around 9.33ms.",
+      "TASK-128 medium measured Unique active users at 7.91ms."
+    ]
+  }
+}

@@ -1330,33 +1330,16 @@ impl Executor {
                     }
                 }
                 if !bare_aggs.is_empty() {
+                    let aggregate_plans =
+                        self.compile_group_aggregate_plans(&bare_aggs, &schema, params);
                     let mut accs: Vec<AggregateAccumulator> = bare_aggs
                         .iter()
                         .map(|(_, name)| AggregateAccumulator::new(name))
                         .collect();
                     for row in &rows {
-                        for (i, (expr, _)) in bare_aggs.iter().enumerate() {
-                            if let Expr::Function(func) = expr {
-                                let arg_val = if let FunctionArguments::List(args) = &func.args {
-                                    if args.args.is_empty() {
-                                        Value::Integer(1)
-                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) =
-                                        &args.args[0]
-                                    {
-                                        Value::Integer(1)
-                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) =
-                                        &args.args[0]
-                                    {
-                                        self.evaluate_value(e, row, &schema, params)
-                                            .unwrap_or(Value::Null)
-                                    } else {
-                                        Value::Null
-                                    }
-                                } else {
-                                    Value::Null
-                                };
-                                accs[i].update(&arg_val);
-                            }
+                        for (i, plan) in aggregate_plans.iter().enumerate() {
+                            let arg_val = plan.arg_source.evaluate(self, row, &schema, params);
+                            accs[i].update(&arg_val);
                         }
                     }
                     let result_row: Vec<Value> = accs.iter().map(|a| a.finalize()).collect();

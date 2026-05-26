@@ -3403,6 +3403,27 @@ async fn test_bare_aggregate_sum_avg() {
 }
 
 #[tokio::test]
+async fn test_bare_aggregate_sum_multiply_expr() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, quantity INTEGER, unit_price INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO items VALUES (1, 2, 10), (2, 3, 20), (3, 4, 5)",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT SUM(quantity * unit_price) FROM items").await;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], fusiondb::common::Value::Integer(100));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_cast_expressions() {
     let (executor, wal) = setup().await;
     // CAST string to integer
