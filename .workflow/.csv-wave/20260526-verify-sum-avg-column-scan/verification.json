@@ -1,0 +1,24 @@
+{
+  "session_id": "20260526-verify-sum-avg-column-scan",
+  "task_id": "TASK-132",
+  "status": "passed",
+  "verified_at": "2026-05-26T15:18:00+08:00",
+  "commands": [
+    {"command": "cargo fmt --check", "status": "passed"},
+    {"command": "cargo check --lib", "status": "passed"},
+    {"command": "cargo test --test sql_integration test_bare_aggregate_sum -- --nocapture", "status": "passed", "tests": 2},
+    {"command": "cargo test --test sql_integration test_count_distinct_fast_path_ignores_null_with_alias -- --nocapture", "status": "passed", "tests": 1},
+    {"command": "cargo test --test sql_integration -- --nocapture", "status": "passed", "tests": 158},
+    {"command": "cargo build --release", "status": "passed"},
+    {"command": "BENCH_SCALE=medium python benchmark.py", "status": "passed"}
+  ],
+  "benchmark_report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task132-sumavg-medium-20260526-151018\\benchmark_report_medium.json",
+  "benchmark_comparison": [
+    {"name": "SUM(amount)", "before_ms": 15.686, "after_ms": 4.413, "speedup": 3.55},
+    {"name": "Total bank balance", "before_ms": 0.894, "after_ms": 0.739, "speedup": 1.21},
+    {"name": "Avg order value", "before_ms": 2.886, "after_ms": 3.113, "speedup": 0.93},
+    {"name": "GROUP BY + HAVING", "before_ms": 14.638, "after_ms": 12.818, "speedup": 1.14},
+    {"name": "Revenue by category", "before_ms": 29.743, "after_ms": 26.199, "speedup": 1.14},
+    {"name": "Best sellers (qty)", "before_ms": 14.617, "after_ms": 13.958, "speedup": 1.05}
+  ]
+}

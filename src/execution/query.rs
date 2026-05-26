@@ -10,6 +10,70 @@ use std::collections::{HashMap, HashSet};
 
 use super::{AggregateAccumulator, Executor, QueryResult};
 
+#[derive(Clone, Copy)]
+enum ColumnAggregateKind {
+    Sum,
+    Avg,
+}
+
+struct ColumnAggregateScanPlan {
+    kind: ColumnAggregateKind,
+    column_index: usize,
+    output_name: String,
+}
+
+struct ColumnAggregateState {
+    kind: ColumnAggregateKind,
+    sum: f64,
+    count: i64,
+    is_int: bool,
+}
+
+impl ColumnAggregateState {
+    fn new(kind: ColumnAggregateKind) -> Self {
+        Self {
+            kind,
+            sum: 0.0,
+            count: 0,
+            is_int: true,
+        }
+    }
+
+    fn update(&mut self, value: Value) {
+        match value {
+            Value::Integer(value) => {
+                self.sum += value as f64;
+                self.count += 1;
+            }
+            Value::Float(value) => {
+                self.sum += value;
+                self.count += 1;
+                self.is_int = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn finalize(&self) -> Value {
+        match self.kind {
+            ColumnAggregateKind::Sum => {
+                if self.is_int {
+                    Value::Integer(self.sum as i64)
+                } else {
+                    Value::Float(self.sum)
+                }
+            }
+            ColumnAggregateKind::Avg => {
+                if self.count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float(self.sum / self.count as f64)
+                }
+            }
+        }
+    }
+}
+
 enum ProjectionOrderValueSource<'a> {
     RowIndex(usize),
     Expr {
@@ -86,6 +150,80 @@ struct GroupAggregatePlan<'a> {
 }
 
 impl Executor {
+    fn simple_column_aggregate_projection(
+        projection: &[SelectItem],
+        schema: &TableSchema,
+        allowed_qualifiers: Option<&[String]>,
+    ) -> Option<Vec<ColumnAggregateScanPlan>> {
+        let mut plans = Vec::with_capacity(projection.len());
+
+        for item in projection {
+            let (expr, output_name) = match item {
+                SelectItem::UnnamedExpr(expr) => (expr, format!("{}", expr)),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.clone()),
+                _ => return None,
+            };
+
+            let Expr::Function(func) = expr else {
+                return None;
+            };
+
+            let kind = match func.name.to_string().to_uppercase().as_str() {
+                "SUM" => ColumnAggregateKind::Sum,
+                "AVG" => ColumnAggregateKind::Avg,
+                _ => return None,
+            };
+
+            let FunctionArguments::List(args) = &func.args else {
+                return None;
+            };
+            if args.duplicate_treatment.is_some() || args.args.len() != 1 {
+                return None;
+            }
+
+            let column_index = Self::column_arg_index(&args.args[0], schema, allowed_qualifiers)?;
+            plans.push(ColumnAggregateScanPlan {
+                kind,
+                column_index,
+                output_name,
+            });
+        }
+
+        if plans.is_empty() {
+            None
+        } else {
+            Some(plans)
+        }
+    }
+
+    async fn simple_column_aggregate_scan(
+        &self,
+        table_name: &str,
+        plans: &[ColumnAggregateScanPlan],
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<Value>> {
+        let prefix = format!("data:{}:", table_name);
+        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let mut states: Vec<ColumnAggregateState> = plans
+            .iter()
+            .map(|plan| ColumnAggregateState::new(plan.kind))
+            .collect();
+
+        for (_, data) in kv_pairs {
+            for (state, plan) in states.iter_mut().zip(plans.iter()) {
+                let value =
+                    crate::common::encoding::RowDecoder::decode_column(&data, plan.column_index)
+                        .map_err(|e| {
+                            FusionError::Execution(format!("Data deserialization error: {}", e))
+                        })?
+                        .unwrap_or(Value::Null);
+                state.update(value);
+            }
+        }
+
+        Ok(states.iter().map(ColumnAggregateState::finalize).collect())
+    }
+
     fn count_distinct_projection<'a>(
         projection: &'a [SelectItem],
         schema: &TableSchema,
@@ -1090,6 +1228,35 @@ impl Executor {
                                         columns: vec![column_name],
                                         rows: vec![vec![Value::Integer(count)]],
                                     });
+                                }
+
+                                if select.having.is_none()
+                                    && query.order_by.is_none()
+                                    && query.limit_clause.is_none()
+                                    && select.from.len() == 1
+                                    && select.from[0].joins.is_empty()
+                                {
+                                    if let Some(plans) = Self::simple_column_aggregate_projection(
+                                        &select.projection,
+                                        &schema,
+                                        Some(&aggregate_qualifiers),
+                                    ) {
+                                        let columns = plans
+                                            .iter()
+                                            .map(|plan| plan.output_name.clone())
+                                            .collect();
+                                        let result_row = self
+                                            .simple_column_aggregate_scan(
+                                                &table_name_str,
+                                                &plans,
+                                                txn,
+                                            )
+                                            .await?;
+                                        return Ok(QueryResult::Select {
+                                            columns,
+                                            rows: vec![result_row],
+                                        });
+                                    }
                                 }
 
                                 for proj_item in &select.projection {

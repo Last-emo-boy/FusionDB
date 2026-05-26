@@ -3484,6 +3484,54 @@ async fn test_bare_aggregate_sum_avg() {
 }
 
 #[tokio::test]
+async fn test_bare_sum_avg_column_scan_uses_only_aggregate_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER, note TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, amount) in [(1_i64, 10_i64), (2, 20), (3, 30)] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(amount),
+                Value::String(format!("note-{}", id)),
+            ]);
+            let corrupt_col_idx = 2usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:sales:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT SUM(amount) AS total_amount, AVG(amount) AS avg_amount FROM sales",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["total_amount", "avg_amount"]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(60));
+    assert_eq!(rows[0][1], Value::Float(20.0));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_bare_aggregate_sum_multiply_expr() {
     let (executor, wal) = setup().await;
     exec_ok(

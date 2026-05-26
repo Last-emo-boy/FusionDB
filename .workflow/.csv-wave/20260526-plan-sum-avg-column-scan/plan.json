@@ -1,0 +1,22 @@
+{
+  "session_id": "20260526-plan-sum-avg-column-scan",
+  "task_id": "TASK-132",
+  "title": "Plan bare SUM/AVG direct column scan",
+  "status": "completed",
+  "created_at": "2026-05-26T15:10:18+08:00",
+  "problem": "Bare SELECT SUM(column), AVG(column) FROM table materialized rows and ran generic aggregate evaluation even when only aggregate argument columns were needed.",
+  "approach": [
+    "Detect one-table bare SUM/AVG column aggregate projections with no WHERE, JOIN, GROUP BY, HAVING, ORDER BY, LIMIT, or DISTINCT aggregate modifier.",
+    "Resolve aggregate argument columns once against the table schema and allowed table/alias qualifiers.",
+    "Scan table data keys and decode only the required aggregate columns via RowDecoder::decode_column.",
+    "Accumulate SUM/AVG state directly and keep expression aggregates such as SUM(quantity * unit_price) on the generic path."
+  ],
+  "expected_impact": [
+    "Improve benchmark SUM(amount).",
+    "Improve simple full-table SUM/AVG analytics where row width is larger than aggregate column width."
+  ],
+  "risk_controls": [
+    "Do not optimize queries with WHERE, JOIN, GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT aggregates, or expression arguments.",
+    "Add SQL integration coverage proving unused columns are not decoded and alias output names are preserved."
+  ]
+}

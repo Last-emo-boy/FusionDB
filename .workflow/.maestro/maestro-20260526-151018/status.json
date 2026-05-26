@@ -1,0 +1,20 @@
+{
+  "session_id": "maestro-20260526-151018",
+  "task_id": "TASK-132",
+  "title": "Optimize bare SUM/AVG column scan",
+  "status": "completed",
+  "started_at": "2026-05-26T15:10:18+08:00",
+  "completed_at": "2026-05-26T15:18:00+08:00",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "non_goals": [
+    "dashboard/ui changes",
+    "SUM/AVG with WHERE, JOIN, GROUP BY, HAVING, ORDER BY, or LIMIT",
+    "expression aggregate fast path",
+    "GROUP BY SUM/AVG column scan"
+  ],
+  "verification": ".workflow/.csv-wave/20260526-verify-sum-avg-column-scan/verification.json",
+  "benchmark_report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task132-sumavg-medium-20260526-151018\\benchmark_report_medium.json"
+}
