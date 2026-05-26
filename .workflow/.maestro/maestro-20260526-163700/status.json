@@ -1,0 +1,20 @@
+{
+  "session_id": "maestro-20260526-163700",
+  "task_id": "TASK-136",
+  "title": "Extend GROUP BY COUNT(column) fast path",
+  "status": "completed",
+  "started_at": "2026-05-26T16:37:00+08:00",
+  "completed_at": "2026-05-26T16:45:00+08:00",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "non_goals": [
+    "dashboard/ui changes",
+    "COUNT DISTINCT in GROUP BY",
+    "COUNT expression arguments",
+    "benchmark suite changes"
+  ],
+  "verification": ".workflow/.csv-wave/20260526-verify-group-count-column-fastpath/verification.json",
+  "benchmark_report": null
+}

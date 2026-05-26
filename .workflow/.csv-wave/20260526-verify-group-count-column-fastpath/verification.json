@@ -1,0 +1,16 @@
+{
+  "session_id": "20260526-verify-group-count-column-fastpath",
+  "task_id": "TASK-136",
+  "status": "passed",
+  "verified_at": "2026-05-26T16:45:00+08:00",
+  "commands": [
+    {"command": "cargo fmt --check", "status": "passed"},
+    {"command": "cargo check --lib", "status": "passed"},
+    {"command": "cargo test --test sql_integration test_group_by_count_column_fast_path_ignores_nulls -- --nocapture", "status": "passed", "tests": 1},
+    {"command": "cargo test --test sql_integration test_group_by_column_aggregates_fast_path -- --nocapture", "status": "passed", "tests": 3},
+    {"command": "cargo test --test sql_integration -- --nocapture", "status": "passed", "tests": 163},
+    {"command": "cargo build --release", "status": "passed"}
+  ],
+  "benchmark_report": null,
+  "notes": "Medium benchmark has no COUNT(column) GROUP BY workload; release build used as performance/packaging gate."
+}

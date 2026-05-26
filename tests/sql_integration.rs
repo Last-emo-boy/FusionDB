@@ -1505,6 +1505,45 @@ async fn test_group_by_column_aggregates_fast_path_preserves_alias_and_nulls() {
 }
 
 #[tokio::test]
+async fn test_group_by_count_column_fast_path_ignores_nulls() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE visits (id INTEGER PRIMARY KEY, city TEXT, user_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO visits VALUES (1, 'Paris', 10), (2, 'Paris', NULL), (3, 'Rome', 20), (4, 'Rome', 30), (5, 'Rome', NULL)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT city AS place, COUNT(user_id) AS active_users, COUNT(*) AS visits FROM visits GROUP BY city ORDER BY place",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["place", "active_users", "visits"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::String("Paris".to_string()),
+                Value::Integer(1),
+                Value::Integer(2),
+            ],
+            vec![
+                Value::String("Rome".to_string()),
+                Value::Integer(2),
+                Value::Integer(3),
+            ],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_group_by_column_aggregates_fast_path_uses_only_group_and_aggregate_columns() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

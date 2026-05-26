@@ -97,6 +97,7 @@ impl ColumnAggregateState {
 #[derive(Clone, Copy)]
 enum GroupColumnAggregateKind {
     CountStar,
+    CountColumn,
     Sum,
     Avg,
     Min,
@@ -137,6 +138,11 @@ impl GroupColumnAggregateState {
     fn update_value(&mut self, value: Value) {
         match self.kind {
             GroupColumnAggregateKind::CountStar => self.update_count_star(),
+            GroupColumnAggregateKind::CountColumn => {
+                if value != Value::Null {
+                    self.count += 1;
+                }
+            }
             GroupColumnAggregateKind::Sum => match value {
                 Value::Integer(value) => {
                     self.sum += value as f64;
@@ -190,7 +196,9 @@ impl GroupColumnAggregateState {
 
     fn finalize(&self) -> Value {
         match self.kind {
-            GroupColumnAggregateKind::CountStar => Value::Integer(self.count),
+            GroupColumnAggregateKind::CountStar | GroupColumnAggregateKind::CountColumn => {
+                Value::Integer(self.count)
+            }
             GroupColumnAggregateKind::Sum => {
                 if self.is_int {
                     Value::Integer(self.sum as i64)
@@ -724,6 +732,10 @@ impl Executor {
                 {
                     (GroupColumnAggregateKind::CountStar, None)
                 }
+                "COUNT" => (
+                    GroupColumnAggregateKind::CountColumn,
+                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                ),
                 "SUM" => (
                     GroupColumnAggregateKind::Sum,
                     Some(Self::column_arg_index(&args.args[0], schema, None)?),
