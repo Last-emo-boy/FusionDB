@@ -1,0 +1,83 @@
+{
+  "session": "20260527-execute-benchprod-059-gate-profile-config",
+  "created_at": "2026-05-27T07:41:00+08:00",
+  "objective": "Move benchmark gate thresholds and unstable allowlists into versioned JSON profiles so gate policy can be reviewed separately from code.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/bench_gate.py",
+    "E:/Playground/FusionDB-bench/gate_profiles/production_medium.json",
+    "E:/Playground/FusionDB-bench/README.md",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod059_default_profile_20260527",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod059_explicit_profile_20260527",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod059_profile_with_matrix_20260527",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod059_expected_fail_20260527",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod059_expected_allowlist_fail_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-059-gate-profile-config/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-059-gate-profile-config/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-059-gate-profile-config/.task/BENCHPROD-059.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database code changes",
+    "external benchmark installation"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-059",
+      "title": "Versioned benchmark gate profiles",
+      "status": "completed",
+      "expected_changes": [
+        "Add gate_profiles/production_medium.json for threshold and allowlist policy.",
+        "Make bench_gate.py load a JSON gate profile by default.",
+        "Keep CLI overrides for temporary threshold and allowlist experiments.",
+        "Record gate profile path in gate reports.",
+        "Update README gate usage documentation.",
+        "Verify default profile pass, explicit profile pass, matrix compatibility, threshold failure, and allowlist failure."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "python -m py_compile bench_gate.py bench_repeat.py bench_stability.py bench_trend.py fusiondb_matrix.py fusiondb_bench.py external_smoke.py external_bootstrap.py",
+      "status": "passed"
+    },
+    {
+      "command": "Get-Content gate_profiles\\production_medium.json -Raw | ConvertFrom-Json",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_gate.py --help",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_gate.py --repeat-report runs\\repeat_benchprod048_production_medium_stream_count_3x_20260527\\bench_repeat_summary.json --run-name gate_benchprod059_default_profile_20260527",
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_default_profile_20260527/bench_gate_summary.md"
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles\\production_medium.json --repeat-report runs\\repeat_benchprod048_production_medium_stream_count_3x_20260527\\bench_repeat_summary.json --run-name gate_benchprod059_explicit_profile_20260527",
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_explicit_profile_20260527/bench_gate_summary.md"
+    },
+    {
+      "command": "python bench_gate.py --repeat-report runs\\repeat_benchprod048_production_medium_stream_count_3x_20260527\\bench_repeat_summary.json --matrix-report runs\\matrix_benchprod052_all_medium_insert_20260527\\matrix_summary.json --matrix-suite all --run-name gate_benchprod059_profile_with_matrix_20260527",
+      "status": "passed",
+      "checks": "37/37",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_profile_with_matrix_20260527/bench_gate_summary.md"
+    },
+    {
+      "command": "python bench_gate.py --repeat-report runs\\repeat_benchprod048_production_medium_stream_count_3x_20260527\\bench_repeat_summary.json --suite-max-p95-ms tsbs=1 --run-name gate_benchprod059_expected_fail_20260527",
+      "status": "expected_failed",
+      "checks": "21/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_expected_fail_20260527/bench_gate_summary.md"
+    },
+    {
+      "command": "python bench_gate.py --repeat-report runs\\repeat_benchprod048_production_medium_stream_count_3x_20260527\\bench_repeat_summary.json --no-default-unstable-allowlist --run-name gate_benchprod059_expected_allowlist_fail_20260527",
+      "status": "expected_failed",
+      "checks": "20/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_expected_allowlist_fail_20260527/bench_gate_summary.md"
+    }
+  ]
+}

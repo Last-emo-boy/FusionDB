@@ -1,0 +1,63 @@
+{
+  "id": "BENCHPROD-059",
+  "title": "Versioned benchmark gate profiles",
+  "status": "completed",
+  "created_at": "2026-05-27T07:41:00+08:00",
+  "completed_at": "2026-05-27T07:41:00+08:00",
+  "scope": "benchmark harness policy and workflow evidence only",
+  "results": {
+    "bench_repo_commit": "469639e feat: 增加benchmark门禁配置",
+    "new_profile": "E:/Playground/FusionDB-bench/gate_profiles/production_medium.json",
+    "profile_summary": {
+      "schema_version": 1,
+      "name": "production_medium",
+      "scale": "medium",
+      "suite": "production",
+      "suites": [
+        "tpcc",
+        "memtier",
+        "tsbs",
+        "ldbc",
+        "chbench"
+      ],
+      "max_unstable_suites": 1,
+      "max_unstable_cases": 6,
+      "allowlist_source": "BENCHPROD-052 baseline with BENCHPROD-048 current-noise allowlist update"
+    },
+    "verification": {
+      "default_profile": {
+        "status": "passed",
+        "checks": "22/22",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_default_profile_20260527/bench_gate_summary.md"
+      },
+      "explicit_profile": {
+        "status": "passed",
+        "checks": "22/22",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_explicit_profile_20260527/bench_gate_summary.md"
+      },
+      "matrix_compatibility": {
+        "status": "passed",
+        "checks": "37/37",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_profile_with_matrix_20260527/bench_gate_summary.md"
+      },
+      "threshold_failure": {
+        "status": "failed as expected",
+        "checks": "21/22",
+        "failure": "stability.tsbs.p95 exceeded artificial 1 ms threshold",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_expected_fail_20260527/bench_gate_summary.md"
+      },
+      "allowlist_failure": {
+        "status": "failed as expected",
+        "checks": "20/22",
+        "failure": "profile allowlist disabled, so current unstable suite/cases were rejected",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod059_expected_allowlist_fail_20260527/bench_gate_summary.md"
+      }
+    }
+  },
+  "next_task_signals": [
+    "BENCHPROD-060: Optimize TSBS Fleet rollup by region, using production_medium gate profile as the acceptance guard.",
+    "BENCHPROD-061: Stabilize CH-benCHmark Customer order join and Warehouse revenue rollup.",
+    "BENCHPROD-063: Add additional gate profiles for tiny smoke and all-suite medium coverage.",
+    "BENCHPROD-064: Add a wrapper command that runs cargo build, bench_repeat.py, and bench_gate.py with a selected profile."
+  ]
+}
