@@ -3,6 +3,7 @@ use crate::storage::Transaction;
 use sqlparser::ast::{
     CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Ident, Statement,
 };
+use std::io::{Cursor, Read};
 
 use super::{Executor, QueryResult};
 
@@ -48,12 +49,6 @@ impl Executor {
             ));
         }
 
-        if !values.is_empty() {
-            return Err(FusionError::NotImplemented(
-                "COPY FROM STDIN payload is not supported yet".to_string(),
-            ));
-        }
-
         let CopySource::Table {
             table_name,
             columns,
@@ -67,9 +62,14 @@ impl Executor {
         let filename = match target {
             CopyTarget::File { filename } => filename,
             CopyTarget::Stdin => {
+                if !values.is_empty() {
+                    return Err(FusionError::NotImplemented(
+                        "inline COPY FROM STDIN payload is not supported yet".to_string(),
+                    ));
+                }
                 return Err(FusionError::NotImplemented(
                     "COPY FROM STDIN is not supported yet".to_string(),
-                ))
+                ));
             }
             CopyTarget::Program { .. } => {
                 return Err(FusionError::NotImplemented(
@@ -92,6 +92,53 @@ impl Executor {
         Ok(QueryResult::Success {
             message: format!("Copied {} rows", count),
         })
+    }
+
+    pub(crate) async fn execute_copy_stdin_payload(
+        &self,
+        statement: &Statement,
+        payload: &[u8],
+        txn: &mut dyn Transaction,
+    ) -> Result<usize> {
+        let Statement::Copy {
+            source,
+            to,
+            target,
+            options,
+            legacy_options,
+            ..
+        } = statement
+        else {
+            return Err(FusionError::Execution(
+                "COPY STDIN execution requires a COPY statement".to_string(),
+            ));
+        };
+
+        if *to {
+            return Err(FusionError::NotImplemented(
+                "COPY TO is not supported yet".to_string(),
+            ));
+        }
+        if !matches!(target, CopyTarget::Stdin) {
+            return Err(FusionError::Execution(
+                "COPY STDIN execution requires COPY FROM STDIN".to_string(),
+            ));
+        }
+
+        let CopySource::Table {
+            table_name,
+            columns,
+        } = source
+        else {
+            return Err(FusionError::Execution(
+                "COPY FROM STDIN requires a table target".to_string(),
+            ));
+        };
+
+        let copy_options = Self::copy_from_options(options, legacy_options)?;
+        let rows = self.read_copy_bytes(payload, &copy_options)?;
+        self.insert_copy_rows(table_name.to_string(), columns, rows, txn)
+            .await
     }
 
     fn copy_from_options(
@@ -200,6 +247,18 @@ impl Executor {
         let file = std::fs::File::open(filename).map_err(|e| {
             FusionError::Execution(format!("COPY failed to open {}: {}", filename, e))
         })?;
+        Self::read_copy_reader(file, options)
+    }
+
+    fn read_copy_bytes(
+        &self,
+        payload: &[u8],
+        options: &CopyFromOptions,
+    ) -> Result<Vec<Vec<Value>>> {
+        Self::read_copy_reader(Cursor::new(payload), options)
+    }
+
+    fn read_copy_reader<R: Read>(reader: R, options: &CopyFromOptions) -> Result<Vec<Vec<Value>>> {
         let mut builder = csv::ReaderBuilder::new();
         builder
             .has_headers(options.header)
@@ -210,7 +269,7 @@ impl Executor {
             builder.escape(Some(escape));
         }
 
-        let mut reader = builder.from_reader(file);
+        let mut reader = builder.from_reader(reader);
         let mut rows = Vec::new();
         for record in reader.records() {
             let record = record

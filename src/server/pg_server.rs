@@ -9,13 +9,17 @@ use pgwire::api::auth::{
     finish_authentication, protocol_negotiation, save_startup_parameters_to_metadata,
     DefaultServerParameterProvider, LoginInfo, StartupHandler,
 };
+use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::results::{
+    CopyResponse, DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag,
+};
 use pgwire::api::stmt::NoopQueryParser;
 use pgwire::api::{ClientInfo, PgWireConnectionState, Type};
 use pgwire::error::{PgWireError, PgWireResult};
-use pgwire::messages::data::{ParameterDescription, RowDescription};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
+use pgwire::messages::data::{NoData, ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, Describe, Execute, Parse, ParseComplete, Sync as PgSync,
 };
@@ -37,6 +41,7 @@ struct Session {
     transaction: Option<Box<dyn Transaction>>,
     statements: HashMap<String, StatementData>, // name -> statement data
     portals: HashMap<String, PortalData>,       // name -> portal data
+    copy_in: Option<CopyInState>,
 }
 
 struct StatementData {
@@ -49,6 +54,11 @@ struct PortalData {
     statement_name: String,
     query: String,
     params: Vec<Value>,
+}
+
+struct CopyInState {
+    statement: Statement,
+    data: Vec<u8>,
 }
 
 pub struct PgHandler {
@@ -68,6 +78,7 @@ impl PgHandler {
                 transaction: None,
                 statements: HashMap::new(),
                 portals: HashMap::new(),
+                copy_in: None,
             })),
         }
     }
@@ -81,6 +92,79 @@ impl PgHandler {
 
     fn auth_error(message: impl Into<String>) -> pgwire::error::ErrorInfo {
         pgwire::error::ErrorInfo::new("ERROR".to_string(), "42501".to_string(), message.into())
+    }
+
+    fn execution_error(message: impl Into<String>) -> pgwire::error::ErrorInfo {
+        pgwire::error::ErrorInfo::new("ERROR".to_string(), "XX000".to_string(), message.into())
+    }
+
+    fn sink_error() -> PgWireError {
+        PgWireError::IoError(std::io::Error::other("Sink Error"))
+    }
+
+    fn is_copy_from_stdin_statement(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::Copy {
+                to: false,
+                target: sqlparser::ast::CopyTarget::Stdin,
+                ..
+            }
+        )
+    }
+
+    fn parse_copy_from_stdin_query(
+        query: &str,
+    ) -> std::result::Result<Option<Statement>, FusionError> {
+        let trimmed = query.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if !upper.starts_with("COPY ") || !upper.contains("STDIN") {
+            return Ok(None);
+        }
+
+        let mut normalized = trimmed.to_string();
+        if !normalized.ends_with(';') {
+            normalized.push(';');
+        }
+
+        let statements = parse_sql(&normalized)
+            .map_err(|e| FusionError::Execution(format!("Parse Error: {:?}", e)))?;
+        let Some(stmt) = statements.first() else {
+            return Ok(None);
+        };
+
+        if Self::is_copy_from_stdin_statement(stmt) {
+            Ok(Some(stmt.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn copy_column_count(stmt: &Statement) -> usize {
+        let Statement::Copy { source, .. } = stmt else {
+            return 0;
+        };
+        match source {
+            sqlparser::ast::CopySource::Table { columns, .. } if !columns.is_empty() => {
+                columns.len()
+            }
+            _ => 0,
+        }
+    }
+
+    fn copy_in_response_for_statement(stmt: &Statement) -> CopyResponse {
+        let columns = Self::copy_column_count(stmt);
+        CopyResponse::new(0, columns, vec![0; columns])
+    }
+
+    async fn begin_copy_from_stdin(&self, stmt: Statement) -> PgWireResult<Response> {
+        let response = Self::copy_in_response_for_statement(&stmt);
+        let mut session = self.session.lock().await;
+        session.copy_in = Some(CopyInState {
+            statement: stmt,
+            data: Vec::new(),
+        });
+        Ok(Response::CopyIn(response))
     }
 
     fn pg_type_for_value(value: &Value) -> Type {
@@ -1220,6 +1304,10 @@ impl pgwire::api::PgWireServerHandlers for PgServerFactory {
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
         self.handler.clone()
     }
+
+    fn copy_handler(&self) -> Arc<impl CopyHandler> {
+        self.handler.clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1231,6 +1319,28 @@ impl SimpleQueryHandler for PgHandler {
         eprintln!("PG Simple Query called: {}", query);
 
         let username = Self::username_for_client(client);
+        match Self::parse_copy_from_stdin_query(query) {
+            Ok(Some(stmt)) => {
+                if let Err(e) = self.executor.authorize_statement(&username, &stmt).await {
+                    return Ok(vec![Response::Error(Box::new(Self::auth_error(format!(
+                        "Authorization Error: {:?}",
+                        e
+                    ))))]);
+                }
+                return Ok(vec![self.begin_copy_from_stdin(stmt).await?]);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Ok(vec![Response::Error(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42000".to_string(),
+                        format!("Parse Error: {:?}", e),
+                    ),
+                ))])
+            }
+        }
+
         if let Err(e) = self.executor.authorize_sql(&username, query).await {
             return Ok(vec![Response::Error(Box::new(Self::auth_error(format!(
                 "Authorization Error: {:?}",
@@ -1401,7 +1511,12 @@ impl ExtendedQueryHandler for PgHandler {
         C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
     {
         let username = Self::username_for_client(client);
-        if let Err(e) = self.executor.authorize_sql(&username, &message.query).await {
+        let auth_result = match Self::parse_copy_from_stdin_query(&message.query) {
+            Ok(Some(stmt)) => self.executor.authorize_statement(&username, &stmt).await,
+            Ok(None) => self.executor.authorize_sql(&username, &message.query).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = auth_result {
             client
                 .send(PgWireBackendMessage::ErrorResponse(
                     Self::auth_error(format!("Authorization Error: {:?}", e)).into(),
@@ -1521,6 +1636,44 @@ impl ExtendedQueryHandler for PgHandler {
         );
 
         let username = Self::username_for_client(client);
+        if let Some(stmt) = Self::parse_copy_from_stdin_query(&query).map_err(|e| {
+            PgWireError::ApiError(Box::new(std::io::Error::other(format!(
+                "Parse Error: {:?}",
+                e
+            ))))
+        })? {
+            if let Err(e) = self.executor.authorize_statement(&username, &stmt).await {
+                client
+                    .send(PgWireBackendMessage::ErrorResponse(
+                        Self::auth_error(format!("Authorization Error: {:?}", e)).into(),
+                    ))
+                    .await
+                    .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                return Ok(());
+            }
+
+            let columns = Self::copy_column_count(&stmt);
+            {
+                let mut session = self.session.lock().await;
+                session.copy_in = Some(CopyInState {
+                    statement: stmt,
+                    data: Vec::new(),
+                });
+            }
+            client.set_state(PgWireConnectionState::CopyInProgress(true));
+            client
+                .send(PgWireBackendMessage::CopyInResponse(
+                    pgwire::messages::copy::CopyInResponse::new(
+                        0,
+                        columns as i16,
+                        vec![0; columns],
+                    ),
+                ))
+                .await
+                .map_err(|_| Self::sink_error())?;
+            return Ok(());
+        }
+
         if let Err(e) = self.executor.authorize_sql(&username, &query).await {
             client
                 .send(PgWireBackendMessage::ErrorResponse(
@@ -1639,7 +1792,6 @@ impl ExtendedQueryHandler for PgHandler {
                         (Vec::new(), String::new())
                     }
                 };
-                let fields = self.describe_query_fields(&query).await?;
                 client
                     .send(PgWireBackendMessage::ParameterDescription(
                         ParameterDescription::new(
@@ -1648,12 +1800,23 @@ impl ExtendedQueryHandler for PgHandler {
                     ))
                     .await
                     .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
-                client
-                    .send(PgWireBackendMessage::RowDescription(RowDescription::new(
-                        fields.iter().map(Into::into).collect(),
-                    )))
-                    .await
-                    .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                if Self::parse_copy_from_stdin_query(&query)
+                    .map(|stmt| stmt.is_some())
+                    .unwrap_or(false)
+                {
+                    client
+                        .send(PgWireBackendMessage::NoData(NoData::new()))
+                        .await
+                        .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                } else {
+                    let fields = self.describe_query_fields(&query).await?;
+                    client
+                        .send(PgWireBackendMessage::RowDescription(RowDescription::new(
+                            fields.iter().map(Into::into).collect(),
+                        )))
+                        .await
+                        .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                }
             }
             b'P' => {
                 let query = {
@@ -1665,13 +1828,23 @@ impl ExtendedQueryHandler for PgHandler {
                         .map(|portal| portal.query.clone())
                         .unwrap_or_default()
                 };
-                let fields = self.describe_query_fields(&query).await?;
-                client
-                    .send(PgWireBackendMessage::RowDescription(RowDescription::new(
-                        fields.iter().map(Into::into).collect(),
-                    )))
-                    .await
-                    .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                if Self::parse_copy_from_stdin_query(&query)
+                    .map(|stmt| stmt.is_some())
+                    .unwrap_or(false)
+                {
+                    client
+                        .send(PgWireBackendMessage::NoData(NoData::new()))
+                        .await
+                        .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                } else {
+                    let fields = self.describe_query_fields(&query).await?;
+                    client
+                        .send(PgWireBackendMessage::RowDescription(RowDescription::new(
+                            fields.iter().map(Into::into).collect(),
+                        )))
+                        .await
+                        .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                }
             }
             _ => {}
         }
@@ -1683,6 +1856,120 @@ impl ExtendedQueryHandler for PgHandler {
         C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
     {
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl CopyHandler for PgHandler {
+    async fn on_copy_data<C>(&self, _client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let mut session = self.session.lock().await;
+        let Some(copy_in) = session.copy_in.as_mut() else {
+            return Err(PgWireError::UserError(Box::new(Self::execution_error(
+                "COPY data received without active COPY FROM STDIN",
+            ))));
+        };
+        copy_in.data.extend_from_slice(copy_data.data.as_ref());
+        Ok(())
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        enum CopyDoneWork {
+            Count(usize),
+            ImplicitTransaction(Statement, Vec<u8>),
+        }
+
+        let work = {
+            let mut session = self.session.lock().await;
+            let Some(copy_in) = session.copy_in.take() else {
+                return Err(PgWireError::UserError(Box::new(Self::execution_error(
+                    "COPY done received without active COPY FROM STDIN",
+                ))));
+            };
+
+            if let Some(txn) = session.transaction.as_mut() {
+                let count = self
+                    .executor
+                    .execute_copy_stdin_payload(&copy_in.statement, &copy_in.data, &mut **txn)
+                    .await
+                    .map_err(|e| {
+                        PgWireError::UserError(Box::new(Self::execution_error(format!(
+                            "COPY execution error: {:?}",
+                            e
+                        ))))
+                    })?;
+                CopyDoneWork::Count(count)
+            } else {
+                CopyDoneWork::ImplicitTransaction(copy_in.statement, copy_in.data)
+            }
+        };
+
+        let count = match work {
+            CopyDoneWork::Count(count) => count,
+            CopyDoneWork::ImplicitTransaction(statement, payload) => {
+                let mut txn = self.storage.begin_transaction().await.map_err(|e| {
+                    PgWireError::UserError(Box::new(Self::execution_error(format!(
+                        "COPY failed to begin transaction: {:?}",
+                        e
+                    ))))
+                })?;
+                match self
+                    .executor
+                    .execute_copy_stdin_payload(&statement, &payload, &mut *txn)
+                    .await
+                {
+                    Ok(count) => {
+                        txn.commit().await.map_err(|e| {
+                            PgWireError::UserError(Box::new(Self::execution_error(format!(
+                                "COPY failed to commit transaction: {:?}",
+                                e
+                            ))))
+                        })?;
+                        count
+                    }
+                    Err(e) => {
+                        let _ = txn.rollback().await;
+                        return Err(PgWireError::UserError(Box::new(Self::execution_error(
+                            format!("COPY execution error: {:?}", e),
+                        ))));
+                    }
+                }
+            }
+        };
+
+        client
+            .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                format!("COPY {}", count),
+            )))
+            .await
+            .map_err(|_| Self::sink_error())?;
+        if matches!(client.state(), PgWireConnectionState::CopyInProgress(true)) {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+        }
+        Ok(())
+    }
+
+    async fn on_copy_fail<C>(&self, _client: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let mut session = self.session.lock().await;
+        session.copy_in = None;
+        PgWireError::UserError(Box::new(Self::execution_error(format!(
+            "COPY IN mode terminated by the user: {}",
+            fail.message
+        ))))
     }
 }
 

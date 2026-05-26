@@ -15,9 +15,9 @@ Current benchmark lab coverage:
 ## Evidence
 
 - `E:/Playground/FusionDB-bench/fusiondb_bench.py` tracks 8 production benchmark targets and reports `native_official_ready = 0`.
-- `src/server/pg_server.rs` still emits all result fields as `Type::TEXT` and returns empty `ParameterDescription` / `RowDescription` for extended Describe.
-- `src/server/pg_server.rs` extended-query `do_query` is still not implemented; execute path is custom and incomplete.
-- `src/execution/copy.rs` supports file-based COPY, but explicitly rejects `COPY FROM STDIN`.
+- `src/server/pg_server.rs` now reports baseline extended-query `ParameterDescription` / `RowDescription` and typed binary rows for simple SELECT projections.
+- `src/server/pg_server.rs` extended-query `do_query` is still not implemented; the custom `on_execute` path covers parameterized queries and COPY IN but remains incomplete for full PostgreSQL parity.
+- `src/execution/copy.rs` supports file-based COPY and PgWire `COPY FROM STDIN` payload loading; direct bulk writer optimization is still open.
 - `src/common/value.rs` has Null/Boolean/Integer/Float/String/Blob/Vector/Array/Object only; DATE/TIMESTAMP/DECIMAL/INTERVAL are not first-class values.
 - `ROADMAP.md` still lists correlated subqueries, cost-based optimizer, and VACUUM as open.
 - `src/storage/fusion.rs` has MVCC snapshot isolation, WAL, LSM/SSTable and OCC write conflict detection, but needs production soak around compaction, vacuum, crash recovery and long-running mixed workloads.
@@ -26,8 +26,8 @@ Current benchmark lab coverage:
 
 | Target | Current position | Native blocker | Distance |
 |---|---|---|---|
-| pgbench | local coverage only via ycsb/tpcc-like | COPY FROM STDIN, extended prepared protocol, VACUUM, metadata/type OIDs | Far |
-| TPC-C / BenchBase | tpcc-like local suite | JDBC/PgWire metadata, official schema/types, transaction mix, FK details | Far |
+| pgbench | local coverage only via ycsb/tpcc-like | pgbench meta-command smoke, VACUUM behavior, remaining metadata/type parity | Medium-far |
+| TPC-C / BenchBase | tpcc-like local suite | JDBC/PgWire edge metadata, official schema/types, transaction mix, FK details | Far |
 | sysbench | no native suite | PostgreSQL/MySQL driver behavior, AUTO_INCREMENT/SERIAL, dialect compatibility | Far |
 | memtier | SQL KV-like suite | Redis/Memcached protocol and pipelining, backpressure metrics | Very far unless kept as SQL-like only |
 | TSBS | tsbs-like local suite | official TSBS adapter, TIMESTAMP semantics, ordered composite index/range optimization | Medium-far |
@@ -77,7 +77,29 @@ Verification:
 - `cargo test --test sql_ddl`
 - `cargo test --test sql_index_cache`
 
-Remaining PgWire gaps:
+Remaining PgWire gaps after BENCHPROD-006:
 - Parameter type inference is still heuristic for general SQL.
 - Complex JOIN/aggregate Describe metadata still falls back to text or runtime inference.
-- COPY FROM STDIN is still open as `BENCHPROD-019`.
+- COPY FROM STDIN is tracked separately as `BENCHPROD-019`.
+
+### BENCHPROD-019 completed
+
+Implemented PgWire `COPY FROM STDIN` baseline:
+- Simple and extended PgWire COPY paths now enter `CopyInProgress` and store COPY state per session.
+- `CopyData` chunks are accumulated without writing temporary files.
+- `CopyDone` loads the payload through the core COPY parser/insert path and returns `COPY n`.
+- Existing file-based COPY continues to use the same CSV/TSV reader.
+- `tokio-postgres::Client::copy_in` now loads both default text/TSV and CSV-with-header payloads.
+
+Verification:
+- `cargo fmt --check`
+- `cargo check --lib`
+- `cargo test --test pg_integration`
+- `cargo test --test sql_dml copy`
+- `cargo test --test sql_ddl`
+- `cargo test --test sql_index_cache`
+
+Remaining COPY/import gaps:
+- PgWire COPY currently buffers payload in memory; direct streaming/bulk row writer remains `BENCHPROD-009`.
+- Binary COPY is not supported.
+- COPY still routes through SQL-string INSERT batches internally, so medium/large load performance is not production-grade yet.

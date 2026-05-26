@@ -1,8 +1,10 @@
+use bytes::Bytes;
 use fusiondb::auth::UserRecord;
 use fusiondb::execution::Executor;
 use fusiondb::server::pg_server;
 use fusiondb::storage::memory::MemoryStorage;
 use fusiondb::storage::Storage;
+use futures::SinkExt;
 use std::sync::Arc;
 use tokio_postgres::types::Type;
 use tokio_postgres::NoTls;
@@ -184,6 +186,98 @@ async fn test_pg_protocol_prepare_reports_columns_and_params() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 2);
     assert_eq!(rows[0].get::<_, String>("val"), "world");
+
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
+async fn test_pg_protocol_copy_from_stdin_text_and_csv() {
+    let wal_path = format!("test_pg_copy_{}.wal", std::process::id());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let executor = Arc::new(Executor::new(storage.clone()));
+    let port = 19992;
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect to server");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query(
+            "CREATE TABLE copy_text_test (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+        )
+        .await
+        .expect("Failed to create text copy table");
+
+    let mut text_sink = std::pin::pin!(client
+        .copy_in("COPY copy_text_test FROM STDIN")
+        .await
+        .expect("COPY text should enter copy-in mode"));
+    text_sink
+        .send(Bytes::from_static(b"1\tAlice\t30\n2\tBob\t\\N\n"))
+        .await
+        .expect("COPY text payload should send");
+    let copied = text_sink.finish().await.expect("COPY text should finish");
+    assert_eq!(copied, 2);
+
+    client
+        .simple_query("CREATE TABLE copy_csv_test (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+        .await
+        .expect("Failed to create csv copy table");
+
+    let mut csv_sink = std::pin::pin!(client
+        .copy_in("COPY copy_csv_test (id, name, age) FROM STDIN WITH (FORMAT CSV, HEADER true, NULL 'NULL')")
+        .await
+        .expect("COPY CSV should enter copy-in mode"));
+    csv_sink
+        .send(Bytes::from_static(
+            b"id,name,age\n10,Carol,41\n11,Dave,NULL\n",
+        ))
+        .await
+        .expect("COPY CSV payload should send");
+    let copied = csv_sink.finish().await.expect("COPY CSV should finish");
+    assert_eq!(copied, 2);
+
+    let rows = client
+        .query(
+            "SELECT id, name, age FROM copy_text_test WHERE id = $1",
+            &[&1i64],
+        )
+        .await
+        .expect("copied text row should be queryable");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("id"), 1);
+    assert_eq!(rows[0].get::<_, String>("name"), "Alice");
+    assert_eq!(rows[0].get::<_, i32>("age"), 30);
+
+    let rows = client
+        .query(
+            "SELECT id, name FROM copy_csv_test WHERE id = $1",
+            &[&10i64],
+        )
+        .await
+        .expect("copied csv row should be queryable");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("id"), 10);
+    assert_eq!(rows[0].get::<_, String>("name"), "Carol");
 
     let _ = std::fs::remove_file(&wal_path);
 }

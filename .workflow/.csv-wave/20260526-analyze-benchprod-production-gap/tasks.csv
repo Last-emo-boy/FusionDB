@@ -1,6 +1,6 @@
 id,title,area,priority,status,next_action,success_criteria
 BENCHPROD-006,PgWire extended-query and metadata parity,protocol,P0,completed,Implemented RowDescription/ParameterDescription/type OIDs plus typed extended rows and strict pg integration tests,tokio-postgres prepare/query_typed returns columns and typed rows
-BENCHPROD-019,COPY FROM STDIN over PgWire,import,P0,open,Add CopyIn protocol path and map pgbench/BenchBase initialization to core loader,pgbench-style COPY payload loads tables without temp files
+BENCHPROD-019,COPY FROM STDIN over PgWire,import,P0,completed,Implemented PgWire CopyIn state/data/done handling with text and CSV payload tests,tokio-postgres copy_in loads TSV and CSV payloads without temp files
 BENCHPROD-007,Production scalar types,sql,P0,open,Add first-class DATE TIMESTAMP DECIMAL NUMERIC INTERVAL storage/cast/compare/encode support,official benchmark schemas do not need lossy FLOAT or INTEGER timestamp substitutions
 BENCHPROD-020,pgbench native smoke adapter,benchmark,P0,open,Add external pgbench invocation with explicit skip/fail reasons,pgbench initialize and select-only/simple run complete against FusionDB
 BENCHPROD-021,BenchBase TPC-C native smoke,benchmark,P0,open,Add BenchBase config/schema compatibility smoke through JDBC/PostgreSQL protocol,BenchBase can load tiny TPC-C and run a short transaction mix
