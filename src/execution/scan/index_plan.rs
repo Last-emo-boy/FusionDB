@@ -65,7 +65,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn primary_key_range_value_expr<'a>(
+    pub(crate) fn primary_key_range_value_expr<'a>(
         &self,
         left: &'a Expr,
         op: &BinaryOperator,

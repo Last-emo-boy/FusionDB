@@ -1,0 +1,38 @@
+{
+  "session": "20260527-execute-benchprod-038-ycsb-range",
+  "task": "BENCHPROD-038",
+  "title": "YCSB range scan pushdown optimization",
+  "status": "completed",
+  "scope": [
+    "src/execution/query/order.rs",
+    "src/execution/scan/index_plan.rs",
+    "tests/sql_index_cache.rs",
+    "E:/Playground/FusionDB/.workflow/.csv-wave/20260527-execute-benchprod-038-ycsb-range"
+  ],
+  "waves": [
+    {
+      "id": 1,
+      "name": "inspect-range-scan-path",
+      "status": "completed"
+    },
+    {
+      "id": 2,
+      "name": "implement-pk-range-order-limit-pushdown",
+      "status": "completed"
+    },
+    {
+      "id": 3,
+      "name": "verify-ycsb-tiny-medium",
+      "status": "completed"
+    },
+    {
+      "id": 4,
+      "name": "record-workflow-evidence",
+      "status": "completed"
+    }
+  ],
+  "artifacts": {
+    "tiny_matrix": "E:/Playground/FusionDB-bench/runs/matrix_ycsb_tiny_after_benchprod038_20260527/matrix_summary.md",
+    "medium_matrix": "E:/Playground/FusionDB-bench/runs/matrix_ycsb_medium_after_benchprod038_20260527/matrix_summary.md"
+  }
+}

@@ -1,7 +1,7 @@
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use crate::storage::Transaction;
-use sqlparser::ast::{Expr, OrderByKind, SelectItem, TableFactor};
+use sqlparser::ast::{BinaryOperator, Expr, OrderByKind, SelectItem, TableFactor};
 use std::cmp::Ordering;
 
 use super::Executor;
@@ -78,8 +78,7 @@ impl Executor {
         let Some(order_by) = order_by else {
             return Ok(None);
         };
-        if select.selection.is_some()
-            || select.having.is_some()
+        if select.having.is_some()
             || select.distinct.is_some()
             || !Self::projection_allows_order_limit_pushdown(&select.projection)
             || !matches!(
@@ -125,6 +124,16 @@ impl Executor {
             .get(order_idx)
             .is_some_and(|column| column.is_primary)
         {
+            if let Some(selection) = &select.selection {
+                let Some(pk_idx) = schema.get_primary_key_index() else {
+                    return Ok(None);
+                };
+                if pk_idx != order_idx
+                    || !self.selection_is_single_primary_key_range(selection, &schema, pk_idx)
+                {
+                    return Ok(None);
+                }
+            }
             Ok(Some(if limit == 0 {
                 0
             } else {
@@ -133,6 +142,23 @@ impl Executor {
         } else {
             Ok(None)
         }
+    }
+
+    fn selection_is_single_primary_key_range(
+        &self,
+        selection: &Expr,
+        schema: &TableSchema,
+        pk_idx: usize,
+    ) -> bool {
+        let Expr::BinaryOp { left, op, right } = selection else {
+            return false;
+        };
+        matches!(
+            op,
+            BinaryOperator::Gt | BinaryOperator::GtEq | BinaryOperator::Lt | BinaryOperator::LtEq
+        ) && self
+            .primary_key_range_value_expr(left, op, right, schema, pk_idx)
+            .is_some()
     }
 
     fn resolve_order_by_projection_index(

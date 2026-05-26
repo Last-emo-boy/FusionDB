@@ -369,6 +369,90 @@ async fn test_select_order_by_primary_key_limit_offset() {
 }
 
 #[tokio::test]
+async fn test_primary_key_range_order_limit_pushdown_skips_rows_after_window() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE range_order_limit (id INTEGER PRIMARY KEY, val TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO range_order_limit VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+    )
+    .await;
+
+    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(3),
+        Value::String("three".to_string()),
+    ]);
+    let corrupt_col_idx = 1usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut corrupt_row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let key = format!(
+            "data:range_order_limit:{}",
+            fusiondb::common::encoding::encode_i64_comparable(3)
+        );
+        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, val FROM range_order_limit WHERE id >= 1 ORDER BY id LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "val"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::String("one".to_string())],
+            vec![Value::Integer(2), Value::String("two".to_string())]
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_primary_key_range_order_limit_offset_pushdown() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE range_order_offset (id INTEGER PRIMARY KEY, val INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO range_order_offset VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, val FROM range_order_offset WHERE id >= 1 ORDER BY id LIMIT 2 OFFSET 1",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(2), Value::Integer(20)],
+            vec![Value::Integer(3), Value::Integer(30)]
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_count_primary_key_uses_prefix_count() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

@@ -1,0 +1,22 @@
+{
+  "id": "BENCHPROD-038",
+  "title": "YCSB range scan pushdown optimization",
+  "area": "optimizer",
+  "priority": "P1",
+  "status": "completed",
+  "success_criteria": [
+    "YCSB medium short range scan p95 improves from previous full medium baseline",
+    "Point lookup/update/secondary index/insert cases stay passing",
+    "Regression tests prove LIMIT/OFFSET correctness for primary-key range ordered scans"
+  ],
+  "evidence": [
+    "E:/Playground/FusionDB-bench/runs/matrix_ycsb_medium_after_benchprod038_20260527/matrix_summary.md",
+    "E:/Playground/FusionDB/.workflow/.csv-wave/20260527-execute-benchprod-038-ycsb-range/context.md"
+  ],
+  "metrics": {
+    "before_short_range_p95_ms": 11.167,
+    "after_short_range_p95_ms": 0.927,
+    "before_short_range_ops_per_sec": 146.3,
+    "after_short_range_ops_per_sec": 1166.0
+  }
+}
