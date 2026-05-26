@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-122,"Reserve DDL metadata result row capacity from known input sizes","src/execution/ddl.rs",completed

@@ -1,0 +1,24 @@
+{
+  "task_id": "TASK-122",
+  "created_at": "2026-05-26T08:05:17+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/ddl.rs",
+  "goal": "Avoid avoidable result-row Vec growth in DDL metadata queries.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to DESCRIBE, SHOW TABLES, or SHOW VIEWS output"
+  ],
+  "implementation": [
+    "Reserve DESCRIBE result rows from schema column count.",
+    "Reserve SHOW TABLES result rows from scanned schema key count.",
+    "Reserve SHOW VIEWS result rows from scanned view key count."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_create_table_and_show_tables -- --nocapture",
+    "cargo test --test sql_integration test_describe_table -- --nocapture",
+    "cargo test --test sql_integration test_show_views -- --nocapture"
+  ]
+}

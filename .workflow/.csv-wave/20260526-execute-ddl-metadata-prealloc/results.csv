@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+TASK-122,completed,"Added capacity hints for DESCRIBE, SHOW TABLES, and SHOW VIEWS result rows.","src/execution/ddl.rs"

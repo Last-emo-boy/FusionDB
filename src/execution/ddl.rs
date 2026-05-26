@@ -19,7 +19,7 @@ impl Executor {
             let schema: TableSchema = bincode::deserialize(&schema_bytes)
                 .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
 
-            let mut rows = Vec::new();
+            let mut rows = Vec::with_capacity(schema.columns.len());
             for col in schema.columns {
                 rows.push(vec![
                     Value::String(col.name),
@@ -94,7 +94,7 @@ impl Executor {
         let prefix = "schema:";
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
 
-        let mut tables = Vec::new();
+        let mut tables = Vec::with_capacity(kv_pairs.len());
         for (k, _) in kv_pairs {
             if let Ok(key_str) = std::str::from_utf8(&k) {
                 if let Some(table_name) = key_str.strip_prefix(prefix) {
@@ -113,7 +113,7 @@ impl Executor {
         let prefix = "view:";
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
 
-        let mut views = Vec::new();
+        let mut views = Vec::with_capacity(kv_pairs.len());
         for (k, v) in kv_pairs {
             if let Ok(key_str) = std::str::from_utf8(&k) {
                 if let Some(view_name) = key_str.strip_prefix(prefix) {
