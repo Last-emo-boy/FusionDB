@@ -4,40 +4,9 @@ use fusiondb::storage::memory::MemoryStorage;
 use fusiondb::storage::Storage;
 use std::sync::Arc;
 
-/// Helper: create an executor with a fresh MemoryStorage (temp WAL file)
-async fn setup() -> (Arc<Executor>, String) {
-    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
-    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
-    let executor = Arc::new(Executor::new(storage));
-    (executor, wal_path)
-}
-
-/// Helper: execute a single SQL statement
-async fn exec(executor: &Executor, sql: &str) -> QueryResult {
-    let stmts = executor.prepare(sql).unwrap();
-    executor.execute(&stmts[0]).await.unwrap()
-}
-
-/// Helper: execute and expect a Select result, return (columns, rows)
-async fn query(executor: &Executor, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
-    match exec(executor, sql).await {
-        QueryResult::Select { columns, rows } => (columns, rows),
-        other => panic!("Expected Select, got {:?}", other),
-    }
-}
-
-/// Helper: execute and expect a Success result, return message
-async fn exec_ok(executor: &Executor, sql: &str) -> String {
-    match exec(executor, sql).await {
-        QueryResult::Success { message } => message,
-        other => panic!("Expected Success, got {:?}", other),
-    }
-}
-
-/// Cleanup WAL file after test
-fn cleanup(wal_path: &str) {
-    let _ = std::fs::remove_file(wal_path);
-}
+#[path = "sql/common.rs"]
+mod common;
+use common::{cleanup, exec_ok, query, setup};
 
 // ==================== DDL Tests ====================
 

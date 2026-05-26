@@ -1,0 +1,17 @@
+{
+  "session_id": "20260526-plan-decouple-002-sql-common",
+  "task_id": "DECOUPLE-002",
+  "title": "Create SQL integration common helper module",
+  "status": "completed",
+  "created_at": "2026-05-26T19:35:00+08:00",
+  "problem": "tests/sql_integration.rs owns common setup/query helpers, making later topic splits duplicate-prone.",
+  "approach": [
+    "Create tests/sql/common.rs for shared SQL integration helpers.",
+    "Import the helper module from tests/sql_integration.rs with #[path = \"sql/common.rs\"].",
+    "Keep direct storage/executor imports in sql_integration.rs for tests that manually inspect transactions or caches."
+  ],
+  "risk_controls": [
+    "Do not move any tests in this task.",
+    "Run focused create-table and SHOW integration filters."
+  ]
+}

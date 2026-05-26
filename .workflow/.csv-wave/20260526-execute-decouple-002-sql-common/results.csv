@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-002,completed,"Created tests/sql/common.rs and imported common SQL integration helpers without moving tests.","tests/sql/common.rs;tests/sql_integration.rs"
