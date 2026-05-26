@@ -4622,6 +4622,91 @@ async fn test_string_agg() {
 }
 
 #[tokio::test]
+async fn test_group_concat_group_by_fast_path_ignores_nulls() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE gc (id INTEGER PRIMARY KEY, grp TEXT, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO gc VALUES (1, 'A', 'Alice'), (2, 'A', NULL), (3, 'A', 'Bob'), (4, 'B', 'Carol')",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT grp, GROUP_CONCAT(name) FROM gc GROUP BY grp ORDER BY grp",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2);
+    if let Value::String(names) = &rows[0][1] {
+        assert!(names.contains("Alice"));
+        assert!(names.contains("Bob"));
+        assert!(!names.contains("NULL"));
+    } else {
+        panic!("GROUP_CONCAT should return a string for non-empty groups");
+    }
+    assert_eq!(rows[1][1], Value::String("Carol".to_string()));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_string_agg_group_by_fast_path_uses_only_group_and_value_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sa_fast (id INTEGER PRIMARY KEY, grp TEXT, name TEXT, note TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, grp, name) in [(1_i64, "A", "Alice"), (2, "A", "Bob"), (3, "B", "Carol")] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(grp.to_string()),
+                Value::String(name.to_string()),
+                Value::String(format!("note-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:sa_fast:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT grp, STRING_AGG(name) FROM sa_fast GROUP BY grp ORDER BY grp",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2);
+    if let Value::String(names) = &rows[0][1] {
+        assert!(names.contains("Alice"));
+        assert!(names.contains("Bob"));
+    } else {
+        panic!("STRING_AGG should return a string for group A");
+    }
+    assert_eq!(rows[1][1], Value::String("Carol".to_string()));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_insert_returning() {
     let (executor, wal) = setup().await;
     exec_ok(

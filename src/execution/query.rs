@@ -103,6 +103,7 @@ enum GroupColumnAggregateKind {
     Avg,
     Min,
     Max,
+    StringAgg,
 }
 
 struct GroupColumnAggregateScanPlan {
@@ -119,6 +120,7 @@ struct GroupColumnAggregateState {
     min: Option<Value>,
     max: Option<Value>,
     distinct: HashSet<Value>,
+    strings: Vec<String>,
 }
 
 impl GroupColumnAggregateState {
@@ -131,6 +133,7 @@ impl GroupColumnAggregateState {
             min: None,
             max: None,
             distinct: HashSet::new(),
+            strings: Vec::new(),
         }
     }
 
@@ -199,6 +202,14 @@ impl GroupColumnAggregateState {
                     self.max = Some(value);
                 }
             }
+            GroupColumnAggregateKind::StringAgg => match value {
+                Value::String(value) => self.strings.push(value),
+                Value::Integer(value) => self.strings.push(value.to_string()),
+                Value::Float(value) => self.strings.push(value.to_string()),
+                Value::Boolean(value) => self.strings.push(value.to_string()),
+                Value::Null => {}
+                _ => {}
+            },
         }
     }
 
@@ -224,6 +235,13 @@ impl GroupColumnAggregateState {
             }
             GroupColumnAggregateKind::Min => self.min.clone().unwrap_or(Value::Null),
             GroupColumnAggregateKind::Max => self.max.clone().unwrap_or(Value::Null),
+            GroupColumnAggregateKind::StringAgg => {
+                if self.strings.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(self.strings.join(","))
+                }
+            }
         }
     }
 }
@@ -798,6 +816,15 @@ impl Executor {
                     }
                     (
                         GroupColumnAggregateKind::Max,
+                        Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                    )
+                }
+                "STRING_AGG" | "GROUP_CONCAT" => {
+                    if args.duplicate_treatment.is_some() {
+                        return None;
+                    }
+                    (
+                        GroupColumnAggregateKind::StringAgg,
                         Some(Self::column_arg_index(&args.args[0], schema, None)?),
                     )
                 }

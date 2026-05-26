@@ -1,0 +1,2 @@
+id,status,summary,files
+TASK-139,completed,"Added GROUP BY STRING_AGG/GROUP_CONCAT column-scan fast path","src/execution/query.rs;tests/sql_integration.rs"
