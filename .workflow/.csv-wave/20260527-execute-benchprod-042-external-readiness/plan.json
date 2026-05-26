@@ -1,0 +1,27 @@
+{
+  "task": "BENCHPROD-042",
+  "title": "External benchmark readiness matrix",
+  "status": "completed",
+  "steps": [
+    {
+      "id": "scan",
+      "description": "Inspect existing external smoke runner and production benchmark docs",
+      "status": "completed"
+    },
+    {
+      "id": "extend_runner",
+      "description": "Add BenchBase/TPC-C, TSBS, LDBC SNB, and CH-benCHmark readiness checks",
+      "status": "completed"
+    },
+    {
+      "id": "document",
+      "description": "Document new target names and artifact environment variables",
+      "status": "completed"
+    },
+    {
+      "id": "verify",
+      "description": "Run the full external smoke matrix and capture report paths",
+      "status": "completed"
+    }
+  ]
+}

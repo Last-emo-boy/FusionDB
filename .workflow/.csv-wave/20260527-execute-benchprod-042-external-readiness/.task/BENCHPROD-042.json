@@ -1,0 +1,9 @@
+{
+  "id": "BENCHPROD-042",
+  "title": "External benchmark readiness matrix",
+  "area": "benchmark_ops",
+  "priority": "P0",
+  "status": "completed",
+  "next_action": "Use the readiness report to install/configure external tools or build target-specific adapters",
+  "success_criteria": "External smoke JSON/Markdown reports include pgbench, sysbench, memtier, BenchBase/TPC-C, TSBS, LDBC SNB, and CH-benCHmark with explicit tool/artifact statuses"
+}
