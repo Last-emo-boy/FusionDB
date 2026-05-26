@@ -61,6 +61,7 @@ if hasattr(sys.stderr, "reconfigure"):
 BASE_URL = os.environ.get("FUSIONDB_URL", "http://127.0.0.1:8091/query")
 HEALTH_URL = BASE_URL.replace("/query", "/health")
 SCALE = os.environ.get("BENCH_SCALE", "medium").lower()
+HTTP_SESSIONS = threading.local()
 
 SCALES = {
     #                 base_rows  users  products  orders  accounts  transfers  events  iters  warmup  batch  threads
@@ -81,6 +82,14 @@ random.seed(SEED)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+def http_session():
+    session = getattr(HTTP_SESSIONS, "session", None)
+    if session is None:
+        session = requests.Session()
+        HTTP_SESSIONS.session = session
+    return session
+
+
 @dataclass
 class BenchResult:
     name: str
@@ -116,7 +125,7 @@ def sql(query: str, silent=True) -> Tuple[Optional[dict], float]:
     """Execute SQL, return (json_response, latency_ms)."""
     try:
         t0 = time.perf_counter()
-        r = requests.post(BASE_URL, json={"sql": query}, timeout=60)
+        r = http_session().post(BASE_URL, json={"sql": query}, timeout=60)
         ms = (time.perf_counter() - t0) * 1000
         r.raise_for_status()
         payload = r.json()
@@ -135,9 +144,17 @@ def sql_ok(q):
 def rows(res):
     if not res or res.get("status") != "ok":
         return 0
-    data = res.get("data") or []
+    data = res.get("data")
+    if data is None:
+        data = res.get("result") or []
     first = data[0] if data else {}
-    return len(first.get("rows", [])) if isinstance(first, dict) else 0
+    if not isinstance(first, dict):
+        return 0
+    if "Select" in first and isinstance(first["Select"], dict):
+        first = first["Select"]
+    if first.get("type") == "select" or "rows" in first:
+        return len(first.get("rows") or [])
+    return 0
 
 def bench(name, query, iters=None, warmup=None, cat=""):
     iters  = iters  or C["iters"]
@@ -235,7 +252,7 @@ def setup() -> Dict[str, float]:
     print(f"  Endpoint: {BASE_URL}")
     print(f"{'═'*100}\n")
 
-    try: requests.get(HEALTH_URL, timeout=3)
+    try: http_session().get(HEALTH_URL, timeout=3)
     except Exception:
         print(f"  ERROR: FusionDB not running at {HEALTH_URL}\n  Start with: cargo run"); sys.exit(1)
 

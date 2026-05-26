@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+TASK-123,completed,"Added thread-local requests.Session reuse and made benchmark rows() parse current Select enum responses.","benchmark.py"

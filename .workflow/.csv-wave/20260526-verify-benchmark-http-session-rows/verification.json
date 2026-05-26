@@ -1,0 +1,42 @@
+{
+  "task_id": "TASK-123",
+  "status": "passed",
+  "verified_at": "2026-05-26T10:31:27+08:00",
+  "checks": [
+    {
+      "command": "python -m py_compile benchmark.py",
+      "status": "passed"
+    },
+    {
+      "command": "inline rows() compatibility checks",
+      "status": "passed",
+      "details": "Enum Select payload returned 2 rows, direct select payload returned 1 row, legacy result payload returned 3 rows."
+    },
+    {
+      "command": "BENCH_SCALE=small FUSIONDB_URL=http://127.0.0.1:8091/query python benchmark.py",
+      "status": "passed",
+      "details": "Release benchmark loaded 7195 rows in 113 ms, reported 63592 rows/sec, and recorded nonzero row counts for 56 benchmark queries."
+    }
+  ],
+  "benchmark": {
+    "scale": "small",
+    "bench_root": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task123-bench-20260526-103127",
+    "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task123-bench-20260526-103127\\benchmark_report_small.json",
+    "rows_loaded": 7195,
+    "load_time_ms": 113,
+    "rows_per_second": 63592,
+    "nonzero_row_benchmarks": 56,
+    "sample_latencies_ms": {
+      "PK point lookup": 0.69,
+      "Index scan (val=X)": 0.69,
+      "Full scan (val=X)": 2.25,
+      "Order detail (JOIN)": 1.59,
+      "Revenue by category": 3.93,
+      "3-table JOIN": 3.39
+    }
+  },
+  "notes": [
+    "The previous benchmark client opened a fresh HTTP connection per query, which inflated simple query latency.",
+    "The previous row-count parser did not unwrap the current QueryResultJson enum response shape."
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "task_id": "TASK-123",
+  "created_at": "2026-05-26T10:31:27+08:00",
+  "phase": "performance-benchmarking",
+  "target": "benchmark.py",
+  "goal": "Reduce benchmark client-side HTTP overhead and restore SELECT row-count reporting for current server JSON serialization.",
+  "scope": [
+    "Benchmark tooling only",
+    "No dashboard changes",
+    "No database engine semantics changes"
+  ],
+  "implementation": [
+    "Reuse one requests.Session per benchmark thread to avoid opening a new HTTP connection for every query.",
+    "Use the same thread-local session for the benchmark health check.",
+    "Update rows() to handle current QueryResultJson enum payloads such as {\"Select\": {\"rows\": [...]}} while preserving older direct and result payload shapes."
+  ],
+  "verification": [
+    "python -m py_compile benchmark.py",
+    "Inline rows() compatibility checks for enum, direct, and legacy result payloads",
+    "Release small benchmark against a temporary FusionDB instance"
+  ]
+}

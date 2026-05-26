@@ -1,0 +1,2 @@
+id,description,status,files
+TASK-123,"Reuse benchmark HTTP sessions and fix SELECT row accounting.",completed,"benchmark.py"
