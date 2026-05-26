@@ -1,0 +1,2 @@
+id,task,scope,status
+TASK-121,"Remove temporary HashSet allocation from column-reference existence checks","src/execution/scan.rs",completed

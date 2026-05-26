@@ -447,9 +447,62 @@ impl Executor {
     }
 
     fn expr_has_column_reference(&self, expr: &Expr) -> bool {
-        let mut cols = HashSet::new();
-        self.extract_columns_from_expr(expr, &mut cols);
-        !cols.is_empty()
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+            Expr::BinaryOp { left, right, .. } => {
+                self.expr_has_column_reference(left) || self.expr_has_column_reference(right)
+            }
+            Expr::Nested(expr) | Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } => {
+                self.expr_has_column_reference(expr)
+            }
+            Expr::Function(func) => {
+                if let FunctionArguments::List(args) = &func.args {
+                    args.args.iter().any(|arg| {
+                        matches!(
+                            arg,
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                                if self.expr_has_column_reference(expr)
+                        )
+                    })
+                } else {
+                    false
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                self.expr_has_column_reference(expr)
+                    || list.iter().any(|expr| self.expr_has_column_reference(expr))
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.expr_has_column_reference(expr)
+                    || self.expr_has_column_reference(low)
+                    || self.expr_has_column_reference(high)
+            }
+            Expr::IsNull(expr)
+            | Expr::IsNotNull(expr)
+            | Expr::InSubquery { expr, .. }
+            | Expr::Like { expr, .. }
+            | Expr::ILike { expr, .. } => self.expr_has_column_reference(expr),
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|expr| self.expr_has_column_reference(expr))
+                    || conditions.iter().any(|cw| {
+                        self.expr_has_column_reference(&cw.condition)
+                            || self.expr_has_column_reference(&cw.result)
+                    })
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|expr| self.expr_has_column_reference(expr))
+            }
+            _ => false,
+        }
     }
 
     fn join_constraint_expr<'a>(

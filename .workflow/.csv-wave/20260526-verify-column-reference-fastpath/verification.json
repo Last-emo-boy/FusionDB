@@ -1,0 +1,35 @@
+{
+  "task_id": "TASK-121",
+  "status": "passed",
+  "verified_at": "2026-05-26T07:59:58+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_with_where_eq -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_with_commuted_primary_key_range -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_explain_commuted_primary_key_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_explain_commuted_primary_key_range_scan -- --nocapture",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Validation used CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0.",
+    "The covered tests exercise equality, commuted range normalization, primary-key lookup explain output, and primary-key range explain output."
+  ]
+}
