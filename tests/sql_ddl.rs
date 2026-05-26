@@ -186,6 +186,60 @@ async fn test_explain_commuted_primary_key_range_scan() {
     cleanup(&wal);
 }
 
+#[tokio::test]
+async fn test_analyze_table_collects_statistics() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE analyze_items (id INTEGER PRIMARY KEY, category TEXT, qty INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO analyze_items VALUES (1, 'book', 5), (2, 'book', 7), (3, 'toy', NULL)",
+    )
+    .await;
+
+    let msg = exec_ok(&executor, "ANALYZE TABLE analyze_items COMPUTE STATISTICS").await;
+
+    assert!(msg.contains("Analyzed table analyze_items"));
+    assert!(msg.contains("3 rows"));
+    assert!(msg.contains("3 columns"));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_includes_analyze_statistics() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_stats (id INTEGER PRIMARY KEY, category TEXT, qty INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO explain_stats VALUES (1, 'book', 5), (2, 'book', 7), (3, 'toy', NULL)",
+    )
+    .await;
+    exec_ok(&executor, "ANALYZE TABLE explain_stats COMPUTE STATISTICS").await;
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT * FROM explain_stats WHERE category = 'book'",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Stats: rows=3"));
+        assert!(plan.contains("category(distinct=2"));
+        assert!(plan.contains("qty(distinct=2, nulls=1"));
+    } else {
+        panic!("expected explain text");
+    }
+    cleanup(&wal);
+}
+
 // ==================== Edge Case Tests ====================
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 mod aggregation;
+mod analyze;
 mod composite_index;
 mod ddl;
 mod dml;
@@ -288,6 +289,7 @@ impl Executor {
             Statement::Explain {
                 statement, analyze, ..
             } => self.handle_explain(statement, *analyze, txn, params).await,
+            Statement::Analyze(analyze) => self.handle_analyze(analyze, txn).await,
             Statement::Drop {
                 names,
                 object_type: sqlparser::ast::ObjectType::View,
@@ -457,6 +459,7 @@ impl Executor {
             }
             Statement::Explain { statement, .. } => Self::statement_permissions(statement),
             Statement::ExplainTable { table_name, .. } => vec![(table_name.to_string(), "SELECT")],
+            Statement::Analyze(analyze) => vec![(analyze.table_name.to_string(), "SELECT")],
             Statement::ShowCreate { obj_name, .. } => vec![(obj_name.to_string(), "SELECT")],
             Statement::Drop {
                 names, object_type, ..

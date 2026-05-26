@@ -1,0 +1,5 @@
+id,title,description,status,files,verification
+BENCHPROD-004-1,Implement ANALYZE storage,"Collect row and column stats and persist them outside TableSchema.",completed,"src/execution/analyze.rs","cargo test --test sql_ddl analyze"
+BENCHPROD-004-2,Dispatch ANALYZE,"Wire sqlparser Statement::Analyze into Executor and authorization.",completed,"src/execution/mod.rs","cargo check --lib"
+BENCHPROD-004-3,Surface stats in EXPLAIN,"Read stored stats in EXPLAIN SELECT output for base and join tables.",completed,"src/execution/ddl/explain.rs","cargo test --test sql_ddl"
+BENCHPROD-004-4,Regression coverage,"Add DDL tests for ANALYZE messages and EXPLAIN stats output.",completed,"tests/sql_ddl.rs","cargo test --test sql_ddl"

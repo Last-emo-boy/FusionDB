@@ -1,0 +1,4 @@
+id,title,description,status,files,verification
+BENCHPROD-008-1,Expand benchmark suite registry,"Add memtier, TSBS, LDBC, ANN, and CH-benCHmark like-workloads to FusionDB-bench.",completed,"E:/Playground/FusionDB-bench/fusiondb_bench.py","python -m py_compile fusiondb_bench.py"
+BENCHPROD-008-2,Add readiness report,"Expose real target readiness, blockers, and next database TASK queue in JSON/Markdown reports.",completed,"E:/Playground/FusionDB-bench/fusiondb_bench.py","python fusiondb_bench.py --list"
+BENCHPROD-008-3,Update bench docs,"Document the expanded suite list, official benchmark caveats, and production-readiness gaps.",completed,"E:/Playground/FusionDB-bench/README.md;E:/Playground/FusionDB-bench/config.example.json","manual review"

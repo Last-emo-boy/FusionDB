@@ -64,6 +64,9 @@ impl Executor {
                     .explain_table_access(&table.relation, &select.selection, txn)
                     .await?;
                 plan.push_str(&format!("  Access Path: {}\n", access_path));
+                if let Some(stats) = self.explain_table_stats(&table.relation, txn).await? {
+                    plan.push_str(&format!("  Stats: {}\n", stats));
+                }
 
                 for join in &table.joins {
                     plan.push_str(&format!("  JOIN: {}\n", join.relation));
@@ -71,6 +74,9 @@ impl Executor {
                         .explain_table_access(&join.relation, &None, txn)
                         .await?;
                     plan.push_str(&format!("    Access Path: {}\n", join_access));
+                    if let Some(stats) = self.explain_table_stats(&join.relation, txn).await? {
+                        plan.push_str(&format!("    Stats: {}\n", stats));
+                    }
                     plan.push_str(&format!("    Operator: {:?}\n", join.join_operator));
                 }
             }
@@ -148,6 +154,50 @@ impl Executor {
         } else {
             Ok("Unknown Table Factor".to_string())
         }
+    }
+
+    async fn explain_table_stats(
+        &self,
+        table: &TableFactor,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<String>> {
+        let TableFactor::Table { name, .. } = table else {
+            return Ok(None);
+        };
+
+        let table_name = name.to_string();
+        let Some(stats) = self.load_table_stats(&table_name, txn).await? else {
+            return Ok(None);
+        };
+
+        let column_parts = stats
+            .columns
+            .iter()
+            .take(4)
+            .map(|column| {
+                let mut part = format!(
+                    "{}(distinct={}, nulls={})",
+                    column.name, column.distinct_count, column.null_count
+                );
+                if let (Some(min), Some(max)) = (&column.min, &column.max) {
+                    part.push_str(&format!(", min={}, max={}", min, max));
+                }
+                part
+            })
+            .collect::<Vec<_>>();
+
+        let suffix = if stats.columns.len() > column_parts.len() {
+            format!(", +{} more", stats.columns.len() - column_parts.len())
+        } else {
+            String::new()
+        };
+
+        Ok(Some(format!(
+            "rows={}, columns=[{}{}]",
+            stats.row_count,
+            column_parts.join("; "),
+            suffix
+        )))
     }
 
     async fn composite_index_for_explain(
