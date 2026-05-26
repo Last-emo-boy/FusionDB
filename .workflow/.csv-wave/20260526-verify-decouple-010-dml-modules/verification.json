@@ -1,0 +1,39 @@
+{
+  "task_id": "DECOUPLE-010",
+  "status": "passed",
+  "verified_at": "2026-05-26T22:32:00+08:00",
+  "environment": {
+    "CARGO_TARGET_DIR": "E:\\Playground\\FusionDB\\target",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "checks": [
+    {
+      "command": "cargo fmt -- src/execution/dml/mod.rs src/execution/dml/insert.rs src/execution/dml/update.rs src/execution/dml/delete.rs src/execution/dml/returning.rs src/execution/dml/constraints.rs",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test insert --test sql_integration",
+      "status": "passed",
+      "notes": "Ran 8 matching integration tests."
+    },
+    {
+      "command": "cargo test update --test sql_integration",
+      "status": "passed",
+      "notes": "Ran 12 matching integration tests."
+    },
+    {
+      "command": "cargo test delete --test sql_integration",
+      "status": "passed",
+      "notes": "Ran 9 matching integration tests."
+    },
+    {
+      "command": "cargo test returning --test sql_integration",
+      "status": "passed",
+      "notes": "Ran 3 matching integration tests."
+    }
+  ]
+}

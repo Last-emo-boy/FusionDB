@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-010,completed,"Split DML execution into insert, update, delete, returning, and constraints submodules while preserving Executor APIs.","src/execution/dml/mod.rs;src/execution/dml/insert.rs;src/execution/dml/update.rs;src/execution/dml/delete.rs;src/execution/dml/returning.rs;src/execution/dml/constraints.rs"

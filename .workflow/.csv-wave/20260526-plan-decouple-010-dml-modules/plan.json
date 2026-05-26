@@ -1,0 +1,20 @@
+{
+  "session_id": "20260526-plan-decouple-010-dml-modules",
+  "task_id": "DECOUPLE-010",
+  "title": "Extract DML insert/update/delete/returning/constraints modules",
+  "status": "completed",
+  "created_at": "2026-05-26T22:24:00+08:00",
+  "problem": "dml.rs combined primary-key targeting helpers, INSERT/UPSERT, UPDATE, DELETE, RETURNING projection, and constraint/default helpers.",
+  "approach": [
+    "Move src/execution/dml.rs to src/execution/dml/mod.rs.",
+    "Keep shared primary-key targeting helpers in mod.rs.",
+    "Extract INSERT and UPSERT expression helper into insert.rs.",
+    "Extract UPDATE and DELETE handlers into update.rs and delete.rs.",
+    "Extract RETURNING projection into returning.rs.",
+    "Extract CHECK/default helpers into constraints.rs."
+  ],
+  "risk_controls": [
+    "Keep Executor handler method names stable.",
+    "Run cargo check --lib and focused insert/update/delete/returning integration tests."
+  ]
+}
