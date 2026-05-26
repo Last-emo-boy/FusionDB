@@ -1,0 +1,2 @@
+id,status,summary,files
+TASK-138,completed,"Added GROUP BY COUNT(DISTINCT column) column-scan fast path","src/execution/query.rs;tests/sql_integration.rs"

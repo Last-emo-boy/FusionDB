@@ -1544,6 +1544,45 @@ async fn test_group_by_count_column_fast_path_ignores_nulls() {
 }
 
 #[tokio::test]
+async fn test_group_by_count_distinct_fast_path_ignores_nulls() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE visits (id INTEGER PRIMARY KEY, city TEXT, user_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO visits VALUES (1, 'Paris', 10), (2, 'Paris', 10), (3, 'Paris', NULL), (4, 'Rome', 20), (5, 'Rome', 30), (6, 'Rome', 30), (7, 'Rome', NULL)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT city AS place, COUNT(DISTINCT user_id) AS active_users, COUNT(*) AS visits FROM visits GROUP BY city ORDER BY place",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["place", "active_users", "visits"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::String("Paris".to_string()),
+                Value::Integer(1),
+                Value::Integer(3),
+            ],
+            vec![
+                Value::String("Rome".to_string()),
+                Value::Integer(2),
+                Value::Integer(4),
+            ],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_group_by_column_aggregates_fast_path_uses_only_group_and_aggregate_columns() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
@@ -1600,6 +1639,63 @@ async fn test_group_by_column_aggregates_fast_path_uses_only_group_and_aggregate
             Value::Integer(1),
         ]
     }));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_count_distinct_fast_path_uses_only_group_and_distinct_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE visits (id INTEGER PRIMARY KEY, city TEXT, user_id INTEGER, note TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, city, user_id) in [
+            (1_i64, "Paris", 10_i64),
+            (2, "Paris", 10),
+            (3, "Paris", 20),
+            (4, "Rome", 30),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(city.to_string()),
+                Value::Integer(user_id),
+                Value::String(format!("note-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:visits:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT city, COUNT(DISTINCT user_id) FROM visits GROUP BY city ORDER BY city",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("Paris".to_string()), Value::Integer(2)],
+            vec![Value::String("Rome".to_string()), Value::Integer(1)],
+        ]
+    );
     cleanup(&wal_path);
 }
 

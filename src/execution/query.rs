@@ -98,6 +98,7 @@ impl ColumnAggregateState {
 enum GroupColumnAggregateKind {
     CountStar,
     CountColumn,
+    CountDistinct,
     Sum,
     Avg,
     Min,
@@ -117,6 +118,7 @@ struct GroupColumnAggregateState {
     is_int: bool,
     min: Option<Value>,
     max: Option<Value>,
+    distinct: HashSet<Value>,
 }
 
 impl GroupColumnAggregateState {
@@ -128,6 +130,7 @@ impl GroupColumnAggregateState {
             is_int: true,
             min: None,
             max: None,
+            distinct: HashSet::new(),
         }
     }
 
@@ -141,6 +144,11 @@ impl GroupColumnAggregateState {
             GroupColumnAggregateKind::CountColumn => {
                 if value != Value::Null {
                     self.count += 1;
+                }
+            }
+            GroupColumnAggregateKind::CountDistinct => {
+                if value != Value::Null {
+                    self.distinct.insert(value);
                 }
             }
             GroupColumnAggregateKind::Sum => match value {
@@ -199,6 +207,7 @@ impl GroupColumnAggregateState {
             GroupColumnAggregateKind::CountStar | GroupColumnAggregateKind::CountColumn => {
                 Value::Integer(self.count)
             }
+            GroupColumnAggregateKind::CountDistinct => Value::Integer(self.distinct.len() as i64),
             GroupColumnAggregateKind::Sum => {
                 if self.is_int {
                     Value::Integer(self.sum as i64)
@@ -718,40 +727,80 @@ impl Executor {
             let FunctionArguments::List(args) = &func.args else {
                 return None;
             };
-            if args.duplicate_treatment.is_some() || args.args.len() != 1 {
+            if args.args.len() != 1 {
                 return None;
             }
 
             let func_name = func.name.to_string().to_uppercase();
             let (kind, column_index) = match func_name.as_str() {
                 "COUNT"
+                    if args.duplicate_treatment == Some(DuplicateTreatment::Distinct)
+                        && !matches!(
+                            args.args[0],
+                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                        ) =>
+                {
+                    (
+                        GroupColumnAggregateKind::CountDistinct,
+                        Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                    )
+                }
+                "COUNT"
                     if matches!(
                         args.args[0],
                         FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
                     ) =>
                 {
+                    if args.duplicate_treatment.is_some() {
+                        return None;
+                    }
                     (GroupColumnAggregateKind::CountStar, None)
                 }
-                "COUNT" => (
-                    GroupColumnAggregateKind::CountColumn,
-                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
-                ),
-                "SUM" => (
-                    GroupColumnAggregateKind::Sum,
-                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
-                ),
-                "AVG" => (
-                    GroupColumnAggregateKind::Avg,
-                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
-                ),
-                "MIN" => (
-                    GroupColumnAggregateKind::Min,
-                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
-                ),
-                "MAX" => (
-                    GroupColumnAggregateKind::Max,
-                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
-                ),
+                "COUNT" => {
+                    if args.duplicate_treatment.is_some() {
+                        return None;
+                    }
+                    (
+                        GroupColumnAggregateKind::CountColumn,
+                        Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                    )
+                }
+                "SUM" => {
+                    if args.duplicate_treatment.is_some() {
+                        return None;
+                    }
+                    (
+                        GroupColumnAggregateKind::Sum,
+                        Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                    )
+                }
+                "AVG" => {
+                    if args.duplicate_treatment.is_some() {
+                        return None;
+                    }
+                    (
+                        GroupColumnAggregateKind::Avg,
+                        Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                    )
+                }
+                "MIN" => {
+                    if args.duplicate_treatment.is_some() {
+                        return None;
+                    }
+                    (
+                        GroupColumnAggregateKind::Min,
+                        Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                    )
+                }
+                "MAX" => {
+                    if args.duplicate_treatment.is_some() {
+                        return None;
+                    }
+                    (
+                        GroupColumnAggregateKind::Max,
+                        Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                    )
+                }
                 _ => return None,
             };
 

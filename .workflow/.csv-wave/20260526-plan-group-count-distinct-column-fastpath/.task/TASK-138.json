@@ -1,0 +1,16 @@
+{
+  "id": "TASK-138",
+  "title": "GROUP BY COUNT(DISTINCT column) column-scan fast path",
+  "created_at": "2026-05-26T17:07:57+08:00",
+  "status": "completed",
+  "owner": "codex",
+  "files": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "acceptance": [
+    "GROUP BY COUNT(DISTINCT column) returns per-group non-null distinct counts.",
+    "The column-scan fast path avoids decoding unused columns.",
+    "Existing GROUP BY aggregate fast-path tests continue to pass."
+  ]
+}
