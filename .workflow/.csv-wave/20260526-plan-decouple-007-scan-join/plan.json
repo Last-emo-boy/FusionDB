@@ -1,0 +1,17 @@
+{
+  "session_id": "20260526-plan-decouple-007-scan-join",
+  "task_id": "DECOUPLE-007",
+  "title": "Extract scan join execution",
+  "status": "completed",
+  "created_at": "2026-05-26T21:26:00+08:00",
+  "problem": "scan/mod.rs still carried join orchestration, join key extraction, join projection pushdown, and indexed join probe helpers.",
+  "approach": [
+    "Create src/execution/scan/join.rs.",
+    "Move execute_join, apply_join_step, join key extraction, projection helpers, and indexed join probe helpers into the new submodule.",
+    "Keep public query-facing Executor::execute_join API stable."
+  ],
+  "risk_controls": [
+    "Do not alter join semantics or scan_single_table behavior.",
+    "Run cargo check --lib and join-focused SQL integration tests."
+  ]
+}

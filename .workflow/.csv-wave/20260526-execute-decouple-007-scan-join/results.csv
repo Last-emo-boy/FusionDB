@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-007,completed,"Extracted scan join execution and helper implementation into scan/join.rs.","src/execution/scan/mod.rs;src/execution/scan/join.rs"
