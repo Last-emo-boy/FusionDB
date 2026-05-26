@@ -163,7 +163,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn value_to_primary_row_id(value: &Value) -> Option<String> {
+    pub(crate) fn value_to_primary_row_id(value: &Value) -> Option<String> {
         match value {
             Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(*i)),
             Value::String(s) => Some(s.clone()),

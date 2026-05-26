@@ -74,13 +74,15 @@ impl Executor {
         let composite_indexes = self
             .load_composite_indexes_for_table(&table_name_str, txn)
             .await?;
+        let parent_foreign_keys = self.load_parent_foreign_keys(&table_name_str, txn).await?;
 
         if delete.returning.is_none() {
             let no_secondary_indexes = schema
                 .columns
                 .iter()
                 .all(|col| !col.is_indexed || col.is_primary)
-                && composite_indexes.is_empty();
+                && composite_indexes.is_empty()
+                && parent_foreign_keys.is_empty();
             if no_secondary_indexes {
                 if let Some(row_id) = &target_row_id {
                     let key = format!("{}{}", prefix, row_id);
@@ -153,6 +155,16 @@ impl Executor {
             }
 
             if delete_flag {
+                self.validate_parent_foreign_key_references(
+                    &table_name_str,
+                    &schema,
+                    &row,
+                    None,
+                    &parent_foreign_keys,
+                    txn,
+                )
+                .await?;
+
                 txn.delete(&k).await?;
 
                 // Invalidate Cache

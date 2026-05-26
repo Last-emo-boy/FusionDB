@@ -30,6 +30,7 @@ impl Executor {
         let composite_indexes = self
             .load_composite_indexes_for_table(&table_name_str, txn)
             .await?;
+        let foreign_keys = self.load_child_foreign_keys(&table_name_str, txn).await?;
 
         // Build column index mapping if explicit column list provided
         let col_mapping: Option<Vec<usize>> = if !columns.is_empty() {
@@ -218,6 +219,14 @@ impl Executor {
                                             existing_row[col_idx] = new_val;
                                         }
                                     }
+                                    self.validate_child_foreign_keys(
+                                        &table_name_str,
+                                        &schema,
+                                        &existing_row,
+                                        &foreign_keys,
+                                        txn,
+                                    )
+                                    .await?;
                                     let value =
                                         crate::common::encoding::RowEncoder::encode(&existing_row);
                                     txn.put(key.as_bytes(), &value).await?;
@@ -263,6 +272,15 @@ impl Executor {
                             }
                         }
                     }
+
+                    self.validate_child_foreign_keys(
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &foreign_keys,
+                        txn,
+                    )
+                    .await?;
 
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
@@ -388,6 +406,14 @@ impl Executor {
                         uuid::Uuid::new_v4().to_string()
                     };
                     let key = format!("data:{}:{}", table_name_str, row_id);
+                    self.validate_child_foreign_keys(
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &foreign_keys,
+                        txn,
+                    )
+                    .await?;
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
                     monitor::inc_row_write();

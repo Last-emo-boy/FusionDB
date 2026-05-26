@@ -43,6 +43,8 @@ impl Executor {
         let composite_indexes = self
             .load_composite_indexes_for_table(&table_name_str, txn)
             .await?;
+        let child_foreign_keys = self.load_child_foreign_keys(&table_name_str, txn).await?;
+        let parent_foreign_keys = self.load_parent_foreign_keys(&table_name_str, txn).await?;
 
         let kv_pairs = if let Some(row_id) = target_row_id {
             // Point Lookup
@@ -129,6 +131,23 @@ impl Executor {
                         }
                     }
                 }
+                self.validate_child_foreign_keys(
+                    &table_name_str,
+                    &schema,
+                    &row,
+                    &child_foreign_keys,
+                    txn,
+                )
+                .await?;
+                self.validate_parent_foreign_key_references(
+                    &table_name_str,
+                    &schema,
+                    &old_row,
+                    Some(&row),
+                    &parent_foreign_keys,
+                    txn,
+                )
+                .await?;
 
                 let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
                 txn.put(&k, &new_value_bytes).await?;

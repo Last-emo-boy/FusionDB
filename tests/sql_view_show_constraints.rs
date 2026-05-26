@@ -385,3 +385,144 @@ async fn test_check_constraint() {
     exec_ok(&executor, "UPDATE ck SET age = 30 WHERE id = 1").await;
     cleanup(&wal);
 }
+
+#[tokio::test]
+async fn test_foreign_key_insert_update_and_parent_delete_checks() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fk_customers (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fk_orders (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES fk_customers(id), note TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fk_customers VALUES (1, 'Alice'), (2, 'Bob')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fk_orders VALUES (10, 1, 'ok'), (11, NULL, 'draft')",
+    )
+    .await;
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("INSERT INTO fk_orders VALUES (12, 99, 'bad')")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("UPDATE fk_orders SET customer_id = 99 WHERE id = 10")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("DELETE FROM fk_customers WHERE id = 1")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+
+    exec_ok(
+        &executor,
+        "UPDATE fk_orders SET customer_id = 2 WHERE id = 10",
+    )
+    .await;
+    let result = executor
+        .execute(
+            &executor
+                .prepare("UPDATE fk_customers SET id = 3 WHERE id = 2")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_table_level_foreign_key_constraint() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER, CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES fk_parent(id))",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO fk_parent VALUES (1, 'p1')").await;
+    exec_ok(&executor, "INSERT INTO fk_child VALUES (1, 1)").await;
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("INSERT INTO fk_child VALUES (2, 2)")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("fk_child_parent"));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_foreign_key_blocks_dependent_alter_and_drop_table() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fk_alter_parent (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fk_alter_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_alter_parent(id))",
+    )
+    .await;
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("ALTER TABLE fk_alter_child DROP COLUMN parent_id")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("ALTER TABLE fk_alter_parent RENAME COLUMN id TO new_id")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+
+    let result = executor
+        .execute(&executor.prepare("DROP TABLE fk_alter_parent").unwrap()[0])
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+    cleanup(&wal);
+}

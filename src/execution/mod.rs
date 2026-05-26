@@ -3,6 +3,7 @@ mod composite_index;
 mod ddl;
 mod dml;
 mod expr;
+mod foreign_key;
 mod query;
 mod scan;
 
@@ -252,6 +253,7 @@ impl Executor {
                 self.handle_create_table(
                     &create_table.name,
                     &create_table.columns,
+                    &create_table.constraints,
                     create_table.if_not_exists,
                     txn,
                 )

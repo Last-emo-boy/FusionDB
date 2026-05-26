@@ -2,7 +2,7 @@ use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Result};
 use crate::monitor;
 use crate::storage::Transaction;
-use sqlparser::ast::ColumnOption;
+use sqlparser::ast::{ColumnOption, TableConstraint};
 
 use super::super::{Executor, QueryResult};
 
@@ -11,6 +11,7 @@ impl Executor {
         &self,
         name: &sqlparser::ast::ObjectName,
         columns: &[sqlparser::ast::ColumnDef],
+        constraints: &[TableConstraint],
         if_not_exists: bool,
         txn: &mut dyn Transaction,
     ) -> Result<QueryResult> {
@@ -76,12 +77,44 @@ impl Executor {
             })
             .collect();
 
+        let foreign_keys = Self::collect_foreign_keys(&table_name, columns, constraints)?;
+        for fk in &foreign_keys {
+            if cols
+                .iter()
+                .all(|column| !column.name.eq_ignore_ascii_case(&fk.child_column))
+            {
+                return Err(FusionError::Execution(format!(
+                    "FOREIGN KEY child column {} not found",
+                    fk.child_column
+                )));
+            }
+
+            let parent_key = format!("schema:{}", fk.parent_table);
+            let parent_schema_bytes = txn.get(parent_key.as_bytes()).await?.ok_or_else(|| {
+                FusionError::Execution(format!("Referenced table {} not found", fk.parent_table))
+            })?;
+            let parent_schema: TableSchema = bincode::deserialize(&parent_schema_bytes)
+                .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
+            if parent_schema
+                .columns
+                .iter()
+                .all(|column| !column.name.eq_ignore_ascii_case(&fk.parent_column))
+            {
+                return Err(FusionError::Execution(format!(
+                    "Referenced column {}.{} not found",
+                    fk.parent_table, fk.parent_column
+                )));
+            }
+        }
+
         let schema = TableSchema::new(table_name.clone(), cols);
         let key = format!("schema:{}", table_name);
         let value = bincode::serialize(&schema)
             .map_err(|e| FusionError::Execution(format!("Schema serialization error: {}", e)))?;
 
         txn.put(key.as_bytes(), &value).await?;
+        self.store_foreign_keys(&table_name, &foreign_keys, txn)
+            .await?;
 
         Ok(QueryResult::Success {
             message: format!("Table {} created", table_name),
@@ -116,6 +149,16 @@ impl Executor {
                     )));
                 }
             }
+            if !self
+                .load_parent_foreign_keys(&table_name, txn)
+                .await?
+                .is_empty()
+            {
+                return Err(FusionError::Execution(format!(
+                    "Cannot drop table {} because it is referenced by a FOREIGN KEY",
+                    table_name
+                )));
+            }
 
             txn.delete(schema_key.as_bytes()).await?;
 
@@ -134,6 +177,7 @@ impl Executor {
                 txn.delete(&k).await?;
             }
             self.delete_index_meta_for_table(&table_name, txn).await?;
+            self.delete_foreign_keys_for_table(&table_name, txn).await?;
 
             dropped_count += 1;
         }
@@ -258,6 +302,28 @@ impl Executor {
                                         col_name
                                     )));
                                 }
+                                let child_foreign_keys =
+                                    self.load_child_foreign_keys(&table_name, txn).await?;
+                                if child_foreign_keys
+                                    .iter()
+                                    .any(|fk| fk.child_column.eq_ignore_ascii_case(&col_name))
+                                {
+                                    return Err(FusionError::Execution(format!(
+                                        "Cannot drop column {} because a FOREIGN KEY depends on it",
+                                        col_name
+                                    )));
+                                }
+                                let parent_foreign_keys =
+                                    self.load_parent_foreign_keys(&table_name, txn).await?;
+                                if parent_foreign_keys
+                                    .iter()
+                                    .any(|fk| fk.parent_column.eq_ignore_ascii_case(&col_name))
+                                {
+                                    return Err(FusionError::Execution(format!(
+                                        "Cannot drop column {} because it is referenced by a FOREIGN KEY",
+                                        col_name
+                                    )));
+                                }
                                 schema.columns.remove(idx);
 
                                 // Rewrite existing rows: remove the column at idx
@@ -322,6 +388,28 @@ impl Executor {
                             }) {
                                 return Err(FusionError::Execution(format!(
                                     "Cannot rename column {} because a composite index depends on it",
+                                    old_name
+                                )));
+                            }
+                            let child_foreign_keys =
+                                self.load_child_foreign_keys(&table_name, txn).await?;
+                            if child_foreign_keys
+                                .iter()
+                                .any(|fk| fk.child_column.eq_ignore_ascii_case(&old_name))
+                            {
+                                return Err(FusionError::Execution(format!(
+                                    "Cannot rename column {} because a FOREIGN KEY depends on it",
+                                    old_name
+                                )));
+                            }
+                            let parent_foreign_keys =
+                                self.load_parent_foreign_keys(&table_name, txn).await?;
+                            if parent_foreign_keys
+                                .iter()
+                                .any(|fk| fk.parent_column.eq_ignore_ascii_case(&old_name))
+                            {
+                                return Err(FusionError::Execution(format!(
+                                    "Cannot rename column {} because it is referenced by a FOREIGN KEY",
                                     old_name
                                 )));
                             }
