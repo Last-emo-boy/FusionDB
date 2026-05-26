@@ -2,11 +2,19 @@ use fusiondb::common::Value;
 use fusiondb::execution::Executor;
 use fusiondb::storage::memory::MemoryStorage;
 use fusiondb::storage::Storage;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[path = "sql/common.rs"]
 mod common;
 use common::{cleanup, exec_ok, query, setup};
+
+fn write_copy_fixture(name: &str, content: &str) -> String {
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("fusiondb_{}_{}.csv", name, uuid::Uuid::new_v4()));
+    std::fs::write(&path, content).unwrap();
+    path.to_string_lossy().replace('\\', "/")
+}
 
 #[tokio::test]
 async fn test_insert_single_row() {
@@ -689,5 +697,90 @@ async fn test_insert_with_column_list() {
         fusiondb::common::Value::String("Alice".to_string())
     );
     assert_eq!(rows[0][2], fusiondb::common::Value::Null); // age not specified
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_copy_from_csv_with_header_and_index_lookup() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE copy_users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_copy_users_age ON copy_users (age)",
+    )
+    .await;
+    let csv_path = write_copy_fixture(
+        "users",
+        "id,name,age\n1,Alice,30\n2,\"Bob, Jr\",42\n3,Carol,NULL\n",
+    );
+
+    let msg = exec_ok(
+        &executor,
+        &format!(
+            "COPY copy_users FROM '{}' WITH (FORMAT CSV, HEADER true, NULL 'NULL')",
+            csv_path
+        ),
+    )
+    .await;
+
+    assert!(msg.contains("Copied 3 rows"));
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, name, age FROM copy_users WHERE age = 42",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::String("Bob, Jr".to_string()),
+            Value::Integer(42)
+        ]]
+    );
+    let _ = std::fs::remove_file(csv_path);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_copy_from_csv_with_column_list_and_defaults() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE copy_partial (id INTEGER PRIMARY KEY, name TEXT, age INTEGER DEFAULT 99)",
+    )
+    .await;
+    let csv_path = write_copy_fixture("partial", "id,name\n1,Alice\n2,Bob\n");
+
+    let msg = exec_ok(
+        &executor,
+        &format!(
+            "COPY copy_partial (id, name) FROM '{}' WITH (FORMAT CSV, HEADER true)",
+            csv_path
+        ),
+    )
+    .await;
+
+    assert!(msg.contains("Copied 2 rows"));
+    let (_, rows) = query(&executor, "SELECT * FROM copy_partial ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::String("Alice".to_string()),
+                Value::Integer(99)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("Bob".to_string()),
+                Value::Integer(99)
+            ]
+        ]
+    );
+    let _ = std::fs::remove_file(csv_path);
     cleanup(&wal);
 }

@@ -1,0 +1,4 @@
+id,title,description,status,files,verification
+BENCHPROD-002-1,Implement COPY FROM CSV,"Add execution support for PostgreSQL-like COPY FROM local CSV files.",completed,"src/execution/copy.rs;src/execution/mod.rs;Cargo.toml;Cargo.lock","cargo test --test sql_dml copy"
+BENCHPROD-002-2,Add COPY regression tests,"Cover CSV header, quoted fields, null marker, column list, defaults, and index lookup.",completed,"tests/sql_dml.rs","cargo test --test sql_dml"
+BENCHPROD-002-3,Wire bench copy load mode,"Let FusionDB-bench generate CSV fixtures and load via COPY for setup phases.",completed,"E:/Playground/FusionDB-bench/fusiondb_bench.py;E:/Playground/FusionDB-bench/README.md;E:/Playground/FusionDB-bench/config.example.json","python -m py_compile fusiondb_bench.py"

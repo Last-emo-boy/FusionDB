@@ -1111,6 +1111,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-skiplist",
  "crossbeam-utils",
+ "csv",
  "env_logger",
  "fastbloom",
  "futures",

@@ -1,6 +1,7 @@
 mod aggregation;
 mod analyze;
 mod composite_index;
+mod copy;
 mod ddl;
 mod dml;
 mod expr;
@@ -290,6 +291,17 @@ impl Executor {
                 statement, analyze, ..
             } => self.handle_explain(statement, *analyze, txn, params).await,
             Statement::Analyze(analyze) => self.handle_analyze(analyze, txn).await,
+            Statement::Copy {
+                source,
+                to,
+                target,
+                options,
+                legacy_options,
+                values,
+            } => {
+                self.handle_copy(source, *to, target, options, legacy_options, values, txn)
+                    .await
+            }
             Statement::Drop {
                 names,
                 object_type: sqlparser::ast::ObjectType::View,
@@ -460,6 +472,19 @@ impl Executor {
             Statement::Explain { statement, .. } => Self::statement_permissions(statement),
             Statement::ExplainTable { table_name, .. } => vec![(table_name.to_string(), "SELECT")],
             Statement::Analyze(analyze) => vec![(analyze.table_name.to_string(), "SELECT")],
+            Statement::Copy { source, to, .. } => match source {
+                sqlparser::ast::CopySource::Table { table_name, .. } => {
+                    vec![(
+                        table_name.to_string(),
+                        if *to { "SELECT" } else { "INSERT" },
+                    )]
+                }
+                sqlparser::ast::CopySource::Query(query) => {
+                    let mut tables = Vec::new();
+                    Self::collect_query_tables(query, &mut tables);
+                    tables.into_iter().map(|table| (table, "SELECT")).collect()
+                }
+            },
             Statement::ShowCreate { obj_name, .. } => vec![(obj_name.to_string(), "SELECT")],
             Statement::Drop {
                 names, object_type, ..
