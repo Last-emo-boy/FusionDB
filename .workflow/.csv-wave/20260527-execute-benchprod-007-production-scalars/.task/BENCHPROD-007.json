@@ -1,0 +1,9 @@
+{
+  "id": "BENCHPROD-007",
+  "title": "Production scalar types",
+  "area": "sql",
+  "priority": "P0",
+  "status": "completed",
+  "next_action": "Use scalar type support to advance native BenchBase/pgbench/TSBS adapters and remaining official-shape benchmark tasks",
+  "success_criteria": "DATE TIMESTAMP DECIMAL NUMERIC and INTERVAL can be declared, inserted, cast, compared, indexed, and exposed through PgWire metadata/results without lossy FLOAT or INTEGER timestamp substitutions"
+}

@@ -66,10 +66,16 @@ impl Executor {
 
                 let left_val = self.evaluate_value(left, row, schema, params)?;
                 let right_val = self.evaluate_value(right, row, schema, params)?;
+                let (left_val, right_val) =
+                    self.align_comparison_values(left, left_val, right, right_val, schema)?;
 
                 match op {
-                    BinaryOperator::Eq => Ok(left_val == right_val),
-                    BinaryOperator::NotEq => Ok(left_val != right_val),
+                    BinaryOperator::Eq => {
+                        Ok(left_val.compare(&right_val) == std::cmp::Ordering::Equal)
+                    }
+                    BinaryOperator::NotEq => {
+                        Ok(left_val.compare(&right_val) != std::cmp::Ordering::Equal)
+                    }
                     BinaryOperator::Gt => self.compare_values(&left_val, &right_val, |l, r| l > r),
                     BinaryOperator::Lt => self.compare_values(&left_val, &right_val, |l, r| l < r),
                     BinaryOperator::GtEq => {
@@ -148,7 +154,9 @@ impl Executor {
                 let mut found = false;
                 for item in list {
                     let item_val = self.evaluate_value(item, row, schema, params)?;
-                    if val == item_val {
+                    let (_, item_val) =
+                        self.align_comparison_values(expr, val.clone(), item, item_val, schema)?;
+                    if val.compare(&item_val) == std::cmp::Ordering::Equal {
                         found = true;
                         break;
                     }
@@ -210,6 +218,10 @@ impl Executor {
                 let val = self.evaluate_value(expr, row, schema, params)?;
                 let low_val = self.evaluate_value(low, row, schema, params)?;
                 let high_val = self.evaluate_value(high, row, schema, params)?;
+                let (val, low_val) =
+                    self.align_comparison_values(expr, val, low, low_val, schema)?;
+                let (val, high_val) =
+                    self.align_comparison_values(expr, val, high, high_val, schema)?;
                 let ge = self.compare_values(&val, &low_val, |l, r| l >= r)?;
                 let le = self.compare_values(&val, &high_val, |l, r| l <= r)?;
                 let result = ge && le;

@@ -226,6 +226,76 @@ async fn test_cast_expressions() {
     // CAST integer to boolean
     let (_, rows) = query(&executor, "SELECT CAST(1 AS BOOLEAN)").await;
     assert_eq!(rows[0][0], fusiondb::common::Value::Boolean(true));
+    let (_, rows) = query(&executor, "SELECT CAST('2024-01-31' AS DATE)").await;
+    assert_eq!(
+        rows[0][0],
+        fusiondb::common::Value::date_from_str("2024-01-31").unwrap()
+    );
+    let (_, rows) = query(&executor, "SELECT CAST('2024-01-31 12:30:45' AS TIMESTAMP)").await;
+    assert_eq!(
+        rows[0][0],
+        fusiondb::common::Value::timestamp_from_str("2024-01-31 12:30:45").unwrap()
+    );
+    let (_, rows) = query(&executor, "SELECT CAST('123.4500' AS DECIMAL(10, 4))").await;
+    assert_eq!(
+        rows[0][0],
+        fusiondb::common::Value::Decimal("123.45".to_string())
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_production_scalar_types_insert_compare_and_order() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE scalar_types (
+            id INTEGER PRIMARY KEY,
+            d DATE,
+            ts TIMESTAMP,
+            amount DECIMAL(12, 2),
+            ratio NUMERIC,
+            span INTERVAL
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO scalar_types VALUES
+            (1, DATE '2024-01-01', TIMESTAMP '2024-01-01 10:00:00', 10.50, CAST('1.2500' AS NUMERIC), INTERVAL '2 days'),
+            (2, '2024-01-03', '2024-01-03 09:30:00', '9.75', '2.5', '3600')",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, d, ts, amount, ratio, span FROM scalar_types WHERE d >= DATE '2024-01-02' ORDER BY amount",
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(2));
+    assert_eq!(rows[0][1], Value::date_from_str("2024-01-03").unwrap());
+    assert_eq!(
+        rows[0][2],
+        Value::timestamp_from_str("2024-01-03 09:30:00").unwrap()
+    );
+    assert_eq!(rows[0][3], Value::Decimal("9.75".to_string()));
+    assert_eq!(rows[0][4], Value::Decimal("2.5".to_string()));
+    assert_eq!(rows[0][5], Value::Interval(3_600_000_000));
+
+    exec_ok(
+        &executor,
+        "UPDATE scalar_types SET amount = amount + CAST('1.25' AS DECIMAL), d = '2024-01-04' WHERE id = 2",
+    )
+    .await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT d, amount FROM scalar_types WHERE amount = CAST('11.00' AS NUMERIC)",
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::date_from_str("2024-01-04").unwrap());
+    assert_eq!(rows[0][1], Value::Decimal("11".to_string()));
     cleanup(&wal);
 }
 

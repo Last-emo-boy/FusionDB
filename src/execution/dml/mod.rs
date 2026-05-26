@@ -71,6 +71,10 @@ impl Executor {
         {
             Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(i)),
             Value::String(s) => Some(s),
+            Value::Date(days) => Some(crate::common::encoding::encode_i64_comparable(days as i64)),
+            Value::Timestamp(micros) => {
+                Some(crate::common::encoding::encode_i64_comparable(micros))
+            }
             _ => None,
         }
     }

@@ -167,6 +167,10 @@ impl Executor {
         match value {
             Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(*i)),
             Value::String(s) => Some(s.clone()),
+            Value::Date(days) => Some(crate::common::encoding::encode_i64_comparable(*days as i64)),
+            Value::Timestamp(micros) => {
+                Some(crate::common::encoding::encode_i64_comparable(*micros))
+            }
             _ => None,
         }
     }
@@ -187,13 +191,18 @@ impl Executor {
         let mut row = vec![Value::Null; schema.columns.len()];
         if let Some(pk_idx) = pk_index {
             if pk_idx < schema.columns.len() {
-                let is_int = matches!(
-                    schema.columns[pk_idx].data_type.as_str(),
-                    "INTEGER" | "BIGINT"
-                );
-                row[pk_idx] = if is_int {
+                let upper = schema.columns[pk_idx].data_type.to_ascii_uppercase();
+                row[pk_idx] = if crate::execution::Executor::is_integer_type_name(&upper) {
                     crate::common::encoding::decode_i64_comparable(row_id)
                         .map(Value::Integer)
+                        .unwrap_or_else(|| Value::String(row_id.to_string()))
+                } else if upper == "DATE" {
+                    crate::common::encoding::decode_i64_comparable(row_id)
+                        .map(|days| Value::Date(days as i32))
+                        .unwrap_or_else(|| Value::String(row_id.to_string()))
+                } else if upper.starts_with("TIMESTAMP") || upper == "DATETIME" {
+                    crate::common::encoding::decode_i64_comparable(row_id)
+                        .map(Value::Timestamp)
                         .unwrap_or_else(|| Value::String(row_id.to_string()))
                 } else {
                     Value::String(row_id.to_string())
@@ -290,6 +299,11 @@ impl Executor {
                             let val = self
                                 .evaluate_value(value_expr, &[], schema, params)
                                 .unwrap_or(Value::Null);
+                            let val = Self::coerce_value_to_column_type(
+                                val,
+                                &schema.columns[col_idx].data_type,
+                            )
+                            .unwrap_or(Value::Null);
                             if let Some(val_str) = self.value_to_index_string(&val) {
                                 let index_prefix = format!(
                                     "index:{}:{}:{}:",
@@ -413,15 +427,11 @@ impl Executor {
                                 let val = self
                                     .evaluate_value(item, &[], schema, params)
                                     .unwrap_or(Value::Null);
+                                let val = Self::coerce_value_to_column_type(val, &col.data_type)
+                                    .unwrap_or(Value::Null);
 
                                 if col.is_primary {
-                                    let val_str = match &val {
-                                        Value::Integer(i) => {
-                                            Some(crate::common::encoding::encode_i64_comparable(*i))
-                                        }
-                                        Value::String(s) => Some(s.clone()),
-                                        _ => None,
-                                    };
+                                    let val_str = Self::value_to_primary_row_id(&val);
                                     if let Some(s) = val_str {
                                         let key = format!("data:{}:{}", table_name, s);
                                         if txn.get(key.as_bytes()).await?.is_some() {
@@ -553,22 +563,14 @@ impl Executor {
                         let high_val = self
                             .evaluate_value(high, &[], schema, params)
                             .unwrap_or(Value::Null);
+                        let low_val = Self::coerce_value_to_column_type(low_val, &col.data_type)
+                            .unwrap_or(Value::Null);
+                        let high_val = Self::coerce_value_to_column_type(high_val, &col.data_type)
+                            .unwrap_or(Value::Null);
 
                         if col.is_primary {
-                            let low_encoded = match low_val {
-                                Value::Integer(i) => {
-                                    Some(crate::common::encoding::encode_i64_comparable(i))
-                                }
-                                Value::String(s) => Some(s),
-                                _ => None,
-                            };
-                            let high_encoded = match high_val {
-                                Value::Integer(i) => {
-                                    Some(crate::common::encoding::encode_i64_comparable(i))
-                                }
-                                Value::String(s) => Some(s),
-                                _ => None,
-                            };
+                            let low_encoded = Self::value_to_primary_row_id(&low_val);
+                            let high_encoded = Self::value_to_primary_row_id(&high_val);
 
                             if let (Some(low_key), Some(high_key)) = (low_encoded, high_encoded) {
                                 let start = format!("data:{}:{}", table_name, low_key);

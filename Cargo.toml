@@ -45,6 +45,7 @@ sha2 = "0.10"
 hmac = "0.12"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 base64 = "0.22"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
 
 [[bin]]
 name = "fusiondb"
@@ -52,5 +53,5 @@ path = "src/main.rs"
 
 [dev-dependencies]
 env_logger = "0.11.8"
-tokio-postgres = "0.7.15"
+tokio-postgres = { version = "0.7.15", features = ["with-chrono-0_4"] }
 tower = { version = "0.5", features = ["util"] }

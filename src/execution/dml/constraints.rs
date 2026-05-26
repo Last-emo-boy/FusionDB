@@ -1,4 +1,4 @@
-use crate::common::Value;
+use crate::common::{Result, Value};
 
 use super::super::Executor;
 
@@ -62,20 +62,34 @@ impl Executor {
         true // If we can't parse, pass the check (don't break existing data)
     }
 
-    pub(super) fn parse_default_value(&self, def_str: &str) -> Value {
+    pub(super) fn parse_default_value(&self, def_str: &str) -> Result<Value> {
+        if let Ok(stmts) = crate::parser::parse_sql(&format!("SELECT {}", def_str)) {
+            if let Some(sqlparser::ast::Statement::Query(query)) = stmts.first() {
+                if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+                    if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
+                        select.projection.first()
+                    {
+                        let schema =
+                            crate::catalog::TableSchema::new("_default".to_string(), vec![]);
+                        return self.evaluate_value(expr, &[], &schema, &[]);
+                    }
+                }
+            }
+        }
+
         // Try parsing as integer
         if let Ok(n) = def_str.parse::<i64>() {
-            return Value::Integer(n);
+            return Ok(Value::Integer(n));
         }
         // Try parsing as float
         if let Ok(f) = def_str.parse::<f64>() {
-            return Value::Float(f);
+            return Ok(Value::Float(f));
         }
         // Boolean
         match def_str.to_lowercase().as_str() {
-            "true" => return Value::Boolean(true),
-            "false" => return Value::Boolean(false),
-            "null" => return Value::Null,
+            "true" => return Ok(Value::Boolean(true)),
+            "false" => return Ok(Value::Boolean(false)),
+            "null" => return Ok(Value::Null),
             _ => {}
         }
         // Strip quotes for string literals
@@ -83,8 +97,8 @@ impl Executor {
         if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
             || (trimmed.starts_with('"') && trimmed.ends_with('"'))
         {
-            return Value::String(trimmed[1..trimmed.len() - 1].to_string());
+            return Ok(Value::String(trimmed[1..trimmed.len() - 1].to_string()));
         }
-        Value::String(def_str.to_string())
+        Ok(Value::String(def_str.to_string()))
     }
 }

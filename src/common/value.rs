@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
+use chrono::Datelike;
 use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -11,7 +12,11 @@ pub enum Value {
     Boolean(bool),
     Integer(i64),
     Float(f64),
+    Decimal(String),
     String(String),
+    Date(i32),
+    Timestamp(i64),
+    Interval(i64),
     Blob(Vec<u8>),
     Vector(Vec<f32>),
     Array(Vec<Value>),
@@ -19,6 +24,211 @@ pub enum Value {
 }
 
 impl Value {
+    pub fn date_from_str(value: &str) -> Option<Self> {
+        let date = chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()?;
+        Some(Value::Date(date.num_days_from_ce()))
+    }
+
+    pub fn timestamp_from_str(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        let normalized = trimmed.trim_end_matches('Z').replace('T', " ");
+        let timestamp = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f")
+            .or_else(|_| {
+                chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d")
+                    .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
+            })
+            .ok()?;
+        Some(Value::Timestamp(timestamp.and_utc().timestamp_micros()))
+    }
+
+    pub fn interval_from_str(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(seconds) = trimmed.parse::<i64>() {
+            return Some(Value::Interval(seconds.saturating_mul(1_000_000)));
+        }
+
+        let mut total_micros = 0i64;
+        let mut saw_part = false;
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        let mut idx = 0usize;
+        while idx + 1 < parts.len() {
+            let Ok(amount) = parts[idx].parse::<f64>() else {
+                return None;
+            };
+            let unit = parts[idx + 1].to_ascii_lowercase();
+            let seconds = match unit.trim_end_matches('s') {
+                "microsecond" => {
+                    total_micros =
+                        total_micros.saturating_add((amount.round() as i64).max(i64::MIN));
+                    saw_part = true;
+                    idx += 2;
+                    continue;
+                }
+                "millisecond" => amount / 1_000.0,
+                "second" => amount,
+                "minute" => amount * 60.0,
+                "hour" => amount * 3_600.0,
+                "day" => amount * 86_400.0,
+                "week" => amount * 604_800.0,
+                "month" => amount * 2_592_000.0,
+                "year" => amount * 31_536_000.0,
+                _ => return None,
+            };
+            total_micros = total_micros.saturating_add((seconds * 1_000_000.0).round() as i64);
+            saw_part = true;
+            idx += 2;
+        }
+
+        saw_part.then_some(Value::Interval(total_micros))
+    }
+
+    pub fn normalize_decimal(value: &str) -> Option<String> {
+        let mut s = value.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let negative = s.starts_with('-');
+        if negative || s.starts_with('+') {
+            s = &s[1..];
+        }
+        if s.is_empty() || s.eq_ignore_ascii_case("nan") || s.eq_ignore_ascii_case("inf") {
+            return None;
+        }
+
+        let mut parts = s.split('.');
+        let int_part = parts.next().unwrap_or_default();
+        let frac_part = parts.next();
+        if parts.next().is_some() {
+            return None;
+        }
+        if int_part.is_empty() && frac_part.map_or(true, str::is_empty) {
+            return None;
+        }
+        if !int_part.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let mut int_digits = int_part.trim_start_matches('0').to_string();
+        if int_digits.is_empty() {
+            int_digits.push('0');
+        }
+
+        let mut frac_digits = frac_part.unwrap_or_default().to_string();
+        if !frac_digits.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        while frac_digits.ends_with('0') {
+            frac_digits.pop();
+        }
+
+        let is_zero = int_digits == "0" && frac_digits.is_empty();
+        let mut out = String::new();
+        if negative && !is_zero {
+            out.push('-');
+        }
+        out.push_str(&int_digits);
+        if !frac_digits.is_empty() {
+            out.push('.');
+            out.push_str(&frac_digits);
+        }
+        Some(out)
+    }
+
+    pub fn decimal_from_f64(value: f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        Self::normalize_decimal(&format!("{:.12}", value)).map(Value::Decimal)
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Integer(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            Value::Decimal(s) => s.parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn to_plain_string(&self) -> String {
+        match self {
+            Value::Null => "NULL".to_string(),
+            Value::Boolean(b) => b.to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Decimal(s) => s.clone(),
+            Value::String(s) => s.clone(),
+            Value::Date(days) => Self::format_date(*days),
+            Value::Timestamp(micros) => Self::format_timestamp(*micros),
+            Value::Interval(micros) => Self::format_interval(*micros),
+            Value::Blob(b) => format!("<BLOB len={}>", b.len()),
+            Value::Vector(v) => format!("{:?}", v),
+            Value::Array(v) => format!("{:?}", v),
+            Value::Object(v) => format!("{:?}", v),
+        }
+    }
+
+    pub fn format_date(days_from_ce: i32) -> String {
+        chrono::NaiveDate::from_num_days_from_ce_opt(days_from_ce)
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| days_from_ce.to_string())
+    }
+
+    pub fn format_timestamp(micros: i64) -> String {
+        chrono::DateTime::from_timestamp_micros(micros)
+            .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            .unwrap_or_else(|| micros.to_string())
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+
+    pub fn format_interval(micros: i64) -> String {
+        if micros % 1_000_000 == 0 {
+            format!("{} seconds", micros / 1_000_000)
+        } else {
+            format!("{} microseconds", micros)
+        }
+    }
+
+    fn compare_decimal_strings(left: &str, right: &str) -> Ordering {
+        let left = Self::normalize_decimal(left).unwrap_or_else(|| "0".to_string());
+        let right = Self::normalize_decimal(right).unwrap_or_else(|| "0".to_string());
+        let left_neg = left.starts_with('-');
+        let right_neg = right.starts_with('-');
+        if left_neg != right_neg {
+            return if left_neg {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+
+        let l = left.trim_start_matches('-');
+        let r = right.trim_start_matches('-');
+        let (li, lf) = l.split_once('.').unwrap_or((l, ""));
+        let (ri, rf) = r.split_once('.').unwrap_or((r, ""));
+        let abs_order = li
+            .len()
+            .cmp(&ri.len())
+            .then_with(|| li.cmp(ri))
+            .then_with(|| {
+                let max = lf.len().max(rf.len());
+                let mut lp = lf.to_string();
+                let mut rp = rf.to_string();
+                lp.extend(std::iter::repeat('0').take(max - lf.len()));
+                rp.extend(std::iter::repeat('0').take(max - rf.len()));
+                lp.cmp(&rp)
+            });
+        if left_neg {
+            abs_order.reverse()
+        } else {
+            abs_order
+        }
+    }
+
     pub fn from_json(v: &serde_json::Value) -> Value {
         match v {
             serde_json::Value::Null => Value::Null,
@@ -52,7 +262,11 @@ impl Value {
             Value::Float(f) => serde_json::Number::from_f64(*f)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),
+            Value::Decimal(s) => serde_json::Value::String(s.clone()),
             Value::String(s) => serde_json::Value::String(s.clone()),
+            Value::Date(days) => serde_json::Value::String(Self::format_date(*days)),
+            Value::Timestamp(micros) => serde_json::Value::String(Self::format_timestamp(*micros)),
+            Value::Interval(micros) => serde_json::Value::String(Self::format_interval(*micros)),
             Value::Blob(b) => serde_json::Value::String(format!("<BLOB len={}>", b.len())), // Base64?
             Value::Vector(v) => serde_json::json!(v),
             Value::Array(arr) => {
@@ -82,9 +296,41 @@ impl Value {
             (Value::Float(f1), Value::Integer(i2)) => {
                 f1.partial_cmp(&(*i2 as f64)).unwrap_or(Ordering::Equal)
             }
+            (Value::Decimal(d1), Value::Decimal(d2)) => Self::compare_decimal_strings(d1, d2),
+            (Value::Decimal(d), Value::Integer(i)) | (Value::Integer(i), Value::Decimal(d)) => {
+                let ord = Self::compare_decimal_strings(d, &i.to_string());
+                if matches!(self, Value::Integer(_)) {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            }
+            (Value::Decimal(d), Value::Float(f)) | (Value::Float(f), Value::Decimal(d)) => {
+                let ord = d
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(|d| d.partial_cmp(f))
+                    .unwrap_or(Ordering::Equal);
+                if matches!(self, Value::Float(_)) {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            }
 
             (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
             (Value::Boolean(b1), Value::Boolean(b2)) => b1.cmp(b2),
+            (Value::Date(d1), Value::Date(d2)) => d1.cmp(d2),
+            (Value::Timestamp(t1), Value::Timestamp(t2)) => t1.cmp(t2),
+            (Value::Date(d), Value::Timestamp(t)) => {
+                let day_micros = (*d as i64 - 719_163) * 86_400_000_000;
+                day_micros.cmp(t)
+            }
+            (Value::Timestamp(t), Value::Date(d)) => {
+                let day_micros = (*d as i64 - 719_163) * 86_400_000_000;
+                t.cmp(&day_micros)
+            }
+            (Value::Interval(i1), Value::Interval(i2)) => i1.cmp(i2),
 
             (v1, v2) => {
                 let t1 = v1.get_type_order();
@@ -98,12 +344,14 @@ impl Value {
         match self {
             Value::Null => 0,
             Value::Boolean(_) => 1,
-            Value::Integer(_) | Value::Float(_) => 2,
+            Value::Integer(_) | Value::Float(_) | Value::Decimal(_) => 2,
             Value::String(_) => 3,
-            Value::Blob(_) => 4,
-            Value::Vector(_) => 5,
-            Value::Array(_) => 6,
-            Value::Object(_) => 7,
+            Value::Date(_) | Value::Timestamp(_) => 4,
+            Value::Interval(_) => 5,
+            Value::Blob(_) => 6,
+            Value::Vector(_) => 7,
+            Value::Array(_) => 8,
+            Value::Object(_) => 9,
         }
     }
 }
@@ -124,7 +372,11 @@ impl Hash for Value {
                 // Here we just hash the bit pattern.
                 f.to_bits().hash(state)
             }
+            Value::Decimal(d) => d.hash(state),
             Value::String(s) => s.hash(state),
+            Value::Date(d) => d.hash(state),
+            Value::Timestamp(t) => t.hash(state),
+            Value::Interval(i) => i.hash(state),
             Value::Blob(b) => b.hash(state),
             Value::Vector(v) => {
                 for f in v {
@@ -153,7 +405,11 @@ impl fmt::Display for Value {
             Value::Boolean(b) => write!(f, "{}", b),
             Value::Integer(i) => write!(f, "{}", i),
             Value::Float(fl) => write!(f, "{}", fl),
+            Value::Decimal(d) => write!(f, "{}", d),
             Value::String(s) => write!(f, "'{}'", s),
+            Value::Date(days) => write!(f, "{}", Self::format_date(*days)),
+            Value::Timestamp(micros) => write!(f, "{}", Self::format_timestamp(*micros)),
+            Value::Interval(micros) => write!(f, "{}", Self::format_interval(*micros)),
             Value::Blob(b) => write!(f, "<BLOB len={}>", b.len()),
             Value::Vector(v) => write!(f, "<VECTOR dim={}>", v.len()),
             Value::Array(arr) => {

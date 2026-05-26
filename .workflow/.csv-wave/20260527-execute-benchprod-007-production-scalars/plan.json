@@ -1,0 +1,28 @@
+{
+  "task": "BENCHPROD-007",
+  "title": "Production scalar types",
+  "status": "completed",
+  "steps": [
+    {
+      "id": "inspect",
+      "description": "Inspect Value, expression, DML, index, COPY, and PgWire type paths",
+      "status": "completed"
+    },
+    {
+      "id": "implement",
+      "description": "Add DATE/TIMESTAMP/DECIMAL/NUMERIC/INTERVAL execution and storage support",
+      "status": "completed"
+    },
+    {
+      "id": "test",
+      "description": "Add SQL and PgWire tests for production scalar types",
+      "status": "completed"
+    },
+    {
+      "id": "verify",
+      "description": "Run targeted tests, release build, and production tiny matrix",
+      "status": "completed"
+    }
+  ]
+}
+

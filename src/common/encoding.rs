@@ -152,6 +152,8 @@ pub fn decode_i64_comparable(s: &str) -> Option<i64> {
 pub fn encode_key(v: &Value) -> String {
     match v {
         Value::Integer(i) => encode_i64_comparable(*i),
+        Value::Date(days) => encode_i64_comparable(*days as i64),
+        Value::Timestamp(micros) | Value::Interval(micros) => encode_i64_comparable(*micros),
         Value::String(s) => s.clone(), // TODO: Escape separators?
         _ => v.to_string(),
     }

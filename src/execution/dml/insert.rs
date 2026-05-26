@@ -85,6 +85,10 @@ impl Executor {
                                 // Use DEFAULT value if specified, otherwise NULL
                                 if let Some(ref def_str) = col.default_value {
                                     self.parse_default_value(def_str)
+                                        .and_then(|value| {
+                                            Self::coerce_value_to_column_type(value, &col.data_type)
+                                        })
+                                        .unwrap_or(Value::Null)
                                 } else {
                                     Value::Null
                                 }
@@ -101,6 +105,7 @@ impl Executor {
                     if row_values.len() != schema.columns.len() {
                         return Err(FusionError::Execution("Column count mismatch".to_string()));
                     }
+                    let row_values = self.coerce_row_to_schema(row_values, &schema)?;
 
                     // Enforce NOT NULL constraints
                     for (idx, col) in schema.columns.iter().enumerate() {
@@ -216,7 +221,11 @@ impl Executor {
                                                 &row_values,
                                                 &schema,
                                             )?;
-                                            existing_row[col_idx] = new_val;
+                                            existing_row[col_idx] =
+                                                Self::coerce_value_to_column_type(
+                                                    new_val,
+                                                    &schema.columns[col_idx].data_type,
+                                                )?;
                                         }
                                     }
                                     self.validate_child_foreign_keys(
@@ -400,6 +409,7 @@ impl Executor {
                             "Column count mismatch in INSERT ... SELECT".to_string(),
                         ));
                     }
+                    let row_values = self.coerce_row_to_schema(row_values, &schema)?;
                     let row_id = if let Some(first) = row_values.first() {
                         encode_key(first)
                     } else {

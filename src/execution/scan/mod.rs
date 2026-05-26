@@ -398,11 +398,26 @@ impl Executor {
                         let val = self
                             .evaluate_value(value_expr, &[], &schema, params)
                             .unwrap_or(Value::Null);
+                        let val = if let Some(pk_idx) = pk_index {
+                            Self::coerce_value_to_column_type(
+                                val,
+                                &schema.columns[pk_idx].data_type,
+                            )
+                            .unwrap_or(Value::Null)
+                        } else {
+                            val
+                        };
                         let row_id = match val {
                             Value::Integer(i) => {
                                 Some(crate::common::encoding::encode_i64_comparable(i))
                             }
                             Value::String(s) => Some(s),
+                            Value::Date(days) => {
+                                Some(crate::common::encoding::encode_i64_comparable(days as i64))
+                            }
+                            Value::Timestamp(micros) => {
+                                Some(crate::common::encoding::encode_i64_comparable(micros))
+                            }
                             _ => None,
                         };
 
@@ -462,8 +477,22 @@ impl Executor {
                             let val = self
                                 .evaluate_value(value_expr, &[], &schema, params)
                                 .unwrap_or(Value::Null);
+                            let val = if let Some(pk_idx) = pk_index {
+                                Self::coerce_value_to_column_type(
+                                    val,
+                                    &schema.columns[pk_idx].data_type,
+                                )
+                                .unwrap_or(Value::Null)
+                            } else {
+                                val
+                            };
 
-                            if let Value::Integer(limit_val) = val {
+                            if let Some(limit_val) = match val {
+                                Value::Integer(i) => Some(i),
+                                Value::Date(days) => Some(days as i64),
+                                Value::Timestamp(micros) => Some(micros),
+                                _ => None,
+                            } {
                                 let table_prefix = format!("data:{}:", table_name);
                                 let min_key = table_prefix.as_bytes().to_vec();
                                 let mut max_key = table_prefix.as_bytes().to_vec();

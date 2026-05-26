@@ -68,6 +68,25 @@ impl Executor {
                 }
                 Ok(Value::Array(values))
             }
+            Expr::TypedString(typed) => {
+                let raw = typed
+                    .value
+                    .clone()
+                    .value
+                    .into_string()
+                    .unwrap_or_else(|| typed.value.to_string().trim_matches('\'').to_string());
+                Self::typed_string_value(&typed.data_type, &raw)
+            }
+            Expr::Interval(interval) => {
+                let raw = self.evaluate_value(&interval.value, row, schema, params)?;
+                Self::coerce_value_to_sql_type(
+                    raw,
+                    &sqlparser::ast::DataType::Interval {
+                        fields: None,
+                        precision: None,
+                    },
+                )
+            }
             Expr::Value(v) => {
                 if let SqlValue::Placeholder(p) = &v.value {
                     let idx = Self::placeholder_index(p);
@@ -197,82 +216,7 @@ impl Executor {
                 expr, data_type, ..
             } => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
-                let type_str = format!("{}", data_type).to_uppercase();
-                match type_str.as_str() {
-                    "INT" | "INTEGER" | "BIGINT" | "INT4" | "INT8" | "SMALLINT" => match val {
-                        Value::Integer(_) => Ok(val),
-                        Value::Float(f) => Ok(Value::Integer(f as i64)),
-                        Value::String(s) => {
-                            s.trim().parse::<i64>().map(Value::Integer).map_err(|_| {
-                                FusionError::Execution(format!("Cannot cast '{}' to INTEGER", s))
-                            })
-                        }
-                        Value::Boolean(b) => Ok(Value::Integer(if b { 1 } else { 0 })),
-                        Value::Null => Ok(Value::Null),
-                        _ => Err(FusionError::Execution(format!(
-                            "Cannot cast {:?} to INTEGER",
-                            val
-                        ))),
-                    },
-                    s if s.starts_with("FLOAT")
-                        || s.starts_with("DOUBLE")
-                        || s.starts_with("REAL")
-                        || s.starts_with("NUMERIC")
-                        || s.starts_with("DECIMAL") =>
-                    {
-                        match val {
-                            Value::Float(_) => Ok(val),
-                            Value::Integer(n) => Ok(Value::Float(n as f64)),
-                            Value::String(s) => {
-                                s.trim().parse::<f64>().map(Value::Float).map_err(|_| {
-                                    FusionError::Execution(format!("Cannot cast '{}' to FLOAT", s))
-                                })
-                            }
-                            Value::Null => Ok(Value::Null),
-                            _ => Err(FusionError::Execution(format!(
-                                "Cannot cast {:?} to FLOAT",
-                                val
-                            ))),
-                        }
-                    }
-                    "TEXT" | "VARCHAR" | "CHAR" | "STRING" => match val {
-                        Value::String(_) => Ok(val),
-                        Value::Integer(n) => Ok(Value::String(n.to_string())),
-                        Value::Float(f) => Ok(Value::String(f.to_string())),
-                        Value::Boolean(b) => Ok(Value::String(b.to_string())),
-                        Value::Null => Ok(Value::Null),
-                        other => Ok(Value::String(format!("{:?}", other))),
-                    },
-                    s if s.starts_with("VARCHAR") || s.starts_with("CHAR(") => match val {
-                        Value::String(_) => Ok(val),
-                        Value::Integer(n) => Ok(Value::String(n.to_string())),
-                        Value::Float(f) => Ok(Value::String(f.to_string())),
-                        Value::Boolean(b) => Ok(Value::String(b.to_string())),
-                        Value::Null => Ok(Value::Null),
-                        other => Ok(Value::String(format!("{:?}", other))),
-                    },
-                    "BOOLEAN" | "BOOL" => match val {
-                        Value::Boolean(_) => Ok(val),
-                        Value::Integer(n) => Ok(Value::Boolean(n != 0)),
-                        Value::String(s) => match s.to_lowercase().as_str() {
-                            "true" | "t" | "1" | "yes" => Ok(Value::Boolean(true)),
-                            "false" | "f" | "0" | "no" => Ok(Value::Boolean(false)),
-                            _ => Err(FusionError::Execution(format!(
-                                "Cannot cast '{}' to BOOLEAN",
-                                s
-                            ))),
-                        },
-                        Value::Null => Ok(Value::Null),
-                        _ => Err(FusionError::Execution(format!(
-                            "Cannot cast {:?} to BOOLEAN",
-                            val
-                        ))),
-                    },
-                    _ => Err(FusionError::Execution(format!(
-                        "Unsupported CAST target type: {}",
-                        type_str
-                    ))),
-                }
+                Self::coerce_value_to_sql_type(val, data_type)
             }
             Expr::Between {
                 expr,
@@ -283,6 +227,10 @@ impl Executor {
                 let val = self.evaluate_value(expr, row, schema, params)?;
                 let low_val = self.evaluate_value(low, row, schema, params)?;
                 let high_val = self.evaluate_value(high, row, schema, params)?;
+                let (val, low_val) =
+                    self.align_comparison_values(expr, val, low, low_val, schema)?;
+                let (val, high_val) =
+                    self.align_comparison_values(expr, val, high, high_val, schema)?;
                 let ge = self.compare_values(&val, &low_val, |l, r| l >= r)?;
                 let le = self.compare_values(&val, &high_val, |l, r| l <= r)?;
                 let result = ge && le;
@@ -323,6 +271,9 @@ impl Executor {
                 (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l + r)),
                 (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 + r)),
                 (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l + r as f64)),
+                (Value::Decimal(l), Value::Decimal(r)) => decimal_math(&l, &r, |a, b| a + b),
+                (Value::Decimal(l), r) => decimal_math(&l, &r.to_plain_string(), |a, b| a + b),
+                (l, Value::Decimal(r)) => decimal_math(&l.to_plain_string(), &r, |a, b| a + b),
                 _ => Err(FusionError::Execution(
                     "Type mismatch in addition".to_string(),
                 )),
@@ -332,6 +283,9 @@ impl Executor {
                 (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
                 (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 - r)),
                 (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l - r as f64)),
+                (Value::Decimal(l), Value::Decimal(r)) => decimal_math(&l, &r, |a, b| a - b),
+                (Value::Decimal(l), r) => decimal_math(&l, &r.to_plain_string(), |a, b| a - b),
+                (l, Value::Decimal(r)) => decimal_math(&l.to_plain_string(), &r, |a, b| a - b),
                 _ => Err(FusionError::Execution(
                     "Type mismatch in subtraction".to_string(),
                 )),
@@ -341,6 +295,9 @@ impl Executor {
                 (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l * r)),
                 (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 * r)),
                 (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l * r as f64)),
+                (Value::Decimal(l), Value::Decimal(r)) => decimal_math(&l, &r, |a, b| a * b),
+                (Value::Decimal(l), r) => decimal_math(&l, &r.to_plain_string(), |a, b| a * b),
+                (l, Value::Decimal(r)) => decimal_math(&l.to_plain_string(), &r, |a, b| a * b),
                 _ => Err(FusionError::Execution(
                     "Type mismatch in multiplication".to_string(),
                 )),
@@ -370,12 +327,34 @@ impl Executor {
                     }
                     Ok(Value::Float(l / r as f64))
                 }
+                (Value::Decimal(l), Value::Decimal(r)) => {
+                    if r == "0" {
+                        return Err(FusionError::Execution("Division by zero".to_string()));
+                    }
+                    decimal_math(&l, &r, |a, b| a / b)
+                }
+                (Value::Decimal(l), r) => {
+                    if r.as_f64() == Some(0.0) {
+                        return Err(FusionError::Execution("Division by zero".to_string()));
+                    }
+                    decimal_math(&l, &r.to_plain_string(), |a, b| a / b)
+                }
+                (l, Value::Decimal(r)) => {
+                    if r == "0" {
+                        return Err(FusionError::Execution("Division by zero".to_string()));
+                    }
+                    decimal_math(&l.to_plain_string(), &r, |a, b| a / b)
+                }
                 _ => Err(FusionError::Execution(
                     "Type mismatch in division".to_string(),
                 )),
             },
-            BinaryOperator::Eq => Ok(Value::Boolean(left_val == right_val)),
-            BinaryOperator::NotEq => Ok(Value::Boolean(left_val != right_val)),
+            BinaryOperator::Eq => Ok(Value::Boolean(
+                left_val.compare(&right_val) == Ordering::Equal,
+            )),
+            BinaryOperator::NotEq => Ok(Value::Boolean(
+                left_val.compare(&right_val) != Ordering::Equal,
+            )),
             BinaryOperator::Gt => Ok(Value::Boolean(
                 left_val.compare(&right_val) == Ordering::Greater,
             )),
@@ -445,6 +424,9 @@ impl Executor {
             (Value::Float(l), Value::Float(r)) => Ok(Value::Float(op_float(*l, *r))),
             (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(op_float(*l as f64, *r))),
             (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(op_float(*l, *r as f64))),
+            (Value::Decimal(l), Value::Decimal(r)) => decimal_math(l, r, op_float),
+            (Value::Decimal(l), r) => decimal_math(l, &r.to_plain_string(), op_float),
+            (l, Value::Decimal(r)) => decimal_math(&l.to_plain_string(), r, op_float),
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             _ => Err(FusionError::Execution(
                 "Type mismatch in arithmetic operation".to_string(),
@@ -461,6 +443,21 @@ impl Executor {
             (Value::Float(l), Value::Float(r)) => Ok(op(l, r)),
             (Value::Integer(l), Value::Float(r)) => Ok(op(&(*l as f64), r)),
             (Value::Float(l), Value::Integer(r)) => Ok(op(l, &(*r as f64))),
+            (Value::Decimal(l), Value::Decimal(r)) => Ok(op(
+                &l.parse::<f64>().unwrap_or_default(),
+                &r.parse::<f64>().unwrap_or_default(),
+            )),
+            (Value::Decimal(l), r) => Ok(op(
+                &l.parse::<f64>().unwrap_or_default(),
+                &r.as_f64().unwrap_or_default(),
+            )),
+            (l, Value::Decimal(r)) => Ok(op(
+                &l.as_f64().unwrap_or_default(),
+                &r.parse::<f64>().unwrap_or_default(),
+            )),
+            (Value::Date(l), Value::Date(r)) => Ok(op(&(*l as f64), &(*r as f64))),
+            (Value::Timestamp(l), Value::Timestamp(r)) => Ok(op(&(*l as f64), &(*r as f64))),
+            (Value::Interval(l), Value::Interval(r)) => Ok(op(&(*l as f64), &(*r as f64))),
             _ => Err(FusionError::Execution(
                 "Type mismatch in comparison".to_string(),
             )),
@@ -484,6 +481,9 @@ impl Executor {
                         return self.json_value_to_fusion_value(&v);
                     }
                 }
+                Value::String(s.clone())
+            }
+            SqlValue::EscapedStringLiteral(s) | SqlValue::NationalStringLiteral(s) => {
                 Value::String(s.clone())
             }
             SqlValue::Boolean(b) => Value::Boolean(*b),
@@ -533,7 +533,29 @@ impl Executor {
             Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(*i)),
             Value::String(s) => Some(s.clone()),
             Value::Boolean(b) => Some(b.to_string()),
+            Value::Decimal(d) => Some(format!("dec:{}", d)),
+            Value::Date(days) => Some(crate::common::encoding::encode_i64_comparable(*days as i64)),
+            Value::Timestamp(micros) => {
+                Some(crate::common::encoding::encode_i64_comparable(*micros))
+            }
+            Value::Interval(micros) => {
+                Some(crate::common::encoding::encode_i64_comparable(*micros))
+            }
             _ => None,
         }
     }
+}
+
+fn decimal_math<F>(left: &str, right: &str, op: F) -> Result<Value>
+where
+    F: Fn(f64, f64) -> f64,
+{
+    let l = left
+        .parse::<f64>()
+        .map_err(|_| FusionError::Execution(format!("Cannot use '{}' as DECIMAL", left)))?;
+    let r = right
+        .parse::<f64>()
+        .map_err(|_| FusionError::Execution(format!("Cannot use '{}' as DECIMAL", right)))?;
+    Value::decimal_from_f64(op(l, r))
+        .ok_or_else(|| FusionError::Execution("DECIMAL arithmetic overflow".to_string()))
 }

@@ -1,0 +1,36 @@
+{
+  "id": "BENCHPROD-043",
+  "title": "Current full benchmark snapshot",
+  "area": "benchmark_ops",
+  "priority": "P0",
+  "status": "completed",
+  "created_at": "2026-05-27T05:36:00+08:00",
+  "completed_at": "2026-05-27T05:50:00+08:00",
+  "summary": "Ran the current full local benchmark matrix at small and medium scale, verified copy-load full small, and captured external benchmark readiness gaps.",
+  "evidence": {
+    "small_insert": "E:/Playground/FusionDB-bench/runs/matrix_all_small_insert_full_20260527/matrix_summary.json",
+    "medium_insert": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_full_20260527/matrix_summary.json",
+    "small_copy": "E:/Playground/FusionDB-bench/runs/matrix_all_small_copy_full_20260527/matrix_summary.json",
+    "external_smoke": "E:/Playground/FusionDB-bench/runs/external_smoke_full_20260527/external_smoke_summary.json"
+  },
+  "results": {
+    "local_medium_suites_passed": 9,
+    "local_medium_suites_failed": 0,
+    "local_medium_cases_passed": 39,
+    "local_medium_cases_failed": 0,
+    "copy_small_suites_passed": 9,
+    "copy_small_cases_passed": 39,
+    "external_targets_checked": 7,
+    "external_tool_available": 0,
+    "external_tool_missing": 4,
+    "external_artifact_missing": 3
+  },
+  "next_tasks": [
+    "BENCHPROD-021",
+    "BENCHPROD-020",
+    "BENCHPROD-040",
+    "BENCHPROD-028",
+    "BENCHPROD-044",
+    "BENCHPROD-045"
+  ]
+}

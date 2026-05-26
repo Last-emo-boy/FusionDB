@@ -8,6 +8,7 @@ mod expr;
 mod foreign_key;
 mod query;
 mod scan;
+mod types;
 
 pub(crate) use aggregation::AggregateAccumulator;
 

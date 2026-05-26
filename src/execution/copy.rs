@@ -394,7 +394,11 @@ impl Executor {
             Value::Boolean(value) => value.to_string(),
             Value::Integer(value) => value.to_string(),
             Value::Float(value) => value.to_string(),
+            Value::Decimal(value) => value.clone(),
             Value::String(value) => format!("'{}'", value.replace('\'', "''")),
+            Value::Date(_) | Value::Timestamp(_) | Value::Interval(_) => {
+                format!("'{}'", value.to_plain_string().replace('\'', "''"))
+            }
             Value::Blob(_) | Value::Vector(_) | Value::Array(_) | Value::Object(_) => {
                 format!("'{}'", value.to_string().replace('\'', "''"))
             }

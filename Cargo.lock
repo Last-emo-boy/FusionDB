@@ -663,6 +663,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -1108,6 +1109,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "bytes",
+ "chrono",
  "crc32fast",
  "crossbeam-skiplist",
  "crossbeam-utils",
@@ -2336,6 +2338,7 @@ checksum = "ef4605b7c057056dd35baeb6ac0c0338e4975b1f2bef0f65da953285eb007095"
 dependencies = [
  "array-init",
  "bytes",
+ "chrono",
  "fallible-iterator",
  "postgres-protocol",
 ]

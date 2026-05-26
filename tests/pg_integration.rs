@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use chrono::{NaiveDate, NaiveDateTime};
 use fusiondb::auth::UserRecord;
 use fusiondb::execution::Executor;
 use fusiondb::server::pg_server;
@@ -186,6 +187,97 @@ async fn test_pg_protocol_prepare_reports_columns_and_params() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 2);
     assert_eq!(rows[0].get::<_, String>("val"), "world");
+
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
+async fn test_pg_protocol_reports_production_scalar_types() {
+    let wal_path = format!("test_pg_scalar_{}.wal", std::process::id());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let executor = Arc::new(Executor::new(storage.clone()));
+    let port = 19991;
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect to server");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query(
+            "CREATE TABLE pg_scalar_test (
+                id INTEGER PRIMARY KEY,
+                d DATE,
+                ts TIMESTAMP,
+                amount NUMERIC,
+                span INTERVAL
+            )",
+        )
+        .await
+        .expect("Failed to create scalar table");
+    client
+        .simple_query(
+            "INSERT INTO pg_scalar_test VALUES
+                (1, DATE '2024-02-01', TIMESTAMP '2024-02-01 12:30:00', CAST('12.50' AS NUMERIC), INTERVAL '1 hour')",
+        )
+        .await
+        .expect("Failed to insert scalar row");
+
+    let statement = client
+        .prepare("SELECT d, ts, amount, span FROM pg_scalar_test WHERE id = $1")
+        .await
+        .expect("prepare should return scalar metadata");
+    assert_eq!(statement.columns()[0].type_(), &Type::DATE);
+    assert_eq!(statement.columns()[1].type_(), &Type::TIMESTAMP);
+    assert_eq!(statement.columns()[2].type_(), &Type::NUMERIC);
+    assert_eq!(statement.columns()[3].type_(), &Type::INTERVAL);
+
+    let rows = client
+        .query(&statement, &[&1i64])
+        .await
+        .expect("scalar typed query should execute");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get::<_, NaiveDate>("d"),
+        NaiveDate::from_ymd_opt(2024, 2, 1).unwrap()
+    );
+    assert_eq!(
+        rows[0].get::<_, NaiveDateTime>("ts"),
+        NaiveDate::from_ymd_opt(2024, 2, 1)
+            .unwrap()
+            .and_hms_opt(12, 30, 0)
+            .unwrap()
+    );
+    let simple_rows = client
+        .simple_query("SELECT amount FROM pg_scalar_test WHERE id = 1")
+        .await
+        .expect("simple numeric query should execute");
+    let amount = simple_rows.iter().find_map(|message| {
+        if let tokio_postgres::SimpleQueryMessage::Row(row) = message {
+            row.get("amount").map(str::to_string)
+        } else {
+            None
+        }
+    });
+    assert_eq!(amount.as_deref(), Some("12.5"));
 
     let _ = std::fs::remove_file(&wal_path);
 }

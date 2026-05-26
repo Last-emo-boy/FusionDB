@@ -101,7 +101,10 @@ impl Executor {
                     if let Some(col_idx) = schema.get_column_index(&col_name) {
                         let new_val =
                             self.evaluate_value(&assignment.value, &old_row, &schema, params)?;
-                        row[col_idx] = new_val;
+                        row[col_idx] = Self::coerce_value_to_column_type(
+                            new_val,
+                            &schema.columns[col_idx].data_type,
+                        )?;
                     } else {
                         return Err(FusionError::Execution(format!(
                             "Column {} not found in assignment",

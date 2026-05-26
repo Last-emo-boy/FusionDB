@@ -1,4 +1,5 @@
 use bytes::{BufMut, BytesMut};
+use chrono::Datelike;
 use futures::{Sink, SinkExt};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,6 +70,8 @@ pub struct PgHandler {
 }
 
 impl PgHandler {
+    const POSTGRES_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
+
     pub fn new(executor: Arc<Executor>, storage: Arc<dyn Storage>) -> Self {
         Self {
             executor,
@@ -172,6 +175,10 @@ impl PgHandler {
             Value::Boolean(_) => Type::BOOL,
             Value::Integer(_) => Type::INT8,
             Value::Float(_) => Type::FLOAT8,
+            Value::Decimal(_) => Type::NUMERIC,
+            Value::Date(_) => Type::DATE,
+            Value::Timestamp(_) => Type::TIMESTAMP,
+            Value::Interval(_) => Type::INTERVAL,
             Value::Blob(_) => Type::BYTEA,
             Value::String(_)
             | Value::Vector(_)
@@ -283,7 +290,11 @@ impl PgHandler {
             Value::Boolean(b) => Some(if b { "t".to_string() } else { "f".to_string() }),
             Value::Integer(i) => Some(i.to_string()),
             Value::Float(f) => Some(f.to_string()),
+            Value::Decimal(d) => Some(d),
             Value::String(s) => Some(s),
+            Value::Date(days) => Some(Value::format_date(days)),
+            Value::Timestamp(micros) => Some(Value::format_timestamp(micros)),
+            Value::Interval(micros) => Some(Value::format_interval(micros)),
             Value::Blob(b) => {
                 const HEX: &[u8; 16] = b"0123456789abcdef";
                 let mut out = String::with_capacity(2 + b.len() * 2);
@@ -401,8 +412,42 @@ impl PgHandler {
                 }
                 true
             }
+            Value::Decimal(s) => {
+                if *data_type == Type::NUMERIC {
+                    Self::put_pg_numeric(out, &s)
+                } else {
+                    out.extend_from_slice(s.as_bytes());
+                    true
+                }
+            }
             Value::String(s) => {
                 out.extend_from_slice(s.as_bytes());
+                true
+            }
+            Value::Date(days) => {
+                if *data_type == Type::DATE {
+                    out.put_i32(days - Self::postgres_epoch_days_from_ce());
+                } else {
+                    out.extend_from_slice(Value::format_date(days).as_bytes());
+                }
+                true
+            }
+            Value::Timestamp(micros) => {
+                if matches!(*data_type, Type::TIMESTAMP | Type::TIMESTAMPTZ) {
+                    out.put_i64(micros - Self::POSTGRES_EPOCH_UNIX_MICROS);
+                } else {
+                    out.extend_from_slice(Value::format_timestamp(micros).as_bytes());
+                }
+                true
+            }
+            Value::Interval(micros) => {
+                if *data_type == Type::INTERVAL {
+                    out.put_i64(micros);
+                    out.put_i32(0);
+                    out.put_i32(0);
+                } else {
+                    out.extend_from_slice(Value::format_interval(micros).as_bytes());
+                }
                 true
             }
             Value::Blob(b) => {
@@ -422,6 +467,75 @@ impl PgHandler {
                 true
             }
         }
+    }
+
+    fn postgres_epoch_days_from_ce() -> i32 {
+        chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+            .unwrap()
+            .num_days_from_ce()
+    }
+
+    fn put_pg_numeric(out: &mut BytesMut, value: &str) -> bool {
+        let Some(normalized) = Value::normalize_decimal(value) else {
+            return false;
+        };
+        let negative = normalized.starts_with('-');
+        let body = normalized.trim_start_matches('-');
+        let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+        let dscale = frac_part.len() as i16;
+
+        if int_part == "0" && frac_part.is_empty() {
+            out.put_i16(0);
+            out.put_i16(0);
+            out.put_i16(if negative { 0x4000 } else { 0 });
+            out.put_i16(0);
+            return true;
+        }
+
+        let mut int_groups = Vec::new();
+        let mut start = int_part.len();
+        while start > 0 {
+            let group_start = start.saturating_sub(4);
+            int_groups.push(int_part[group_start..start].parse::<i16>().unwrap_or(0));
+            start = group_start;
+        }
+        int_groups.reverse();
+        while int_groups.first() == Some(&0) {
+            int_groups.remove(0);
+        }
+
+        let mut frac_groups = Vec::new();
+        if !frac_part.is_empty() {
+            let mut padded = frac_part.to_string();
+            while padded.len() % 4 != 0 {
+                padded.push('0');
+            }
+            for chunk in padded.as_bytes().chunks(4) {
+                let group = std::str::from_utf8(chunk)
+                    .ok()
+                    .and_then(|s| s.parse::<i16>().ok())
+                    .unwrap_or(0);
+                frac_groups.push(group);
+            }
+        }
+        while frac_groups.last() == Some(&0) {
+            frac_groups.pop();
+        }
+
+        let weight = if !int_groups.is_empty() {
+            int_groups.len() as i16 - 1
+        } else {
+            -1
+        };
+        let ndigits = int_groups.len() + frac_groups.len();
+        out.put_i16(ndigits as i16);
+        out.put_i16(weight);
+        out.put_i16(if negative { 0x4000 } else { 0 });
+        out.put_i16(dscale);
+        for digit in int_groups.into_iter().chain(frac_groups) {
+            out.put_i16(digit);
+        }
+        true
     }
 
     fn infer_parameter_types_from_query(query: &str, provided_oids: &[u32]) -> Vec<Type> {
@@ -645,7 +759,13 @@ impl PgHandler {
             Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => s
                 .trim()
                 .parse::<f64>()
-                .map(Value::Float)
+                .map(|value| {
+                    if *param_type == Type::NUMERIC {
+                        Value::decimal_from_f64(value).unwrap_or(Value::Float(value))
+                    } else {
+                        Value::Float(value)
+                    }
+                })
                 .unwrap_or(Value::String(s)),
             Type::BOOL => match s.trim().to_ascii_lowercase().as_str() {
                 "t" | "true" | "1" | "yes" | "on" => Value::Boolean(true),
@@ -653,6 +773,11 @@ impl PgHandler {
                 _ => Value::String(s),
             },
             Type::BYTEA => Value::Blob(bytes.to_vec()),
+            Type::DATE => Value::date_from_str(&s).unwrap_or(Value::String(s)),
+            Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+                Value::timestamp_from_str(&s).unwrap_or(Value::String(s))
+            }
+            Type::INTERVAL => Value::interval_from_str(&s).unwrap_or(Value::String(s)),
             _ => {
                 if let Ok(i) = s.parse::<i64>() {
                     Value::Integer(i)
@@ -683,6 +808,30 @@ impl PgHandler {
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]))),
             Type::BOOL if bytes.len() == 1 => Value::Boolean(bytes[0] != 0),
+            Type::DATE if bytes.len() == 4 => {
+                let pg_days = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                Value::Date(Self::postgres_epoch_days_from_ce() + pg_days)
+            }
+            Type::TIMESTAMP | Type::TIMESTAMPTZ if bytes.len() == 8 => {
+                let pg_micros = i64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                Value::Timestamp(Self::POSTGRES_EPOCH_UNIX_MICROS + pg_micros)
+            }
+            Type::INTERVAL if bytes.len() == 16 => {
+                let micros = i64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                let days = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+                let months = i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+                let total = micros
+                    .saturating_add(days as i64 * 86_400_000_000)
+                    .saturating_add(months as i64 * 30 * 86_400_000_000);
+                Value::Interval(total)
+            }
+            Type::NUMERIC => Self::decode_pg_numeric(bytes)
+                .map(Value::Decimal)
+                .unwrap_or_else(|| Value::String(String::from_utf8_lossy(bytes).to_string())),
             Type::BYTEA => Value::Blob(bytes.to_vec()),
             Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::UNKNOWN => {
                 Value::String(String::from_utf8_lossy(bytes).to_string())
@@ -691,6 +840,75 @@ impl PgHandler {
                 .map(|s| Self::decode_text_param(s.as_bytes(), param_type))
                 .unwrap_or_else(|_| Value::Blob(bytes.to_vec())),
         }
+    }
+
+    fn decode_pg_numeric(bytes: &[u8]) -> Option<String> {
+        if bytes.len() < 8 || bytes.len() % 2 != 0 {
+            return None;
+        }
+        let ndigits = i16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+        let weight = i16::from_be_bytes([bytes[2], bytes[3]]);
+        let sign = i16::from_be_bytes([bytes[4], bytes[5]]);
+        let dscale = i16::from_be_bytes([bytes[6], bytes[7]]).max(0) as usize;
+        if bytes.len() < 8 + ndigits * 2 {
+            return None;
+        }
+        if sign == -0x4000 {
+            return None;
+        }
+
+        let mut digits = Vec::with_capacity(ndigits);
+        for idx in 0..ndigits {
+            let offset = 8 + idx * 2;
+            digits.push(i16::from_be_bytes([bytes[offset], bytes[offset + 1]]).max(0) as u16);
+        }
+
+        let mut int_part = String::new();
+        if weight >= 0 {
+            for pos in (0..=weight as usize).rev() {
+                let digit_idx = weight as isize - pos as isize;
+                let digit = digit_idx
+                    .try_into()
+                    .ok()
+                    .and_then(|idx: usize| digits.get(idx))
+                    .copied()
+                    .unwrap_or(0);
+                if int_part.is_empty() {
+                    int_part.push_str(&digit.to_string());
+                } else {
+                    int_part.push_str(&format!("{:04}", digit));
+                }
+            }
+        }
+        if int_part.is_empty() {
+            int_part.push('0');
+        }
+
+        let mut frac_part = String::new();
+        let mut pos = -1isize;
+        while frac_part.len() < dscale {
+            let digit_idx = weight as isize - pos;
+            let digit = digit_idx
+                .try_into()
+                .ok()
+                .and_then(|idx: usize| digits.get(idx))
+                .copied()
+                .unwrap_or(0);
+            frac_part.push_str(&format!("{:04}", digit));
+            pos -= 1;
+        }
+        frac_part.truncate(dscale);
+
+        let mut out = String::new();
+        if sign == 0x4000 {
+            out.push('-');
+        }
+        out.push_str(&int_part);
+        if !frac_part.is_empty() {
+            out.push('.');
+            out.push_str(&frac_part);
+        }
+        Value::normalize_decimal(&out)
     }
 
     fn max_placeholder_in_text(query: &str) -> usize {
