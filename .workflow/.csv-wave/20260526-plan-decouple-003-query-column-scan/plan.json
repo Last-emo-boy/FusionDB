@@ -1,0 +1,17 @@
+{
+  "session_id": "20260526-plan-decouple-003-query-column-scan",
+  "task_id": "DECOUPLE-003",
+  "title": "Extract query column-scan fast paths",
+  "status": "completed",
+  "created_at": "2026-05-26T20:05:00+08:00",
+  "problem": "Column-scan aggregate, DISTINCT, and GROUP BY fast paths occupied over 1000 lines in query/mod.rs.",
+  "approach": [
+    "Create src/execution/query/column_scan.rs.",
+    "Move column-scan fast path types and Executor helper methods into the new submodule.",
+    "Keep shared query helpers such as order_limit_column_name and column_arg_index in query/mod.rs."
+  ],
+  "risk_controls": [
+    "Do not change fast path semantics.",
+    "Run cargo check --lib plus column_scan, distinct, and group_by SQL integration filters."
+  ]
+}

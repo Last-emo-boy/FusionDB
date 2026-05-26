@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-003,completed,"Extracted column-scan fast path implementation into query/column_scan.rs while keeping Executor method call sites stable.","src/execution/query/mod.rs;src/execution/query/column_scan.rs"
