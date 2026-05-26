@@ -1081,6 +1081,39 @@ impl Executor {
         Ok(())
     }
 
+    fn simple_order_limit_supported(
+        columns: &[String],
+        order_by: Option<&sqlparser::ast::OrderBy>,
+    ) -> bool {
+        let Some(order_by) = order_by else {
+            return true;
+        };
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return false;
+        };
+
+        exprs.iter().all(|order_expr| {
+            let index = match &order_expr.expr {
+                Expr::Value(sqlparser::ast::ValueWithSpan {
+                    value: sqlparser::ast::Value::Number(n, _),
+                    ..
+                }) => n
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|position| position.checked_sub(1)),
+                Expr::Identifier(ident) => columns
+                    .iter()
+                    .position(|column| column.eq_ignore_ascii_case(&ident.value)),
+                Expr::Function(func) => columns
+                    .iter()
+                    .position(|column| column.eq_ignore_ascii_case(&format!("{}", func))),
+                _ => None,
+            };
+
+            index.is_some_and(|index| index < columns.len())
+        })
+    }
+
     fn order_limit_column_name(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -1799,8 +1832,6 @@ impl Executor {
                 && select.distinct.is_some()
                 && select.having.is_none()
                 && is_group_by_none
-                && query.order_by.is_none()
-                && query.limit_clause.is_none()
                 && select.from.len() == 1
                 && select.from[0].joins.is_empty()
             {
@@ -1818,12 +1849,18 @@ impl Executor {
                         if let Some((column_index, column_name)) =
                             Self::single_column_distinct_projection(&select.projection, &schema)
                         {
+                            let columns = vec![column_name];
                             let predicate = if let Some(selection) = select.selection.as_ref() {
                                 self.simple_column_predicate_scan_plan(selection, &schema, params)
                             } else {
                                 None
                             };
-                            if select.selection.is_none() || predicate.is_some() {
+                            if (select.selection.is_none() || predicate.is_some())
+                                && Self::simple_order_limit_supported(
+                                    &columns,
+                                    query.order_by.as_ref(),
+                                )
+                            {
                                 let rows = self
                                     .distinct_column_scan(
                                         &table_name_str,
@@ -1832,10 +1869,15 @@ impl Executor {
                                         txn,
                                     )
                                     .await?;
-                                return Ok(QueryResult::Select {
-                                    columns: vec![column_name],
-                                    rows,
-                                });
+                                let mut rows = rows;
+                                Self::apply_simple_group_by_order_limit(
+                                    &mut rows,
+                                    &columns,
+                                    query.order_by.as_ref(),
+                                    limit,
+                                    offset,
+                                )?;
+                                return Ok(QueryResult::Select { columns, rows });
                             }
                         }
                     }

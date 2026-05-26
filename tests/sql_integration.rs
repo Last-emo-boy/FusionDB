@@ -3420,6 +3420,64 @@ async fn test_select_distinct_with_simple_where_uses_column_scan() {
 }
 
 #[tokio::test]
+async fn test_select_distinct_order_limit_uses_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE distinct_order (id INTEGER PRIMARY KEY, city TEXT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, city) in [
+            (1_i64, "Paris"),
+            (2, "Berlin"),
+            (3, "Tokyo"),
+            (4, "Paris"),
+            (5, "Rome"),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(city.to_string()),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 2usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:distinct_order:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT DISTINCT city FROM distinct_order ORDER BY city LIMIT 2 OFFSET 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["city"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("Paris".to_string())],
+            vec![Value::String("Rome".to_string())],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_alter_table_add_column() {
     let (executor, wal) = setup().await;
     exec_ok(

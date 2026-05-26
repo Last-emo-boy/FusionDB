@@ -1,0 +1,32 @@
+{
+  "id": "TASK-147",
+  "title": "Single-column DISTINCT ORDER/LIMIT column scan",
+  "status": "completed",
+  "files": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "description": "Route single-column DISTINCT with supported ORDER BY, LIMIT, and OFFSET through column-level decoding.",
+  "scope": {
+    "included": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "excluded": [
+      "dashboard",
+      "ui"
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "single-column DISTINCT fast path supports simple ORDER BY on output column or ordinal",
+      "fast path applies LIMIT and OFFSET after DISTINCT ordering",
+      "tests prove unused corrupt columns are not decoded"
+    ]
+  },
+  "execution_directives": [
+    "Use E:\\\\Playground\\\\FusionDB\\\\target as CARGO_TARGET_DIR",
+    "Keep dashboard/UI untouched",
+    "Stage only files produced by TASK-147"
+  ]
+}

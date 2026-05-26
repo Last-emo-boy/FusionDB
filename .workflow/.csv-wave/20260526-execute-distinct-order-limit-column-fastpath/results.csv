@@ -1,0 +1,2 @@
+id,title,status,findings,files_modified,tests_passed,error
+TASK-147,Single-column DISTINCT ORDER/LIMIT column scan,completed,"Added simple order/limit support to the single-column DISTINCT column-scan path and verified ORDER BY LIMIT/OFFSET avoids decoding unused columns.","src/execution/query.rs;tests/sql_integration.rs","cargo fmt; select_distinct; group_by; count_distinct; order_by",

@@ -1,0 +1,32 @@
+{
+  "session": "20260526-plan-distinct-order-limit-column-fastpath",
+  "created_at": "2026-05-26T19:20:00+08:00",
+  "objective": "Extend single-column DISTINCT column-scan fast path to support simple ORDER BY, LIMIT, and OFFSET.",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui"
+  ],
+  "tasks": [
+    {
+      "id": "TASK-147",
+      "title": "Single-column DISTINCT ORDER/LIMIT column scan",
+      "status": "planned",
+      "expected_changes": [
+        "Allow single-column DISTINCT fast path to run when ORDER BY references the output column or ordinal.",
+        "Apply existing simple order/limit handling after column-level DISTINCT scan.",
+        "Verify unused columns are not decoded for DISTINCT ORDER BY LIMIT/OFFSET."
+      ]
+    }
+  ],
+  "verification_plan": [
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo fmt -- src/execution/query.rs tests/sql_integration.rs",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_distinct --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test group_by --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test count_distinct --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test order_by --test sql_integration"
+  ]
+}
