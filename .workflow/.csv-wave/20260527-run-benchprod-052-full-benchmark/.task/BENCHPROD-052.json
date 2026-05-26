@@ -1,0 +1,85 @@
+{
+  "id": "BENCHPROD-052",
+  "title": "Full benchmark and production medium repeat baseline",
+  "status": "completed",
+  "created_at": "2026-05-27T07:12:00+08:00",
+  "completed_at": "2026-05-27T07:12:00+08:00",
+  "scope": "benchmark evidence and workflow record only",
+  "results": {
+    "production_medium_repeat": {
+      "scale": "medium",
+      "suite": "production",
+      "suites": [
+        "tpcc",
+        "memtier",
+        "tsbs",
+        "ldbc",
+        "chbench"
+      ],
+      "repeats": 3,
+      "threads": 4,
+      "load_mode": "insert",
+      "matrix_passed": 3,
+      "matrix_failed": 0,
+      "cases_per_matrix": 20,
+      "case_errors": 0,
+      "unstable_suites": 1,
+      "unstable_cases": 6,
+      "summary_report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod052_medium_production_3x_20260527/bench_repeat_summary.md",
+      "stability_report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod052_medium_production_3x_20260527/stability/bench_stability_summary.md",
+      "trend_reports": [
+        "E:/Playground/FusionDB-bench/runs/repeat_benchprod052_medium_production_3x_20260527/trends/trend_01_to_02/bench_trend_summary.md",
+        "E:/Playground/FusionDB-bench/runs/repeat_benchprod052_medium_production_3x_20260527/trends/trend_02_to_03/bench_trend_summary.md"
+      ],
+      "gate_readiness": "usable as an execution/error gate and a provisional performance baseline; latency gates should account for unstable LDBC and micro-case variance"
+    },
+    "all_suite_medium_matrix": {
+      "scale": "medium",
+      "suite": "all",
+      "suites": [
+        "ycsb",
+        "tpcc",
+        "tpch",
+        "search",
+        "memtier",
+        "tsbs",
+        "ldbc",
+        "ann",
+        "chbench"
+      ],
+      "threads": 4,
+      "load_mode": "insert",
+      "suites_passed": 9,
+      "suites_failed": 0,
+      "cases": 39,
+      "case_errors": 0,
+      "summary_report": "E:/Playground/FusionDB-bench/runs/matrix_benchprod052_all_medium_insert_20260527/matrix_summary.md"
+    }
+  },
+  "current_capability": [
+    "YCSB-like point read, point update, short range scan, secondary-index equality, insert, and mixed read/update throughput.",
+    "TPC-C-like new order, payment, order status, stock level, and delivery status operations.",
+    "TPC-H-like pricing summary, segment revenue, revenue filter, returned-item revenue, and top-orders queries.",
+    "Search workloads for FTS MATCH, LIKE prefix/contains, vector nearest neighbor, and embedding function.",
+    "memtier-like SQL key/value GET, SET, ADD, and mixed GET/SET throughput.",
+    "TSBS-like tag/time range, fleet rollup, latest points, and single-point ingest.",
+    "LDBC-like one-hop, recent posts, tag popularity, and two-hop traversal queries.",
+    "ANN HNSW nearest-neighbor, filtered nearest-neighbor, vector insert, and recall@k metrics.",
+    "CH-benCHmark-like hybrid OLTP/OLAP throughput, warehouse revenue rollup, and customer-order join."
+  ],
+  "main_hotspots": [
+    "TSBS Fleet rollup by region remains the slowest all-suite case at p95 41.240 ms.",
+    "ANN HNSW nearest neighbor is p95 40.304 ms with recall@10 1.000 on the local synthetic medium dataset.",
+    "CH-benCHmark Customer order join is p95 26.503 ms.",
+    "LDBC suite latency stability is weak: p95 CV 16.35%, spread 37.23%.",
+    "Unstable production cases: LDBC Tag popularity, TSBS Ingest one point, TPC-C Stock level query, memtier ADD new key, CH Warehouse revenue rollup, TPC-C Delivery status update."
+  ],
+  "next_task_signals": [
+    "BENCHPROD-048: Optimize and stabilize LDBC Tag popularity using repeat/stability gates.",
+    "BENCHPROD-053: Convert production medium repeat x3 into a formal benchmark gate with thresholds for errors, suite latency, and known noisy cases.",
+    "BENCHPROD-054: Add official benchmark adapter inventory and runnable smoke for BenchBase TPC-C or pgbench under E:/Playground.",
+    "BENCHPROD-055: Add TSBS official data/query adapter path and timestamp-native coverage.",
+    "BENCHPROD-056: Add ANN real-dataset import plus external ground-truth validation.",
+    "BENCHPROD-057: Add CH-benCHmark official-shape schema/query coverage and mixed HTAP snapshot checks."
+  ]
+}

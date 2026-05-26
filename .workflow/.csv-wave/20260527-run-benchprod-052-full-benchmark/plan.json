@@ -1,0 +1,53 @@
+{
+  "session": "20260527-run-benchprod-052-full-benchmark",
+  "created_at": "2026-05-27T07:12:00+08:00",
+  "objective": "Run a full current benchmark pass and a repeated production medium benchmark to establish current FusionDB capability, performance data, and gate readiness.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/runs/repeat_benchprod052_medium_production_3x_20260527",
+    "E:/Playground/FusionDB-bench/runs/matrix_benchprod052_all_medium_insert_20260527",
+    ".workflow/.csv-wave/20260527-run-benchprod-052-full-benchmark/context.md",
+    ".workflow/.csv-wave/20260527-run-benchprod-052-full-benchmark/plan.json",
+    ".workflow/.csv-wave/20260527-run-benchprod-052-full-benchmark/.task/BENCHPROD-052.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database code changes",
+    "benchmark harness code changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-052",
+      "title": "Full benchmark and production medium repeat baseline",
+      "status": "completed",
+      "expected_changes": [
+        "Build release FusionDB before benchmark execution.",
+        "Run production medium repeat x3 over tpcc, memtier, tsbs, ldbc, and chbench.",
+        "Run all-suite medium matrix over ycsb, tpcc, tpch, search, memtier, tsbs, ldbc, ann, and chbench.",
+        "Record pass/fail counts, representative suite metrics, stability hotspots, and next optimization tasks."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod052_medium_production_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod052_medium_production_3x_20260527/bench_repeat_summary.md",
+      "matrix_passed": 3,
+      "matrix_failed": 0,
+      "case_errors": 0
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite all --threads 4 --run-name matrix_benchprod052_all_medium_insert_20260527 --suite-timeout 3600",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_benchprod052_all_medium_insert_20260527/matrix_summary.md",
+      "suites": "9/9",
+      "cases": 39,
+      "case_errors": 0
+    }
+  ]
+}
