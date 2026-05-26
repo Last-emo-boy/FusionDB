@@ -806,6 +806,73 @@ impl Executor {
             .collect())
     }
 
+    fn apply_simple_group_by_order_limit(
+        rows: &mut Vec<Vec<Value>>,
+        columns: &[String],
+        order_by: Option<&sqlparser::ast::OrderBy>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<()> {
+        if let Some(order_by) = order_by {
+            let OrderByKind::Expressions(exprs) = &order_by.kind else {
+                return Ok(());
+            };
+
+            let mut order_keys = Vec::with_capacity(exprs.len());
+            for order_expr in exprs {
+                let index = match &order_expr.expr {
+                    Expr::Value(sqlparser::ast::ValueWithSpan {
+                        value: sqlparser::ast::Value::Number(n, _),
+                        ..
+                    }) => n
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|position| position.checked_sub(1)),
+                    Expr::Identifier(ident) => columns
+                        .iter()
+                        .position(|column| column.eq_ignore_ascii_case(&ident.value)),
+                    Expr::Function(func) => columns
+                        .iter()
+                        .position(|column| column.eq_ignore_ascii_case(&format!("{}", func))),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    FusionError::Execution(format!(
+                        "Unsupported GROUP BY fast-path ORDER BY expression: {}",
+                        order_expr.expr
+                    ))
+                })?;
+
+                if index >= columns.len() {
+                    return Err(FusionError::Execution(format!(
+                        "ORDER BY position {} is out of range",
+                        index + 1
+                    )));
+                }
+
+                order_keys.push((index, order_expr.options.asc.unwrap_or(true)));
+            }
+
+            rows.sort_by(|left, right| {
+                for (index, asc) in &order_keys {
+                    let ordering = left[*index].compare(&right[*index]);
+                    if ordering != Ordering::Equal {
+                        return if *asc { ordering } else { ordering.reverse() };
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+
+        if offset > 0 || limit.is_some() {
+            let take = limit.unwrap_or(usize::MAX);
+            let limited = rows.drain(..).skip(offset).take(take).collect::<Vec<_>>();
+            *rows = limited;
+        }
+
+        Ok(())
+    }
+
     fn order_limit_column_name(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -1768,8 +1835,6 @@ impl Executor {
             if !is_join
                 && select.selection.is_none()
                 && select.having.is_none()
-                && query.order_by.is_none()
-                && query.limit_clause.is_none()
                 && select.from.len() == 1
                 && select.from[0].joins.is_empty()
             {
@@ -1800,10 +1865,16 @@ impl Executor {
                                             txn,
                                         )
                                         .await?;
-                                    return Ok(QueryResult::Select {
-                                        columns: vec![group_name, count_name],
-                                        rows,
-                                    });
+                                    let mut rows = rows;
+                                    let columns = vec![group_name, count_name];
+                                    Self::apply_simple_group_by_order_limit(
+                                        &mut rows,
+                                        &columns,
+                                        query.order_by.as_ref(),
+                                        limit,
+                                        offset,
+                                    )?;
+                                    return Ok(QueryResult::Select { columns, rows });
                                 }
 
                                 if let Some((group_column_index, group_name, aggregate_plans)) =
@@ -1826,6 +1897,14 @@ impl Executor {
                                             txn,
                                         )
                                         .await?;
+                                    let mut rows = rows;
+                                    Self::apply_simple_group_by_order_limit(
+                                        &mut rows,
+                                        &columns,
+                                        query.order_by.as_ref(),
+                                        limit,
+                                        offset,
+                                    )?;
                                     return Ok(QueryResult::Select { columns, rows });
                                 }
                             }

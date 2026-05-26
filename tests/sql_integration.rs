@@ -1565,6 +1565,48 @@ async fn test_group_by_column_aggregates_fast_path_uses_only_group_and_aggregate
 }
 
 #[tokio::test]
+async fn test_group_by_column_aggregates_fast_path_order_by_limit() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, category TEXT, amount INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sales VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 100), (4, 'C', 5), (5, 'C', 6)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT category, SUM(amount) AS total FROM sales GROUP BY category ORDER BY total DESC LIMIT 2",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["category", "total"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("B".to_string()), Value::Integer(100)],
+            vec![Value::String("A".to_string()), Value::Integer(30)],
+        ]
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT category, COUNT(*) FROM sales GROUP BY category ORDER BY COUNT(*) DESC LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        vec![Value::String("A".to_string()), Value::Integer(2)]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_group_by_sum_multiply_expr() {
     let (executor, wal) = setup().await;
     exec_ok(

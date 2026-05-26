@@ -1,0 +1,23 @@
+{
+  "session_id": "20260526-verify-group-order-limit-aggregate-scan",
+  "task_id": "TASK-135",
+  "status": "passed",
+  "verified_at": "2026-05-26T16:27:00+08:00",
+  "commands": [
+    {"command": "cargo fmt --check", "status": "passed"},
+    {"command": "cargo check --lib", "status": "passed"},
+    {"command": "cargo test --test sql_integration test_group_by_column_aggregates_fast_path_order_by_limit -- --nocapture", "status": "passed", "tests": 1},
+    {"command": "cargo test --test sql_integration test_group_by_column_aggregates_fast_path -- --nocapture", "status": "passed", "tests": 3},
+    {"command": "cargo test --test sql_integration -- --nocapture", "status": "passed", "tests": 162},
+    {"command": "cargo build --release", "status": "passed"},
+    {"command": "BENCH_SCALE=medium python benchmark.py", "status": "passed"}
+  ],
+  "benchmark_report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task135-group-order-medium-20260526-161850\\benchmark_report_medium.json",
+  "benchmark_comparison": [
+    {"name": "Best sellers (qty)", "before_ms": 13.848, "after_ms": 6.553, "speedup": 2.11},
+    {"name": "Top 10 spenders", "before_ms": 5.461, "after_ms": 2.801, "speedup": 1.95},
+    {"name": "Event counts by type", "before_ms": 11.144, "after_ms": 4.967, "speedup": 2.24},
+    {"name": "City distribution", "before_ms": 1.315, "after_ms": 0.916, "speedup": 1.44},
+    {"name": "Daily revenue top30", "before_ms": 5.471, "after_ms": 2.832, "speedup": 1.93}
+  ]
+}

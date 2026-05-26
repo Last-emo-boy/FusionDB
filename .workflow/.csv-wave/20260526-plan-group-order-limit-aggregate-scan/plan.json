@@ -1,0 +1,23 @@
+{
+  "session_id": "20260526-plan-group-order-limit-aggregate-scan",
+  "task_id": "TASK-135",
+  "title": "Plan GROUP BY aggregate ORDER BY/LIMIT fast path",
+  "status": "completed",
+  "created_at": "2026-05-26T16:18:50+08:00",
+  "problem": "Simple GROUP BY aggregate queries with ORDER BY aggregate and LIMIT could not use the direct column aggregate scan because the fast path rejected ORDER BY/LIMIT and fell back to row materialization.",
+  "approach": [
+    "Allow the simple GROUP BY column aggregate scan to run when ORDER BY and LIMIT are present.",
+    "Sort the small grouped result set by output projection column, alias, aggregate expression, or ordinal.",
+    "Apply OFFSET/LIMIT after sorting the grouped result rows.",
+    "Keep WHERE, JOIN, HAVING, expression aggregates, and unsupported ORDER BY expressions on the generic path or return the existing error semantics."
+  ],
+  "expected_impact": [
+    "Improve Best sellers (qty).",
+    "Improve Top 10 spenders.",
+    "Improve Event counts by type and Daily revenue top30."
+  ],
+  "risk_controls": [
+    "Reuse existing direct group aggregate result shape.",
+    "Add SQL integration coverage for ORDER BY alias and ORDER BY aggregate expression with LIMIT."
+  ]
+}
