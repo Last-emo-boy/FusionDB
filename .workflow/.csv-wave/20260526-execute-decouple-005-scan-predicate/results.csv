@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-005,completed,"Converted scan into a directory module and extracted predicate helper implementation into scan/predicate.rs.","src/execution/scan/mod.rs;src/execution/scan/predicate.rs"

@@ -1,0 +1,17 @@
+{
+  "session_id": "20260526-plan-decouple-005-scan-predicate",
+  "task_id": "DECOUPLE-005",
+  "title": "Convert scan.rs to scan/mod.rs and extract predicate helpers",
+  "status": "completed",
+  "created_at": "2026-05-26T20:44:00+08:00",
+  "problem": "scan.rs mixed scan orchestration with predicate splitting, predicate ownership checks, and schema column resolution helpers.",
+  "approach": [
+    "Move src/execution/scan.rs to src/execution/scan/mod.rs.",
+    "Create src/execution/scan/predicate.rs for conjunctive predicate and schema-column helper methods.",
+    "Keep existing Executor method call sites stable with pub(super) helpers."
+  ],
+  "risk_controls": [
+    "Do not alter predicate semantics or scan execution branches.",
+    "Run cargo check --lib and where-focused SQL integration tests."
+  ]
+}
