@@ -1,0 +1,30 @@
+{
+  "session": "20260526-plan-bare-min-max-column-fastpath",
+  "created_at": "2026-05-26T17:24:00+08:00",
+  "objective": "Extend bare aggregate column-scan fast path to support MIN and MAX over ordinary columns.",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui"
+  ],
+  "tasks": [
+    {
+      "id": "TASK-140",
+      "title": "Bare MIN/MAX ordinary-column scan fast path",
+      "status": "planned",
+      "expected_changes": [
+        "Add MIN/MAX state to the bare column aggregate fast path.",
+        "Accept MIN(column) and MAX(column) in simple bare aggregate projection detection.",
+        "Verify ordinary-column MIN/MAX avoids decoding unused columns and works with simple WHERE predicates."
+      ]
+    }
+  ],
+  "verification_plan": [
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target cargo test bare_min_max --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target cargo test bare_sum_avg --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target cargo test bare_aggregate --test sql_integration"
+  ]
+}

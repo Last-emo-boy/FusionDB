@@ -14,6 +14,8 @@ use super::{AggregateAccumulator, Executor, QueryResult};
 enum ColumnAggregateKind {
     Sum,
     Avg,
+    Min,
+    Max,
 }
 
 struct ColumnAggregateScanPlan {
@@ -47,6 +49,8 @@ struct ColumnAggregateState {
     sum: f64,
     count: i64,
     is_int: bool,
+    min: Option<Value>,
+    max: Option<Value>,
 }
 
 impl ColumnAggregateState {
@@ -56,21 +60,49 @@ impl ColumnAggregateState {
             sum: 0.0,
             count: 0,
             is_int: true,
+            min: None,
+            max: None,
         }
     }
 
     fn update(&mut self, value: Value) {
-        match value {
-            Value::Integer(value) => {
-                self.sum += value as f64;
-                self.count += 1;
+        match self.kind {
+            ColumnAggregateKind::Sum | ColumnAggregateKind::Avg => match value {
+                Value::Integer(value) => {
+                    self.sum += value as f64;
+                    self.count += 1;
+                }
+                Value::Float(value) => {
+                    self.sum += value;
+                    self.count += 1;
+                    self.is_int = false;
+                }
+                _ => {}
+            },
+            ColumnAggregateKind::Min => {
+                if value == Value::Null {
+                    return;
+                }
+                if self
+                    .min
+                    .as_ref()
+                    .is_none_or(|current| value.compare(current) == Ordering::Less)
+                {
+                    self.min = Some(value);
+                }
             }
-            Value::Float(value) => {
-                self.sum += value;
-                self.count += 1;
-                self.is_int = false;
+            ColumnAggregateKind::Max => {
+                if value == Value::Null {
+                    return;
+                }
+                if self
+                    .max
+                    .as_ref()
+                    .is_none_or(|current| value.compare(current) == Ordering::Greater)
+                {
+                    self.max = Some(value);
+                }
             }
-            _ => {}
         }
     }
 
@@ -90,6 +122,8 @@ impl ColumnAggregateState {
                     Value::Float(self.sum / self.count as f64)
                 }
             }
+            ColumnAggregateKind::Min => self.min.clone().unwrap_or(Value::Null),
+            ColumnAggregateKind::Max => self.max.clone().unwrap_or(Value::Null),
         }
     }
 }
@@ -343,6 +377,8 @@ impl Executor {
             let kind = match func.name.to_string().to_uppercase().as_str() {
                 "SUM" => ColumnAggregateKind::Sum,
                 "AVG" => ColumnAggregateKind::Avg,
+                "MIN" => ColumnAggregateKind::Min,
+                "MAX" => ColumnAggregateKind::Max,
                 _ => return None,
             };
 

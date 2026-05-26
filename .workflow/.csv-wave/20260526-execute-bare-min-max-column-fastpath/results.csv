@@ -1,0 +1,2 @@
+id,status,summary,files
+TASK-140,completed,"Added bare ordinary-column MIN/MAX column-scan fast path","src/execution/query.rs;tests/sql_integration.rs"

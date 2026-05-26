@@ -1,0 +1,17 @@
+{
+  "id": "TASK-140",
+  "title": "Bare MIN/MAX ordinary-column scan fast path",
+  "created_at": "2026-05-26T17:24:00+08:00",
+  "status": "completed",
+  "owner": "codex",
+  "files": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "acceptance": [
+    "Bare MIN(column) and MAX(column) can use column-only decoding.",
+    "Simple WHERE predicates continue to work with MIN/MAX column scans.",
+    "Existing SUM/AVG bare aggregate fast-path behavior is preserved.",
+    "Build/test artifacts are placed under the E: drive target directory."
+  ]
+}
