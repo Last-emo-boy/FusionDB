@@ -1,0 +1,29 @@
+{
+  "task_id": "DECOUPLE-006",
+  "status": "passed",
+  "verified_at": "2026-05-26T21:18:00+08:00",
+  "environment": {
+    "CARGO_TARGET_DIR": "E:\\Playground\\FusionDB\\target",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "checks": [
+    {
+      "command": "cargo fmt -- src/execution/scan/mod.rs src/execution/scan/index_plan.rs src/execution/scan/predicate.rs",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test index --test sql_integration",
+      "status": "passed",
+      "notes": "Ran 18 matching integration tests."
+    },
+    {
+      "command": "cargo test primary_key --test sql_integration",
+      "status": "passed",
+      "notes": "Ran 22 matching integration tests after fixing PK aggregate fast-path precedence in a separate commit."
+    }
+  ]
+}

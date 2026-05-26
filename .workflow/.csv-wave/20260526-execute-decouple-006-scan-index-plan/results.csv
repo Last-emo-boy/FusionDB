@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-006,completed,"Extracted scan index planning and row-id helper implementation into scan/index_plan.rs.","src/execution/scan/mod.rs;src/execution/scan/index_plan.rs"

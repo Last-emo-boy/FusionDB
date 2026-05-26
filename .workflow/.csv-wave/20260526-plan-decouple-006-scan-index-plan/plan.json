@@ -1,0 +1,17 @@
+{
+  "session_id": "20260526-plan-decouple-006-scan-index-plan",
+  "task_id": "DECOUPLE-006",
+  "title": "Extract scan index planning",
+  "status": "completed",
+  "created_at": "2026-05-26T21:10:00+08:00",
+  "problem": "scan/mod.rs still contained index candidate planning, row-id helpers, and primary-key row reconstruction helpers.",
+  "approach": [
+    "Create src/execution/scan/index_plan.rs.",
+    "Move IndexScanPlan, try_index_scan, index candidate thresholds, and row-id/partial decode helpers into the new submodule.",
+    "Keep scan/mod.rs call sites stable through Executor helper methods and the small-index threshold import."
+  ],
+  "risk_controls": [
+    "Keep scan execution branches intact.",
+    "Run cargo check --lib plus index and primary_key SQL integration subsets."
+  ]
+}
