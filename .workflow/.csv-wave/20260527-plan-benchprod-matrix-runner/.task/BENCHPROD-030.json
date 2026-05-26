@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-030",
+  "title": "Production benchmark matrix runner",
+  "status": "completed",
+  "area": "benchmark_ops",
+  "priority": "P0",
+  "files": [
+    "E:/Playground/FusionDB-bench/fusiondb_matrix.py",
+    "E:/Playground/FusionDB-bench/README.md",
+    "E:/Playground/FusionDB-bench/.gitignore"
+  ],
+  "description": "Add a matrix runner that executes production-target benchmark suites in isolated FusionDB server/data directories and produces one summary report.",
+  "convergence": {
+    "criteria": [
+      "fusiondb_matrix.py supports --suite production",
+      "fusiondb_matrix.py writes matrix_summary.json",
+      "fusiondb_matrix.py writes matrix_summary.md",
+      ".gitignore ignores runs/"
+    ]
+  },
+  "verification": [
+    "python -m py_compile fusiondb_matrix.py fusiondb_bench.py",
+    "python fusiondb_matrix.py --scale tiny --suite production --load-mode insert --allow-failures"
+  ],
+  "result": {
+    "completed_at": "2026-05-27T01:26:13+08:00",
+    "reports": [
+      "E:/Playground/FusionDB-bench/runs/matrix_production_tiny_insert_20260527_012523/matrix_summary.md",
+      "E:/Playground/FusionDB-bench/runs/matrix_production_medium_insert_20260527_012553/matrix_summary.md"
+    ],
+    "medium_summary": {
+      "passed": 5,
+      "failed": 0,
+      "slowest_targets": [
+        "TSBS Fleet rollup by region p95=102.344ms",
+        "TSBS Tag-filtered time range p95=68.715ms",
+        "TSBS Latest points for host p95=67.151ms",
+        "TPC-C Order status lookup p95=44.413ms",
+        "CH Customer order join p95=31.521ms"
+      ]
+    }
+  }
+}

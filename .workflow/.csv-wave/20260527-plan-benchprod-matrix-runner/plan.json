@@ -1,0 +1,48 @@
+{
+  "session": "20260527-plan-benchprod-matrix-runner",
+  "created_at": "2026-05-27T01:20:00+08:00",
+  "objective": "Add an isolated benchmark matrix runner for production-target suites in E:/Playground/FusionDB-bench.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/fusiondb_matrix.py",
+    "E:/Playground/FusionDB-bench/README.md",
+    "E:/Playground/FusionDB-bench/.gitignore"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database execution semantics"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-030",
+      "title": "Production benchmark matrix runner",
+      "status": "completed",
+      "expected_changes": [
+        "Run TPC-C-like, memtier-like, TSBS-like, LDBC-like, and CH-benCHmark-like suites in isolated server/data directories.",
+        "Continue after suite failures and collect per-suite JSON/Markdown reports.",
+        "Write a matrix_summary.json and matrix_summary.md with suite-level and case-level metrics.",
+        "Keep generated artifacts under E:/Playground/FusionDB-bench/runs/."
+      ]
+    }
+  ],
+  "verification_plan": [
+    "python -m py_compile fusiondb_matrix.py fusiondb_bench.py",
+    "python fusiondb_matrix.py --scale tiny --suite production --load-mode insert --allow-failures"
+  ],
+  "verification_results": [
+    {
+      "command": "python -m py_compile fusiondb_matrix.py fusiondb_bench.py",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale tiny --suite production --load-mode insert --allow-failures",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_production_tiny_insert_20260527_012523/matrix_summary.md"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite production --load-mode insert --allow-failures",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_production_medium_insert_20260527_012553/matrix_summary.md"
+    }
+  ]
+}
