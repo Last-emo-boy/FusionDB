@@ -669,6 +669,36 @@ async fn test_select_order_by_limit_offset() {
 }
 
 #[tokio::test]
+async fn test_select_order_by_primary_key_limit_offset() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_order_window (id INTEGER PRIMARY KEY, val INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO pk_order_window VALUES (5, 50), (1, 10), (4, 40), (2, 20), (3, 30)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, val FROM pk_order_window ORDER BY id ASC LIMIT 2 OFFSET 1",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(2), Value::Integer(20)],
+            vec![Value::Integer(3), Value::Integer(30)]
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_order_by_alias() {
     let (executor, wal) = setup().await;
     exec_ok(

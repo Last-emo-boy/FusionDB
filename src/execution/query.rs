@@ -33,6 +33,112 @@ struct SortOrderKey<'a> {
 }
 
 impl Executor {
+    fn order_limit_column_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(idents) => {
+                let capacity = idents.iter().map(|ident| ident.value.len()).sum::<usize>()
+                    + idents.len().saturating_sub(1);
+                let mut name = String::with_capacity(capacity);
+                for (index, ident) in idents.iter().enumerate() {
+                    if index > 0 {
+                        name.push('.');
+                    }
+                    name.push_str(&ident.value);
+                }
+                Some(name)
+            }
+            _ => None,
+        }
+    }
+
+    fn projection_allows_order_limit_pushdown(projection: &[SelectItem]) -> bool {
+        projection.iter().all(|item| match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
+            SelectItem::UnnamedExpr(expr) => Self::expr_allows_order_limit_pushdown(expr),
+            SelectItem::ExprWithAlias { expr, .. } => Self::expr_allows_order_limit_pushdown(expr),
+        })
+    }
+
+    fn expr_allows_order_limit_pushdown(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
+            Expr::Nested(inner) => Self::expr_allows_order_limit_pushdown(inner),
+            _ => false,
+        }
+    }
+
+    async fn primary_key_order_scan_limit(
+        &self,
+        select: &sqlparser::ast::Select,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+        limit: Option<usize>,
+        offset: usize,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<usize>> {
+        let Some(limit) = limit else {
+            return Ok(None);
+        };
+        let Some(order_by) = order_by else {
+            return Ok(None);
+        };
+        if select.selection.is_some()
+            || select.having.is_some()
+            || select.distinct.is_some()
+            || !Self::projection_allows_order_limit_pushdown(&select.projection)
+            || !matches!(
+                select.group_by,
+                sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty()
+            )
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return Ok(None);
+        };
+
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return Ok(None);
+        };
+        let [order_expr] = exprs.as_slice() else {
+            return Ok(None);
+        };
+        if !order_expr.options.asc.unwrap_or(true) {
+            return Ok(None);
+        }
+
+        let table_name = name.to_string();
+        let schema_key = format!("schema:{}", table_name);
+        let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
+            return Ok(None);
+        };
+        let schema: TableSchema = bincode::deserialize(&schema_bytes)
+            .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
+
+        let Some(order_col) = Self::order_limit_column_name(&order_expr.expr) else {
+            return Ok(None);
+        };
+        let Ok(order_idx) = self.resolve_column_index(&order_col, &schema) else {
+            return Ok(None);
+        };
+        if schema
+            .columns
+            .get(order_idx)
+            .is_some_and(|column| column.is_primary)
+        {
+            Ok(Some(if limit == 0 {
+                0
+            } else {
+                offset.saturating_add(limit)
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         let mut seen = HashSet::with_capacity(rows.len());
         let mut unique_rows = Vec::with_capacity(rows.len());
@@ -617,10 +723,13 @@ impl Executor {
                 }
             }
 
+            let primary_key_order_limit = self
+                .primary_key_order_scan_limit(select, query.order_by.as_ref(), limit, offset, txn)
+                .await?;
             let push_down_limit = if is_group_by_none && query.order_by.is_none() {
                 limit.map(|l| l + offset)
             } else {
-                None
+                primary_key_order_limit
             };
 
             let is_wildcard = select

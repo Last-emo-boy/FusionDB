@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+TASK-124,completed,"Added conservative primary-key ordered LIMIT pushdown and integration coverage.","src/execution/query.rs;tests/sql_integration.rs"

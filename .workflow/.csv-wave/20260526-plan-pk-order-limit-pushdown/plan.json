@@ -1,0 +1,27 @@
+{
+  "task_id": "TASK-124",
+  "created_at": "2026-05-26T11:01:50+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/query.rs",
+  "goal": "Avoid full table scan and full sort for single-table ORDER BY primary-key ASC LIMIT/OFFSET queries.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "Do not change non-primary-key ORDER BY behavior",
+    "Do not change JOIN, GROUP BY, HAVING, DISTINCT, or WHERE semantics"
+  ],
+  "implementation": [
+    "Detect conservative single-table ORDER BY primary-key ASC LIMIT/OFFSET shapes in query planning.",
+    "Confirm the ORDER BY expression resolves to the table primary key before passing a scan window.",
+    "Pass LIMIT+OFFSET to scan_single_table so the storage scan only materializes the needed primary-key prefix window.",
+    "Keep scan_single_table's existing schema-level primary-key ASC guard as a second safety check."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_select_order_by_primary_key_limit_offset -- --nocapture",
+    "cargo test --test sql_integration test_select_order_by_limit_offset -- --nocapture",
+    "Release small benchmark",
+    "Release medium benchmark"
+  ]
+}

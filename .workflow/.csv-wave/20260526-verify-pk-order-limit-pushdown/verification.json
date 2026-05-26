@@ -1,0 +1,64 @@
+{
+  "task_id": "TASK-124",
+  "status": "passed",
+  "verified_at": "2026-05-26T11:01:50+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_order_by_primary_key_limit_offset -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_order_by_limit_offset -- --nocapture",
+      "status": "passed",
+      "details": "Existing non-primary-key ORDER BY LIMIT/OFFSET test still passes."
+    },
+    {
+      "command": "cargo build --release",
+      "status": "passed",
+      "details": "Built with CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0."
+    },
+    {
+      "command": "BENCH_SCALE=small FUSIONDB_URL=http://127.0.0.1:8091/query python benchmark.py",
+      "status": "passed",
+      "details": "ORDER BY id LIMIT 50 averaged 0.93 ms versus TASK-123 small baseline 2.93 ms."
+    },
+    {
+      "command": "BENCH_SCALE=medium FUSIONDB_URL=http://127.0.0.1:8091/query python benchmark.py",
+      "status": "passed",
+      "details": "ORDER BY id LIMIT 50 averaged 0.73 ms versus TASK-123 medium baseline 17.11 ms."
+    }
+  ],
+  "benchmark": {
+    "small": {
+      "bench_root": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task124-bench-20260526-110115",
+      "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task124-bench-20260526-110115\\benchmark_report_small.json",
+      "rows_loaded": 7195,
+      "load_time_ms": 107,
+      "order_by_id_limit_50_avg_ms": 0.93,
+      "order_by_val_desc_limit_50_avg_ms": 2.52
+    },
+    "medium": {
+      "bench_root": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task124-medium-20260526-110150",
+      "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task124-medium-20260526-110150\\benchmark_report_medium.json",
+      "rows_loaded": 50555,
+      "load_time_ms": 711,
+      "rows_per_second": 71079,
+      "order_by_id_limit_50_avg_ms": 0.73,
+      "order_by_val_desc_limit_50_avg_ms": 16.33,
+      "three_table_join_avg_ms": 41.79,
+      "revenue_by_category_avg_ms": 32.59
+    }
+  },
+  "notes": [
+    "TASK-123 medium baseline measured ORDER BY id LIMIT 50 at 17.11 ms.",
+    "The non-primary-key ORDER BY benchmark remains full-sort shaped, confirming the pushdown is not applied broadly."
+  ]
+}

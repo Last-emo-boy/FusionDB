@@ -1,0 +1,2 @@
+id,description,status,files
+TASK-124,"Push down scan window for single-table ORDER BY primary-key ASC LIMIT/OFFSET queries.",completed,"src/execution/query.rs;tests/sql_integration.rs"
