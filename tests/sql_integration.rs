@@ -2773,6 +2773,30 @@ async fn test_select_distinct() {
 }
 
 #[tokio::test]
+async fn test_select_distinct_fast_path_preserves_null_and_alias() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE visits (id INTEGER PRIMARY KEY, city TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO visits VALUES (1, 'Paris'), (2, 'Rome'), (3, 'Paris'), (4, NULL), (5, NULL)",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "SELECT DISTINCT city AS place FROM visits").await;
+
+    assert_eq!(cols, vec!["place"]);
+    assert_eq!(rows.len(), 3);
+    assert!(rows
+        .iter()
+        .any(|row| row[0] == fusiondb::common::Value::Null));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_alter_table_add_column() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -141,6 +141,80 @@ impl Executor {
         Ok(seen.len() as i64)
     }
 
+    fn single_column_distinct_projection<'a>(
+        projection: &'a [SelectItem],
+        schema: &TableSchema,
+    ) -> Option<(usize, String)> {
+        let [item] = projection else {
+            return None;
+        };
+
+        match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                let idx = schema
+                    .columns
+                    .iter()
+                    .position(|col| col.name.eq_ignore_ascii_case(&ident.value))?;
+                Some((idx, ident.value.clone()))
+            }
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => {
+                let name =
+                    Self::order_limit_column_name(&Expr::CompoundIdentifier(idents.clone()))?;
+                let idx = schema
+                    .columns
+                    .iter()
+                    .position(|col| col.name.eq_ignore_ascii_case(&name))?;
+                Some((idx, schema.columns[idx].name.clone()))
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(ident),
+                alias,
+            } => {
+                let idx = schema
+                    .columns
+                    .iter()
+                    .position(|col| col.name.eq_ignore_ascii_case(&ident.value))?;
+                Some((idx, alias.value.clone()))
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::CompoundIdentifier(idents),
+                alias,
+            } => {
+                let name =
+                    Self::order_limit_column_name(&Expr::CompoundIdentifier(idents.clone()))?;
+                let idx = schema
+                    .columns
+                    .iter()
+                    .position(|col| col.name.eq_ignore_ascii_case(&name))?;
+                Some((idx, alias.value.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    async fn distinct_column_scan(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<Vec<Value>>> {
+        let prefix = format!("data:{}:", table_name);
+        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
+        let mut rows = Vec::new();
+
+        for (_, data) in kv_pairs {
+            let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+            if seen.insert(value.clone()) {
+                rows.push(vec![value]);
+            }
+        }
+
+        Ok(rows)
+    }
+
     fn order_limit_column_name(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -854,6 +928,42 @@ impl Executor {
 
             // Push down limit only if no ORDER BY and no GROUP BY (simplified)
             let is_group_by_none = matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty());
+
+            if !is_join
+                && select.distinct.is_some()
+                && select.selection.is_none()
+                && select.having.is_none()
+                && is_group_by_none
+                && query.order_by.is_none()
+                && query.limit_clause.is_none()
+                && select.from.len() == 1
+                && select.from[0].joins.is_empty()
+            {
+                if let TableFactor::Table { name, .. } = &select.from[0].relation {
+                    let table_name_str = name.to_string();
+                    let schema_key = format!("schema:{}", table_name_str);
+                    if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
+                        let schema: TableSchema =
+                            bincode::deserialize(&schema_bytes).map_err(|e| {
+                                FusionError::Execution(format!(
+                                    "Schema deserialization error: {}",
+                                    e
+                                ))
+                            })?;
+                        if let Some((column_index, column_name)) =
+                            Self::single_column_distinct_projection(&select.projection, &schema)
+                        {
+                            let rows = self
+                                .distinct_column_scan(&table_name_str, column_index, txn)
+                                .await?;
+                            return Ok(QueryResult::Select {
+                                columns: vec![column_name],
+                                rows,
+                            });
+                        }
+                    }
+                }
+            }
 
             // Optimization: Aggregates on PK (COUNT(*), MIN(id), MAX(id)) and
             // single-column COUNT(DISTINCT col) without materializing full rows.

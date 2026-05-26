@@ -1,0 +1,47 @@
+{
+  "session_id": "20260526-verify-distinct-column-scan",
+  "task_id": "TASK-130",
+  "title": "Verify single-column SELECT DISTINCT direct scan",
+  "status": "passed",
+  "verified_at": "2026-05-26T14:20:00+08:00",
+  "commands": [
+    {
+      "command": "cargo test --test sql_integration distinct -- --nocapture",
+      "status": "passed",
+      "tests": "5 passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release",
+      "status": "passed"
+    },
+    {
+      "command": "BENCH_SCALE=medium python benchmark.py",
+      "status": "passed",
+      "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task130-distinct-column-medium-20260526-140920\\benchmark_report_medium.json"
+    }
+  ],
+  "benchmark": {
+    "scale": "medium",
+    "rows_loaded": 50555,
+    "load_time_ms": 678.0,
+    "key_results_ms": {
+      "DISTINCT": 5.74,
+      "Never-ordered items": 7.27,
+      "Subquery IN": 7.18,
+      "Unique active users": 4.58,
+      "Revenue by category": 25.54
+    },
+    "baseline_notes": [
+      "TASK-129 clean medium reported DISTINCT at 12.09ms and Never-ordered items at 13.40ms.",
+      "TASK-130 medium measured DISTINCT at 5.74ms and Never-ordered items at 7.27ms."
+    ]
+  }
+}

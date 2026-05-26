@@ -1,0 +1,22 @@
+{
+  "session_id": "20260526-plan-distinct-column-scan",
+  "task_id": "TASK-130",
+  "title": "Plan single-column SELECT DISTINCT direct scan",
+  "status": "completed",
+  "created_at": "2026-05-26T14:09:20+08:00",
+  "problem": "SELECT DISTINCT single_column currently materializes full rows, projects values, then clones full result rows into a HashSet for deduplication. The benchmark DISTINCT query and subquery DISTINCT inner scans pay that cost repeatedly.",
+  "approach": [
+    "Detect SELECT DISTINCT single column from one base table with no WHERE, JOIN, GROUP BY, HAVING, ORDER BY, LIMIT, or OFFSET.",
+    "Resolve the target column once against schema.",
+    "Scan table rows and decode only the target column with RowDecoder::decode_column.",
+    "Deduplicate directly while preserving first-seen output order and returning one-column rows."
+  ],
+  "expected_impact": [
+    "Improve benchmark DISTINCT.",
+    "Improve Never-ordered items by accelerating its inner SELECT DISTINCT product_id subquery."
+  ],
+  "risk_controls": [
+    "Keep ORDER BY, LIMIT, multi-column DISTINCT, and expression DISTINCT on existing generic path.",
+    "Add SQL integration coverage for alias and NULL preservation."
+  ]
+}
