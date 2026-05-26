@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+DECOUPLE-008,completed,"Split expression execution into value, function, pattern, and subquery submodules while preserving Executor call sites.","src/execution/expr/mod.rs;src/execution/expr/value.rs;src/execution/expr/function.rs;src/execution/expr/pattern.rs;src/execution/expr/subquery.rs"

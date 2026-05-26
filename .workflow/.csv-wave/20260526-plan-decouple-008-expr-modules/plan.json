@@ -1,0 +1,19 @@
+{
+  "session_id": "20260526-plan-decouple-008-expr-modules",
+  "task_id": "DECOUPLE-008",
+  "title": "Extract expression pattern/function/subquery/value helpers",
+  "status": "completed",
+  "created_at": "2026-05-26T21:45:00+08:00",
+  "problem": "expr.rs combined boolean expression evaluation, value evaluation, function dispatch, LIKE/token helpers, subquery materialization, and column extraction.",
+  "approach": [
+    "Move src/execution/expr.rs to src/execution/expr/mod.rs.",
+    "Extract value evaluation and comparison helpers into value.rs.",
+    "Extract SQL function dispatch and vector helpers into function.rs.",
+    "Extract LIKE/token helpers into pattern.rs.",
+    "Extract subquery materialization helpers into subquery.rs."
+  ],
+  "risk_controls": [
+    "Keep Executor method names and call sites stable.",
+    "Run cargo check --lib, expr unit tests, and focused function/subquery integration tests."
+  ]
+}

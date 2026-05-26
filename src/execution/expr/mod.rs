@@ -1,0 +1,469 @@
+mod function;
+mod pattern;
+mod subquery;
+mod value;
+
+use crate::catalog::TableSchema;
+use crate::common::{FusionError, Result, Value};
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value as SqlValue,
+};
+use std::collections::HashSet;
+
+use super::Executor;
+
+impl Executor {
+    pub(crate) fn placeholder_index(placeholder: &str) -> usize {
+        placeholder
+            .strip_prefix('$')
+            .unwrap_or(placeholder)
+            .parse::<usize>()
+            .unwrap_or(0)
+    }
+
+    fn compound_identifier_name(idents: &[sqlparser::ast::Ident]) -> String {
+        let capacity = idents.iter().map(|ident| ident.value.len()).sum::<usize>()
+            + idents.len().saturating_sub(1);
+        let mut name = String::with_capacity(capacity);
+
+        for (index, ident) in idents.iter().enumerate() {
+            if index > 0 {
+                name.push('.');
+            }
+            name.push_str(&ident.value);
+        }
+
+        name
+    }
+
+    pub(crate) fn evaluate_expr(
+        &self,
+        expr: &Expr,
+        row: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Result<bool> {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                // Handle logical operators with short-circuit evaluation
+                match op {
+                    BinaryOperator::And => {
+                        let l = self.evaluate_expr(left, row, schema, params)?;
+                        if !l {
+                            return Ok(false);
+                        }
+                        return self.evaluate_expr(right, row, schema, params);
+                    }
+                    BinaryOperator::Or => {
+                        let l = self.evaluate_expr(left, row, schema, params)?;
+                        if l {
+                            return Ok(true);
+                        }
+                        return self.evaluate_expr(right, row, schema, params);
+                    }
+                    _ => {}
+                }
+
+                let left_val = self.evaluate_value(left, row, schema, params)?;
+                let right_val = self.evaluate_value(right, row, schema, params)?;
+
+                match op {
+                    BinaryOperator::Eq => Ok(left_val == right_val),
+                    BinaryOperator::NotEq => Ok(left_val != right_val),
+                    BinaryOperator::Gt => self.compare_values(&left_val, &right_val, |l, r| l > r),
+                    BinaryOperator::Lt => self.compare_values(&left_val, &right_val, |l, r| l < r),
+                    BinaryOperator::GtEq => {
+                        self.compare_values(&left_val, &right_val, |l, r| l >= r)
+                    }
+                    BinaryOperator::LtEq => {
+                        self.compare_values(&left_val, &right_val, |l, r| l <= r)
+                    }
+                    _ => Err(FusionError::Execution(format!(
+                        "Unsupported operator: {}",
+                        op
+                    ))),
+                }
+            }
+            Expr::MatchAgainst {
+                columns,
+                match_value,
+                ..
+            } => {
+                let search_terms = if let SqlValue::SingleQuotedString(s) = match_value {
+                    Self::tokenize(s)
+                } else if let SqlValue::Placeholder(p) = match_value {
+                    let idx = Self::placeholder_index(p);
+                    if idx > 0 && idx <= params.len() {
+                        if let Value::String(s) = &params[idx - 1] {
+                            Self::tokenize(s)
+                        } else {
+                            return Err(FusionError::Execution(
+                                "MATCH AGAINST parameter must be a string".to_string(),
+                            ));
+                        }
+                    } else {
+                        return Err(FusionError::Execution(
+                            "Invalid parameter index".to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(FusionError::Execution(
+                        "MATCH AGAINST requires a string literal or placeholder".to_string(),
+                    ));
+                };
+
+                if search_terms.is_empty() {
+                    return Ok(false);
+                }
+
+                if columns.len() != 1 {
+                    return Err(FusionError::Execution(
+                        "MATCH currently supports only single column".to_string(),
+                    ));
+                }
+                let col_ident = &columns[0];
+                let col_name = col_ident.to_string();
+
+                let col_idx = self.resolve_column_index(&col_name, schema)?;
+                let val = &row[col_idx];
+
+                if let Value::String(text) = val {
+                    let text_tokens = Self::tokenize_unique(text);
+                    for term in search_terms {
+                        if !text_tokens.contains(&term) {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let val = self.evaluate_value(expr, row, schema, params)?;
+                let mut found = false;
+                for item in list {
+                    let item_val = self.evaluate_value(item, row, schema, params)?;
+                    if val == item_val {
+                        found = true;
+                        break;
+                    }
+                }
+                if *negated {
+                    Ok(!found)
+                } else {
+                    Ok(found)
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => {
+                let s = self.evaluate_value(expr, row, schema, params)?;
+                let p = self.evaluate_value(pattern, row, schema, params)?;
+                if let (Value::String(s_str), Value::String(p_str)) = (s, p) {
+                    let matched = Self::like_match(&s_str, &p_str);
+                    if *negated {
+                        Ok(!matched)
+                    } else {
+                        Ok(matched)
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            Expr::ILike {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => {
+                let s = self.evaluate_value(expr, row, schema, params)?;
+                let p = self.evaluate_value(pattern, row, schema, params)?;
+                if let (Value::String(s_str), Value::String(p_str)) = (s, p) {
+                    let matched = Self::like_match(&s_str.to_lowercase(), &p_str.to_lowercase());
+                    Ok(if *negated { !matched } else { matched })
+                } else {
+                    Ok(false)
+                }
+            }
+            Expr::IsNull(expr) => {
+                let val = self.evaluate_value(expr, row, schema, params)?;
+                Ok(val == Value::Null)
+            }
+            Expr::IsNotNull(expr) => {
+                let val = self.evaluate_value(expr, row, schema, params)?;
+                Ok(val != Value::Null)
+            }
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
+                let val = self.evaluate_value(expr, row, schema, params)?;
+                let low_val = self.evaluate_value(low, row, schema, params)?;
+                let high_val = self.evaluate_value(high, row, schema, params)?;
+                let ge = self.compare_values(&val, &low_val, |l, r| l >= r)?;
+                let le = self.compare_values(&val, &high_val, |l, r| l <= r)?;
+                let result = ge && le;
+                Ok(if *negated { !result } else { result })
+            }
+            Expr::Nested(inner) => self.evaluate_expr(inner, row, schema, params),
+            Expr::UnaryOp { op, expr } => match op {
+                sqlparser::ast::UnaryOperator::Not => {
+                    let res = self.evaluate_expr(expr, row, schema, params)?;
+                    Ok(!res)
+                }
+                _ => Err(FusionError::Execution(
+                    "Unsupported unary operator in boolean expression".to_string(),
+                )),
+            },
+            Expr::IsFalse(inner) => {
+                let val = self.evaluate_value(inner, row, schema, params)?;
+                Ok(val == Value::Boolean(false))
+            }
+            Expr::IsTrue(inner) => {
+                let val = self.evaluate_value(inner, row, schema, params)?;
+                Ok(val == Value::Boolean(true))
+            }
+            Expr::Value(v) => match &v.value {
+                SqlValue::Boolean(b) => Ok(*b),
+                _ => Err(FusionError::Execution(format!(
+                    "Cannot use {:?} as boolean",
+                    v.value
+                ))),
+            },
+            _ => {
+                // Fallback: try evaluate_value and check if it's a boolean
+                match self.evaluate_value(expr, row, schema, params) {
+                    Ok(Value::Boolean(b)) => Ok(b),
+                    Ok(_) => Err(FusionError::Execution(format!(
+                        "Unsupported expression type: {}",
+                        expr
+                    ))),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn extract_aggregates_from_expr(
+        &self,
+        expr: &Expr,
+        aggregates: &mut Vec<(Expr, String)>,
+    ) {
+        match expr {
+            Expr::Function(func) => {
+                let name = func.name.to_string().to_uppercase();
+                if matches!(
+                    name.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "GROUP_CONCAT"
+                ) {
+                    // Check for DISTINCT modifier (e.g., COUNT(DISTINCT col))
+                    let is_distinct = if let FunctionArguments::List(args) = &func.args {
+                        args.duplicate_treatment
+                            == Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                    } else {
+                        false
+                    };
+                    let effective_name = if is_distinct && name == "COUNT" {
+                        "COUNT_DISTINCT".to_string()
+                    } else {
+                        name
+                    };
+                    if !aggregates.iter().any(|(e, _)| e == expr) {
+                        aggregates.push((expr.clone(), effective_name));
+                    }
+                } else if let FunctionArguments::List(args) = &func.args {
+                    for arg in &args.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            self.extract_aggregates_from_expr(e, aggregates);
+                        }
+                    }
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.extract_aggregates_from_expr(left, aggregates);
+                self.extract_aggregates_from_expr(right, aggregates);
+            }
+            Expr::Nested(expr) => self.extract_aggregates_from_expr(expr, aggregates),
+            Expr::UnaryOp { expr, .. } => self.extract_aggregates_from_expr(expr, aggregates),
+            Expr::Cast { expr, .. } => self.extract_aggregates_from_expr(expr, aggregates),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn extract_columns_from_expr(&self, expr: &Expr, cols: &mut HashSet<String>) {
+        match expr {
+            Expr::Identifier(ident) => {
+                cols.insert(ident.value.clone());
+            }
+            Expr::CompoundIdentifier(idents) => {
+                cols.insert(Self::compound_identifier_name(idents));
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.extract_columns_from_expr(left, cols);
+                self.extract_columns_from_expr(right, cols);
+            }
+            Expr::Nested(expr) => self.extract_columns_from_expr(expr, cols),
+            Expr::UnaryOp { expr, .. } => self.extract_columns_from_expr(expr, cols),
+            Expr::Cast { expr, .. } => self.extract_columns_from_expr(expr, cols),
+            Expr::Function(func) => {
+                if let FunctionArguments::List(args) = &func.args {
+                    for arg in &args.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            self.extract_columns_from_expr(e, cols);
+                        }
+                    }
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                self.extract_columns_from_expr(expr, cols);
+                for e in list {
+                    self.extract_columns_from_expr(e, cols);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.extract_columns_from_expr(expr, cols);
+                self.extract_columns_from_expr(low, cols);
+                self.extract_columns_from_expr(high, cols);
+            }
+            Expr::IsNull(expr) => self.extract_columns_from_expr(expr, cols),
+            Expr::IsNotNull(expr) => self.extract_columns_from_expr(expr, cols),
+            Expr::InSubquery { expr, .. } => self.extract_columns_from_expr(expr, cols),
+            Expr::Like { expr, .. } => self.extract_columns_from_expr(expr, cols),
+            Expr::ILike { expr, .. } => self.extract_columns_from_expr(expr, cols),
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    self.extract_columns_from_expr(op, cols);
+                }
+                for cw in conditions {
+                    self.extract_columns_from_expr(&cw.condition, cols);
+                    self.extract_columns_from_expr(&cw.result, cols);
+                }
+                if let Some(el) = else_result {
+                    self.extract_columns_from_expr(el, cols);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn evaluate_final_group_expr(
+        &self,
+        expr: &Expr,
+        group_key: &[Value],
+        group_exprs: &[Expr],
+        agg_map: &std::collections::HashMap<Expr, Value>,
+        _schema: &TableSchema,
+        _params: &[Value],
+    ) -> Result<Value> {
+        // 1. Check if it is a pre-calculated aggregate
+        if let Some(val) = agg_map.get(expr) {
+            return Ok(val.clone());
+        }
+
+        // 2. Check if it matches a group expression
+        if let Some(idx) = group_exprs.iter().position(|e| e == expr) {
+            return Ok(group_key[idx].clone());
+        }
+
+        // 3. Recurse / Evaluate
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                let l = self.evaluate_final_group_expr(left, group_key, group_exprs, agg_map, _schema, _params)?;
+                let r = self.evaluate_final_group_expr(right, group_key, group_exprs, agg_map, _schema, _params)?;
+                self.evaluate_binary_op(l, op, r)
+            },
+            Expr::Nested(e) => self.evaluate_final_group_expr(e, group_key, group_exprs, agg_map, _schema, _params),
+            Expr::Value(v) => Ok(self.sql_value_to_fusion_value(&v.value)),
+            Expr::Identifier(ident) => {
+                Err(FusionError::Execution(format!("Column '{}' must appear in the GROUP BY clause or be used in an aggregate function", ident.value)))
+            },
+            Expr::UnaryOp { op, expr } => {
+                 let val = self.evaluate_final_group_expr(expr, group_key, group_exprs, agg_map, _schema, _params)?;
+                 match op {
+                     sqlparser::ast::UnaryOperator::Minus => {
+                         match val {
+                             Value::Integer(i) => Ok(Value::Integer(-i)),
+                             Value::Float(f) => Ok(Value::Float(-f)),
+                             _ => Err(FusionError::Execution("Unary minus on non-number".to_string())),
+                         }
+                     },
+                     _ => Err(FusionError::Execution("Unsupported unary operator in GROUP BY".to_string())),
+                 }
+            },
+            _ => Err(FusionError::Execution("Unsupported expression in GROUP BY projection".to_string())),
+        }
+    }
+
+    // Optimize: Parallel Scan for Wildcard LIKE using Rayon
+    pub(crate) fn parallel_filter_rows(
+        &self,
+        rows: Vec<Vec<Value>>,
+        filter_expr: &Expr,
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Vec<Vec<Value>> {
+        use rayon::iter::IntoParallelIterator;
+        use rayon::iter::ParallelIterator;
+
+        rows.into_par_iter()
+            .filter(|row| {
+                self.evaluate_expr(filter_expr, row, schema, params)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    #[test]
+    fn placeholder_index_parses_dollar_parameters() {
+        assert_eq!(Executor::placeholder_index("$1"), 1);
+        assert_eq!(Executor::placeholder_index("2"), 2);
+        assert_eq!(Executor::placeholder_index("$bad"), 0);
+    }
+
+    #[test]
+    fn tokenize_unique_deduplicates_tokens() {
+        let tokens = Executor::tokenize_unique("Quick quick, brown fox!");
+        assert_eq!(tokens.len(), 3);
+        assert!(tokens.contains("quick"));
+        assert!(tokens.contains("brown"));
+        assert!(tokens.contains("fox"));
+    }
+
+    #[test]
+    fn like_match_fast_percent_patterns() {
+        assert!(Executor::like_match("Alice", "Ali%"));
+        assert!(Executor::like_match("Alice", "%ce"));
+        assert!(Executor::like_match("Charlie", "%li%"));
+        assert!(Executor::like_match("alphabet soup", "a%bet%soup"));
+        assert!(!Executor::like_match("alphabet soup", "a%bet%soap"));
+    }
+
+    #[test]
+    fn like_match_wildcard_patterns_still_match() {
+        assert!(Executor::like_match("Bob", "Bo_"));
+        assert!(Executor::like_match("Bob", "B?b"));
+        assert!(!Executor::like_match("Bobby", "Bo_"));
+    }
+}
