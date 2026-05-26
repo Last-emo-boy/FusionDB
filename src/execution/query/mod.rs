@@ -571,37 +571,6 @@ impl Executor {
                                     });
                                 }
 
-                                if select.having.is_none()
-                                    && query.order_by.is_none()
-                                    && query.limit_clause.is_none()
-                                    && select.from.len() == 1
-                                    && select.from[0].joins.is_empty()
-                                {
-                                    if let Some(plans) = Self::simple_column_aggregate_projection(
-                                        &select.projection,
-                                        &schema,
-                                        Some(&aggregate_qualifiers),
-                                        false,
-                                    ) {
-                                        let columns = plans
-                                            .iter()
-                                            .map(|plan| plan.output_name.clone())
-                                            .collect();
-                                        let result_row = self
-                                            .simple_column_aggregate_scan(
-                                                &table_name_str,
-                                                &plans,
-                                                None,
-                                                txn,
-                                            )
-                                            .await?;
-                                        return Ok(QueryResult::Select {
-                                            columns,
-                                            rows: vec![result_row],
-                                        });
-                                    }
-                                }
-
                                 for proj_item in &select.projection {
                                     let expr = match proj_item {
                                         SelectItem::UnnamedExpr(expr) => Some(expr),
@@ -683,6 +652,37 @@ impl Executor {
                                         columns: col_names,
                                         rows: vec![result_row],
                                     });
+                                }
+
+                                if select.having.is_none()
+                                    && query.order_by.is_none()
+                                    && query.limit_clause.is_none()
+                                    && select.from.len() == 1
+                                    && select.from[0].joins.is_empty()
+                                {
+                                    if let Some(plans) = Self::simple_column_aggregate_projection(
+                                        &select.projection,
+                                        &schema,
+                                        Some(&aggregate_qualifiers),
+                                        false,
+                                    ) {
+                                        let columns = plans
+                                            .iter()
+                                            .map(|plan| plan.output_name.clone())
+                                            .collect();
+                                        let result_row = self
+                                            .simple_column_aggregate_scan(
+                                                &table_name_str,
+                                                &plans,
+                                                None,
+                                                txn,
+                                            )
+                                            .await?;
+                                        return Ok(QueryResult::Select {
+                                            columns,
+                                            rows: vec![result_row],
+                                        });
+                                    }
                                 }
                             }
                         }
