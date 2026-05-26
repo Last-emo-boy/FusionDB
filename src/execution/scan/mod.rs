@@ -600,7 +600,10 @@ impl Executor {
                             }
                         }
 
-                        if Self::should_use_index_plan(row_ids_vec.len(), limit, order_by) {
+                        if row_ids_vec.is_empty() && index_plan.exact {
+                            index_used = true;
+                            selection_fully_applied = true;
+                        } else if Self::should_use_index_plan(row_ids_vec.len(), limit, order_by) {
                             index_used = true;
                             selection_fully_applied = index_plan.exact;
 

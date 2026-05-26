@@ -1,0 +1,56 @@
+{
+  "session": "20260527-execute-benchprod-032-empty-index-orderstatus",
+  "created_at": "2026-05-27T02:25:15+08:00",
+  "objective": "Optimize TPC-C OrderStatus by avoiding full scans after exact empty secondary-index hits.",
+  "scope": [
+    "src/execution/scan/mod.rs",
+    "tests/sql_index_cache.rs",
+    ".workflow/.csv-wave/20260526-analyze-benchprod-production-gap/tasks.csv",
+    ".workflow/.csv-wave/20260527-execute-benchprod-032-empty-index-orderstatus"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-032",
+      "title": "TPC-C OrderStatus indexed empty-result optimization",
+      "status": "completed",
+      "expected_changes": [
+        "Use exact empty index plans instead of falling back to table scans.",
+        "Add regression coverage for missing-value secondary-index lookups.",
+        "Verify TPC-C medium and full medium benchmark matrices."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache empty_secondary_index_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite tpcc --load-mode insert --allow-failures --run-name matrix_tpcc_medium_after_benchprod032_empty_index_20260527",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_tpcc_medium_after_benchprod032_empty_index_20260527/matrix_summary.md"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite all --load-mode insert --allow-failures --run-name matrix_all_medium_after_benchprod032_20260527",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_after_benchprod032_20260527/matrix_summary.md"
+    }
+  ]
+}

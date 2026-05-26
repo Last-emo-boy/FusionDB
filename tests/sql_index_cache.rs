@@ -547,6 +547,61 @@ async fn test_create_integer_btree_index_after_load_uses_comparable_keys() {
 }
 
 #[tokio::test]
+async fn test_empty_secondary_index_lookup_skips_full_table_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE empty_idx_probe (id INTEGER PRIMARY KEY, bucket INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO empty_idx_probe VALUES (1, 1, 'ok'), (2, 2, 'bad')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_empty_idx_probe_bucket ON empty_idx_probe (bucket)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Integer(2),
+            Value::String("bad".to_string()),
+        ]);
+        let corrupt_col_idx = 2usize;
+        let off_pos = 2 + corrupt_col_idx * 4;
+        let start =
+            u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        for byte in &mut corrupt_row[start..] {
+            *byte = 0xff;
+        }
+        let key = format!(
+            "data:empty_idx_probe:{}",
+            fusiondb::common::encoding::encode_i64_comparable(2)
+        );
+        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT payload FROM empty_idx_probe WHERE bucket = 999",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["payload"]);
+    assert!(rows.is_empty());
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_create_composite_btree_index_and_lookup() {
     let (executor, wal) = setup().await;
     exec_ok(

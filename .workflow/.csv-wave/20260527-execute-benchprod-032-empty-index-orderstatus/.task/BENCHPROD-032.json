@@ -1,0 +1,27 @@
+{
+  "id": "BENCHPROD-032",
+  "title": "TPC-C OrderStatus indexed empty-result optimization",
+  "status": "completed",
+  "area": "optimizer",
+  "priority": "P0",
+  "files": [
+    "src/execution/scan/mod.rs",
+    "tests/sql_index_cache.rs",
+    ".workflow/.csv-wave/20260526-analyze-benchprod-production-gap/tasks.csv",
+    ".workflow/.csv-wave/20260527-execute-benchprod-032-empty-index-orderstatus/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-032-empty-index-orderstatus/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-032-empty-index-orderstatus/.task/BENCHPROD-032.json"
+  ],
+  "description": "Avoid full table scans when a secondary-index equality lookup returns an exact empty result, improving TPC-C OrderStatus.",
+  "result": {
+    "completed_at": "2026-05-27T02:25:00+08:00",
+    "baseline_report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_after_benchprod036_20260527/matrix_summary.md",
+    "tpcc_after_report": "E:/Playground/FusionDB-bench/runs/matrix_tpcc_medium_after_benchprod032_empty_index_20260527/matrix_summary.md",
+    "full_after_report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_after_benchprod032_20260527/matrix_summary.md",
+    "improvements": [
+      "TPC-C OrderStatus p95: 39.258ms -> 2.081ms on full medium matrix",
+      "TPC-C medium average p95: 10.473ms -> 3.212ms on full medium matrix",
+      "Full medium matrix remains 9/9 suites and 39/39 cases passing"
+    ]
+  }
+}
