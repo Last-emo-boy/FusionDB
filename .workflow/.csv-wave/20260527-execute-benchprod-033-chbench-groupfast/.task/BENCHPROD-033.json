@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-033",
+  "title": "CH-benCHmark join and rollup optimizer pass",
+  "status": "completed",
+  "area": "optimizer",
+  "priority": "P0",
+  "files": [
+    "src/execution/query/mod.rs",
+    "tests/sql_join.rs",
+    ".workflow/.csv-wave/20260527-execute-benchprod-033-chbench-groupfast/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-033-chbench-groupfast/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-033-chbench-groupfast/.task/BENCHPROD-033.json"
+  ],
+  "description": "Add a projected GROUP BY COUNT/SUM fast path for CH-style join and rollup queries.",
+  "result": {
+    "completed_at": "2026-05-27T03:14:00+08:00",
+    "baseline_report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_full_observe_20260527/matrix_summary.md",
+    "after_report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_after_benchprod033_groupfast_20260527/matrix_summary.md",
+    "ch_suite_report": "E:/Playground/FusionDB-bench/runs/matrix_chbench_medium_after_benchprod033_groupfast_20260527/matrix_summary.md",
+    "full_medium_passed_suites": 9,
+    "full_medium_passed_cases": 39,
+    "customer_order_join_p95_ms": {
+      "before": 36.301,
+      "after_full_medium": 28.466,
+      "after_ch_suite": 25.840
+    },
+    "warehouse_rollup_p95_ms": {
+      "before": 13.972,
+      "after_full_medium": 13.738,
+      "after_ch_suite": 8.929
+    }
+  }
+}

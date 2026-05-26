@@ -67,6 +67,11 @@ struct GroupAggregatePlan<'a> {
     arg_source: RowValueSource<'a>,
 }
 
+struct SimpleProjectedGroupAggregatePlan {
+    func_name: String,
+    arg_index: Option<usize>,
+}
+
 impl Executor {
     fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         let mut seen = HashSet::with_capacity(rows.len());
@@ -244,6 +249,117 @@ impl Executor {
                 } else {
                     RowValueSource::Expr(expr)
                 },
+            })
+            .collect()
+    }
+
+    fn simple_projected_group_aggregate_projection(
+        &self,
+        projection: &[SelectItem],
+        group_exprs: &[Expr],
+        schema: &TableSchema,
+    ) -> Option<(
+        usize,
+        String,
+        Vec<SimpleProjectedGroupAggregatePlan>,
+        Vec<String>,
+    )> {
+        if projection.len() < 2 || group_exprs.len() != 1 {
+            return None;
+        }
+
+        let group_name = Self::order_limit_column_name(&group_exprs[0])?;
+        let group_index = self.resolve_column_index(&group_name, schema).ok()?;
+
+        let output_group_name = match &projection[0] {
+            SelectItem::UnnamedExpr(expr) if expr == &group_exprs[0] => group_name,
+            SelectItem::ExprWithAlias { expr, alias } if expr == &group_exprs[0] => {
+                alias.value.clone()
+            }
+            _ => return None,
+        };
+
+        let mut plans = Vec::with_capacity(projection.len() - 1);
+        let mut output_columns = Vec::with_capacity(projection.len());
+        output_columns.push(output_group_name.clone());
+
+        for item in projection.iter().skip(1) {
+            let (expr, output_name) = match item {
+                SelectItem::UnnamedExpr(expr @ Expr::Function(_)) => (expr, format!("{}", expr)),
+                SelectItem::ExprWithAlias {
+                    expr: expr @ Expr::Function(_),
+                    alias,
+                } => (expr, alias.value.clone()),
+                _ => return None,
+            };
+
+            let Expr::Function(func) = expr else {
+                return None;
+            };
+            let FunctionArguments::List(args) = &func.args else {
+                return None;
+            };
+            if args.duplicate_treatment.is_some() || args.args.len() != 1 {
+                return None;
+            }
+
+            let func_name = func.name.to_string().to_uppercase();
+            let arg_index = match func_name.as_str() {
+                "COUNT"
+                    if matches!(
+                        args.args[0],
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                    ) =>
+                {
+                    None
+                }
+                "SUM" => Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                _ => return None,
+            };
+
+            plans.push(SimpleProjectedGroupAggregatePlan {
+                func_name,
+                arg_index,
+            });
+            output_columns.push(output_name);
+        }
+
+        Some((group_index, output_group_name, plans, output_columns))
+    }
+
+    fn apply_simple_projected_group_aggregates(
+        rows: Vec<Vec<Value>>,
+        group_index: usize,
+        aggregate_plans: &[SimpleProjectedGroupAggregatePlan],
+    ) -> Vec<Vec<Value>> {
+        let mut groups: HashMap<Value, Vec<AggregateAccumulator>> =
+            HashMap::with_capacity(rows.len().min(4096));
+
+        for row in rows {
+            let group_key = row.get(group_index).cloned().unwrap_or(Value::Null);
+            let accs = groups.entry(group_key).or_insert_with(|| {
+                aggregate_plans
+                    .iter()
+                    .map(|plan| AggregateAccumulator::new(&plan.func_name))
+                    .collect()
+            });
+
+            for (acc, plan) in accs.iter_mut().zip(aggregate_plans.iter()) {
+                let value = plan
+                    .arg_index
+                    .and_then(|index| row.get(index))
+                    .unwrap_or(&Value::Integer(1));
+                acc.update(value);
+            }
+        }
+
+        groups
+            .into_iter()
+            .map(|(group_value, accs)| {
+                let mut row = Vec::with_capacity(accs.len() + 1);
+                row.push(group_value);
+                row.extend(accs.iter().map(AggregateAccumulator::finalize));
+                row
             })
             .collect()
     }
@@ -1028,111 +1144,153 @@ impl Executor {
                         self.extract_aggregates_from_expr(having, &mut aggregates);
                     }
 
-                    let group_key_sources =
-                        self.compile_group_key_sources(group_exprs, &schema, params);
-                    let aggregate_plans =
-                        self.compile_group_aggregate_plans(&aggregates, &schema, params);
-
-                    let mut groups: std::collections::HashMap<
-                        Vec<Value>,
-                        Vec<AggregateAccumulator>,
-                    > = std::collections::HashMap::with_capacity(rows.len());
-
-                    for row in rows {
-                        let mut group_key = Vec::with_capacity(group_exprs.len());
-                        for source in &group_key_sources {
-                            group_key.push(source.evaluate(self, &row, &schema, params));
-                        }
-
-                        let accs = groups.entry(group_key).or_insert_with(|| {
-                            aggregate_plans
-                                .iter()
-                                .map(|plan| AggregateAccumulator::new(&plan.func_name))
-                                .collect()
-                        });
-
-                        for (i, plan) in aggregate_plans.iter().enumerate() {
-                            let arg_val = plan.arg_source.evaluate(self, &row, &schema, params);
-                            accs[i].update(&arg_val);
-                        }
-                    }
-
-                    let mut grouped_rows = Vec::with_capacity(groups.len());
-
-                    for (group_key, accs) in groups {
-                        let mut agg_map =
-                            std::collections::HashMap::with_capacity(aggregates.len());
-                        for (i, plan) in aggregate_plans.iter().enumerate() {
-                            agg_map.insert(plan.expr.clone(), accs[i].finalize());
-                        }
-
-                        if let Some(having) = &select.having {
-                            let val = self.evaluate_final_group_expr(
-                                having,
-                                &group_key,
+                    let used_simple_group_by = if select.having.is_none() {
+                        if let Some((group_index, _group_name, simple_plans, simple_columns)) = self
+                            .simple_projected_group_aggregate_projection(
+                                &select.projection,
                                 group_exprs,
-                                &agg_map,
                                 &schema,
-                                params,
-                            )?;
-                            let keep = match val {
-                                Value::Boolean(b) => b,
-                                Value::Null => false,
-                                _ => {
-                                    return Err(FusionError::Execution(
-                                        "HAVING clause must return boolean".to_string(),
-                                    ))
-                                }
-                            };
-                            if !keep {
-                                continue;
+                            )
+                        {
+                            rows = Self::apply_simple_projected_group_aggregates(
+                                rows,
+                                group_index,
+                                &simple_plans,
+                            );
+                            schema = TableSchema::new(
+                                "temp_group_by_result".to_string(),
+                                simple_columns
+                                    .iter()
+                                    .map(|name| Column {
+                                        name: name.clone(),
+                                        data_type: "UNKNOWN".to_string(),
+                                        is_primary: false,
+                                        is_indexed: false,
+                                        index_type: IndexType::None,
+                                        default_value: None,
+                                        is_nullable: true,
+                                        is_unique: false,
+                                        check_expr: None,
+                                    })
+                                    .collect(),
+                            );
+                            columns = simple_columns;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !used_simple_group_by {
+                        let group_key_sources =
+                            self.compile_group_key_sources(group_exprs, &schema, params);
+                        let aggregate_plans =
+                            self.compile_group_aggregate_plans(&aggregates, &schema, params);
+
+                        let mut groups: std::collections::HashMap<
+                            Vec<Value>,
+                            Vec<AggregateAccumulator>,
+                        > = std::collections::HashMap::with_capacity(rows.len());
+
+                        for row in rows {
+                            let mut group_key = Vec::with_capacity(group_exprs.len());
+                            for source in &group_key_sources {
+                                group_key.push(source.evaluate(self, &row, &schema, params));
+                            }
+
+                            let accs = groups.entry(group_key).or_insert_with(|| {
+                                aggregate_plans
+                                    .iter()
+                                    .map(|plan| AggregateAccumulator::new(&plan.func_name))
+                                    .collect()
+                            });
+
+                            for (i, plan) in aggregate_plans.iter().enumerate() {
+                                let arg_val = plan.arg_source.evaluate(self, &row, &schema, params);
+                                accs[i].update(&arg_val);
                             }
                         }
 
-                        let mut new_row = Vec::with_capacity(select.projection.len());
+                        let mut grouped_rows = Vec::with_capacity(groups.len());
 
-                        for item in &select.projection {
-                            let val = match item {
-                                SelectItem::UnnamedExpr(expr) => self.evaluate_final_group_expr(
-                                    expr,
+                        for (group_key, accs) in groups {
+                            let mut agg_map =
+                                std::collections::HashMap::with_capacity(aggregates.len());
+                            for (i, plan) in aggregate_plans.iter().enumerate() {
+                                agg_map.insert(plan.expr.clone(), accs[i].finalize());
+                            }
+
+                            if let Some(having) = &select.having {
+                                let val = self.evaluate_final_group_expr(
+                                    having,
                                     &group_key,
                                     group_exprs,
                                     &agg_map,
                                     &schema,
                                     params,
-                                )?,
-                                SelectItem::ExprWithAlias { expr, .. } => self
-                                    .evaluate_final_group_expr(
-                                        expr,
-                                        &group_key,
-                                        group_exprs,
-                                        &agg_map,
-                                        &schema,
-                                        params,
-                                    )?,
-                                _ => Value::Null,
-                            };
-                            new_row.push(val);
-                        }
-                        grouped_rows.push(new_row);
-                    }
-                    rows = grouped_rows;
+                                )?;
+                                let keep = match val {
+                                    Value::Boolean(b) => b,
+                                    Value::Null => false,
+                                    _ => {
+                                        return Err(FusionError::Execution(
+                                            "HAVING clause must return boolean".to_string(),
+                                        ))
+                                    }
+                                };
+                                if !keep {
+                                    continue;
+                                }
+                            }
 
-                    let new_cols: Vec<Column> = columns
-                        .iter()
-                        .map(|name| Column {
-                            name: name.clone(),
-                            data_type: "UNKNOWN".to_string(),
-                            is_primary: false,
-                            is_indexed: false,
-                            index_type: IndexType::None,
-                            default_value: None,
-                            is_nullable: true,
-                            is_unique: false,
-                            check_expr: None,
-                        })
-                        .collect();
-                    schema = TableSchema::new("temp_group_by_result".to_string(), new_cols);
+                            let mut new_row = Vec::with_capacity(select.projection.len());
+
+                            for item in &select.projection {
+                                let val = match item {
+                                    SelectItem::UnnamedExpr(expr) => self
+                                        .evaluate_final_group_expr(
+                                            expr,
+                                            &group_key,
+                                            group_exprs,
+                                            &agg_map,
+                                            &schema,
+                                            params,
+                                        )?,
+                                    SelectItem::ExprWithAlias { expr, .. } => self
+                                        .evaluate_final_group_expr(
+                                            expr,
+                                            &group_key,
+                                            group_exprs,
+                                            &agg_map,
+                                            &schema,
+                                            params,
+                                        )?,
+                                    _ => Value::Null,
+                                };
+                                new_row.push(val);
+                            }
+                            grouped_rows.push(new_row);
+                        }
+                        rows = grouped_rows;
+
+                        let new_cols: Vec<Column> = columns
+                            .iter()
+                            .map(|name| Column {
+                                name: name.clone(),
+                                data_type: "UNKNOWN".to_string(),
+                                is_primary: false,
+                                is_indexed: false,
+                                index_type: IndexType::None,
+                                default_value: None,
+                                is_nullable: true,
+                                is_unique: false,
+                                check_expr: None,
+                            })
+                            .collect();
+                        schema = TableSchema::new("temp_group_by_result".to_string(), new_cols);
+                    }
                 }
             }
 

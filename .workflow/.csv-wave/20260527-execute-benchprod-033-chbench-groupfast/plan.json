@@ -1,0 +1,65 @@
+{
+  "session": "20260527-execute-benchprod-033-chbench-groupfast",
+  "created_at": "2026-05-27T03:14:00+08:00",
+  "objective": "Improve CH-benCHmark join and rollup analytical cases with a projected group aggregate fast path.",
+  "scope": [
+    "src/execution/query/mod.rs",
+    "tests/sql_join.rs",
+    ".workflow/.csv-wave/20260527-execute-benchprod-033-chbench-groupfast"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-033",
+      "title": "CH-benCHmark join and rollup optimizer pass",
+      "status": "completed",
+      "expected_changes": [
+        "Optimize simple post-join/post-scan GROUP BY COUNT/SUM aggregate shapes.",
+        "Improve CH Customer order join p95 without regressing full medium matrix.",
+        "Keep all Rust join/group aggregate tests passing."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join -- --nocapture",
+      "status": "passed",
+      "passed": 10,
+      "failed": 0
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate -- --nocapture",
+      "status": "passed",
+      "passed": 34,
+      "failed": 0
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite chbench --load-mode insert --allow-failures --run-name matrix_chbench_medium_after_benchprod033_groupfast_20260527",
+      "status": "passed",
+      "suite_passed": 1,
+      "suite_failed": 0,
+      "case_passed": 3,
+      "case_failed": 0
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite all --load-mode insert --allow-failures --run-name matrix_all_medium_after_benchprod033_groupfast_20260527",
+      "status": "passed",
+      "suite_passed": 9,
+      "suite_failed": 0,
+      "case_passed": 39,
+      "case_failed": 0
+    }
+  ]
+}

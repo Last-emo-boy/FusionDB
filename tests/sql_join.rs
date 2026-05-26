@@ -396,6 +396,63 @@ async fn test_join_projection_pushdown_with_group_by() {
 }
 
 #[tokio::test]
+async fn test_join_group_by_count_sum_fast_shape() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, city TEXT, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total FLOAT, status TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_orders_customer_id ON orders (customer_id)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO customers VALUES (1, 'Paris', 'Alice'), (2, 'Berlin', 'Bob'), (3, 'Paris', 'Cara')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO orders VALUES (1, 1, 10.5, 'new'), (2, 1, 5.0, 'paid'), (3, 2, 7.5, 'new'), (4, 3, 2.0, 'new')",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT customers.city, COUNT(*), SUM(orders.total) FROM customers INNER JOIN orders ON customers.id = orders.customer_id GROUP BY customers.city ORDER BY SUM(orders.total) DESC",
+    )
+    .await;
+
+    assert_eq!(
+        cols,
+        vec!["customers.city", "COUNT(*)", "SUM(orders.total)"]
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::String("Paris".to_string()),
+                Value::Integer(3),
+                Value::Float(17.5),
+            ],
+            vec![
+                Value::String("Berlin".to_string()),
+                Value::Integer(1),
+                Value::Float(7.5),
+            ],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_left_join() {
     let (executor, wal) = setup().await;
     exec_ok(
