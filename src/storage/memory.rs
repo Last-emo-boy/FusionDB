@@ -6,7 +6,7 @@
 /// write buffer with the committed snapshot so that read-your-own-writes
 /// semantics are honoured within a transaction.
 use super::wal::{WalEntry, WalManager};
-use super::{Storage, Transaction};
+use super::{ScanVisitor, Storage, Transaction};
 use crate::common::Result;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -181,6 +181,28 @@ impl Transaction for MemoryTransaction {
             return self.scan_range(prefix, &end, limit).await;
         }
         Ok(Vec::new())
+    }
+
+    async fn scan_prefix_for_each(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        let Some(end) = Self::prefix_end(prefix) else {
+            return Ok(0);
+        };
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 {
+            return Ok(0);
+        }
+
+        let mut visited = 0;
+        self.for_each_merged_range(prefix, &end, |key, value| {
+            visited += 1;
+            visitor.visit(key, value) && visited < safe_limit
+        });
+        Ok(visited)
     }
 
     async fn scan_range(
@@ -371,6 +393,50 @@ mod tests {
             assert_eq!(results.len(), 2);
             assert_eq!(results[0].0, b"data:t:2");
             assert_eq!(results[1].0, b"data:t:3");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_scan_prefix_for_each_merges_write_buffer_without_materializing() {
+        let path = temp_wal();
+        let storage = MemoryStorage::new(&path).unwrap();
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:t:1", b"row1").await.unwrap();
+            txn.put(b"data:t:2", b"row2").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:t:3", b"row3").await.unwrap();
+            txn.delete(b"data:t:1").await.unwrap();
+
+            struct Collector {
+                rows: Vec<(Vec<u8>, Vec<u8>)>,
+            }
+
+            impl crate::storage::ScanVisitor for Collector {
+                fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+                    self.rows.push((key.to_vec(), value.to_vec()));
+                    true
+                }
+            }
+
+            let mut collector = Collector { rows: Vec::new() };
+            let visited = txn
+                .scan_prefix_for_each(b"data:t:", None, &mut collector)
+                .await
+                .unwrap();
+
+            assert_eq!(visited, 2);
+            assert_eq!(
+                collector.rows,
+                vec![
+                    (b"data:t:2".to_vec(), b"row2".to_vec()),
+                    (b"data:t:3".to_vec(), b"row3".to_vec()),
+                ]
+            );
         }
         let _ = std::fs::remove_file(&path);
     }

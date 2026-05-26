@@ -1,6 +1,6 @@
 use super::columnar::ColumnarVectorStore;
 use super::wal::{WalEntry, WalManager};
-use super::{Storage, Transaction};
+use super::{ScanVisitor, Storage, Transaction};
 use crate::common::Result;
 use crate::config::StorageConfig;
 use async_trait::async_trait;
@@ -1325,6 +1325,29 @@ impl Transaction for FusionTransaction {
         Ok(Vec::new())
     }
 
+    async fn scan_prefix_for_each(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        let Some(end) = FusionStorage::prefix_end(prefix) else {
+            return Ok(0);
+        };
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 {
+            return Ok(0);
+        }
+
+        let mut visited = 0;
+        self.for_each_visible_range(prefix, &end, |user_k, val| {
+            visited += 1;
+            visitor.visit(user_k, val) && visited < safe_limit
+        })
+        .await?;
+        Ok(visited)
+    }
+
     async fn scan_range(
         &self,
         start: &[u8],
@@ -1895,6 +1918,64 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![b"data:x:003".as_slice(), b"data:x:004".as_slice()]
             );
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_scan_prefix_for_each_matches_scan_prefix_after_overwrite_delete_and_write_buffer(
+    ) {
+        let data_dir = unique_storage_dir("scan_for_each");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:x:001", b"one").await.unwrap();
+            txn.put(b"data:x:002", b"two").await.unwrap();
+            txn.put(b"data:y:001", b"other").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:x:002", b"two-new").await.unwrap();
+            txn.delete(b"data:x:001").await.unwrap();
+            txn.put(b"data:x:003", b"three").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:x:004", b"four").await.unwrap();
+            txn.delete(b"data:x:002").await.unwrap();
+
+            let rows = txn.scan_prefix(b"data:x:", None).await.unwrap();
+            struct Collector {
+                rows: Vec<(Vec<u8>, Vec<u8>)>,
+            }
+
+            impl crate::storage::ScanVisitor for Collector {
+                fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+                    self.rows.push((key.to_vec(), value.to_vec()));
+                    true
+                }
+            }
+
+            let mut collector = Collector { rows: Vec::new() };
+            let visited = txn
+                .scan_prefix_for_each(b"data:x:", None, &mut collector)
+                .await
+                .unwrap();
+
+            assert_eq!(visited, rows.len());
+            assert_eq!(collector.rows, rows);
         }
 
         cleanup_storage_dir(&data_dir);

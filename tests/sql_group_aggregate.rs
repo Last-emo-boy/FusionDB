@@ -716,6 +716,85 @@ async fn test_group_by_aggregates_with_and_where_uses_column_scan() {
 }
 
 #[tokio::test]
+async fn test_group_by_aggregates_with_multi_predicate_partial_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE tsbs_rollup (id INTEGER PRIMARY KEY, host_id INTEGER, region TEXT, rack TEXT, ts INTEGER, usage_user FLOAT, usage_system FLOAT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, region, rack, ts, usage_user, usage_system) in [
+            (1_i64, "east", "rack-a", 500_i64, 99.0_f64, 99.0_f64),
+            (2, "east", "rack-a", 1000, 10.0, 5.0),
+            (3, "east", "rack-b", 2000, 30.0, 8.0),
+            (4, "west", "rack-c", 2000, 7.0, 9.0),
+            (5, "west", "rack-d", 50000, 100.0, 100.0),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(id * 10),
+                Value::String(region.to_string()),
+                Value::String(rack.to_string()),
+                Value::Integer(ts),
+                Value::Float(usage_user),
+                Value::Float(usage_system),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            for corrupt_col_idx in [1usize, 3usize, 7usize] {
+                let off_pos = 2 + corrupt_col_idx * 4;
+                let start =
+                    u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+                let end = if corrupt_col_idx + 1 < 8 {
+                    let next_off_pos = off_pos + 4;
+                    u32::from_le_bytes(row[next_off_pos..next_off_pos + 4].try_into().unwrap())
+                        as usize
+                } else {
+                    row.len()
+                };
+                for byte in &mut row[start..end] {
+                    *byte = 0xff;
+                }
+            }
+            let key = format!(
+                "data:tsbs_rollup:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT region, AVG(usage_user), MAX(usage_system) FROM tsbs_rollup WHERE ts >= 1000 AND ts < 50000 GROUP BY region ORDER BY region",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::String("east".to_string()),
+                Value::Float(20.0),
+                Value::Float(8.0),
+            ],
+            vec![
+                Value::String("west".to_string()),
+                Value::Float(7.0),
+                Value::Float(9.0),
+            ],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_group_by_reuses_predicate_group_column_value() {
     let (executor, wal) = setup().await;
     exec_ok(

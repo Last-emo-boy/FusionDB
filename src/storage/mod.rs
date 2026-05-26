@@ -16,6 +16,19 @@ pub mod wal;
 pub use fusion::FusionStorage;
 pub use fusion::FusionTransaction;
 
+pub trait ScanVisitor: Send {
+    fn visit(&mut self, key: &[u8], value: &[u8]) -> bool;
+}
+
+impl<F> ScanVisitor for F
+where
+    F: for<'a, 'b> FnMut(&'a [u8], &'b [u8]) -> bool + Send,
+{
+    fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+        self(key, value)
+    }
+}
+
 #[async_trait]
 pub trait Transaction: Send + Sync {
     /// Get a value by key (from write buffer or storage)
@@ -33,6 +46,17 @@ pub trait Transaction: Send + Sync {
         prefix: &[u8],
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// Visit keys with a prefix without materializing the full result set.
+    ///
+    /// The visitor returns `false` to stop early. The return value is the number
+    /// of visible key-value pairs visited.
+    async fn scan_prefix_for_each(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize>;
 
     /// Scan keys in a range [start, end) with optional limit
     async fn scan_range(

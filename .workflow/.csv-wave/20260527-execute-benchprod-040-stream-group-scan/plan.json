@@ -1,0 +1,104 @@
+{
+  "session": "20260527-execute-benchprod-040-stream-group-scan",
+  "created_at": "2026-05-27T06:45:00+08:00",
+  "objective": "Complete BENCHPROD-040 by replacing group aggregate full prefix materialization with streaming prefix scan and proving TSBS rollup performance improvement.",
+  "scope": [
+    "src/storage/mod.rs",
+    "src/storage/memory.rs",
+    "src/storage/fusion.rs",
+    "src/execution/query/column_scan.rs",
+    "tests/sql_group_aggregate.rs",
+    "E:/Playground/FusionDB-bench/runs/matrix_tsbs_medium_after_benchprod040_stream_scan_20260527",
+    "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_benchprod040_stream_scan_20260527",
+    "E:/Playground/FusionDB-bench/runs/trend_benchprod040_stream_vs_043_full_20260527",
+    "E:/Playground/FusionDB-bench/runs/trend_benchprod040_stream_vs_046_full_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-040-stream-group-scan/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-040-stream-group-scan/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-040-stream-group-scan/.task/BENCHPROD-040.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "external benchmark adapters",
+    "unrelated line-ending-only status in src/common/encoding.rs"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-040",
+      "title": "Streaming prefix scan for group aggregate rollups",
+      "status": "completed",
+      "expected_changes": [
+        "Expose a transaction-level prefix visitor API that avoids materializing all scan rows into a Vec.",
+        "Implement the visitor API for MemoryTransaction and FusionTransaction while preserving write-buffer/delete visibility.",
+        "Use the streaming API in group-by column aggregate fast path.",
+        "Keep the multi-predicate partial decode coverage that protects group aggregate fast path from decoding unused columns.",
+        "Verify correctness with targeted storage and SQL aggregate tests.",
+        "Verify performance with TSBS medium and full medium benchmark matrices."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test test_scan_prefix_for_each_merges_write_buffer_without_materializing -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test fusion_scan_prefix_for_each_matches_scan_prefix_after_overwrite_delete_and_write_buffer -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate -- --nocapture",
+      "status": "passed",
+      "tests": 35
+    },
+    {
+      "command": "cargo test --lib -- --nocapture",
+      "status": "passed",
+      "tests": 107
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite tsbs --load-mode insert --run-name matrix_tsbs_medium_after_benchprod040_stream_scan_20260527 --threads 4 --suite-timeout 1800 --allow-failures",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_tsbs_medium_after_benchprod040_stream_scan_20260527/matrix_summary.md",
+      "suite_passed": 1,
+      "suite_failed": 0,
+      "case_passed": 4,
+      "case_failed": 0
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite all --load-mode insert --run-name matrix_all_medium_insert_benchprod040_stream_scan_20260527 --threads 4 --suite-timeout 3600 --allow-failures",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_benchprod040_stream_scan_20260527/matrix_summary.md",
+      "suite_passed": 9,
+      "suite_failed": 0,
+      "case_passed": 39,
+      "case_failed": 0
+    },
+    {
+      "command": "python bench_trend.py --baseline runs/matrix_all_medium_insert_full_20260527/matrix_summary.json --current runs/matrix_all_medium_insert_benchprod040_stream_scan_20260527/matrix_summary.json --run-name trend_benchprod040_stream_vs_043_full_20260527",
+      "status": "completed_with_known_noise",
+      "report": "E:/Playground/FusionDB-bench/runs/trend_benchprod040_stream_vs_043_full_20260527/bench_trend_summary.md",
+      "suite_improvements": 1,
+      "suite_regressions": 1,
+      "case_improvements": 2,
+      "case_regressions": 4
+    },
+    {
+      "command": "python bench_trend.py --baseline runs/matrix_all_medium_insert_benchprod046_current_20260527/matrix_summary.json --current runs/matrix_all_medium_insert_benchprod040_stream_scan_20260527/matrix_summary.json --run-name trend_benchprod040_stream_vs_046_full_20260527",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/trend_benchprod040_stream_vs_046_full_20260527/bench_trend_summary.md",
+      "suite_improvements": 2,
+      "suite_regressions": 0,
+      "case_improvements": 5,
+      "case_regressions": 1
+    }
+  ]
+}

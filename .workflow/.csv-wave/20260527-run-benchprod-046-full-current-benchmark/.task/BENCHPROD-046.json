@@ -1,0 +1,54 @@
+{
+  "id": "BENCHPROD-046",
+  "title": "Current full benchmark snapshot on active working tree",
+  "status": "completed",
+  "created_at": "2026-05-27T06:28:30+08:00",
+  "completed_at": "2026-05-27T06:28:30+08:00",
+  "scope": "benchmark evidence capture only",
+  "database_revision": "60f42464e335f354dcafd9b64a2ec20da55c89a6",
+  "bench_revision": "981c51cbc32a60111a7a2ca9a44751c14a5268c4",
+  "working_tree_note": "FusionDB working tree had uncommitted BENCHPROD-040 changes in src/execution/query/column_scan.rs and tests/sql_group_aggregate.rs during this run.",
+  "results": {
+    "medium_insert": {
+      "status": "passed",
+      "suites": "9/9",
+      "cases": "39/39",
+      "errors": 0,
+      "artifact": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_benchprod046_current_20260527/matrix_summary.md"
+    },
+    "small_insert": {
+      "status": "passed",
+      "suites": "9/9",
+      "cases": "39/39",
+      "errors": 0,
+      "artifact": "E:/Playground/FusionDB-bench/runs/matrix_all_small_insert_benchprod046_current_20260527/matrix_summary.md"
+    },
+    "small_copy": {
+      "status": "passed",
+      "suites": "9/9",
+      "cases": "39/39",
+      "errors": 0,
+      "artifact": "E:/Playground/FusionDB-bench/runs/matrix_all_small_copy_benchprod046_current_20260527/matrix_summary.md"
+    },
+    "external_readiness": {
+      "ready_for_smoke": 0,
+      "targets": 7,
+      "tool_missing": 4,
+      "artifact_missing": 3,
+      "artifact": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod046_current_20260527/external_smoke_summary.md"
+    },
+    "trend": {
+      "baseline": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_full_20260527/matrix_summary.json",
+      "current": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_benchprod046_current_20260527/matrix_summary.json",
+      "suite_regressions": 2,
+      "case_regressions": 7,
+      "artifact": "E:/Playground/FusionDB-bench/runs/trend_benchprod046_vs_043_medium_20260527/bench_trend_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "Revert or redesign the uncommitted BENCHPROD-040 decode-reuse attempt because the current trend shows regressions.",
+    "Prioritize streaming/visitor table scan for group aggregate instead of adding per-row HashMap decode caching.",
+    "Install or configure one external benchmark artifact first, preferably pgbench or BenchBase TPC-C, under E:/Playground.",
+    "Keep local full matrix as regression gate before committing performance-sensitive database changes."
+  ]
+}

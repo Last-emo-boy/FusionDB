@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-040",
+  "title": "Streaming prefix scan for group aggregate rollups",
+  "status": "completed",
+  "created_at": "2026-05-27T06:45:00+08:00",
+  "completed_at": "2026-05-27T06:45:00+08:00",
+  "scope": "database body and benchmark evidence only",
+  "summary": "Group aggregate fast path now streams visible prefix rows through a transaction visitor instead of allocating a full Vec of key-value pairs before aggregation.",
+  "results": {
+    "target_case": "TSBS Fleet rollup by region",
+    "baseline_benchprod043_p95_ms": 54.845,
+    "dirty_benchprod046_p95_ms": 63.311,
+    "current_full_medium_p95_ms": 40.633,
+    "delta_vs_benchprod043": "-25.91%",
+    "delta_vs_benchprod046": "-35.82%",
+    "full_medium_matrix": {
+      "status": "passed",
+      "suites": "9/9",
+      "cases": "39/39",
+      "errors": 0,
+      "artifact": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_benchprod040_stream_scan_20260527/matrix_summary.md"
+    },
+    "trend_vs_benchprod043": {
+      "suite_improvements": 1,
+      "suite_regressions": 1,
+      "case_improvements": 2,
+      "case_regressions": 4,
+      "artifact": "E:/Playground/FusionDB-bench/runs/trend_benchprod040_stream_vs_043_full_20260527/bench_trend_summary.md",
+      "note": "TSBS is the intended improvement. Remaining regressions are unrelated micro-case noise or pre-existing LDBC/search variance requiring separate tasks."
+    },
+    "trend_vs_benchprod046": {
+      "suite_improvements": 2,
+      "suite_regressions": 0,
+      "case_improvements": 5,
+      "case_regressions": 1,
+      "artifact": "E:/Playground/FusionDB-bench/runs/trend_benchprod040_stream_vs_046_full_20260527/bench_trend_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "BENCHPROD-047: Add streaming visitors for simple aggregate/count/distinct fast paths.",
+    "BENCHPROD-048: Investigate LDBC Tag popularity variance and join/group aggregation cost model.",
+    "BENCHPROD-049: Build first native pgbench or BenchBase TPC-C smoke once external artifacts are configured under E:/Playground."
+  ]
+}

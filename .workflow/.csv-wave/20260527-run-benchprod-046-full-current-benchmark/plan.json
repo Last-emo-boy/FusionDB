@@ -1,0 +1,95 @@
+{
+  "session": "20260527-run-benchprod-046-full-current-benchmark",
+  "created_at": "2026-05-27T06:28:30+08:00",
+  "objective": "Run a current full FusionDB benchmark snapshot on the active working tree and summarize capability, performance, trend, copy-load readiness, and external benchmark gaps.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_benchprod046_current_20260527",
+    "E:/Playground/FusionDB-bench/runs/matrix_all_small_insert_benchprod046_current_20260527",
+    "E:/Playground/FusionDB-bench/runs/matrix_all_small_copy_benchprod046_current_20260527",
+    "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod046_current_20260527",
+    "E:/Playground/FusionDB-bench/runs/external_bootstrap_benchprod046_current_20260527",
+    "E:/Playground/FusionDB-bench/runs/trend_benchprod046_vs_043_medium_20260527",
+    ".workflow/.csv-wave/20260527-run-benchprod-046-full-current-benchmark/context.md",
+    ".workflow/.csv-wave/20260527-run-benchprod-046-full-current-benchmark/plan.json",
+    ".workflow/.csv-wave/20260527-run-benchprod-046-full-current-benchmark/.task/BENCHPROD-046.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database code changes",
+    "committing unproven BENCHPROD-040 performance changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-046",
+      "title": "Current full benchmark snapshot on active working tree",
+      "status": "completed",
+      "expected_changes": [
+        "Build the current release FusionDB binary.",
+        "Run all local benchmark suites at medium scale with insert load.",
+        "Run all local benchmark suites at small scale with insert load.",
+        "Run all local benchmark suites at small scale with copy load.",
+        "Run external benchmark readiness and bootstrap scans for pgbench, sysbench, memtier, BenchBase TPC-C, TSBS, LDBC, and CH-benCHmark.",
+        "Compare current medium insert run against BENCHPROD-043 medium baseline."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite all --load-mode insert --run-name matrix_all_medium_insert_benchprod046_current_20260527 --threads 4 --suite-timeout 3600 --allow-failures",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_benchprod046_current_20260527/matrix_summary.md",
+      "suite_passed": 9,
+      "suite_failed": 0,
+      "case_passed": 39,
+      "case_failed": 0
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale small --suite all --load-mode insert --run-name matrix_all_small_insert_benchprod046_current_20260527 --threads 4 --suite-timeout 1800 --allow-failures",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_all_small_insert_benchprod046_current_20260527/matrix_summary.md",
+      "suite_passed": 9,
+      "suite_failed": 0,
+      "case_passed": 39,
+      "case_failed": 0
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale small --suite all --load-mode copy --run-name matrix_all_small_copy_benchprod046_current_20260527 --threads 4 --suite-timeout 1800 --allow-failures",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_all_small_copy_benchprod046_current_20260527/matrix_summary.md",
+      "suite_passed": 9,
+      "suite_failed": 0,
+      "case_passed": 39,
+      "case_failed": 0
+    },
+    {
+      "command": "python external_smoke.py --target all --run-name external_smoke_benchprod046_current_20260527",
+      "status": "completed_with_gaps",
+      "report": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod046_current_20260527/external_smoke_summary.md",
+      "targets_checked": 7,
+      "ready_for_smoke": 0,
+      "tool_missing": 4,
+      "artifact_missing": 3
+    },
+    {
+      "command": "python external_bootstrap.py --target all --search-root E:/Playground --run-name external_bootstrap_benchprod046_current_20260527",
+      "status": "completed_with_gaps",
+      "report": "E:/Playground/FusionDB-bench/runs/external_bootstrap_benchprod046_current_20260527/external_bootstrap_summary.md",
+      "targets_checked": 7,
+      "ready_for_smoke": 0,
+      "tool_missing": 4,
+      "artifact_missing": 3
+    },
+    {
+      "command": "python bench_trend.py --baseline runs/matrix_all_medium_insert_full_20260527/matrix_summary.json --current runs/matrix_all_medium_insert_benchprod046_current_20260527/matrix_summary.json --run-name trend_benchprod046_vs_043_medium_20260527",
+      "status": "completed_with_regressions",
+      "report": "E:/Playground/FusionDB-bench/runs/trend_benchprod046_vs_043_medium_20260527/bench_trend_summary.md",
+      "suite_regressions": 2,
+      "case_regressions": 7
+    }
+  ]
+}
