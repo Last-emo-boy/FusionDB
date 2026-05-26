@@ -1,0 +1,2 @@
+id,title,status,findings,files_modified,tests_passed,error
+TASK-149,Reuse decoded predicate values in column scans,completed,"Added helper-based predicate value reuse across aggregate, distinct, count-distinct, and GROUP BY column scans; added same-column COUNT and GROUP BY tests.","src/execution/query.rs;tests/sql_integration.rs","cargo fmt; select_count; group_by; count_distinct; select_distinct",

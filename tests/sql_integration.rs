@@ -1026,6 +1026,30 @@ async fn test_select_count_nullable_column_with_simple_where_column_scan() {
 }
 
 #[tokio::test]
+async fn test_select_count_reuses_predicate_column_value() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE count_reuse (id INTEGER PRIMARY KEY, category TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO count_reuse VALUES (1, 'A'), (2, 'B'), (3, NULL), (4, 'A')",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT COUNT(category) FROM count_reuse WHERE category = 'A'",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_count_null_literal() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -1922,6 +1946,37 @@ async fn test_group_by_aggregates_with_simple_where_uses_column_scan() {
         ]
     );
     cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_reuses_predicate_group_column_value() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE grouped_reuse (id INTEGER PRIMARY KEY, category TEXT, total INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO grouped_reuse VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 99), (4, NULL, 5)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT category, SUM(total), COUNT(*) FROM grouped_reuse WHERE category = 'A' GROUP BY category",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::String("A".to_string()),
+            Value::Integer(30),
+            Value::Integer(2),
+        ]]
+    );
+    cleanup(&wal);
 }
 
 #[tokio::test]

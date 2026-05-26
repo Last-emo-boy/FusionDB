@@ -1,0 +1,32 @@
+{
+  "session": "20260526-plan-column-scan-predicate-reuse",
+  "created_at": "2026-05-26T19:50:00+08:00",
+  "objective": "Avoid duplicate column decoding in column-scan fast paths when predicate and target columns overlap.",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui"
+  ],
+  "tasks": [
+    {
+      "id": "TASK-149",
+      "title": "Reuse decoded predicate values in column scans",
+      "status": "planned",
+      "expected_changes": [
+        "Decode the simple predicate column once per row.",
+        "Reuse the decoded predicate value when it is also the aggregate, distinct, or group column.",
+        "Verify COUNT and GROUP BY paths where predicate and target columns are the same."
+      ]
+    }
+  ],
+  "verification_plan": [
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo fmt -- src/execution/query.rs tests/sql_integration.rs",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_count --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test group_by --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test count_distinct --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_distinct --test sql_integration"
+  ]
+}

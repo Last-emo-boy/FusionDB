@@ -1,0 +1,32 @@
+{
+  "id": "TASK-149",
+  "title": "Reuse decoded predicate values in column scans",
+  "status": "completed",
+  "files": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "description": "Reduce duplicate RowDecoder::decode_column calls in column-scan fast paths by reusing the decoded predicate column value when it matches a target column.",
+  "scope": {
+    "included": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "excluded": [
+      "dashboard",
+      "ui"
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "column-scan fast paths share helper logic for decoded predicate values",
+      "COUNT(column) WHERE same_column = value is covered",
+      "GROUP BY same_column WHERE same_column = value is covered"
+    ]
+  },
+  "execution_directives": [
+    "Use E:\\\\Playground\\\\FusionDB\\\\target as CARGO_TARGET_DIR",
+    "Keep dashboard/UI untouched",
+    "Stage only files produced by TASK-149"
+  ]
+}

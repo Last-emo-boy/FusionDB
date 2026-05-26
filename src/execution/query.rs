@@ -381,6 +381,37 @@ struct GroupAggregatePlan<'a> {
 }
 
 impl Executor {
+    fn decoded_predicate_value(
+        data: &[u8],
+        predicate: Option<&ColumnPredicateScanPlan>,
+    ) -> Result<Option<Value>> {
+        let Some(predicate) = predicate else {
+            return Ok(None);
+        };
+        let value =
+            crate::common::encoding::RowDecoder::decode_column(data, predicate.column_index)
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+        Ok(Some(value))
+    }
+
+    fn decode_column_or_reuse_predicate(
+        data: &[u8],
+        column_index: usize,
+        predicate: Option<&ColumnPredicateScanPlan>,
+        predicate_value: Option<&Value>,
+    ) -> Result<Value> {
+        if predicate.is_some_and(|predicate| predicate.column_index == column_index) {
+            if let Some(value) = predicate_value {
+                return Ok(value.clone());
+            }
+        }
+
+        crate::common::encoding::RowDecoder::decode_column(data, column_index)
+            .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+            .map_or(Ok(Value::Null), Ok)
+    }
+
     fn simple_column_aggregate_projection(
         projection: &[SelectItem],
         schema: &TableSchema,
@@ -451,25 +482,20 @@ impl Executor {
             .collect();
 
         for (_, data) in kv_pairs {
+            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
-                    &data,
-                    predicate.column_index,
-                )
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
-                if !predicate.matches(&predicate_value) {
+                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
                     continue;
                 }
             }
 
             for (state, plan) in states.iter_mut().zip(plans.iter()) {
-                let value =
-                    crate::common::encoding::RowDecoder::decode_column(&data, plan.column_index)
-                        .map_err(|e| {
-                            FusionError::Execution(format!("Data deserialization error: {}", e))
-                        })?
-                        .unwrap_or(Value::Null);
+                let value = Self::decode_column_or_reuse_predicate(
+                    &data,
+                    plan.column_index,
+                    predicate,
+                    predicate_value.as_ref(),
+                )?;
                 state.update(value);
             }
         }
@@ -598,21 +624,19 @@ impl Executor {
         let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
 
         for (_, data) in kv_pairs {
+            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
-                    &data,
-                    predicate.column_index,
-                )
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
-                if !predicate.matches(&predicate_value) {
+                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
                     continue;
                 }
             }
 
-            let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
+            let value = Self::decode_column_or_reuse_predicate(
+                &data,
+                column_index,
+                predicate,
+                predicate_value.as_ref(),
+            )?;
             if value != Value::Null {
                 seen.insert(value);
             }
@@ -685,21 +709,19 @@ impl Executor {
         let mut rows = Vec::new();
 
         for (_, data) in kv_pairs {
+            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
-                    &data,
-                    predicate.column_index,
-                )
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
-                if !predicate.matches(&predicate_value) {
+                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
                     continue;
                 }
             }
 
-            let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
+            let value = Self::decode_column_or_reuse_predicate(
+                &data,
+                column_index,
+                predicate,
+                predicate_value.as_ref(),
+            )?;
             if seen.insert(value.clone()) {
                 rows.push(vec![value]);
             }
@@ -786,21 +808,19 @@ impl Executor {
         let mut counts: HashMap<Value, i64> = HashMap::with_capacity(kv_pairs.len().min(4096));
 
         for (_, data) in kv_pairs {
+            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
-                    &data,
-                    predicate.column_index,
-                )
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
-                if !predicate.matches(&predicate_value) {
+                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
                     continue;
                 }
             }
 
-            let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
+            let value = Self::decode_column_or_reuse_predicate(
+                &data,
+                column_index,
+                predicate,
+                predicate_value.as_ref(),
+            )?;
             *counts.entry(value).or_insert(0) += 1;
         }
 
@@ -962,24 +982,19 @@ impl Executor {
             HashMap::with_capacity(kv_pairs.len().min(4096));
 
         for (_, data) in kv_pairs {
+            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
-                    &data,
-                    predicate.column_index,
-                )
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
-                if !predicate.matches(&predicate_value) {
+                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
                     continue;
                 }
             }
 
-            let group_value =
-                crate::common::encoding::RowDecoder::decode_column(&data, group_column_index)
-                    .map_err(|e| {
-                        FusionError::Execution(format!("Data deserialization error: {}", e))
-                    })?
-                    .unwrap_or(Value::Null);
+            let group_value = Self::decode_column_or_reuse_predicate(
+                &data,
+                group_column_index,
+                predicate,
+                predicate_value.as_ref(),
+            )?;
 
             let states = groups.entry(group_value).or_insert_with(|| {
                 aggregate_plans
@@ -990,12 +1005,12 @@ impl Executor {
 
             for (state, plan) in states.iter_mut().zip(aggregate_plans.iter()) {
                 if let Some(column_index) = plan.column_index {
-                    let value =
-                        crate::common::encoding::RowDecoder::decode_column(&data, column_index)
-                            .map_err(|e| {
-                                FusionError::Execution(format!("Data deserialization error: {}", e))
-                            })?
-                            .unwrap_or(Value::Null);
+                    let value = Self::decode_column_or_reuse_predicate(
+                        &data,
+                        column_index,
+                        predicate,
+                        predicate_value.as_ref(),
+                    )?;
                     state.update_value(value);
                 } else {
                     state.update_count_star();
