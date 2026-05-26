@@ -1034,7 +1034,7 @@ impl Executor {
             txn.get(schema_key.as_bytes())
                 .await?
                 .map(|schema_bytes| {
-                    bincode::deserialize(&schema_bytes).map_err(|e| {
+                    bincode::deserialize::<TableSchema>(&schema_bytes).map_err(|e| {
                         FusionError::Execution(format!("Schema deserialization error: {}", e))
                     })
                 })
@@ -1042,19 +1042,6 @@ impl Executor {
         } else {
             None
         };
-
-        let (right_schema_base, right_rows) = if right_selection.is_some() {
-            self.scan_single_table(relation, &right_selection, &None, txn, params, None, None)
-                .await?
-        } else {
-            self.scan_table_base(relation, txn).await?
-        };
-        let mut right_schema = right_schema_base.clone();
-        self.prefix_schema_columns(&mut right_schema, relation)?;
-
-        let mut new_columns = left_schema.columns.clone();
-        new_columns.extend(right_schema.columns.clone());
-        let new_schema = TableSchema::new("join_result".to_string(), new_columns);
 
         let is_left_outer = matches!(
             join_operator,
@@ -1074,11 +1061,17 @@ impl Executor {
 
         let join_expr = Self::combine_predicates(join_predicates.clone());
         if supports_left_driven_probe && right_table_name.is_some() {
-            if let Some(expr) = &join_expr {
+            if let (Some(expr), Some(probe_schema)) = (&join_expr, schema_for_probe.as_ref()) {
+                let mut right_schema_for_probe = probe_schema.clone();
+                self.prefix_schema_columns(&mut right_schema_for_probe, relation)?;
+
+                let mut new_columns = left_schema.columns.clone();
+                new_columns.extend(right_schema_for_probe.columns.clone());
+                let new_schema = TableSchema::new("join_result".to_string(), new_columns);
+
                 if let Some((left_key_indices, right_key_indices, residual_expr)) =
-                    self.extract_join_keys(expr, &left_schema, &right_schema)
+                    self.extract_join_keys(expr, &left_schema, &right_schema_for_probe)
                 {
-                    let probe_schema = schema_for_probe.as_ref().unwrap_or(&right_schema_base);
                     if let Some((probe_left_idx, probe_right_idx)) = self
                         .choose_indexed_join_probe_pair(
                             &left_key_indices,
@@ -1116,7 +1109,7 @@ impl Executor {
                                         &new_schema,
                                         params,
                                         is_left_outer,
-                                        right_schema.columns.len(),
+                                        right_schema_for_probe.columns.len(),
                                         limit,
                                         &mut probed_rows,
                                     )? {
@@ -1151,7 +1144,7 @@ impl Executor {
                                     &new_schema,
                                     params,
                                     is_left_outer,
-                                    right_schema.columns.len(),
+                                    right_schema_for_probe.columns.len(),
                                     limit,
                                     &mut probed_rows,
                                 )?;
@@ -1167,6 +1160,19 @@ impl Executor {
                 }
             }
         }
+
+        let (right_schema_base, right_rows) = if right_selection.is_some() {
+            self.scan_single_table(relation, &right_selection, &None, txn, params, None, None)
+                .await?
+        } else {
+            self.scan_table_base(relation, txn).await?
+        };
+        let mut right_schema = right_schema_base.clone();
+        self.prefix_schema_columns(&mut right_schema, relation)?;
+
+        let mut new_columns = left_schema.columns.clone();
+        new_columns.extend(right_schema.columns.clone());
+        let new_schema = TableSchema::new("join_result".to_string(), new_columns);
 
         let row_width = left_schema.columns.len() + right_schema.columns.len();
         let mut new_rows = Vec::new();

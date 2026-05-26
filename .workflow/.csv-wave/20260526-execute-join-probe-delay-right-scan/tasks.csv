@@ -1,0 +1,2 @@
+id,description,status,files
+TASK-126,"Delay right-table scan until indexed JOIN probe fallback is needed.",completed,"src/execution/scan.rs"

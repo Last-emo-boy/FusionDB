@@ -1,0 +1,47 @@
+{
+  "task_id": "TASK-126",
+  "status": "passed",
+  "verified_at": "2026-05-26T11:40:18+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration join -- --nocapture",
+      "status": "passed",
+      "details": "Ran 9 JOIN integration tests covering inner, left, cross, multi-table, indexed probe, multi-key residual, projection pushdown, and row-cache behavior."
+    },
+    {
+      "command": "cargo build --release",
+      "status": "passed",
+      "details": "Built with CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0."
+    },
+    {
+      "command": "BENCH_SCALE=medium FUSIONDB_URL=http://127.0.0.1:8091/query python benchmark.py",
+      "status": "passed",
+      "details": "Order detail JOIN averaged 0.67 ms and 3-table JOIN averaged 1.71 ms."
+    }
+  ],
+  "benchmark": {
+    "medium": {
+      "bench_root": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task126-medium-20260526-114018",
+      "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task126-medium-20260526-114018\\benchmark_report_medium.json",
+      "rows_loaded": 50555,
+      "load_time_ms": 675,
+      "rows_per_second": 74907,
+      "order_detail_join_avg_ms": 0.67,
+      "three_table_join_avg_ms": 1.71,
+      "revenue_by_category_avg_ms": 27.85,
+      "order_by_val_desc_limit_50_avg_ms": 9.44
+    }
+  },
+  "notes": [
+    "TASK-125 medium baseline measured Order detail JOIN at 33.29 ms and 3-table JOIN at 40.91 ms.",
+    "The optimization removes eager right-table materialization only when existing indexed probe logic applies."
+  ]
+}

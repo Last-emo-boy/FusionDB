@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+TASK-126,completed,"Avoided eager right-table materialization on indexed JOIN probe paths.","src/execution/scan.rs"

@@ -1,0 +1,26 @@
+{
+  "task_id": "TASK-126",
+  "created_at": "2026-05-26T11:40:18+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/scan.rs",
+  "goal": "Avoid full right-table materialization when an indexed left-driven JOIN probe can satisfy the join.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "Preserve hash join and nested-loop fallback behavior",
+    "Preserve LEFT JOIN null-extension semantics"
+  ],
+  "implementation": [
+    "Load the right table schema before probing, without scanning right table rows.",
+    "Prefix the schema for join-key extraction and result schema construction on the probe path.",
+    "Attempt indexed probe using the existing primary-key/BTree fetch path.",
+    "Defer right table scan until after the probe path is known to be unavailable."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration join -- --nocapture",
+    "cargo build --release",
+    "Release medium benchmark"
+  ]
+}
