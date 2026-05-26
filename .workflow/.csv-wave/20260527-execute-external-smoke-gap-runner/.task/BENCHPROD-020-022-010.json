@@ -1,0 +1,23 @@
+{
+  "ids": ["BENCHPROD-020", "BENCHPROD-022", "BENCHPROD-010"],
+  "title": "External benchmark smoke/gap runner",
+  "area": "benchmark_ops",
+  "status": "gap_documented",
+  "success_criteria": [
+    "External tool availability is detected without manual shell probing",
+    "Missing tools produce structured JSON/Markdown gap reports",
+    "Reports clearly distinguish SQL-like local suites from native external benchmark readiness"
+  ],
+  "evidence": [
+    "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod020_022_20260527/external_smoke_summary.md",
+    "E:/Playground/FusionDB/.workflow/.csv-wave/20260527-execute-external-smoke-gap-runner/context.md"
+  ],
+  "results": {
+    "pgbench": "tool_missing",
+    "sysbench": "tool_missing",
+    "memtier_benchmark": "tool_missing"
+  },
+  "notes": [
+    "This is not a native official benchmark pass. It is a reproducible gap report and adapter entry point."
+  ]
+}

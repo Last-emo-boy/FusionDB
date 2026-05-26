@@ -1,0 +1,31 @@
+{
+  "session": "20260527-execute-external-smoke-gap-runner",
+  "title": "External benchmark smoke/gap runner",
+  "status": "completed",
+  "scope": [
+    "E:/Playground/FusionDB-bench/external_smoke.py",
+    "E:/Playground/FusionDB-bench/README.md",
+    "E:/Playground/FusionDB/.workflow/.csv-wave/20260527-execute-external-smoke-gap-runner"
+  ],
+  "waves": [
+    {
+      "id": 1,
+      "name": "implement-runner",
+      "status": "completed"
+    },
+    {
+      "id": 2,
+      "name": "verify-tool-gap-report",
+      "status": "completed"
+    },
+    {
+      "id": 3,
+      "name": "record-workflow-evidence",
+      "status": "completed"
+    }
+  ],
+  "artifacts": {
+    "external_smoke_markdown": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod020_022_20260527/external_smoke_summary.md",
+    "external_smoke_json": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod020_022_20260527/external_smoke_summary.json"
+  }
+}
