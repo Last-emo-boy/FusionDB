@@ -1,0 +1,245 @@
+{
+  "session_id": "maestro-20260526-184404",
+  "status": "ready",
+  "scope": "database-core",
+  "non_goals": [
+    "dashboard changes",
+    "ui changes",
+    "semantic rewrites before mechanical module extraction"
+  ],
+  "file_size_snapshot": {
+    "tests/sql_integration.rs": 5925,
+    "src/execution/query.rs": 3149,
+    "src/execution/scan.rs": 2605,
+    "src/execution/expr.rs": 1627,
+    "src/execution/dml.rs": 1083,
+    "src/execution/ddl.rs": 989,
+    "src/execution/mod.rs": 778
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "theme": "Mechanical module scaffolding",
+      "tasks": [
+        {
+          "id": "DECOUPLE-001",
+          "title": "Convert query.rs to query/mod.rs without behavior changes",
+          "files": [
+            "src/execution/query.rs",
+            "src/execution/query/mod.rs",
+            "src/execution/mod.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/mod.rs src/execution/query/mod.rs",
+            "cargo check --lib",
+            "cargo test show --test sql_integration"
+          ],
+          "notes": "Mechanical move first; no helper extraction in same commit."
+        },
+        {
+          "id": "DECOUPLE-002",
+          "title": "Create SQL integration common test helper module",
+          "files": [
+            "tests/sql_integration.rs",
+            "tests/sql/common.rs"
+          ],
+          "validation": [
+            "cargo fmt -- tests/sql_integration.rs tests/sql/common.rs",
+            "cargo test test_create_table --test sql_integration"
+          ],
+          "notes": "Introduce shared helpers while keeping old test target intact."
+        }
+      ]
+    },
+    {
+      "wave": 2,
+      "theme": "Low-risk query extraction",
+      "tasks": [
+        {
+          "id": "DECOUPLE-003",
+          "title": "Extract query column-scan fast paths",
+          "files": [
+            "src/execution/query/mod.rs",
+            "src/execution/query/column_scan.rs",
+            "tests/sql_integration.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/query/mod.rs src/execution/query/column_scan.rs tests/sql_integration.rs",
+            "cargo test column_scan --test sql_integration",
+            "cargo test distinct --test sql_integration",
+            "cargo test group_by --test sql_integration"
+          ],
+          "notes": "Move ColumnAggregateKind, ColumnPredicateScanPlan, simple/count/distinct/group column scan helpers."
+        },
+        {
+          "id": "DECOUPLE-004",
+          "title": "Extract query ORDER BY helpers",
+          "files": [
+            "src/execution/query/mod.rs",
+            "src/execution/query/order.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/query/mod.rs src/execution/query/order.rs",
+            "cargo test order_by --test sql_integration"
+          ],
+          "notes": "Move sort key source enums and compare/sort helpers."
+        }
+      ]
+    },
+    {
+      "wave": 3,
+      "theme": "Scan extraction",
+      "tasks": [
+        {
+          "id": "DECOUPLE-005",
+          "title": "Convert scan.rs to scan/mod.rs and extract predicate helpers",
+          "files": [
+            "src/execution/scan.rs",
+            "src/execution/scan/mod.rs",
+            "src/execution/scan/predicate.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/scan/mod.rs src/execution/scan/predicate.rs",
+            "cargo check --lib",
+            "cargo test where --test sql_integration"
+          ],
+          "notes": "Start with pure predicate split/combine helpers."
+        },
+        {
+          "id": "DECOUPLE-006",
+          "title": "Extract scan index planning",
+          "files": [
+            "src/execution/scan/mod.rs",
+            "src/execution/scan/index_plan.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/scan/mod.rs src/execution/scan/index_plan.rs",
+            "cargo test index --test sql_integration",
+            "cargo test primary_key --test sql_integration"
+          ],
+          "notes": "Move IndexScanPlan, try_index_scan, row-id helpers, and index candidate helpers."
+        },
+        {
+          "id": "DECOUPLE-007",
+          "title": "Extract scan join execution",
+          "files": [
+            "src/execution/scan/mod.rs",
+            "src/execution/scan/join.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/scan/mod.rs src/execution/scan/join.rs",
+            "cargo test join --test sql_integration"
+          ],
+          "notes": "Move execute_join, apply_join_step, stage projection, and join key helpers."
+        }
+      ]
+    },
+    {
+      "wave": 4,
+      "theme": "Expression and DDL/DML extraction",
+      "tasks": [
+        {
+          "id": "DECOUPLE-008",
+          "title": "Extract expression pattern/function/subquery helpers",
+          "files": [
+            "src/execution/expr.rs",
+            "src/execution/expr/mod.rs",
+            "src/execution/expr/function.rs",
+            "src/execution/expr/pattern.rs",
+            "src/execution/expr/subquery.rs",
+            "src/execution/expr/value.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/expr/mod.rs src/execution/expr/function.rs src/execution/expr/pattern.rs src/execution/expr/subquery.rs src/execution/expr/value.rs",
+            "cargo test --lib execution::expr",
+            "cargo test function --test sql_integration",
+            "cargo test subquery --test sql_integration"
+          ],
+          "notes": "Do after query/scan extraction to reduce conflict pressure."
+        },
+        {
+          "id": "DECOUPLE-009",
+          "title": "Extract DDL show/explain/index/table/view modules",
+          "files": [
+            "src/execution/ddl.rs",
+            "src/execution/ddl/mod.rs",
+            "src/execution/ddl/show.rs",
+            "src/execution/ddl/explain.rs",
+            "src/execution/ddl/index.rs",
+            "src/execution/ddl/table.rs",
+            "src/execution/ddl/view.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/ddl/mod.rs src/execution/ddl/show.rs src/execution/ddl/explain.rs src/execution/ddl/index.rs src/execution/ddl/table.rs src/execution/ddl/view.rs",
+            "cargo test show --test sql_integration",
+            "cargo test explain --test sql_integration",
+            "cargo test index --test sql_integration"
+          ],
+          "notes": "Handlers are already operation-grouped, so this is a good mechanical split."
+        },
+        {
+          "id": "DECOUPLE-010",
+          "title": "Extract DML insert/update/delete/returning/constraints modules",
+          "files": [
+            "src/execution/dml.rs",
+            "src/execution/dml/mod.rs",
+            "src/execution/dml/insert.rs",
+            "src/execution/dml/update.rs",
+            "src/execution/dml/delete.rs",
+            "src/execution/dml/returning.rs",
+            "src/execution/dml/constraints.rs"
+          ],
+          "validation": [
+            "cargo fmt -- src/execution/dml/mod.rs src/execution/dml/insert.rs src/execution/dml/update.rs src/execution/dml/delete.rs src/execution/dml/returning.rs src/execution/dml/constraints.rs",
+            "cargo test insert --test sql_integration",
+            "cargo test update --test sql_integration",
+            "cargo test delete --test sql_integration",
+            "cargo test returning --test sql_integration"
+          ],
+          "notes": "DML should follow scan extraction because index/cache behavior is shared."
+        }
+      ]
+    },
+    {
+      "wave": 5,
+      "theme": "SQL integration test split",
+      "tasks": [
+        {
+          "id": "DECOUPLE-011",
+          "title": "Split SQL integration tests by topic",
+          "files": [
+            "tests/sql_integration.rs",
+            "tests/sql/common.rs",
+            "tests/sql_ddl.rs",
+            "tests/sql_select.rs",
+            "tests/sql_dml.rs",
+            "tests/sql_group_aggregate.rs",
+            "tests/sql_join.rs",
+            "tests/sql_index_cache.rs",
+            "tests/sql_set_subquery.rs",
+            "tests/sql_expr_functions.rs",
+            "tests/sql_window.rs",
+            "tests/sql_view_show_constraints.rs",
+            "tests/sql_returning_upsert_vector_rbac.rs"
+          ],
+          "validation": [
+            "cargo fmt -- tests/sql/*.rs tests/sql_*.rs",
+            "cargo test --test sql_ddl",
+            "cargo test --test sql_select",
+            "cargo test --test sql_dml",
+            "cargo test --test sql_join",
+            "cargo test --test sql_integration"
+          ],
+          "notes": "Move one bucket per commit if conflicts rise. Full split can be broken into multiple TASKs."
+        }
+      ]
+    }
+  ],
+  "stop_conditions": [
+    "Any mechanical move changes behavior or requires broad lifetime rewrites.",
+    "Focused tests fail outside touched area.",
+    "A module extraction needs more than one public cross-module API introduced in the same task.",
+    "Unrelated uncommitted changes appear in touched files."
+  ],
+  "recommended_next_task": "DECOUPLE-001"
+}

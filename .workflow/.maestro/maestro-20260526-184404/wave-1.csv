@@ -1,0 +1,5 @@
+id,skill_call,topic
+E1,"$maestro-plan --explore-only execution-query-boundary","Explore src/execution/query.rs responsibilities and propose module boundaries for fast paths, projection, ordering, grouping, window, and query orchestration. Read only; do not modify files."
+E2,"$maestro-plan --explore-only scan-boundary","Explore src/execution/scan.rs responsibilities and propose module boundaries for table scan, join execution, index planning, and row fetch helpers. Read only; do not modify files."
+E3,"$maestro-plan --explore-only expression-dml-ddl-boundary","Explore src/execution/expr.rs, dml.rs, ddl.rs and propose low-risk extraction seams and shared helper modules. Read only; do not modify files."
+E4,"$maestro-plan --explore-only test-suite-split-strategy","Explore tests/sql_integration.rs and propose a test-module split strategy with commands that preserve coverage and reduce merge conflicts. Read only; do not modify files."

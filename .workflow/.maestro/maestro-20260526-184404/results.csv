@@ -1,0 +1,6 @@
+id,status,summary,artifacts
+E1,completed,"Local fallback analysis identified query.rs split boundaries for column_scan, order, window, and aggregate helpers.",".workflow/.maestro/maestro-20260526-184404/exploration-findings.md"
+E2,completed,"Local fallback analysis identified scan.rs split boundaries for predicate, index_plan, join, and table scan helpers.",".workflow/.maestro/maestro-20260526-184404/exploration-findings.md"
+E3,completed,"Local fallback analysis identified expr/dml/ddl split boundaries and migration order.",".workflow/.maestro/maestro-20260526-184404/exploration-findings.md"
+E4,completed,"Local fallback analysis identified sql_integration.rs topic buckets and split targets.",".workflow/.maestro/maestro-20260526-184404/exploration-findings.md"
+P1,completed,"Generated phased decoupling plan with 11 tasks across 5 waves.",".workflow/.maestro/maestro-20260526-184404/decoupling-plan.json"
