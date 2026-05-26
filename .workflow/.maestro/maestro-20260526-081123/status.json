@@ -1,0 +1,47 @@
+{
+  "session_id": "maestro-20260526-081123",
+  "source": "maestro",
+  "created_at": "2026-05-26T08:11:23+08:00",
+  "updated_at": "2026-05-26T08:11:23+08:00",
+  "intent": "close out database core performance task iteration",
+  "task_type": "closeout",
+  "chain_name": "database-core-performance-closeout",
+  "phase": "closeout",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "auto",
+  "cli_tool": "codex",
+  "lifecycle_position": "closeout",
+  "target": "database core",
+  "context": {
+    "issue_id": null,
+    "milestone_num": null,
+    "spec_session_id": null,
+    "scratch_dir": null,
+    "plan_dir": ".workflow/.csv-wave/20260526-closeout-database-core-performance",
+    "analysis_dir": null,
+    "brainstorm_dir": null
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "artifacts": ".workflow/.csv-wave/20260526-closeout-database-core-performance/closeout.json"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-verify",
+      "args": "verify completed database-core-performance task iteration and enter closeout",
+      "type": "skill",
+      "status": "completed",
+      "started_at": "2026-05-26T08:11:23+08:00",
+      "completed_at": "2026-05-26T08:11:23+08:00",
+      "error": null,
+      "wave_n": 1
+    }
+  ],
+  "current_step": 0,
+  "status": "completed"
+}
