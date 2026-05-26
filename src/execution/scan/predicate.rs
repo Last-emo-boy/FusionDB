@@ -33,7 +33,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn collect_conjunctive_predicates(expr: &Expr) -> Vec<Expr> {
+    pub(crate) fn collect_conjunctive_predicates(expr: &Expr) -> Vec<Expr> {
         let mut predicates = Vec::with_capacity(Self::conjunctive_predicate_count(expr));
         Self::split_conjunctive_predicates(expr, &mut predicates);
         predicates
@@ -119,7 +119,7 @@ impl Executor {
         Self::combine_predicates(local)
     }
 
-    pub(super) fn column_name_from_expr(expr: &Expr) -> Option<String> {
+    pub(crate) fn column_name_from_expr(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
             Expr::CompoundIdentifier(idents) => Some(Self::scan_compound_identifier_name(idents)),

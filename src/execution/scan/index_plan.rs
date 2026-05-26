@@ -12,12 +12,12 @@ use super::Executor;
 pub(super) const SMALL_INDEX_FETCH_THRESHOLD: usize = 64;
 
 pub(crate) struct IndexScanPlan {
-    pub(super) row_ids: HashSet<String>,
-    pub(super) exact: bool,
+    pub(crate) row_ids: HashSet<String>,
+    pub(crate) exact: bool,
 }
 
 impl Executor {
-    fn equality_schema_column_value_expr<'a>(
+    pub(crate) fn equality_schema_column_value_expr<'a>(
         &self,
         left: &'a Expr,
         right: &'a Expr,
@@ -171,7 +171,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn row_id_from_key(key: &[u8]) -> Option<&str> {
+    pub(crate) fn row_id_from_key(key: &[u8]) -> Option<&str> {
         std::str::from_utf8(key)
             .ok()?
             .rsplit(':')
@@ -268,6 +268,13 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<Option<IndexScanPlan>>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if let Some(plan) = self
+                .try_composite_index_scan(expr, table_name, schema, txn, params, limit)
+                .await?
+            {
+                return Ok(Some(plan));
+            }
+
             match expr {
                 Expr::BinaryOp {
                     left,

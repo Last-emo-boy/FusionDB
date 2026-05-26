@@ -133,6 +133,7 @@ impl Executor {
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
             }
+            self.delete_index_meta_for_table(&table_name, txn).await?;
 
             dropped_count += 1;
         }
@@ -243,6 +244,20 @@ impl Executor {
                                         "Cannot drop PRIMARY KEY column".to_string(),
                                     ));
                                 }
+                                let affected_indexes = self
+                                    .load_composite_indexes_for_table(&table_name, txn)
+                                    .await?;
+                                if affected_indexes.iter().any(|index| {
+                                    index
+                                        .columns
+                                        .iter()
+                                        .any(|column| column.eq_ignore_ascii_case(&col_name))
+                                }) {
+                                    return Err(FusionError::Execution(format!(
+                                        "Cannot drop column {} because a composite index depends on it",
+                                        col_name
+                                    )));
+                                }
                                 schema.columns.remove(idx);
 
                                 // Rewrite existing rows: remove the column at idx
@@ -296,6 +311,20 @@ impl Executor {
                     let col = schema.columns.iter_mut().find(|c| c.name == old_name);
                     match col {
                         Some(c) => {
+                            let affected_indexes = self
+                                .load_composite_indexes_for_table(&table_name, txn)
+                                .await?;
+                            if affected_indexes.iter().any(|index| {
+                                index
+                                    .columns
+                                    .iter()
+                                    .any(|column| column.eq_ignore_ascii_case(&old_name))
+                            }) {
+                                return Err(FusionError::Execution(format!(
+                                    "Cannot rename column {} because a composite index depends on it",
+                                    old_name
+                                )));
+                            }
                             c.name = new_name.clone();
                             messages.push(format!("Renamed {} to {}", old_name, new_name));
                         }

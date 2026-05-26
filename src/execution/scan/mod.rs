@@ -2,6 +2,7 @@ mod index_plan;
 mod join;
 mod predicate;
 
+pub(crate) use index_plan::IndexScanPlan;
 use index_plan::SMALL_INDEX_FETCH_THRESHOLD;
 
 use crate::catalog::{IndexType, TableSchema};

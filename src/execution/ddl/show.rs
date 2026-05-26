@@ -147,7 +147,8 @@ impl Executor {
             };
 
             let meta_str = String::from_utf8(v).unwrap_or_default();
-            let Some((table_name, column_name)) = meta_str.split_once(':') else {
+            let Some((table_name, column_name, _columns)) = Self::describe_index_columns(&meta_str)
+            else {
                 continue;
             };
             if table_filter.is_some_and(|filter| filter != table_name) {
@@ -156,8 +157,8 @@ impl Executor {
 
             indexes.push(vec![
                 Value::String(index_name.to_string()),
-                Value::String(table_name.to_string()),
-                Value::String(column_name.to_string()),
+                Value::String(table_name),
+                Value::String(column_name),
             ]);
         }
 

@@ -112,6 +112,13 @@ impl Executor {
                     .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
 
                 if let Some(sel) = selection {
+                    if let Some(index_name) = self
+                        .composite_index_for_explain(sel, &table_name, txn)
+                        .await?
+                    {
+                        return Ok(format!("Index Scan using {}", index_name));
+                    }
+
                     if let Expr::BinaryOp { left, op, right } = sel {
                         if *op == BinaryOperator::Eq {
                             if (self.explain_column_index(left, &schema) == Some(0)
@@ -141,6 +148,65 @@ impl Executor {
         } else {
             Ok("Unknown Table Factor".to_string())
         }
+    }
+
+    async fn composite_index_for_explain(
+        &self,
+        selection: &Expr,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<String>> {
+        let indexes = self
+            .load_composite_indexes_for_table(table_name, txn)
+            .await?;
+        if indexes.is_empty() {
+            return Ok(None);
+        }
+
+        let predicates = Self::collect_conjunctive_predicates(selection);
+        let mut equality_columns = HashSet::with_capacity(predicates.len());
+
+        for predicate in predicates {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = predicate
+            else {
+                continue;
+            };
+
+            let left_columns = !self.explain_expr_has_column_reference(&left);
+            let right_columns = !self.explain_expr_has_column_reference(&right);
+
+            if !left_columns {
+                if let Some(column) = Self::column_name_from_expr(&left) {
+                    if right_columns {
+                        equality_columns.insert(column);
+                    }
+                }
+            }
+
+            if !right_columns {
+                if let Some(column) = Self::column_name_from_expr(&right) {
+                    if left_columns {
+                        equality_columns.insert(column);
+                    }
+                }
+            }
+        }
+
+        Ok(indexes
+            .into_iter()
+            .filter(|index| {
+                index.columns.iter().all(|column| {
+                    equality_columns
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(column))
+                })
+            })
+            .max_by_key(|index| index.columns.len())
+            .map(|index| format!("{} (BTree composite)", index.name)))
     }
 
     fn explain_column_index(&self, expr: &Expr, schema: &TableSchema) -> Option<usize> {

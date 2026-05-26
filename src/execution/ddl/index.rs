@@ -21,6 +21,13 @@ impl Executor {
             .as_ref()
             .map(|n| n.to_string())
             .unwrap_or_else(|| format!("idx_{}_{}", table_name_str, uuid::Uuid::new_v4()));
+        let meta_key = format!("index_meta:{}", index_name_str);
+        if txn.get(meta_key.as_bytes()).await?.is_some() {
+            return Err(FusionError::Execution(format!(
+                "Index {} already exists",
+                index_name_str
+            )));
+        }
 
         let schema_key = format!("schema:{}", table_name_str);
         let schema_bytes = txn
@@ -31,11 +38,13 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
         let mut target_col_indices = Vec::new();
+        let mut target_col_names = Vec::new();
         for index_col in columns {
             let col_expr = &index_col.column;
             if let Expr::Identifier(ident) = &col_expr.expr {
                 if let Some(idx) = schema.get_column_index(&ident.value) {
                     target_col_indices.push(idx);
+                    target_col_names.push(schema.columns[idx].name.clone());
                 } else {
                     return Err(FusionError::Execution(format!(
                         "Column {} not found",
@@ -49,13 +58,11 @@ impl Executor {
             }
         }
 
-        if target_col_indices.len() != 1 {
+        if target_col_indices.is_empty() {
             return Err(FusionError::Execution(
-                "Currently only single-column index is supported".to_string(),
+                "CREATE INDEX requires at least one column".to_string(),
             ));
         }
-        let col_idx = target_col_indices[0];
-        let col_name = schema.columns[col_idx].name.clone();
 
         let mut index_type = IndexType::BTree;
         for opt in index_options {
@@ -70,13 +77,24 @@ impl Executor {
             }
         }
 
-        schema.columns[col_idx].is_indexed = true;
-        schema.columns[col_idx].index_type = index_type.clone();
+        if target_col_indices.len() != 1 && index_type != IndexType::BTree {
+            return Err(FusionError::Execution(
+                "Composite indexes only support BTree".to_string(),
+            ));
+        }
 
-        // If HNSW, initialize the vector index
-        if index_type == IndexType::HNSW {
-            let idx_name = format!("hnsw_{}_{}", table_name_str, col_name);
-            self.vector_index.create_index(&idx_name);
+        if target_col_indices.len() == 1 {
+            let col_idx = target_col_indices[0];
+            let col_name = schema.columns[col_idx].name.clone();
+
+            schema.columns[col_idx].is_indexed = true;
+            schema.columns[col_idx].index_type = index_type.clone();
+
+            // If HNSW, initialize the vector index
+            if index_type == IndexType::HNSW {
+                let idx_name = format!("hnsw_{}_{}", table_name_str, col_name);
+                self.vector_index.create_index(&idx_name);
+            }
         }
         let new_schema_value = bincode::serialize(&schema)
             .map_err(|e| FusionError::Execution(format!("Schema serialization error: {}", e)))?;
@@ -94,6 +112,31 @@ impl Executor {
                 .next()
                 .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?;
 
+            let row = if target_col_indices.len() > 1 {
+                crate::common::encoding::RowDecoder::decode_partial(&v, &target_col_indices)
+                    .map_err(|e| {
+                        FusionError::Execution(format!("Data deserialization error: {}", e))
+                    })?
+            } else {
+                Vec::new()
+            };
+
+            if target_col_indices.len() > 1 {
+                if let Some(index_key) = self.composite_index_key(
+                    &table_name_str,
+                    &target_col_names,
+                    &row,
+                    &schema,
+                    row_id,
+                ) {
+                    txn.put(index_key.as_bytes(), &[]).await?;
+                    count += 1;
+                }
+                continue;
+            }
+
+            let col_idx = target_col_indices[0];
+            let col_name = &target_col_names[0];
             let val = if let Some(row) = self.row_cache.get(key_str) {
                 monitor::inc_row_cache_hit();
                 row.get(col_idx).cloned()
@@ -121,30 +164,35 @@ impl Executor {
                         .insert(&idx_name, row_id.to_string(), vec.clone())?;
                 }
             } else {
-                let val_str = match &val {
-                    Value::Integer(i) => i.to_string(),
-                    Value::String(s) => s.clone(),
-                    Value::Boolean(b) => b.to_string(),
-                    _ => continue,
-                };
-                let index_key = format!(
-                    "index:{}:{}:{}:{}",
-                    table_name_str, col_name, val_str, row_id
-                );
-                txn.put(index_key.as_bytes(), &[]).await?;
+                if let Some(val_str) = self.value_to_index_string(&val) {
+                    let index_key = format!(
+                        "index:{}:{}:{}:{}",
+                        table_name_str, col_name, val_str, row_id
+                    );
+                    txn.put(index_key.as_bytes(), &[]).await?;
+                } else {
+                    continue;
+                }
             }
             count += 1;
         }
 
         // Store index metadata for DROP INDEX support
-        let meta_key = format!("index_meta:{}", index_name_str);
-        let meta_val = format!("{}:{}", table_name_str, col_name);
+        let meta_val = if target_col_names.len() == 1 {
+            format!("{}:{}", table_name_str, target_col_names[0])
+        } else {
+            Self::composite_index_meta_value(&table_name_str, &target_col_names)
+        };
         txn.put(meta_key.as_bytes(), meta_val.as_bytes()).await?;
 
         Ok(QueryResult::Success {
             message: format!(
                 "Index {} ({:?}) created on {}({}), indexed {} rows",
-                index_name_str, index_type, table_name_str, col_name, count
+                index_name_str,
+                index_type,
+                table_name_str,
+                target_col_names.join(", "),
+                count
             ),
         })
     }
@@ -161,34 +209,39 @@ impl Executor {
             // Index metadata key: index_meta:<index_name>
             let meta_key = format!("index_meta:{}", index_name);
             if let Some(meta_bytes) = txn.get(meta_key.as_bytes()).await? {
-                // Meta stores "table_name:column_name"
                 let meta_str = String::from_utf8(meta_bytes).unwrap_or_default();
-                let parts: Vec<&str> = meta_str.split(':').collect();
-                if parts.len() >= 2 {
-                    let table_name = parts[0];
-                    let col_name = parts[1];
+                if let Some(meta) = Self::parse_index_meta(&index_name, &meta_str) {
+                    let table_name = meta.table;
 
                     // Delete index entries
-                    let index_prefix = format!("index:{}:{}:", table_name, col_name);
+                    let index_prefix = if meta.columns.len() == 1 {
+                        format!("index:{}:{}:", table_name, meta.columns[0])
+                    } else {
+                        Self::composite_index_prefix(&table_name, &meta.columns)
+                    };
                     let entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
                     for (k, _) in entries {
                         txn.delete(&k).await?;
                     }
 
                     // Update schema: mark column as not indexed
-                    let schema_key = format!("schema:{}", table_name);
-                    if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
-                        if let Ok(mut schema) = bincode::deserialize::<TableSchema>(&schema_bytes) {
-                            for col in &mut schema.columns {
-                                if col.name == col_name {
-                                    col.is_indexed = false;
-                                    col.index_type = IndexType::None;
+                    if meta.columns.len() == 1 {
+                        let schema_key = format!("schema:{}", table_name);
+                        if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
+                            if let Ok(mut schema) =
+                                bincode::deserialize::<TableSchema>(&schema_bytes)
+                            {
+                                for col in &mut schema.columns {
+                                    if col.name == meta.columns[0] {
+                                        col.is_indexed = false;
+                                        col.index_type = IndexType::None;
+                                    }
                                 }
+                                let new_bytes = bincode::serialize(&schema).map_err(|e| {
+                                    FusionError::Execution(format!("Serialize error: {}", e))
+                                })?;
+                                txn.put(schema_key.as_bytes(), &new_bytes).await?;
                             }
-                            let new_bytes = bincode::serialize(&schema).map_err(|e| {
-                                FusionError::Execution(format!("Serialize error: {}", e))
-                            })?;
-                            txn.put(schema_key.as_bytes(), &new_bytes).await?;
                         }
                     }
                 }

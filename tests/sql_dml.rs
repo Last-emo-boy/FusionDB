@@ -261,6 +261,60 @@ async fn test_delete_primary_key_updates_secondary_index() {
 }
 
 #[tokio::test]
+async fn test_dml_maintains_composite_index_entries() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE stock (id INTEGER PRIMARY KEY, warehouse_id INTEGER, item_id INTEGER, qty INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_stock_warehouse_item ON stock (warehouse_id, item_id)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO stock VALUES (1, 1, 100, 50), (2, 1, 101, 60)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT qty FROM stock WHERE warehouse_id = 1 AND item_id = 100",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(50)]]);
+
+    exec_ok(
+        &executor,
+        "UPDATE stock SET item_id = 102, qty = 70 WHERE id = 1",
+    )
+    .await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT qty FROM stock WHERE warehouse_id = 1 AND item_id = 100",
+    )
+    .await;
+    assert!(rows.is_empty());
+    let (_, rows) = query(
+        &executor,
+        "SELECT qty FROM stock WHERE warehouse_id = 1 AND item_id = 102",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(70)]]);
+
+    exec_ok(&executor, "DELETE FROM stock WHERE id = 1").await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT qty FROM stock WHERE warehouse_id = 1 AND item_id = 102",
+    )
+    .await;
+    assert!(rows.is_empty());
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_delete_primary_key_reuses_row_cache_for_secondary_index() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

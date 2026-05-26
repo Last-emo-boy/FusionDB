@@ -512,6 +512,112 @@ async fn test_create_btree_index() {
 }
 
 #[tokio::test]
+async fn test_create_integer_btree_index_after_load_uses_comparable_keys() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE int_idx (id INTEGER PRIMARY KEY, bucket INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO int_idx VALUES (1, 7, 'a'), (2, 8, 'b'), (3, 7, 'c')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_int_idx_bucket ON int_idx (bucket)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT payload FROM int_idx WHERE bucket = 7 ORDER BY id",
+    )
+    .await;
+    assert_eq!(cols, vec!["payload"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("a".to_string())],
+            vec![Value::String("c".to_string())]
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_create_composite_btree_index_and_lookup() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, warehouse_id INTEGER, district_id INTEGER, customer_id INTEGER, amount INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO orders VALUES (1, 1, 10, 100, 25), (2, 1, 10, 101, 30), (3, 2, 20, 100, 35)",
+    )
+    .await;
+
+    let msg = exec_ok(
+        &executor,
+        "CREATE INDEX idx_orders_warehouse_district_customer ON orders (warehouse_id, district_id, customer_id)",
+    )
+    .await;
+    assert!(msg.contains("indexed 3 rows"));
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT amount FROM orders WHERE warehouse_id = 1 AND district_id = 10 AND customer_id = 101",
+    )
+    .await;
+    assert_eq!(cols, vec!["amount"]);
+    assert_eq!(rows, vec![vec![Value::Integer(30)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT amount FROM orders WHERE warehouse_id = 1 AND district_id = 10 AND customer_id = 101",
+    )
+    .await;
+    let Value::String(plan) = &rows[0][0] else {
+        panic!("expected explain text");
+    };
+    assert!(plan.contains("idx_orders_warehouse_district_customer"));
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_show_indexes_reports_composite_columns() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_show_comp (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_show_comp_ab ON idx_show_comp (a, b)",
+    )
+    .await;
+
+    let results = executor
+        .execute_sql("SHOW INDEXES FROM idx_show_comp")
+        .await
+        .unwrap();
+    if let QueryResult::Select { rows, .. } = &results[0] {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::String("idx_show_comp_ab".to_string()));
+        assert_eq!(rows[0][2], Value::String("a,b".to_string()));
+    } else {
+        panic!("Expected Select result from SHOW INDEXES FROM");
+    }
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_fts_match_against_multi_token_intersects_index_hits() {
     let (executor, wal) = setup().await;
     exec_ok(

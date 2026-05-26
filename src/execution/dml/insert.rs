@@ -27,6 +27,9 @@ impl Executor {
             .ok_or_else(|| FusionError::Execution(format!("Table {} not found", table_name_str)))?;
         let schema: TableSchema = bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
+        let composite_indexes = self
+            .load_composite_indexes_for_table(&table_name_str, txn)
+            .await?;
 
         // Build column index mapping if explicit column list provided
         let col_mapping: Option<Vec<usize>> = if !columns.is_empty() {
@@ -240,6 +243,16 @@ impl Executor {
                                             }
                                         }
                                     }
+                                    self.update_loaded_composite_indexes_for_row(
+                                        &composite_indexes,
+                                        &table_name_str,
+                                        &schema,
+                                        &old_existing_row,
+                                        &existing_row,
+                                        &row_id,
+                                        txn,
+                                    )
+                                    .await?;
                                     monitor::inc_row_write();
                                     if returning.is_some() {
                                         inserted_rows.push(existing_row);
@@ -330,6 +343,16 @@ impl Executor {
                         }
                     }
 
+                    self.put_loaded_composite_indexes_for_row(
+                        &composite_indexes,
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &row_id,
+                        txn,
+                    )
+                    .await?;
+
                     if returning.is_some() {
                         inserted_rows.push(row_values.clone());
                     }
@@ -378,6 +401,15 @@ impl Executor {
                             }
                         }
                     }
+                    self.put_loaded_composite_indexes_for_row(
+                        &composite_indexes,
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &row_id,
+                        txn,
+                    )
+                    .await?;
                     count += 1;
                 }
                 return Ok(QueryResult::Success {

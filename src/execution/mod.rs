@@ -1,4 +1,5 @@
 mod aggregation;
+mod composite_index;
 mod ddl;
 mod dml;
 mod expr;

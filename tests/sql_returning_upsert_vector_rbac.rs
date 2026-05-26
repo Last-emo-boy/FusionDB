@@ -168,6 +168,47 @@ async fn test_upsert_do_update_invalidates_row_cache_for_index_lookup() {
 }
 
 #[tokio::test]
+async fn test_upsert_do_update_maintains_composite_index() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE district_orders (id INTEGER PRIMARY KEY, warehouse_id INTEGER, district_id INTEGER, status TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_district_orders_wd ON district_orders (warehouse_id, district_id)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO district_orders VALUES (1, 1, 10, 'open')",
+    )
+    .await;
+
+    exec_ok(
+        &executor,
+        "INSERT INTO district_orders VALUES (1, 2, 20, 'moved') ON CONFLICT (id) DO UPDATE SET warehouse_id = EXCLUDED.warehouse_id, district_id = EXCLUDED.district_id, status = EXCLUDED.status",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT status FROM district_orders WHERE warehouse_id = 1 AND district_id = 10",
+    )
+    .await;
+    assert!(rows.is_empty());
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT status FROM district_orders WHERE warehouse_id = 2 AND district_id = 20",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::String("moved".to_string())]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_upsert_do_update_reuses_row_cache_for_existing_row() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

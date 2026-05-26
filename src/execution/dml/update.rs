@@ -40,6 +40,9 @@ impl Executor {
             params,
             &allowed_qualifiers,
         );
+        let composite_indexes = self
+            .load_composite_indexes_for_table(&table_name_str, txn)
+            .await?;
 
         let kv_pairs = if let Some(row_id) = target_row_id {
             // Point Lookup
@@ -192,6 +195,16 @@ impl Executor {
                         }
                     }
                 }
+                self.update_loaded_composite_indexes_for_row(
+                    &composite_indexes,
+                    &table_name_str,
+                    &schema,
+                    &old_row,
+                    &row,
+                    row_id,
+                    txn,
+                )
+                .await?;
 
                 if update.returning.is_some() {
                     updated_rows.push(row.clone());

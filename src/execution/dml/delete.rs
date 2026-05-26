@@ -71,12 +71,16 @@ impl Executor {
             params,
             &allowed_qualifiers,
         );
+        let composite_indexes = self
+            .load_composite_indexes_for_table(&table_name_str, txn)
+            .await?;
 
         if delete.returning.is_none() {
             let no_secondary_indexes = schema
                 .columns
                 .iter()
-                .all(|col| !col.is_indexed || col.is_primary);
+                .all(|col| !col.is_indexed || col.is_primary)
+                && composite_indexes.is_empty();
             if no_secondary_indexes {
                 if let Some(row_id) = &target_row_id {
                     let key = format!("{}{}", prefix, row_id);
@@ -184,6 +188,15 @@ impl Executor {
                         }
                     }
                 }
+                self.delete_loaded_composite_indexes_for_row(
+                    &composite_indexes,
+                    &table_name_str,
+                    &schema,
+                    &row,
+                    row_id,
+                    txn,
+                )
+                .await?;
 
                 if delete.returning.is_some() {
                     deleted_rows.push(row.clone());
