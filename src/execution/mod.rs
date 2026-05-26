@@ -103,6 +103,8 @@ impl Executor {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let upper = trimmed.to_uppercase();
         if upper == "SHOW VIEWS"
+            || upper == "SHOW INDEXES"
+            || upper.starts_with("SHOW INDEXES FROM ")
             || upper == "SHOW USERS"
             || upper.starts_with("CREATE USER ")
             || upper.starts_with("DROP USER ")
@@ -509,6 +511,22 @@ impl Executor {
             let start = std::time::Instant::now();
             let mut txn = self.storage.begin_transaction().await?;
             let res = self.handle_show_views(&mut *txn).await;
+            if res.is_ok() {
+                txn.commit().await?;
+            }
+            crate::monitor::record_query(trimmed, start.elapsed());
+            return res.map(|r| vec![r]);
+        }
+
+        if upper == "SHOW INDEXES" || upper.starts_with("SHOW INDEXES FROM ") {
+            let table_filter = if upper.starts_with("SHOW INDEXES FROM ") {
+                Some(trimmed["SHOW INDEXES FROM ".len()..].trim()).filter(|table| !table.is_empty())
+            } else {
+                None
+            };
+            let start = std::time::Instant::now();
+            let mut txn = self.storage.begin_transaction().await?;
+            let res = self.handle_show_indexes(table_filter, &mut *txn).await;
             if res.is_ok() {
                 txn.commit().await?;
             }

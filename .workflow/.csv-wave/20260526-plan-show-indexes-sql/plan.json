@@ -1,0 +1,22 @@
+{
+  "session_id": "20260526-plan-show-indexes-sql",
+  "task_id": "TASK-150",
+  "title": "Plan SHOW INDEXES SQL metadata command",
+  "status": "completed",
+  "created_at": "2026-05-26T16:45:00+08:00",
+  "problem": "FusionDB stores index metadata for CREATE INDEX and DROP INDEX, but users cannot inspect existing indexes through SQL.",
+  "approach": [
+    "Route SHOW INDEXES and SHOW INDEXES FROM <table> through the custom execute_sql path.",
+    "Scan index_meta:<index_name> records and decode table/column metadata without touching table data.",
+    "Return stable Index, Table, Column columns and sort rows by index name for deterministic tests.",
+    "Verify SHOW INDEXES before and after DROP INDEX."
+  ],
+  "expected_impact": [
+    "Improves SQL observability for index lifecycle operations.",
+    "Adds a cheap metadata-only path with no dashboard changes."
+  ],
+  "risk_controls": [
+    "Keep implementation read-only and scoped to existing index_meta records.",
+    "Do not change CREATE INDEX, DROP INDEX, planner, storage, dashboard, or UI behavior."
+  ]
+}

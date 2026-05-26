@@ -132,6 +132,58 @@ impl Executor {
         })
     }
 
+    pub(crate) async fn handle_show_indexes(
+        &self,
+        table_filter: Option<&str>,
+        txn: &mut dyn Transaction,
+    ) -> Result<QueryResult> {
+        let prefix = "index_meta:";
+        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+
+        let mut indexes = Vec::with_capacity(kv_pairs.len());
+        for (k, v) in kv_pairs {
+            let Ok(key_str) = std::str::from_utf8(&k) else {
+                continue;
+            };
+            let Some(index_name) = key_str.strip_prefix(prefix) else {
+                continue;
+            };
+
+            let meta_str = String::from_utf8(v).unwrap_or_default();
+            let Some((table_name, column_name)) = meta_str.split_once(':') else {
+                continue;
+            };
+            if table_filter.is_some_and(|filter| filter != table_name) {
+                continue;
+            }
+
+            indexes.push(vec![
+                Value::String(index_name.to_string()),
+                Value::String(table_name.to_string()),
+                Value::String(column_name.to_string()),
+            ]);
+        }
+
+        indexes.sort_by(|left, right| {
+            let Value::String(left_name) = &left[0] else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Value::String(right_name) = &right[0] else {
+                return std::cmp::Ordering::Equal;
+            };
+            left_name.cmp(right_name)
+        });
+
+        Ok(QueryResult::Select {
+            columns: vec![
+                "Index".to_string(),
+                "Table".to_string(),
+                "Column".to_string(),
+            ],
+            rows: indexes,
+        })
+    }
+
     pub(crate) async fn handle_explain(
         &self,
         stmt: &Statement,

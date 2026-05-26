@@ -1,0 +1,3 @@
+id,status,summary,artifacts
+TASK-150-plan,completed,"Planned SQL metadata visibility for existing index_meta records.",".workflow/.csv-wave/20260526-plan-show-indexes-sql/plan.json"
+TASK-150-execute,completed,"Implemented SHOW INDEXES and SHOW INDEXES FROM <table> through execute_sql and a read-only metadata scan handler.","src/execution/mod.rs;src/execution/ddl.rs;tests/sql_integration.rs"

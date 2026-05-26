@@ -1,0 +1,33 @@
+{
+  "task_id": "TASK-150",
+  "status": "passed",
+  "verified_at": "2026-05-26T16:52:00+08:00",
+  "environment": {
+    "CARGO_TARGET_DIR": "E:\\Playground\\FusionDB\\target",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "checks": [
+    {
+      "command": "cargo fmt -- src/execution/mod.rs src/execution/ddl.rs tests/sql_integration.rs",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test test_show_indexes --test sql_integration",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test test_drop_index --test sql_integration",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test show --test sql_integration",
+      "status": "passed",
+      "notes": "Ran 4 show-related integration tests."
+    }
+  ],
+  "notes": [
+    "SHOW INDEXES uses existing index_meta records and does not scan table rows.",
+    "SHOW INDEXES FROM <table> filters metadata rows by table name.",
+    "DROP INDEX removes metadata and the filtered SHOW INDEXES result reflects that removal."
+  ]
+}

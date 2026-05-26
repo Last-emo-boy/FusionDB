@@ -1,0 +1,2 @@
+id,title,status,checks,error
+TASK-150,"Verify SHOW INDEXES SQL metadata command","completed","cargo fmt;cargo test test_show_indexes --test sql_integration;cargo test test_drop_index --test sql_integration;cargo test show --test sql_integration",""

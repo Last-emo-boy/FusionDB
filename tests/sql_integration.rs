@@ -5156,6 +5156,72 @@ async fn test_drop_index() {
 }
 
 #[tokio::test]
+async fn test_show_indexes() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE si (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE si_other (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "CREATE INDEX idx_si_name ON si (name)").await;
+    exec_ok(&executor, "CREATE INDEX idx_si_age ON si (age)").await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_si_other_name ON si_other (name)",
+    )
+    .await;
+
+    let results = executor.execute_sql("SHOW INDEXES").await.unwrap();
+    if let QueryResult::Select { columns, rows } = &results[0] {
+        assert_eq!(columns, &vec!["Index", "Table", "Column"]);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&vec![
+            Value::String("idx_si_name".to_string()),
+            Value::String("si".to_string()),
+            Value::String("name".to_string()),
+        ]));
+        assert!(rows.contains(&vec![
+            Value::String("idx_si_age".to_string()),
+            Value::String("si".to_string()),
+            Value::String("age".to_string()),
+        ]));
+        assert!(rows.contains(&vec![
+            Value::String("idx_si_other_name".to_string()),
+            Value::String("si_other".to_string()),
+            Value::String("name".to_string()),
+        ]));
+    } else {
+        panic!("Expected Select result from SHOW INDEXES");
+    }
+
+    let results = executor.execute_sql("SHOW INDEXES FROM si").await.unwrap();
+    if let QueryResult::Select { rows, .. } = &results[0] {
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row[1] == Value::String("si".to_string())));
+    } else {
+        panic!("Expected Select result from SHOW INDEXES FROM");
+    }
+
+    exec_ok(&executor, "DROP INDEX idx_si_name").await;
+    let results = executor.execute_sql("SHOW INDEXES FROM si").await.unwrap();
+    if let QueryResult::Select { rows, .. } = &results[0] {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::String("idx_si_age".to_string()));
+    } else {
+        panic!("Expected Select result from SHOW INDEXES after DROP INDEX");
+    }
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_check_constraint() {
     let (executor, wal) = setup().await;
     exec_ok(&executor, "CREATE TABLE ck (id INTEGER PRIMARY KEY, age INTEGER CHECK(age > 0), score INTEGER CHECK(score >= 0))").await;
