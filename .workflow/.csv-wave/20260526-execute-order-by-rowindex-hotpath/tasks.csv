@@ -1,0 +1,2 @@
+id,description,status,files
+TASK-125,"Resolve full-schema ORDER BY columns to row indices and compare by reference.",completed,"src/execution/query.rs"

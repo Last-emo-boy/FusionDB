@@ -1,0 +1,24 @@
+{
+  "task_id": "TASK-125",
+  "created_at": "2026-05-26T11:22:43+08:00",
+  "phase": "database-core-performance",
+  "target": "src/execution/query.rs",
+  "goal": "Reduce repeated expression evaluation and value cloning in ORDER BY comparison for full-schema rows.",
+  "scope": [
+    "Database core only",
+    "No dashboard changes",
+    "No semantic changes to alias, ordinal, projection, GROUP BY, or set-operation ordering"
+  ],
+  "implementation": [
+    "Resolve wildcard SELECT ORDER BY identifiers and ordinals to schema row indices before sorting.",
+    "Use direct row-index value references during sort comparison instead of cloning Values.",
+    "Keep existing projection and expression sort paths for non-wildcard and computed ORDER BY cases."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_integration test_select_order_by -- --nocapture",
+    "cargo build --release",
+    "Release medium benchmark"
+  ]
+}

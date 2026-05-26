@@ -1,0 +1,48 @@
+{
+  "task_id": "TASK-125",
+  "status": "passed",
+  "verified_at": "2026-05-26T11:22:43+08:00",
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration test_select_order_by -- --nocapture",
+      "status": "passed",
+      "details": "Covered ORDER BY ASC, DESC, LIMIT/OFFSET, primary-key LIMIT/OFFSET, alias, and ordinal cases."
+    },
+    {
+      "command": "cargo build --release",
+      "status": "passed",
+      "details": "Built with CARGO_TARGET_DIR=C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-target, CARGO_BUILD_JOBS=1, RUSTFLAGS=-C debuginfo=0."
+    },
+    {
+      "command": "BENCH_SCALE=medium FUSIONDB_URL=http://127.0.0.1:8091/query python benchmark.py",
+      "status": "passed",
+      "details": "ORDER BY val DESC L50 averaged 13.48 ms versus TASK-124 medium baseline 16.33 ms."
+    }
+  ],
+  "benchmark": {
+    "medium": {
+      "bench_root": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task125-medium-20260526-112243",
+      "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task125-medium-20260526-112243\\benchmark_report_medium.json",
+      "rows_loaded": 50555,
+      "load_time_ms": 729,
+      "rows_per_second": 69340,
+      "order_by_val_desc_limit_50_avg_ms": 13.48,
+      "order_by_3_cols_avg_ms": 1.42,
+      "order_by_id_limit_50_avg_ms": 0.74,
+      "three_table_join_avg_ms": 40.91,
+      "revenue_by_category_avg_ms": 31.33
+    }
+  },
+  "notes": [
+    "TASK-124 medium baseline measured ORDER BY val DESC L50 at 16.33 ms.",
+    "The remaining dominant bottlenecks are JOIN and analytics aggregation paths."
+  ]
+}

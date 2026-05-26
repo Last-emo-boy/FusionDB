@@ -1,0 +1,2 @@
+id,status,summary,artifacts
+TASK-125,completed,"Optimized ORDER BY comparison for wildcard full-schema rows by using row-index sources and borrowed Values.","src/execution/query.rs"

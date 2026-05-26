@@ -344,6 +344,28 @@ impl Executor {
             })
     }
 
+    fn resolve_schema_order_value_index(
+        &self,
+        expr: &Expr,
+        schema: &TableSchema,
+        columns: &[String],
+    ) -> Option<usize> {
+        if let Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::Number(n, _),
+            ..
+        }) = expr
+        {
+            let index = n.parse::<usize>().ok()?.checked_sub(1)?;
+            if index < columns.len() && index < schema.columns.len() {
+                return Some(index);
+            }
+            return None;
+        }
+
+        let col_name = Self::order_limit_column_name(expr)?;
+        self.resolve_column_index(&col_name, schema).ok()
+    }
+
     fn evaluate_projection_order_value_source(
         &self,
         source: &ProjectionOrderValueSource<'_>,
@@ -368,10 +390,18 @@ impl Executor {
         expr: &'a Expr,
         projection: &'a [SelectItem],
         columns: &[String],
+        schema: &TableSchema,
         rows_are_projected: bool,
+        rows_are_full_schema: bool,
     ) -> SortOrderValueSource<'a> {
         if rows_are_projected {
             if let Some(index) = self.resolve_order_by_projection_index(expr, projection, columns) {
+                return SortOrderValueSource::RowIndex(index);
+            }
+        }
+
+        if rows_are_full_schema {
+            if let Some(index) = self.resolve_schema_order_value_index(expr, schema, columns) {
                 return SortOrderValueSource::RowIndex(index);
             }
         }
@@ -396,11 +426,12 @@ impl Executor {
         params: &[Value],
     ) -> Ordering {
         match source {
-            SortOrderValueSource::RowIndex(index) => {
-                let val_a = left.get(*index).cloned().unwrap_or(Value::Null);
-                let val_b = right.get(*index).cloned().unwrap_or(Value::Null);
-                self.compare_for_sort(&val_a, &val_b)
-            }
+            SortOrderValueSource::RowIndex(index) => match (left.get(*index), right.get(*index)) {
+                (Some(val_a), Some(val_b)) => self.compare_for_sort(val_a, val_b),
+                (Some(val_a), None) => self.compare_for_sort(val_a, &Value::Null),
+                (None, Some(val_b)) => self.compare_for_sort(&Value::Null, val_b),
+                (None, None) => Ordering::Equal,
+            },
             SortOrderValueSource::Projection {
                 source,
                 fallback_expr,
@@ -1101,6 +1132,7 @@ impl Executor {
                         sqlparser::ast::GroupByExpr::Expressions(ref group_exprs, _)
                             if !group_exprs.is_empty()
                     );
+                    let rows_are_full_schema = is_wildcard && !rows_are_projected;
                     let sort_keys: Vec<SortOrderKey<'_>> = exprs
                         .iter()
                         .map(|order_expr| SortOrderKey {
@@ -1108,7 +1140,9 @@ impl Executor {
                                 &order_expr.expr,
                                 projection,
                                 &columns,
+                                &schema,
                                 rows_are_projected,
+                                rows_are_full_schema,
                             ),
                             asc: order_expr.options.asc.unwrap_or(true),
                         })
