@@ -280,6 +280,45 @@ impl ScanVisitor for GroupAggregateScanVisitor<'_> {
     }
 }
 
+struct GroupCountScanVisitor<'a> {
+    group_column_index: usize,
+    predicate: Option<&'a ColumnPredicateScanPlan>,
+    counts: &'a mut HashMap<Value, i64>,
+    error: Option<FusionError>,
+}
+
+impl GroupCountScanVisitor<'_> {
+    fn visit_row(&mut self, data: &[u8]) -> Result<()> {
+        let predicate_value = Executor::decoded_predicate_value(data, self.predicate)?;
+        if let Some(predicate) = self.predicate {
+            if !predicate.matches_data(data, predicate_value.as_ref())? {
+                return Ok(());
+            }
+        }
+
+        let value = Executor::decode_column_or_reuse_predicate(
+            data,
+            self.group_column_index,
+            self.predicate,
+            predicate_value.as_ref(),
+        )?;
+        *self.counts.entry(value).or_insert(0) += 1;
+        Ok(())
+    }
+}
+
+impl ScanVisitor for GroupCountScanVisitor<'_> {
+    fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        match self.visit_row(value) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(err);
+                false
+            }
+        }
+    }
+}
+
 impl GroupColumnAggregateState {
     fn new(kind: GroupColumnAggregateKind) -> Self {
         Self {
@@ -845,24 +884,22 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         let prefix = format!("data:{}:", table_name);
-        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
-        let mut counts: HashMap<Value, i64> = HashMap::with_capacity(kv_pairs.len().min(4096));
+        let mut counts: HashMap<Value, i64> = HashMap::with_capacity(4096);
 
-        for (_, data) in kv_pairs {
-            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
-            if let Some(predicate) = predicate {
-                if !predicate.matches_data(&data, predicate_value.as_ref())? {
-                    continue;
-                }
-            }
-
-            let value = Self::decode_column_or_reuse_predicate(
-                &data,
-                column_index,
+        let scan_error = {
+            let mut visitor = GroupCountScanVisitor {
+                group_column_index: column_index,
                 predicate,
-                predicate_value.as_ref(),
-            )?;
-            *counts.entry(value).or_insert(0) += 1;
+                counts: &mut counts,
+                error: None,
+            };
+            txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
+                .await?;
+            visitor.error
+        };
+
+        if let Some(err) = scan_error {
+            return Err(err);
         }
 
         Ok(counts

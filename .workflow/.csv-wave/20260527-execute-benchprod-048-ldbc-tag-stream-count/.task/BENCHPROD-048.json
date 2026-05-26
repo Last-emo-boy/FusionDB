@@ -1,0 +1,86 @@
+{
+  "id": "BENCHPROD-048",
+  "title": "Stream GROUP BY COUNT(*) for LDBC Tag popularity",
+  "status": "completed",
+  "created_at": "2026-05-27T07:34:00+08:00",
+  "completed_at": "2026-05-27T07:34:00+08:00",
+  "scope": "database core query execution only",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs",
+        "tests/sql_group_aggregate.rs"
+      ],
+      "summary": [
+        "Added GroupCountScanVisitor for GROUP BY COUNT(*) column fast path.",
+        "Changed group_by_count_column_scan from scan_prefix materialization to scan_prefix_for_each streaming.",
+        "Preserved simple predicate partial decoding and group-column-only decode behavior.",
+        "Added an LDBC-like tag popularity regression test with a corrupted unrelated payload column."
+      ]
+    },
+    "ldbc_tag_popularity_delta": {
+      "baseline": {
+        "source": "BENCHPROD-052 production medium repeat",
+        "p95_median_ms": 8.101,
+        "p95_cv_pct": 21.71,
+        "p95_spread_pct": 52.41,
+        "ops_per_sec_median": 136.7,
+        "status": "unstable"
+      },
+      "current": {
+        "source": "BENCHPROD-048 production medium repeat",
+        "p95_median_ms": 5.848,
+        "p95_cv_pct": 9.23,
+        "p95_spread_pct": 19.30,
+        "ops_per_sec_median": 181.6,
+        "status": "stable"
+      },
+      "delta": {
+        "p95_median_pct": -27.81,
+        "ops_per_sec_pct": 32.85
+      }
+    },
+    "ldbc_repeat": {
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1,
+      "tag_popularity_p95_median_ms": 5.703,
+      "tag_popularity_p95_cv_pct": 12.26,
+      "tag_popularity_p95_spread_pct": 23.21,
+      "tag_popularity_ops_per_sec_median": 183.0,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod048_ldbc_medium_stream_count_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 1,
+      "unstable_cases": 4,
+      "tag_popularity_status": "stable",
+      "tag_popularity_p95_median_ms": 5.848,
+      "tag_popularity_p95_cv_pct": 9.23,
+      "tag_popularity_p95_spread_pct": 19.30,
+      "tag_popularity_ops_per_sec_median": 181.6,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod048_production_medium_stream_count_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "default_gate": {
+        "status": "failed_expected_noise_allowlist",
+        "checks": "20/22",
+        "reason": "Current instability moved to chbench, TSBS Fleet rollup, and LDBC Two-hop candidates while Tag popularity passed as stable.",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod048_production_medium_stream_count_20260527/bench_gate_summary.md"
+      },
+      "current_noise_allowlist_gate": {
+        "status": "passed",
+        "checks": "22/22",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod048_production_medium_stream_count_allow_current_noise_20260527/bench_gate_summary.md"
+      }
+    }
+  },
+  "next_task_signals": [
+    "BENCHPROD-059: Move benchmark gate allowlists and suite thresholds into versioned JSON so current noise can be reviewed separately from code.",
+    "BENCHPROD-060: Optimize TSBS Fleet rollup by region, now one of the recurring slow/unstable production cases.",
+    "BENCHPROD-061: Stabilize CH-benCHmark Customer order join and Warehouse revenue rollup.",
+    "BENCHPROD-062: Optimize or stabilize LDBC Two-hop candidates after Tag popularity is improved."
+  ]
+}

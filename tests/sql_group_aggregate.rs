@@ -582,6 +582,65 @@ async fn test_group_by_count_with_simple_where_uses_column_scan() {
 }
 
 #[tokio::test]
+async fn test_group_by_count_with_simple_where_streams_only_needed_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE ldbc_tags (id INTEGER PRIMARY KEY, creation_day INTEGER, tag TEXT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, creation_day, tag) in [
+            (1_i64, 10_i64, "old"),
+            (2, 30, "database"),
+            (3, 31, "graph"),
+            (4, 32, "database"),
+            (5, 33, "storage"),
+            (6, 34, "database"),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(creation_day),
+                Value::String(tag.to_string()),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:ldbc_tags:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT tag, COUNT(*) FROM ldbc_tags WHERE creation_day >= 30 GROUP BY tag ORDER BY COUNT(*) DESC LIMIT 2",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["tag", "COUNT(*)"]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        vec![Value::String("database".to_string()), Value::Integer(3)]
+    );
+    assert_eq!(rows[1][1], Value::Integer(1));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_group_by_aggregates_with_simple_where_uses_column_scan() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
