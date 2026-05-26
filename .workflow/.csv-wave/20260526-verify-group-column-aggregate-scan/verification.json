@@ -1,0 +1,26 @@
+{
+  "session_id": "20260526-verify-group-column-aggregate-scan",
+  "task_id": "TASK-133",
+  "status": "passed",
+  "verified_at": "2026-05-26T15:48:00+08:00",
+  "commands": [
+    {"command": "cargo fmt --check", "status": "passed"},
+    {"command": "cargo check --lib", "status": "passed"},
+    {"command": "cargo test --test sql_integration test_group_by_column_aggregates_fast_path -- --nocapture", "status": "passed", "tests": 2},
+    {"command": "cargo test --test sql_integration test_group_by_sum -- --nocapture", "status": "passed", "tests": 2},
+    {"command": "cargo test --test sql_integration -- --nocapture", "status": "passed", "tests": 160},
+    {"command": "cargo build --release", "status": "passed"},
+    {"command": "BENCH_SCALE=medium python benchmark.py", "status": "passed"}
+  ],
+  "benchmark_report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task133-group-agg-medium-20260526-154043\\benchmark_report_medium.json",
+  "benchmark_comparison": [
+    {"name": "Revenue by status", "before_ms": 5.174, "after_ms": 2.881, "speedup": 1.80},
+    {"name": "Avg balance by type", "before_ms": 0.985, "after_ms": 0.749, "speedup": 1.32},
+    {"name": "Category avg price", "before_ms": 1.183, "after_ms": 0.811, "speedup": 1.46},
+    {"name": "High-card GROUP BY", "before_ms": 3.236, "after_ms": 2.738, "speedup": 1.18},
+    {"name": "GROUP BY category", "before_ms": 5.672, "after_ms": 5.094, "speedup": 1.11},
+    {"name": "Daily volume", "before_ms": 3.415, "after_ms": 3.077, "speedup": 1.11},
+    {"name": "Best sellers (qty)", "before_ms": 13.958, "after_ms": 10.570, "speedup": 1.32},
+    {"name": "Event counts by type", "before_ms": 9.494, "after_ms": 9.081, "speedup": 1.04}
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "session_id": "maestro-20260526-154043",
+  "task_id": "TASK-133",
+  "title": "Optimize simple GROUP BY column aggregates",
+  "status": "completed",
+  "started_at": "2026-05-26T15:40:43+08:00",
+  "completed_at": "2026-05-26T15:48:00+08:00",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "non_goals": [
+    "dashboard/ui changes",
+    "GROUP BY with WHERE, HAVING, ORDER BY, LIMIT, or JOIN",
+    "aggregate expression arguments",
+    "cost-based optimizer"
+  ],
+  "verification": ".workflow/.csv-wave/20260526-verify-group-column-aggregate-scan/verification.json",
+  "benchmark_report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task133-group-agg-medium-20260526-154043\\benchmark_report_medium.json"
+}

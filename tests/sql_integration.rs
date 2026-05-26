@@ -1440,6 +1440,131 @@ async fn test_group_by_sum() {
 }
 
 #[tokio::test]
+async fn test_group_by_column_aggregates_fast_path_preserves_alias_and_nulls() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, category TEXT, amount INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO orders VALUES (1, 'A', 10), (2, 'A', 30), (3, 'B', 5), (4, NULL, 7)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT category AS cat, SUM(amount) AS total, AVG(amount) AS avg_amount, MIN(amount) AS min_amount, MAX(amount) AS max_amount, COUNT(*) AS n FROM orders GROUP BY category",
+    )
+    .await;
+
+    assert_eq!(
+        cols,
+        vec![
+            "cat",
+            "total",
+            "avg_amount",
+            "min_amount",
+            "max_amount",
+            "n"
+        ]
+    );
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| {
+        row == &vec![
+            Value::String("A".to_string()),
+            Value::Integer(40),
+            Value::Float(20.0),
+            Value::Integer(10),
+            Value::Integer(30),
+            Value::Integer(2),
+        ]
+    }));
+    assert!(rows.iter().any(|row| {
+        row == &vec![
+            Value::String("B".to_string()),
+            Value::Integer(5),
+            Value::Float(5.0),
+            Value::Integer(5),
+            Value::Integer(5),
+            Value::Integer(1),
+        ]
+    }));
+    assert!(rows.iter().any(|row| {
+        row == &vec![
+            Value::Null,
+            Value::Integer(7),
+            Value::Float(7.0),
+            Value::Integer(7),
+            Value::Integer(7),
+            Value::Integer(1),
+        ]
+    }));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_group_by_column_aggregates_fast_path_uses_only_group_and_aggregate_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE metrics (id INTEGER PRIMARY KEY, category TEXT, amount INTEGER, note TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, category, amount) in [(1_i64, "A", 10_i64), (2, "A", 20), (3, "B", 7)] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(category.to_string()),
+                Value::Integer(amount),
+                Value::String(format!("note-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:metrics:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT category, SUM(amount), COUNT(*) FROM metrics GROUP BY category",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| {
+        row == &vec![
+            Value::String("A".to_string()),
+            Value::Integer(30),
+            Value::Integer(2),
+        ]
+    }));
+    assert!(rows.iter().any(|row| {
+        row == &vec![
+            Value::String("B".to_string()),
+            Value::Integer(7),
+            Value::Integer(1),
+        ]
+    }));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_group_by_sum_multiply_expr() {
     let (executor, wal) = setup().await;
     exec_ok(

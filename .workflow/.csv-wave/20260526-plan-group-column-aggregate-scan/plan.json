@@ -1,0 +1,23 @@
+{
+  "session_id": "20260526-plan-group-column-aggregate-scan",
+  "task_id": "TASK-133",
+  "title": "Plan simple GROUP BY column aggregate scan",
+  "status": "completed",
+  "created_at": "2026-05-26T15:40:43+08:00",
+  "problem": "Simple GROUP BY column queries with SUM/AVG/MIN/MAX/COUNT still materialized rows and used generic group expression evaluation even when only the grouping column and aggregate argument columns were required.",
+  "approach": [
+    "Detect single-table GROUP BY one-column projections whose first projection is the group column and remaining projections are COUNT(*), SUM(column), AVG(column), MIN(column), or MAX(column).",
+    "Reject WHERE, JOIN, HAVING, ORDER BY, LIMIT, DISTINCT aggregates, and expression aggregate arguments.",
+    "Scan table rows and decode only the grouping column and aggregate argument columns.",
+    "Accumulate group aggregate states directly in a HashMap keyed by Value."
+  ],
+  "expected_impact": [
+    "Improve Revenue by status.",
+    "Improve Avg balance by type and Category avg price.",
+    "Reduce row materialization cost for simple GROUP BY analytics."
+  ],
+  "risk_controls": [
+    "Keep GROUP BY expressions, HAVING, ORDER BY, WHERE, JOIN, and SUM(expression) on the generic path.",
+    "Add SQL integration coverage for aliases, NULL groups, mixed aggregate functions, and corrupt unused columns."
+  ]
+}

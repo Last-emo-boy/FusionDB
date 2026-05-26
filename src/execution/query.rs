@@ -74,6 +74,123 @@ impl ColumnAggregateState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum GroupColumnAggregateKind {
+    CountStar,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+struct GroupColumnAggregateScanPlan {
+    kind: GroupColumnAggregateKind,
+    column_index: Option<usize>,
+    output_name: String,
+}
+
+struct GroupColumnAggregateState {
+    kind: GroupColumnAggregateKind,
+    count: i64,
+    sum: f64,
+    is_int: bool,
+    min: Option<Value>,
+    max: Option<Value>,
+}
+
+impl GroupColumnAggregateState {
+    fn new(kind: GroupColumnAggregateKind) -> Self {
+        Self {
+            kind,
+            count: 0,
+            sum: 0.0,
+            is_int: true,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn update_count_star(&mut self) {
+        self.count += 1;
+    }
+
+    fn update_value(&mut self, value: Value) {
+        match self.kind {
+            GroupColumnAggregateKind::CountStar => self.update_count_star(),
+            GroupColumnAggregateKind::Sum => match value {
+                Value::Integer(value) => {
+                    self.sum += value as f64;
+                    self.count += 1;
+                }
+                Value::Float(value) => {
+                    self.sum += value;
+                    self.count += 1;
+                    self.is_int = false;
+                }
+                _ => {}
+            },
+            GroupColumnAggregateKind::Avg => match value {
+                Value::Integer(value) => {
+                    self.sum += value as f64;
+                    self.count += 1;
+                }
+                Value::Float(value) => {
+                    self.sum += value;
+                    self.count += 1;
+                    self.is_int = false;
+                }
+                _ => {}
+            },
+            GroupColumnAggregateKind::Min => {
+                if value == Value::Null {
+                    return;
+                }
+                if self
+                    .min
+                    .as_ref()
+                    .is_none_or(|current| value.compare(current) == Ordering::Less)
+                {
+                    self.min = Some(value);
+                }
+            }
+            GroupColumnAggregateKind::Max => {
+                if value == Value::Null {
+                    return;
+                }
+                if self
+                    .max
+                    .as_ref()
+                    .is_none_or(|current| value.compare(current) == Ordering::Greater)
+                {
+                    self.max = Some(value);
+                }
+            }
+        }
+    }
+
+    fn finalize(&self) -> Value {
+        match self.kind {
+            GroupColumnAggregateKind::CountStar => Value::Integer(self.count),
+            GroupColumnAggregateKind::Sum => {
+                if self.is_int {
+                    Value::Integer(self.sum as i64)
+                } else {
+                    Value::Float(self.sum)
+                }
+            }
+            GroupColumnAggregateKind::Avg => {
+                if self.count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float(self.sum / self.count as f64)
+                }
+            }
+            GroupColumnAggregateKind::Min => self.min.clone().unwrap_or(Value::Null),
+            GroupColumnAggregateKind::Max => self.max.clone().unwrap_or(Value::Null),
+        }
+    }
+}
+
 enum ProjectionOrderValueSource<'a> {
     RowIndex(usize),
     Expr {
@@ -439,6 +556,144 @@ impl Executor {
         Ok(counts
             .into_iter()
             .map(|(value, count)| vec![value, Value::Integer(count)])
+            .collect())
+    }
+
+    fn simple_group_by_column_aggregate_projection(
+        projection: &[SelectItem],
+        group_exprs: &[Expr],
+        schema: &TableSchema,
+    ) -> Option<(usize, String, Vec<GroupColumnAggregateScanPlan>)> {
+        if projection.len() < 2 || group_exprs.len() != 1 {
+            return None;
+        }
+
+        let group_column_name = Self::order_limit_column_name(&group_exprs[0])?;
+        let group_column_index = schema
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(&group_column_name))?;
+
+        let output_group_name = match &projection[0] {
+            SelectItem::UnnamedExpr(expr) if expr == &group_exprs[0] => match expr {
+                Expr::Identifier(ident) => ident.value.clone(),
+                Expr::CompoundIdentifier(_) => schema.columns[group_column_index].name.clone(),
+                _ => return None,
+            },
+            SelectItem::ExprWithAlias { expr, alias } if expr == &group_exprs[0] => {
+                alias.value.clone()
+            }
+            _ => return None,
+        };
+
+        let mut aggregate_plans = Vec::with_capacity(projection.len() - 1);
+
+        for item in projection.iter().skip(1) {
+            let (func, output_name) = match item {
+                SelectItem::UnnamedExpr(Expr::Function(func)) => (func, format!("{}", func)),
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Function(func),
+                    alias,
+                } => (func, alias.value.clone()),
+                _ => return None,
+            };
+
+            let FunctionArguments::List(args) = &func.args else {
+                return None;
+            };
+            if args.duplicate_treatment.is_some() || args.args.len() != 1 {
+                return None;
+            }
+
+            let func_name = func.name.to_string().to_uppercase();
+            let (kind, column_index) = match func_name.as_str() {
+                "COUNT"
+                    if matches!(
+                        args.args[0],
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                    ) =>
+                {
+                    (GroupColumnAggregateKind::CountStar, None)
+                }
+                "SUM" => (
+                    GroupColumnAggregateKind::Sum,
+                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                ),
+                "AVG" => (
+                    GroupColumnAggregateKind::Avg,
+                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                ),
+                "MIN" => (
+                    GroupColumnAggregateKind::Min,
+                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                ),
+                "MAX" => (
+                    GroupColumnAggregateKind::Max,
+                    Some(Self::column_arg_index(&args.args[0], schema, None)?),
+                ),
+                _ => return None,
+            };
+
+            aggregate_plans.push(GroupColumnAggregateScanPlan {
+                kind,
+                column_index,
+                output_name,
+            });
+        }
+
+        Some((group_column_index, output_group_name, aggregate_plans))
+    }
+
+    async fn group_by_column_aggregate_scan(
+        &self,
+        table_name: &str,
+        group_column_index: usize,
+        aggregate_plans: &[GroupColumnAggregateScanPlan],
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<Vec<Value>>> {
+        let prefix = format!("data:{}:", table_name);
+        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let mut groups: HashMap<Value, Vec<GroupColumnAggregateState>> =
+            HashMap::with_capacity(kv_pairs.len().min(4096));
+
+        for (_, data) in kv_pairs {
+            let group_value =
+                crate::common::encoding::RowDecoder::decode_column(&data, group_column_index)
+                    .map_err(|e| {
+                        FusionError::Execution(format!("Data deserialization error: {}", e))
+                    })?
+                    .unwrap_or(Value::Null);
+
+            let states = groups.entry(group_value).or_insert_with(|| {
+                aggregate_plans
+                    .iter()
+                    .map(|plan| GroupColumnAggregateState::new(plan.kind))
+                    .collect()
+            });
+
+            for (state, plan) in states.iter_mut().zip(aggregate_plans.iter()) {
+                if let Some(column_index) = plan.column_index {
+                    let value =
+                        crate::common::encoding::RowDecoder::decode_column(&data, column_index)
+                            .map_err(|e| {
+                                FusionError::Execution(format!("Data deserialization error: {}", e))
+                            })?
+                            .unwrap_or(Value::Null);
+                    state.update_value(value);
+                } else {
+                    state.update_count_star();
+                }
+            }
+        }
+
+        Ok(groups
+            .into_iter()
+            .map(|(group_value, states)| {
+                let mut row = Vec::with_capacity(states.len() + 1);
+                row.push(group_value);
+                row.extend(states.iter().map(GroupColumnAggregateState::finalize));
+                row
+            })
             .collect())
     }
 
@@ -1386,6 +1641,29 @@ impl Executor {
                                         columns: vec![group_name, count_name],
                                         rows,
                                     });
+                                }
+
+                                if let Some((group_column_index, group_name, aggregate_plans)) =
+                                    Self::simple_group_by_column_aggregate_projection(
+                                        &select.projection,
+                                        group_exprs,
+                                        &schema,
+                                    )
+                                {
+                                    let mut columns = Vec::with_capacity(aggregate_plans.len() + 1);
+                                    columns.push(group_name);
+                                    columns.extend(
+                                        aggregate_plans.iter().map(|plan| plan.output_name.clone()),
+                                    );
+                                    let rows = self
+                                        .group_by_column_aggregate_scan(
+                                            &table_name_str,
+                                            group_column_index,
+                                            &aggregate_plans,
+                                            txn,
+                                        )
+                                        .await?;
+                                    return Ok(QueryResult::Select { columns, rows });
                                 }
                             }
                         }
