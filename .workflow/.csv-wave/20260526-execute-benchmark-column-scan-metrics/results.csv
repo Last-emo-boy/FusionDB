@@ -1,0 +1,2 @@
+id,title,status,findings,files_modified,tests_passed,error
+TASK-145,Benchmark column-scan fast path metrics,completed,"Added Part 9 Column-Scan Fast Paths to benchmark.py using existing bench/events tables; covers COUNT, COUNT DISTINCT WHERE, DISTINCT WHERE, MIN/MAX, STRING_AGG, and GROUP_CONCAT workloads.","benchmark.py","py_compile; count_distinct; select_distinct; bare_string; bare_min_max",

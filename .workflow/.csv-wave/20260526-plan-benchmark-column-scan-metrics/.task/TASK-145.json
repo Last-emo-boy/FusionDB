@@ -1,0 +1,31 @@
+{
+  "id": "TASK-145",
+  "title": "Benchmark column-scan fast path metrics",
+  "status": "completed",
+  "files": [
+    "benchmark.py"
+  ],
+  "description": "Add a dedicated benchmark section for recently optimized column-scan aggregate and DISTINCT SQL paths.",
+  "scope": {
+    "included": [
+      "benchmark.py"
+    ],
+    "excluded": [
+      "dashboard",
+      "ui",
+      "database execution semantics"
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "benchmark.py includes Part 9 — Column-Scan Fast Paths",
+      "Part 9 covers recent COUNT, COUNT DISTINCT, DISTINCT, MIN/MAX, STRING_AGG, and GROUP_CONCAT fast paths",
+      "benchmark.py compiles"
+    ]
+  },
+  "execution_directives": [
+    "Use E:\\\\Playground\\\\FusionDB\\\\target as CARGO_TARGET_DIR for Rust verification",
+    "Keep dashboard/UI untouched",
+    "Stage only files produced by TASK-145"
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "session": "20260526-plan-benchmark-column-scan-metrics",
+  "created_at": "2026-05-26T18:50:00+08:00",
+  "objective": "Extend benchmark coverage with dedicated column-scan fast path metrics for recent SQL optimizations.",
+  "scope": [
+    "benchmark.py"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database execution semantics"
+  ],
+  "tasks": [
+    {
+      "id": "TASK-145",
+      "title": "Benchmark column-scan fast path metrics",
+      "status": "planned",
+      "expected_changes": [
+        "Add a benchmark section for narrow column-scan aggregate and DISTINCT workloads.",
+        "Cover COUNT(column), COUNT(DISTINCT ... WHERE ...), DISTINCT ... WHERE ..., MIN/MAX, STRING_AGG, and GROUP_CONCAT.",
+        "Keep data setup unchanged by reusing existing benchmark tables."
+      ]
+    }
+  ],
+  "verification_plan": [
+    "python -m py_compile benchmark.py",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test count_distinct --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_distinct --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test bare_string --test sql_integration",
+    "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test bare_min_max --test sql_integration"
+  ]
+}

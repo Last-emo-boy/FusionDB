@@ -1,0 +1,37 @@
+{
+  "session": "20260526-verify-benchmark-column-scan-metrics",
+  "created_at": "2026-05-26T18:50:00+08:00",
+  "task_id": "TASK-145",
+  "status": "passed",
+  "checks": [
+    {
+      "name": "Python syntax",
+      "command": "python -m py_compile benchmark.py",
+      "status": "passed"
+    },
+    {
+      "name": "COUNT DISTINCT SQL coverage",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test count_distinct --test sql_integration",
+      "status": "passed",
+      "details": "5 passed"
+    },
+    {
+      "name": "DISTINCT SQL coverage",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test select_distinct --test sql_integration",
+      "status": "passed",
+      "details": "3 passed"
+    },
+    {
+      "name": "STRING_AGG SQL coverage",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test bare_string --test sql_integration",
+      "status": "passed",
+      "details": "1 passed"
+    },
+    {
+      "name": "MIN/MAX SQL coverage",
+      "command": "CARGO_TARGET_DIR=E:\\\\Playground\\\\FusionDB\\\\target CARGO_PROFILE_TEST_DEBUG=0 cargo test bare_min_max --test sql_integration",
+      "status": "passed",
+      "details": "2 passed"
+    }
+  ]
+}

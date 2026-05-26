@@ -35,6 +35,11 @@ All-in-one performance benchmark for FusionDB covering:
     Large transfer review, exposure rollups, failed-transfer audits,
     suspicious spend and activity patterns.
 
+  Part 9 — Column-Scan Fast Paths
+    Narrow aggregate and DISTINCT workloads that should avoid full-row
+    materialization: COUNT(column), COUNT(DISTINCT ... WHERE ...),
+    DISTINCT ... WHERE ..., MIN/MAX, STRING_AGG, GROUP_CONCAT.
+
 Usage:
     1. Start FusionDB:  cargo run
     2. Run benchmark:   python benchmark.py
@@ -747,6 +752,23 @@ def part8_risk_audit() -> List[BenchResult]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Part 9 — Column-Scan Fast Paths
+# ═══════════════════════════════════════════════════════════════════════════════
+def part9_column_scan_fast_paths() -> List[BenchResult]:
+    R, cat = [], "ColumnScan"
+
+    R.append(bench("Bare COUNT nullable", "SELECT COUNT(category) FROM bench", cat=cat))
+    R.append(bench("Bare COUNT with WHERE", "SELECT COUNT(category) FROM bench WHERE val >= 500", cat=cat))
+    R.append(bench("COUNT DISTINCT WHERE", "SELECT COUNT(DISTINCT user_id) FROM events WHERE event_type = 'click'", cat=cat))
+    R.append(bench("DISTINCT with WHERE", "SELECT DISTINCT category FROM bench WHERE val >= 500", cat=cat))
+    R.append(bench("Bare MIN/MAX numeric", "SELECT MIN(amount), MAX(amount) FROM bench", cat=cat))
+    R.append(bench("Bare STRING_AGG", "SELECT STRING_AGG(category) FROM bench WHERE val < 5", cat=cat))
+    R.append(bench("Bare GROUP_CONCAT", "SELECT GROUP_CONCAT(category) FROM bench WHERE val < 5", cat=cat))
+
+    return R
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Report Rendering
 # ═══════════════════════════════════════════════════════════════════════════════
 COL_W = 110
@@ -823,6 +845,7 @@ def main():
         ("Part 6 — Stress & Edge Cases",          part6_stress),
         ("Part 7 — Inventory & Fulfillment",      part7_inventory_fulfillment),
         ("Part 8 — Risk & Audit",                 part8_risk_audit),
+        ("Part 9 — Column-Scan Fast Paths",        part9_column_scan_fast_paths),
     ]
 
     print(f"{'═'*COL_W}")
