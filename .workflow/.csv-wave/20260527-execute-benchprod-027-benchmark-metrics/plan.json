@@ -1,0 +1,49 @@
+{
+  "session": "20260527-execute-benchprod-027-benchmark-metrics",
+  "created_at": "2026-05-27T03:03:00+08:00",
+  "objective": "Expand benchmark reporting metrics and record evidence for production-grade performance iteration.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/fusiondb_bench.py",
+    "E:/Playground/FusionDB-bench/fusiondb_matrix.py",
+    ".workflow/.csv-wave/20260527-execute-benchprod-027-benchmark-metrics"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database core changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-027",
+      "title": "Benchmark credibility report",
+      "status": "completed",
+      "expected_changes": [
+        "Expose p50/p90/p99/min/max/stddev/sample counts in benchmark Markdown reports.",
+        "Expose suite-level distribution averages in matrix JSON/Markdown reports.",
+        "Verify tiny and medium target-suite runs still pass."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "python -m py_compile fusiondb_bench.py fusiondb_matrix.py",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale tiny --suite memtier,tsbs --load-mode insert --allow-failures --run-name matrix_metrics_tiny_memtier_tsbs_20260527",
+      "status": "passed",
+      "suite_passed": 2,
+      "suite_failed": 0,
+      "case_passed": 8,
+      "case_failed": 0
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite memtier,tsbs --load-mode insert --allow-failures --run-name matrix_metrics_medium_memtier_tsbs_20260527",
+      "status": "passed",
+      "suite_passed": 2,
+      "suite_failed": 0,
+      "case_passed": 8,
+      "case_failed": 0
+    }
+  ]
+}

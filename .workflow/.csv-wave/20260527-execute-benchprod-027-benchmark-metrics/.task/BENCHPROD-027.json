@@ -1,0 +1,36 @@
+{
+  "id": "BENCHPROD-027",
+  "title": "Benchmark credibility report",
+  "status": "completed",
+  "area": "benchmark_ops",
+  "priority": "P2",
+  "files": [
+    "E:/Playground/FusionDB-bench/fusiondb_bench.py",
+    "E:/Playground/FusionDB-bench/fusiondb_matrix.py",
+    ".workflow/.csv-wave/20260527-execute-benchprod-027-benchmark-metrics/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-027-benchmark-metrics/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-027-benchmark-metrics/.task/BENCHPROD-027.json"
+  ],
+  "description": "Expand benchmark report metrics so optimizer/storage work can be judged with richer latency distribution evidence.",
+  "result": {
+    "completed_at": "2026-05-27T03:03:00+08:00",
+    "metrics_added": [
+      "p50_ms",
+      "p90_ms",
+      "p99_ms",
+      "min_ms",
+      "max_ms",
+      "stddev_ms",
+      "samples",
+      "suite avg_avg_ms",
+      "suite avg_p50_ms",
+      "suite avg_p90_ms",
+      "suite avg_p99_ms"
+    ],
+    "verification_reports": [
+      "E:/Playground/FusionDB-bench/runs/matrix_metrics_tiny_memtier_tsbs_20260527/matrix_summary.md",
+      "E:/Playground/FusionDB-bench/runs/matrix_metrics_medium_memtier_tsbs_20260527/matrix_summary.md"
+    ],
+    "database_core_changed": false
+  }
+}

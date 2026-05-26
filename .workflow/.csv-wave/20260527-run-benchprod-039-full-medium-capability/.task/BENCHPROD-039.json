@@ -1,0 +1,51 @@
+{
+  "id": "BENCHPROD-039",
+  "title": "Full medium benchmark capability snapshot",
+  "status": "completed",
+  "area": "benchmark_ops",
+  "priority": "P0",
+  "files": [
+    ".workflow/.csv-wave/20260527-run-benchprod-039-full-medium-capability/context.md",
+    ".workflow/.csv-wave/20260527-run-benchprod-039-full-medium-capability/plan.json",
+    ".workflow/.csv-wave/20260527-run-benchprod-039-full-medium-capability/.task/BENCHPROD-039.json"
+  ],
+  "description": "Run the full medium benchmark matrix after latest fixes and record what FusionDB can currently execute.",
+  "result": {
+    "completed_at": "2026-05-27T02:32:30+08:00",
+    "report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_full_observe_20260527/matrix_summary.md",
+    "scale": "medium",
+    "load_mode": "insert",
+    "suites": [
+      "ycsb",
+      "tpcc",
+      "tpch",
+      "search",
+      "memtier",
+      "tsbs",
+      "ldbc",
+      "ann",
+      "chbench"
+    ],
+    "passed_suites": 9,
+    "failed_suites": 0,
+    "passed_cases": 39,
+    "failed_cases": 0,
+    "slowest_cases": [
+      {
+        "suite": "tsbs",
+        "case": "Fleet rollup by region",
+        "p95_ms": 59.256
+      },
+      {
+        "suite": "ann",
+        "case": "HNSW nearest neighbor",
+        "p95_ms": 45.222
+      },
+      {
+        "suite": "chbench",
+        "case": "Customer order join",
+        "p95_ms": 36.301
+      }
+    ]
+  }
+}
