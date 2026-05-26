@@ -1,0 +1,12 @@
+{
+  "id": "BENCHPROD-044",
+  "title": "External benchmark artifact bootstrap",
+  "area": "benchmark_ops",
+  "priority": "P0",
+  "status": "completed",
+  "summary": "Added external_bootstrap.py to scan E:/Playground or configured roots for external benchmark binaries/artifacts and emit structured setup reports plus reviewable PowerShell env commands.",
+  "evidence": {
+    "script": "E:/Playground/FusionDB-bench/external_bootstrap.py",
+    "report": "E:/Playground/FusionDB-bench/runs/external_bootstrap_benchprod044_20260527/external_bootstrap_summary.json"
+  }
+}

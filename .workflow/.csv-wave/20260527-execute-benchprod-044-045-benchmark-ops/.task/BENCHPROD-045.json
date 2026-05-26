@@ -1,0 +1,12 @@
+{
+  "id": "BENCHPROD-045",
+  "title": "Benchmark trend and regression report",
+  "area": "benchmark_ops",
+  "priority": "P1",
+  "status": "completed",
+  "summary": "Added bench_trend.py to compare matrix_summary JSON files and flag p95, ops/sec, and error-count regressions at suite and case level.",
+  "evidence": {
+    "script": "E:/Playground/FusionDB-bench/bench_trend.py",
+    "report": "E:/Playground/FusionDB-bench/runs/trend_benchprod045_medium_20260527/bench_trend_summary.json"
+  }
+}
