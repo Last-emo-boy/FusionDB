@@ -1,0 +1,83 @@
+{
+  "id": "BENCHPROD-053",
+  "title": "Benchmark gate evaluator",
+  "status": "completed",
+  "created_at": "2026-05-27T07:24:00+08:00",
+  "completed_at": "2026-05-27T07:24:00+08:00",
+  "scope": "benchmark harness gate and workflow evidence only",
+  "results": {
+    "bench_repo_commit": "538c3bb feat: 增加benchmark门禁评估",
+    "new_tool": "E:/Playground/FusionDB-bench/bench_gate.py",
+    "default_profile": {
+      "scale": "medium",
+      "suite": "production",
+      "suites": [
+        "tpcc",
+        "memtier",
+        "tsbs",
+        "ldbc",
+        "chbench"
+      ],
+      "load_mode": "insert",
+      "min_repeats": 3,
+      "max_matrix_failures": 0,
+      "max_case_errors": 0,
+      "max_unstable_suites": 1,
+      "max_unstable_cases": 6,
+      "stability_metric": "median"
+    },
+    "default_thresholds": {
+      "suite_max_p95_ms": {
+        "tpcc": 5.0,
+        "memtier": 1.0,
+        "tsbs": 16.0,
+        "ldbc": 4.0,
+        "chbench": 18.0
+      },
+      "suite_min_ops_sec": {
+        "tpcc": 450.0,
+        "memtier": 1100.0,
+        "tsbs": 400.0,
+        "ldbc": 850.0,
+        "chbench": 200.0
+      },
+      "allowed_unstable_suites": [
+        "ldbc"
+      ],
+      "allowed_unstable_cases": [
+        "chbench:Warehouse revenue rollup",
+        "ldbc:Tag popularity",
+        "memtier:ADD new key",
+        "tpcc:Delivery status update",
+        "tpcc:Stock level query",
+        "tsbs:Ingest one point"
+      ]
+    },
+    "verification": {
+      "baseline_gate": {
+        "status": "passed",
+        "checks": "37/37",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod053_baseline_20260527/bench_gate_summary.md"
+      },
+      "expected_failure": {
+        "status": "failed as expected",
+        "checks": "21/22",
+        "failure": "stability.tsbs.p95 exceeded artificial 1 ms threshold",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod053_expected_fail_20260527/bench_gate_summary.md"
+      },
+      "tiny_smoke": {
+        "repeat_status": "passed",
+        "gate_status": "passed",
+        "checks": "22/22",
+        "repeat_report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod053_tiny_production_2x_20260527/bench_repeat_summary.md",
+        "gate_report": "E:/Playground/FusionDB-bench/runs/gate_benchprod053_tiny_smoke_20260527/bench_gate_summary.md"
+      }
+    }
+  },
+  "next_task_signals": [
+    "BENCHPROD-048: Use bench_gate.py while optimizing LDBC Tag popularity so regressions are caught immediately.",
+    "BENCHPROD-054: Add official benchmark adapter inventory and runnable smoke for BenchBase TPC-C or pgbench under E:/Playground.",
+    "BENCHPROD-058: Add CI/local profile wrappers for cargo build, bench_repeat.py, and bench_gate.py.",
+    "BENCHPROD-059: Split threshold configuration into versioned JSON once the gate starts tracking multiple profiles."
+  ]
+}
