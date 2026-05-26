@@ -1,0 +1,33 @@
+{
+  "session": "20260527-execute-benchprod-037-ann-recall",
+  "task": "BENCHPROD-037",
+  "title": "ANN recall and HNSW metric expansion",
+  "status": "completed",
+  "scope": [
+    "E:/Playground/FusionDB-bench/fusiondb_bench.py",
+    "E:/Playground/FusionDB-bench/fusiondb_matrix.py",
+    "E:/Playground/FusionDB-bench/README.md",
+    "E:/Playground/FusionDB/.workflow/.csv-wave/20260527-execute-benchprod-037-ann-recall"
+  ],
+  "waves": [
+    {
+      "id": 1,
+      "name": "implement-ann-recall-metrics",
+      "status": "completed"
+    },
+    {
+      "id": 2,
+      "name": "verify-ann-tiny-medium",
+      "status": "completed"
+    },
+    {
+      "id": 3,
+      "name": "record-workflow-evidence",
+      "status": "completed"
+    }
+  ],
+  "artifacts": {
+    "tiny_matrix": "E:/Playground/FusionDB-bench/runs/matrix_ann_tiny_after_benchprod037_20260527/matrix_summary.md",
+    "medium_matrix": "E:/Playground/FusionDB-bench/runs/matrix_ann_medium_after_benchprod037_20260527/matrix_summary.md"
+  }
+}

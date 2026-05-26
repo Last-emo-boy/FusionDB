@@ -1,0 +1,20 @@
+{
+  "id": "BENCHPROD-037",
+  "title": "ANN recall and HNSW metric expansion",
+  "area": "vector",
+  "priority": "P1",
+  "status": "completed",
+  "success_criteria": [
+    "ANN report includes recall@1 and recall@10 metrics",
+    "ANN report includes HNSW setup/search timing visibility",
+    "ANN medium matrix passes with 3/3 cases and 0 errors"
+  ],
+  "evidence": [
+    "E:/Playground/FusionDB-bench/runs/matrix_ann_tiny_after_benchprod037_20260527/matrix_summary.md",
+    "E:/Playground/FusionDB-bench/runs/matrix_ann_medium_after_benchprod037_20260527/matrix_summary.md",
+    "E:/Playground/FusionDB/.workflow/.csv-wave/20260527-execute-benchprod-037-ann-recall/context.md"
+  ],
+  "notes": [
+    "True persistent HNSW disk/memory index size is not exposed by FusionDB yet; benchmark records vector payload estimate and lazy first-search build timing."
+  ]
+}
