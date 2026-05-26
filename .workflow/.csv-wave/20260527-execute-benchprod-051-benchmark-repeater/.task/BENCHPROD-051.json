@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-051",
+  "title": "Benchmark matrix repeater",
+  "status": "completed",
+  "created_at": "2026-05-27T07:05:00+08:00",
+  "completed_at": "2026-05-27T07:05:00+08:00",
+  "scope": "benchmark harness and workflow evidence only",
+  "results": {
+    "tiny_production_repeat": {
+      "repeats": 2,
+      "suites": "5/5 per matrix",
+      "cases": "20 per matrix",
+      "matrix_passed": 2,
+      "matrix_failed": 0,
+      "case_errors": 0,
+      "stability_report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod051_tiny_production_2x_20260527/stability/bench_stability_summary.md",
+      "trend_report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod051_tiny_production_2x_20260527/trends/trend_01_to_02/bench_trend_summary.md",
+      "summary_report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod051_tiny_production_2x_20260527/bench_repeat_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "BENCHPROD-052: Run production medium repeat x3 as the new performance gate baseline.",
+    "BENCHPROD-048: Revisit LDBC tag popularity with repeat/stability gates.",
+    "BENCHPROD-049: Configure native pgbench or BenchBase under E:/Playground."
+  ]
+}
