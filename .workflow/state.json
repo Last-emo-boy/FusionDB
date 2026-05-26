@@ -1,9 +1,9 @@
 {
   "workflow_name": "FusionDB",
   "created_at": "2026-05-25T01:15:27.4681925+08:00",
-  "updated_at": "2026-05-26T11:40:18+08:00",
+  "updated_at": "2026-05-26T12:13:50+08:00",
   "current_phase": "database-core-performance",
-  "current_session": ".workflow/.maestro/maestro-20260526-114018",
+  "current_session": ".workflow/.maestro/maestro-20260526-121343",
   "constraints": [
     "Only iterate database core; do not modify dashboard/"
   ],
@@ -1155,6 +1155,16 @@
     },
     {
       "path": ".workflow/.csv-wave/20260526-verify-join-probe-delay-right-scan/verification.json",
+      "type": "verification",
+      "status": "passed"
+    },
+    {
+      "path": ".workflow/.maestro/maestro-20260526-121343/status.json",
+      "type": "maestro-session",
+      "status": "completed"
+    },
+    {
+      "path": ".workflow/.csv-wave/20260526-verify-group-by-aggregate-fastpath/verification.json",
       "type": "verification",
       "status": "passed"
     }

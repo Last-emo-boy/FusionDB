@@ -1408,6 +1408,38 @@ async fn test_group_by_sum() {
     cleanup(&wal);
 }
 
+#[tokio::test]
+async fn test_group_by_sum_multiply_expr() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT, quantity INTEGER, unit_price INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO items VALUES (1, 'A', 2, 10), (2, 'A', 3, 20), (3, 'B', 4, 5)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT category, SUM(quantity * unit_price) FROM items GROUP BY category ORDER BY category",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        vec![Value::String("A".to_string()), Value::Integer(80)]
+    );
+    assert_eq!(
+        rows[1],
+        vec![Value::String("B".to_string()), Value::Integer(20)]
+    );
+    cleanup(&wal);
+}
+
 // ==================== JOIN Tests ====================
 
 #[tokio::test]

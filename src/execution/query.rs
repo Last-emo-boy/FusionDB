@@ -32,6 +32,59 @@ struct SortOrderKey<'a> {
     asc: bool,
 }
 
+enum RowValueSource<'a> {
+    One,
+    Column(usize),
+    Literal(Value),
+    MultiplyColumns(usize, usize),
+    Expr(&'a Expr),
+}
+
+impl<'a> RowValueSource<'a> {
+    fn evaluate(
+        &self,
+        executor: &Executor,
+        row: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Value {
+        match self {
+            RowValueSource::One => Value::Integer(1),
+            RowValueSource::Column(index) => row.get(*index).cloned().unwrap_or(Value::Null),
+            RowValueSource::Literal(value) => value.clone(),
+            RowValueSource::MultiplyColumns(left_idx, right_idx) => {
+                let Some(left) = row.get(*left_idx) else {
+                    return Value::Null;
+                };
+                let Some(right) = row.get(*right_idx) else {
+                    return Value::Null;
+                };
+
+                match (left, right) {
+                    (Value::Integer(left), Value::Integer(right)) => Value::Integer(*left * *right),
+                    (Value::Integer(left), Value::Float(right)) => {
+                        Value::Float(*left as f64 * *right)
+                    }
+                    (Value::Float(left), Value::Integer(right)) => {
+                        Value::Float(*left * *right as f64)
+                    }
+                    (Value::Float(left), Value::Float(right)) => Value::Float(*left * *right),
+                    _ => Value::Null,
+                }
+            }
+            RowValueSource::Expr(expr) => executor
+                .evaluate_value(expr, row, schema, params)
+                .unwrap_or(Value::Null),
+        }
+    }
+}
+
+struct GroupAggregatePlan<'a> {
+    expr: Expr,
+    func_name: String,
+    arg_source: RowValueSource<'a>,
+}
+
 impl Executor {
     fn order_limit_column_name(expr: &Expr) -> Option<String> {
         match expr {
@@ -219,6 +272,104 @@ impl Executor {
             .columns
             .iter()
             .position(|col| col.name.eq_ignore_ascii_case(col_name))
+    }
+
+    fn row_value_source_for_expr<'a>(
+        &'a self,
+        expr: &'a Expr,
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> RowValueSource<'a> {
+        match expr {
+            Expr::Identifier(ident) => self
+                .resolve_column_index(&ident.value, schema)
+                .map(RowValueSource::Column)
+                .unwrap_or(RowValueSource::Expr(expr)),
+            Expr::CompoundIdentifier(_) => Self::order_limit_column_name(expr)
+                .and_then(|name| self.resolve_column_index(&name, schema).ok())
+                .map(RowValueSource::Column)
+                .unwrap_or(RowValueSource::Expr(expr)),
+            Expr::Nested(inner) => self.row_value_source_for_expr(inner, schema, params),
+            Expr::Value(value) => {
+                if let sqlparser::ast::Value::Placeholder(p) = &value.value {
+                    let idx = Self::placeholder_index(p);
+                    if idx > 0 && idx <= params.len() {
+                        RowValueSource::Literal(params[idx - 1].clone())
+                    } else {
+                        RowValueSource::Expr(expr)
+                    }
+                } else {
+                    RowValueSource::Literal(self.sql_value_to_fusion_value(&value.value))
+                }
+            }
+            Expr::BinaryOp {
+                left,
+                op: sqlparser::ast::BinaryOperator::Multiply,
+                right,
+            } => {
+                match (
+                    self.row_value_source_for_expr(left, schema, params),
+                    self.row_value_source_for_expr(right, schema, params),
+                ) {
+                    (RowValueSource::Column(left_idx), RowValueSource::Column(right_idx)) => {
+                        RowValueSource::MultiplyColumns(left_idx, right_idx)
+                    }
+                    _ => RowValueSource::Expr(expr),
+                }
+            }
+            _ => RowValueSource::Expr(expr),
+        }
+    }
+
+    fn aggregate_arg_source<'a>(
+        &'a self,
+        func: &'a sqlparser::ast::Function,
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> RowValueSource<'a> {
+        let FunctionArguments::List(args) = &func.args else {
+            return RowValueSource::Literal(Value::Null);
+        };
+
+        match args.args.first() {
+            None | Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => RowValueSource::One,
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) => {
+                self.row_value_source_for_expr(expr, schema, params)
+            }
+            _ => RowValueSource::Literal(Value::Null),
+        }
+    }
+
+    fn compile_group_key_sources<'a>(
+        &'a self,
+        group_exprs: &'a [Expr],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Vec<RowValueSource<'a>> {
+        group_exprs
+            .iter()
+            .map(|expr| self.row_value_source_for_expr(expr, schema, params))
+            .collect()
+    }
+
+    fn compile_group_aggregate_plans<'a>(
+        &'a self,
+        aggregates: &'a [(Expr, String)],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Vec<GroupAggregatePlan<'a>> {
+        aggregates
+            .iter()
+            .map(|(expr, func_name)| GroupAggregatePlan {
+                expr: expr.clone(),
+                func_name: func_name.clone(),
+                arg_source: if let Expr::Function(func) = expr {
+                    self.aggregate_arg_source(func, schema, params)
+                } else {
+                    RowValueSource::Expr(expr)
+                },
+            })
+            .collect()
     }
 
     fn primary_key_arg_index(
@@ -998,6 +1149,11 @@ impl Executor {
                         self.extract_aggregates_from_expr(having, &mut aggregates);
                     }
 
+                    let group_key_sources =
+                        self.compile_group_key_sources(group_exprs, &schema, params);
+                    let aggregate_plans =
+                        self.compile_group_aggregate_plans(&aggregates, &schema, params);
+
                     let mut groups: std::collections::HashMap<
                         Vec<Value>,
                         Vec<AggregateAccumulator>,
@@ -1005,43 +1161,20 @@ impl Executor {
 
                     for row in rows {
                         let mut group_key = Vec::with_capacity(group_exprs.len());
-                        for expr in group_exprs {
-                            let val = self
-                                .evaluate_value(expr, &row, &schema, params)
-                                .unwrap_or(Value::Null);
-                            group_key.push(val);
+                        for source in &group_key_sources {
+                            group_key.push(source.evaluate(self, &row, &schema, params));
                         }
 
                         let accs = groups.entry(group_key).or_insert_with(|| {
-                            aggregates
+                            aggregate_plans
                                 .iter()
-                                .map(|(_, name)| AggregateAccumulator::new(name))
+                                .map(|plan| AggregateAccumulator::new(&plan.func_name))
                                 .collect()
                         });
 
-                        for (i, (expr, _)) in aggregates.iter().enumerate() {
-                            if let Expr::Function(func) = expr {
-                                let arg_val = if let FunctionArguments::List(args) = &func.args {
-                                    if args.args.is_empty() {
-                                        Value::Integer(1)
-                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) =
-                                        &args.args[0]
-                                    {
-                                        Value::Integer(1)
-                                    } else if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) =
-                                        &args.args[0]
-                                    {
-                                        self.evaluate_value(e, &row, &schema, params)
-                                            .unwrap_or(Value::Null)
-                                    } else {
-                                        Value::Null
-                                    }
-                                } else {
-                                    Value::Null
-                                };
-
-                                accs[i].update(&arg_val);
-                            }
+                        for (i, plan) in aggregate_plans.iter().enumerate() {
+                            let arg_val = plan.arg_source.evaluate(self, &row, &schema, params);
+                            accs[i].update(&arg_val);
                         }
                     }
 
@@ -1050,8 +1183,8 @@ impl Executor {
                     for (group_key, accs) in groups {
                         let mut agg_map =
                             std::collections::HashMap::with_capacity(aggregates.len());
-                        for (i, (expr, _)) in aggregates.iter().enumerate() {
-                            agg_map.insert(expr.clone(), accs[i].finalize());
+                        for (i, plan) in aggregate_plans.iter().enumerate() {
+                            agg_map.insert(plan.expr.clone(), accs[i].finalize());
                         }
 
                         if let Some(having) = &select.having {

@@ -1,0 +1,31 @@
+{
+  "session_id": "20260526-plan-group-by-aggregate-fastpath",
+  "task_id": "TASK-127",
+  "title": "Optimize GROUP BY aggregate hot path",
+  "status": "completed",
+  "created_at": "2026-05-26T12:13:43+08:00",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "TASK-127"
+      ]
+    }
+  ],
+  "requirements": [
+    "Do not modify dashboard/",
+    "Preserve GROUP BY and COUNT(DISTINCT) semantics",
+    "Verify with focused integration tests, release build, and medium benchmark"
+  ],
+  "expected_benchmark_impact": [
+    "Best sellers (qty)",
+    "Revenue by category",
+    "Event counts by type",
+    "High-card GROUP BY",
+    "Unique active users"
+  ]
+}

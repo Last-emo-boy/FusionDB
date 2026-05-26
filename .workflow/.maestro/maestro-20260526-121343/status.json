@@ -1,0 +1,21 @@
+{
+  "session_id": "maestro-20260526-121343",
+  "task_id": "TASK-127",
+  "title": "GROUP BY aggregate fast path",
+  "phase": "database-core-performance",
+  "status": "completed",
+  "started_at": "2026-05-26T12:13:43+08:00",
+  "completed_at": "2026-05-26T12:13:50+08:00",
+  "constraints": [
+    "Only iterate database core; do not modify dashboard/"
+  ],
+  "artifacts": [
+    ".workflow/.csv-wave/20260526-plan-group-by-aggregate-fastpath/plan.json",
+    ".workflow/.csv-wave/20260526-execute-group-by-aggregate-fastpath/tasks.csv",
+    ".workflow/.csv-wave/20260526-execute-group-by-aggregate-fastpath/results.csv",
+    ".workflow/.csv-wave/20260526-execute-group-by-aggregate-fastpath/context.md",
+    ".workflow/.csv-wave/20260526-verify-group-by-aggregate-fastpath/verification.json",
+    ".workflow/.csv-wave/20260526-verify-group-by-aggregate-fastpath/context.md"
+  ],
+  "summary": "Compiled GROUP BY key and aggregate argument row-value sources so simple column grouping, COUNT(*), simple column aggregates, and column multiplication aggregates avoid repeated generic expression evaluation."
+}

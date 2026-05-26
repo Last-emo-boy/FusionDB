@@ -1,0 +1,55 @@
+{
+  "session_id": "20260526-verify-group-by-aggregate-fastpath",
+  "task_id": "TASK-127",
+  "title": "Verify GROUP BY aggregate fast path",
+  "status": "passed",
+  "verified_at": "2026-05-26T12:13:50+08:00",
+  "commands": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_integration group_by -- --nocapture",
+      "status": "passed",
+      "tests": "4 passed"
+    },
+    {
+      "command": "cargo test --test sql_integration count_distinct -- --nocapture",
+      "status": "passed",
+      "tests": "1 passed"
+    },
+    {
+      "command": "cargo build --release",
+      "status": "passed",
+      "note": "Initial release build timed out while background compilation continued; a follow-up release build completed successfully."
+    },
+    {
+      "command": "BENCH_SCALE=medium python benchmark.py",
+      "status": "passed",
+      "report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task127-medium-20260526-121343\\benchmark_report_medium.json"
+    }
+  ],
+  "benchmark": {
+    "scale": "medium",
+    "rows_loaded": 50555,
+    "load_time_ms": 689.17,
+    "key_results_ms": {
+      "GROUP BY category": 11.25,
+      "GROUP BY + HAVING": 10.39,
+      "Revenue by category": 26.50,
+      "Best sellers (qty)": 10.72,
+      "Event counts by type": 9.38,
+      "Unique active users": 9.33,
+      "High-card GROUP BY": 5.87
+    },
+    "baseline_notes": [
+      "TASK-126 medium reported Best sellers (qty) around 13.80ms and Revenue by category around 27.85ms.",
+      "TASK-127 medium measured Best sellers (qty) at 10.72ms and Revenue by category at 26.50ms."
+    ]
+  }
+}
