@@ -27,6 +27,14 @@ All-in-one performance benchmark for FusionDB covering:
     Wide IN lists, multi-column ORDER BY, high-cardinality GROUP BY,
     3-table JOINs, bulk UPDATE/DELETE, UNION queries.
 
+  Part 7 — Inventory & Fulfillment
+    Stock availability, replenishment candidates, shipment queues,
+    cart reservation checks, restock writes.
+
+  Part 8 — Risk & Audit
+    Large transfer review, exposure rollups, failed-transfer audits,
+    suspicious spend and activity patterns.
+
 Usage:
     1. Start FusionDB:  cargo run
     2. Run benchmark:   python benchmark.py
@@ -98,11 +106,21 @@ class BenchResult:
     row_count: int = 0
     error: Optional[str] = None
     note: str = ""
+    planned_iters: int = 0
+    warmup_iters: int = 0
+    errors: List[str] = field(default_factory=list)
+    total_ops: int = 0
+    wall_ms: float = 0
+    throughput_ops_sec: float = 0
 
     @property
     def avg(self):  return statistics.mean(self.times_ms) if self.times_ms else 0
     @property
     def p50(self):  return statistics.median(self.times_ms) if self.times_ms else 0
+    @property
+    def p90(self):
+        if len(self.times_ms) < 2: return self.avg
+        s = sorted(self.times_ms); return s[min(int(len(s)*0.90), len(s)-1)]
     @property
     def p95(self):
         if len(self.times_ms) < 2: return self.avg
@@ -119,6 +137,32 @@ class BenchResult:
     def ops_sec(self): return 1000.0 / self.avg if self.avg > 0 else 0
     @property
     def total_ms(self): return sum(self.times_ms)
+    @property
+    def stddev_ms(self): return statistics.pstdev(self.times_ms) if len(self.times_ms) > 1 else 0
+    @property
+    def cv_pct(self): return (self.stddev_ms / self.avg * 100) if self.avg > 0 else 0
+    @property
+    def mad_ms(self):
+        if not self.times_ms: return 0
+        med = self.p50
+        return statistics.median([abs(x - med) for x in self.times_ms])
+    @property
+    def rows_sec(self): return self.row_count / max(self.avg / 1000, 0.001) if self.row_count else 0
+    @property
+    def success_count(self): return len(self.times_ms)
+    @property
+    def error_count(self): return len(self.errors) if self.errors else (1 if self.error else 0)
+
+    def record(self, res, ms, capture_rows=True):
+        if not res or res.get("status") == "error":
+            msg = str((res or {}).get("error") or "unknown error")
+            self.error = self.error or msg
+            self.errors.append(msg)
+            return False
+        self.times_ms.append(ms)
+        if capture_rows:
+            self.row_count = rows(res)
+        return True
 
 
 def sql(query: str, silent=True) -> Tuple[Optional[dict], float]:
@@ -159,14 +203,12 @@ def rows(res):
 def bench(name, query, iters=None, warmup=None, cat=""):
     iters  = iters  or C["iters"]
     warmup = warmup or C["warmup"]
-    r = BenchResult(name=name, category=cat)
+    r = BenchResult(name=name, category=cat, planned_iters=iters, warmup_iters=warmup)
     for _ in range(warmup): sql(query)
     for _ in range(iters):
         res, ms = sql(query)
-        if res and res.get("status") == "error":
-            r.error = str(res.get("error") or "unknown error"); break
-        r.times_ms.append(ms)
-        r.row_count = rows(res)
+        if not r.record(res, ms):
+            break
     return r
 
 def insert_batch(table, values_list):
@@ -363,16 +405,17 @@ def part1_base() -> List[BenchResult]:
     for label, tpl in [("Single INSERT", "INSERT INTO bench VALUES ({rid},999,'bw',0)"),
                         ("Single UPDATE", "UPDATE bench SET val=0 WHERE id={rid}"),
                         ("Single DELETE", "DELETE FROM bench WHERE id={rid}")]:
-        r = BenchResult(name=label, category=cat)
+        r = BenchResult(name=label, category=cat, planned_iters=C["iters"])
         for i in range(C["iters"]):
             rid = N + 200000 + i
             if label == "Single INSERT":
-                _, ms = sql(tpl.format(rid=rid))
+                res, ms = sql(tpl.format(rid=rid))
             elif label == "Single UPDATE":
-                _, ms = sql(tpl.format(rid=N + 200000 + i))
+                res, ms = sql(tpl.format(rid=N + 200000 + i))
             else:
-                _, ms = sql(tpl.format(rid=N + 200000 + i))
-            r.times_ms.append(ms)
+                res, ms = sql(tpl.format(rid=N + 200000 + i))
+            if not r.record(res, ms, capture_rows=False):
+                break
         R.append(r)
 
     # Complex filters
@@ -410,32 +453,36 @@ def part2_ecommerce() -> List[BenchResult]:
     R.append(bench("Orders by status",    "SELECT * FROM orders WHERE status = 'shipped' LIMIT 50", cat=cat))
 
     # Write: place order
-    r = BenchResult(name="Place order (INSERT)", category=cat)
+    r = BenchResult(name="Place order (INSERT)", category=cat, planned_iters=C["iters"])
     for i in range(C["iters"]):
         oid = no + 100000 + i
-        _, ms = sql(f"INSERT INTO orders VALUES ({oid},{random.randint(0,nu-1)},'pending',{round(random.uniform(20,1000),2)},1300)")
-        r.times_ms.append(ms)
+        res, ms = sql(f"INSERT INTO orders VALUES ({oid},{random.randint(0,nu-1)},'pending',{round(random.uniform(20,1000),2)},1300)")
+        if not r.record(res, ms, capture_rows=False):
+            break
     R.append(r)
 
     # Write: update order status
-    r = BenchResult(name="Confirm order (UPDATE)", category=cat)
+    r = BenchResult(name="Confirm order (UPDATE)", category=cat, planned_iters=C["iters"])
     for i in range(C["iters"]):
-        _, ms = sql(f"UPDATE orders SET status = 'confirmed' WHERE id = {no+100000+i}")
-        r.times_ms.append(ms)
+        res, ms = sql(f"UPDATE orders SET status = 'confirmed' WHERE id = {no+100000+i}")
+        if not r.record(res, ms, capture_rows=False):
+            break
     R.append(r)
 
     # Write: cancel order
-    r = BenchResult(name="Cancel order (UPDATE)", category=cat)
+    r = BenchResult(name="Cancel order (UPDATE)", category=cat, planned_iters=C["iters"])
     for i in range(C["iters"]):
-        _, ms = sql(f"UPDATE orders SET status = 'cancelled' WHERE id = {no+100000+i}")
-        r.times_ms.append(ms)
+        res, ms = sql(f"UPDATE orders SET status = 'cancelled' WHERE id = {no+100000+i}")
+        if not r.record(res, ms, capture_rows=False):
+            break
     R.append(r)
 
     # Write: deduct stock
-    r = BenchResult(name="Deduct stock (UPDATE)", category=cat)
+    r = BenchResult(name="Deduct stock (UPDATE)", category=cat, planned_iters=C["iters"])
     for i in range(C["iters"]):
-        _, ms = sql(f"UPDATE products SET stock = stock - 1 WHERE id = {random.randint(0,np_-1)}")
-        r.times_ms.append(ms)
+        res, ms = sql(f"UPDATE products SET stock = stock - 1 WHERE id = {random.randint(0,np_-1)}")
+        if not r.record(res, ms, capture_rows=False):
+            break
     R.append(r)
 
     return R
@@ -457,19 +504,21 @@ def part3_financial() -> List[BenchResult]:
     R.append(bench("Daily volume",        "SELECT transfer_day, COUNT(*), SUM(amount) FROM transfers GROUP BY transfer_day ORDER BY transfer_day DESC LIMIT 30", cat=cat))
 
     # Write: execute transfer
-    r = BenchResult(name="Record transfer (INS)", category=cat)
+    r = BenchResult(name="Record transfer (INS)", category=cat, planned_iters=C["iters"])
     base_tid = C["transfers"] + 100000
     for i in range(C["iters"]):
         s = random.randint(0,na-1); d = random.randint(0,na-1)
-        _, ms = sql(f"INSERT INTO transfers VALUES ({base_tid+i},{s},{d},{round(random.uniform(10,1000),2)},'completed',1400)")
-        r.times_ms.append(ms)
+        res, ms = sql(f"INSERT INTO transfers VALUES ({base_tid+i},{s},{d},{round(random.uniform(10,1000),2)},'completed',1400)")
+        if not r.record(res, ms, capture_rows=False):
+            break
     R.append(r)
 
     # Write: debit account
-    r = BenchResult(name="Debit account (UPD)", category=cat)
+    r = BenchResult(name="Debit account (UPD)", category=cat, planned_iters=C["iters"])
     for i in range(C["iters"]):
-        _, ms = sql(f"UPDATE accounts SET balance = balance - 10 WHERE id = {random.randint(0,na-1)}")
-        r.times_ms.append(ms)
+        res, ms = sql(f"UPDATE accounts SET balance = balance - 10 WHERE id = {random.randint(0,na-1)}")
+        if not r.record(res, ms, capture_rows=False):
+            break
     R.append(r)
 
     R.append(bench("Total bank balance",  "SELECT SUM(balance) FROM accounts", cat=cat))
@@ -518,31 +567,39 @@ def part5_concurrent() -> List[BenchResult]:
 
     def read_op():
         c = random.random()
-        if   c < 0.25: sql(f"SELECT * FROM users WHERE id = {random.randint(0,nu-1)}")
-        elif c < 0.45: sql(f"SELECT * FROM products WHERE category = '{CATEGORIES[random.randint(0,len(CATEGORIES)-1)]}' LIMIT 10")
-        elif c < 0.65: sql(f"SELECT * FROM orders WHERE user_id = {random.randint(0,nu-1)} LIMIT 5")
-        elif c < 0.80: sql("SELECT status, COUNT(*) FROM orders GROUP BY status")
-        elif c < 0.90: sql("SELECT SUM(total) FROM orders WHERE status = 'delivered'")
-        else:          sql(f"SELECT * FROM events WHERE event_type = '{EVENT_TYPES[random.randint(0,len(EVENT_TYPES)-1)]}' LIMIT 20")
+        if   c < 0.25: res, _ = sql(f"SELECT * FROM users WHERE id = {random.randint(0,nu-1)}")
+        elif c < 0.45: res, _ = sql(f"SELECT * FROM products WHERE category = '{CATEGORIES[random.randint(0,len(CATEGORIES)-1)]}' LIMIT 10")
+        elif c < 0.65: res, _ = sql(f"SELECT * FROM orders WHERE user_id = {random.randint(0,nu-1)} LIMIT 5")
+        elif c < 0.80: res, _ = sql("SELECT status, COUNT(*) FROM orders GROUP BY status")
+        elif c < 0.90: res, _ = sql("SELECT SUM(total) FROM orders WHERE status = 'delivered'")
+        else:          res, _ = sql(f"SELECT * FROM events WHERE event_type = '{EVENT_TYPES[random.randint(0,len(EVENT_TYPES)-1)]}' LIMIT 20")
+        return res
 
     def write_op(wid, idx):
         c = random.random()
         oid = 800000 + wid * 10000 + idx
-        if   c < 0.40: sql(f"INSERT INTO orders VALUES ({oid},{random.randint(0,nu-1)},'pending',{round(random.uniform(10,500),2)},1400)")
-        elif c < 0.65: sql(f"UPDATE products SET stock = stock - 1 WHERE id = {random.randint(0,np_-1)}")
-        elif c < 0.85: sql(f"UPDATE orders SET status = 'confirmed' WHERE id = {random.randint(0,no-1)}")
-        else:          sql(f"INSERT INTO events VALUES ({700000+wid*10000+idx},{random.randint(0,nu-1)},'click',{1700000000+random.randint(0,86400*30)})")
+        if   c < 0.40: res, _ = sql(f"INSERT INTO orders VALUES ({oid},{random.randint(0,nu-1)},'pending',{round(random.uniform(10,500),2)},1400)")
+        elif c < 0.65: res, _ = sql(f"UPDATE products SET stock = stock - 1 WHERE id = {random.randint(0,np_-1)}")
+        elif c < 0.85: res, _ = sql(f"UPDATE orders SET status = 'confirmed' WHERE id = {random.randint(0,no-1)}")
+        else:          res, _ = sql(f"INSERT INTO events VALUES ({700000+wid*10000+idx},{random.randint(0,nu-1)},'click',{1700000000+random.randint(0,86400*30)})")
+        return res
 
     def run_mixed(name, read_pct):
-        lats = []; lock = threading.Lock()
+        lats = []; errors = []; lock = threading.Lock()
         def worker(wid):
-            local = []
+            local_lats = []; local_errors = []
             for i in range(ops_per):
                 t0 = time.perf_counter()
-                if random.random() < read_pct: read_op()
-                else: write_op(wid, i)
-                local.append((time.perf_counter()-t0)*1000)
-            with lock: lats.extend(local)
+                if random.random() < read_pct: res = read_op()
+                else: res = write_op(wid, i)
+                ms = (time.perf_counter()-t0)*1000
+                if not res or res.get("status") == "error":
+                    local_errors.append(str((res or {}).get("error") or "unknown error"))
+                else:
+                    local_lats.append(ms)
+            with lock:
+                lats.extend(local_lats)
+                errors.extend(local_errors)
 
         t0 = time.perf_counter()
         threads = [threading.Thread(target=worker, args=(w,)) for w in range(nw)]
@@ -553,7 +610,14 @@ def part5_concurrent() -> List[BenchResult]:
         r = BenchResult(name=name, category=cat); r.times_ms = lats
         total_ops = nw * ops_per
         throughput = total_ops / max(wall/1000, 0.001)
-        r.note = f"{total_ops} ops | {nw} threads | wall {wall:.0f}ms | {throughput:.0f} ops/s"
+        r.planned_iters = total_ops
+        r.total_ops = total_ops
+        r.wall_ms = wall
+        r.throughput_ops_sec = throughput
+        r.errors = errors
+        if errors:
+            r.error = errors[0]
+        r.note = f"{total_ops} ops | {nw} threads | wall {wall:.0f}ms | {throughput:.0f} ops/s | errors {len(errors)}"
         return r
 
     R.append(run_mixed("Read-heavy  (80:20)", 0.80))
@@ -586,9 +650,9 @@ def part6_stress() -> List[BenchResult]:
     R.append(bench("COUNT all events",    "SELECT COUNT(*) FROM events", cat=cat))
 
     # Bulk UPDATE + restore
-    r = BenchResult(name="Bulk UPDATE status", category=cat)
-    _, ms = sql("UPDATE orders SET status = 'archived' WHERE status = 'cancelled'")
-    r.times_ms.append(ms)
+    r = BenchResult(name="Bulk UPDATE status", category=cat, planned_iters=1)
+    res, ms = sql("UPDATE orders SET status = 'archived' WHERE status = 'cancelled'")
+    r.record(res, ms, capture_rows=False)
     R.append(r)
     sql_ok("UPDATE orders SET status = 'cancelled' WHERE status = 'archived'")
 
@@ -602,22 +666,108 @@ def part6_stress() -> List[BenchResult]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Part 7 — Inventory & Fulfillment
+# ═══════════════════════════════════════════════════════════════════════════════
+def part7_inventory_fulfillment() -> List[BenchResult]:
+    R, cat = [], "Inventory"
+    np_, no = C["products"], C["orders"]
+
+    R.append(bench("Stock by category",   "SELECT category, COUNT(*), SUM(stock), AVG(price) FROM products GROUP BY category ORDER BY SUM(stock) DESC", cat=cat))
+    R.append(bench("Reorder candidates",  "SELECT id, name, category, stock FROM products WHERE stock < 25 ORDER BY stock LIMIT 50", cat=cat))
+    R.append(bench("Available catalog",   "SELECT id, name, price, stock FROM products WHERE stock > 0 AND rating >= 4 ORDER BY rating DESC LIMIT 50", cat=cat))
+    R.append(bench("Shipment queue",      "SELECT id, user_id, total, order_day FROM orders WHERE status = 'confirmed' ORDER BY order_day LIMIT 100", cat=cat))
+    R.append(bench("Order reservation JOIN",
+        "SELECT oi.order_id, oi.product_id, oi.quantity, p.stock FROM order_items oi "
+        "INNER JOIN products p ON oi.product_id = p.id WHERE p.stock > 0 LIMIT 100", cat=cat))
+    R.append(bench("Fulfillment backlog", "SELECT status, COUNT(*), SUM(total) FROM orders WHERE status IN ('pending','confirmed','shipped') GROUP BY status", cat=cat))
+
+    r = BenchResult(name="Restock products (UPD)", category=cat, planned_iters=C["iters"])
+    for _ in range(C["iters"]):
+        pid = random.randint(0, np_ - 1)
+        res, ms = sql(f"UPDATE products SET stock = stock + 10 WHERE id = {pid}")
+        if not r.record(res, ms, capture_rows=False):
+            break
+    R.append(r)
+
+    r = BenchResult(name="Mark shipped (UPD)", category=cat, planned_iters=C["iters"])
+    for i in range(C["iters"]):
+        oid = (no // 2 + i) % no
+        res, ms = sql(f"UPDATE orders SET status = 'shipped' WHERE id = {oid}")
+        if not r.record(res, ms, capture_rows=False):
+            break
+    R.append(r)
+
+    return R
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Part 8 — Risk & Audit
+# ═══════════════════════════════════════════════════════════════════════════════
+def part8_risk_audit() -> List[BenchResult]:
+    R, cat = [], "Risk"
+    na, nt, nu = C["accounts"], C["transfers"], C["users"]
+
+    R.append(bench("Large transfers",     "SELECT * FROM transfers WHERE amount > 4500 ORDER BY amount DESC LIMIT 50", cat=cat))
+    R.append(bench("Failed audit",        "SELECT transfer_day, COUNT(*), SUM(amount) FROM transfers WHERE status = 'failed' GROUP BY transfer_day ORDER BY transfer_day DESC LIMIT 30", cat=cat))
+    R.append(bench("Account outflow",     "SELECT from_acct, COUNT(*), SUM(amount) FROM transfers WHERE status = 'completed' GROUP BY from_acct ORDER BY SUM(amount) DESC LIMIT 20", cat=cat))
+    R.append(bench("Account inflow",      "SELECT to_acct, COUNT(*), SUM(amount) FROM transfers WHERE status = 'completed' GROUP BY to_acct ORDER BY SUM(amount) DESC LIMIT 20", cat=cat))
+    R.append(bench("Negative balance scan","SELECT id, owner, balance FROM accounts WHERE balance < 0 ORDER BY balance LIMIT 20", cat=cat))
+    R.append(bench("High spender users",  "SELECT user_id, COUNT(*), SUM(total) FROM orders WHERE total > 1000 GROUP BY user_id ORDER BY SUM(total) DESC LIMIT 20", cat=cat))
+    R.append(bench("Signup audit",        "SELECT user_id, COUNT(*) FROM events WHERE event_type = 'signup' GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 20", cat=cat))
+    R.append(bench("Risk review JOIN",
+        "SELECT t.id, a.acct_type, t.amount FROM transfers t "
+        "INNER JOIN accounts a ON t.from_acct = a.id WHERE t.amount > 4000 LIMIT 100", cat=cat))
+
+    r = BenchResult(name="Flag transfer (UPD)", category=cat, planned_iters=C["iters"])
+    for i in range(C["iters"]):
+        tid = (nt // 2 + i) % nt
+        res, ms = sql(f"UPDATE transfers SET status = 'review' WHERE id = {tid}")
+        if not r.record(res, ms, capture_rows=False):
+            break
+    R.append(r)
+
+    r = BenchResult(name="Risk event insert", category=cat, planned_iters=C["iters"])
+    base_eid = C["events"] + 900000
+    for i in range(C["iters"]):
+        uid = random.randint(0, nu - 1)
+        res, ms = sql(f"INSERT INTO events VALUES ({base_eid+i},{uid},'risk_review',{1700000000+random.randint(0,86400*30)})")
+        if not r.record(res, ms, capture_rows=False):
+            break
+    R.append(r)
+
+    r = BenchResult(name="Balance correction (UPD)", category=cat, planned_iters=C["iters"])
+    for _ in range(C["iters"]):
+        aid = random.randint(0, na - 1)
+        res, ms = sql(f"UPDATE accounts SET balance = balance + 1 WHERE id = {aid}")
+        if not r.record(res, ms, capture_rows=False):
+            break
+    R.append(r)
+
+    return R
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Report Rendering
 # ═══════════════════════════════════════════════════════════════════════════════
 COL_W = 110
 
 def section(title, results):
     print(f"\n  ┌─ {title}")
-    print(f"  │ {'Query':<28} {'Avg':>8} {'P50':>8} {'P95':>8} {'P99':>8} {'Min':>8} {'Max':>8} {'Ops/s':>9} {'Rows':>6}")
-    print(f"  │ {'─'*97}")
+    print(f"  │ {'Query':<28} {'Avg':>8} {'P50':>8} {'P90':>8} {'P95':>8} {'P99':>8} {'Std':>8} {'CV%':>7} {'Ops/s':>9} {'Rows':>6}")
+    print(f"  │ {'─'*108}")
     for r in results:
-        if r.error:
-            print(f"  │ {r.name:<28} {'ERR':>8}  {r.error[:60]}")
+        if r.error and not r.times_ms:
+            print(f"  │ {r.name:<28} {'ERR':>8}  {r.error[:60]}  ({r.success_count}/{r.planned_iters or r.success_count} ok)")
         elif r.note:
-            print(f"  │ {r.name:<28} {r.avg:>7.1f}ms {r.p50:>7.1f}ms {r.p95:>7.1f}ms {r.p99:>7.1f}ms {r.min_ms:>7.1f}ms {r.max_ms:>7.1f}ms")
+            print(f"  │ {r.name:<28} {r.avg:>7.1f}ms {r.p50:>7.1f}ms {r.p90:>7.1f}ms {r.p95:>7.1f}ms {r.p99:>7.1f}ms {r.stddev_ms:>7.1f}ms {r.cv_pct:>6.1f}%")
             print(f"  │   └─ {r.note}")
+            if r.error:
+                print(f"  │      sample error: {r.error[:80]}")
+        elif r.error:
+            print(f"  │ {r.name:<28} {r.avg:>7.1f}ms {r.p50:>7.1f}ms {r.p90:>7.1f}ms {r.p95:>7.1f}ms {r.p99:>7.1f}ms {r.stddev_ms:>7.1f}ms {r.cv_pct:>6.1f}% {r.ops_sec:>8.0f} {r.row_count:>6}")
+            print(f"  │   └─ partial: {r.success_count}/{r.planned_iters or r.success_count} ok, error: {r.error[:80]}")
         else:
-            print(f"  │ {r.name:<28} {r.avg:>7.1f}ms {r.p50:>7.1f}ms {r.p95:>7.1f}ms {r.p99:>7.1f}ms {r.min_ms:>7.1f}ms {r.max_ms:>7.1f}ms {r.ops_sec:>8.0f} {r.row_count:>6}")
+            print(f"  │ {r.name:<28} {r.avg:>7.1f}ms {r.p50:>7.1f}ms {r.p90:>7.1f}ms {r.p95:>7.1f}ms {r.p99:>7.1f}ms {r.stddev_ms:>7.1f}ms {r.cv_pct:>6.1f}% {r.ops_sec:>8.0f} {r.row_count:>6}")
     print(f"  └{'─'*COL_W}")
 
 
@@ -633,11 +783,24 @@ def save_report(timings, all_results):
         report["benchmarks"].append({
             "name": r.name, "category": r.category,
             "avg_ms": round(r.avg,3), "p50_ms": round(r.p50,3),
+            "p90_ms": round(r.p90,3),
             "p95_ms": round(r.p95,3), "p99_ms": round(r.p99,3),
             "min_ms": round(r.min_ms,3), "max_ms": round(r.max_ms,3),
+            "stddev_ms": round(r.stddev_ms,3),
+            "cv_pct": round(r.cv_pct,3),
+            "mad_ms": round(r.mad_ms,3),
             "ops_per_sec": round(r.ops_sec,1),
-            "row_count": r.row_count, "iters": len(r.times_ms),
-            "error": r.error, "note": r.note,
+            "rows_per_sec": round(r.rows_sec,1),
+            "row_count": r.row_count,
+            "iters": len(r.times_ms),
+            "planned_iters": r.planned_iters,
+            "warmup_iters": r.warmup_iters,
+            "success_count": r.success_count,
+            "error_count": r.error_count,
+            "total_ops": r.total_ops,
+            "wall_ms": round(r.wall_ms,3),
+            "throughput_ops_sec": round(r.throughput_ops_sec,1),
+            "error": r.error, "errors": r.errors, "note": r.note,
         })
     fname = f"benchmark_report_{SCALE}.json"
     with open(fname, "w") as f: json.dump(report, f, indent=2)
@@ -658,6 +821,8 @@ def main():
         ("Part 4 — Analytics / OLAP",             part4_analytics),
         ("Part 5 — Concurrent Mixed Workload",    part5_concurrent),
         ("Part 6 — Stress & Edge Cases",          part6_stress),
+        ("Part 7 — Inventory & Fulfillment",      part7_inventory_fulfillment),
+        ("Part 8 — Risk & Audit",                 part8_risk_audit),
     ]
 
     print(f"{'═'*COL_W}")

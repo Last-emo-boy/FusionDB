@@ -120,13 +120,13 @@ cargo test                              # 176 tests (unit + SQL integration + pg
 # Start the server first
 cargo run
 
-# In another terminal — run unified benchmark (6 parts)
+# In another terminal — run unified benchmark (8 parts)
 python benchmark.py                     # Medium scale (default)
 BENCH_SCALE=small python benchmark.py   # Quick smoke test
 BENCH_SCALE=large python benchmark.py   # Full stress test
 ```
 
-The benchmark covers **6 scenarios** in a single run:
+The benchmark covers **8 scenarios** in a single run:
 
 | Part | Scenario | What it tests |
 |---|---|---|
@@ -136,8 +136,10 @@ The benchmark covers **6 scenarios** in a single run:
 | 4 | **Analytics / OLAP** | Revenue reports, top spenders, category rankings, time-series events, subqueries |
 | 5 | **Concurrent Workload** | Multi-threaded mixed R/W at 80:20, 50:50, 20:80 ratios with throughput measurement |
 | 6 | **Stress & Edge Cases** | Wide IN, 3-table JOIN, high-cardinality GROUP BY, bulk UPDATE, UNION, CROSS JOIN |
+| 7 | **Inventory & Fulfillment** | Stock rollups, reorder candidates, shipment queues, reservation joins, restock writes |
+| 8 | **Risk & Audit** | Large-transfer review, failed-transfer audits, account exposure, suspicious spend/activity patterns |
 
-Results are printed to terminal and saved as `benchmark_report_<scale>.json`.
+Results are printed to terminal and saved as `benchmark_report_<scale>.json`, including latency percentiles, standard deviation, coefficient of variation, success/error counts, row throughput, and concurrent workload throughput.
 
 ### Dashboard UI (FusionDB Studio)
 

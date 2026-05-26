@@ -1,0 +1,17 @@
+{
+  "id": "TASK-137",
+  "title": "Extend benchmark metrics and business scenarios",
+  "created_at": "2026-05-26T16:52:45+08:00",
+  "status": "completed",
+  "owner": "codex",
+  "files": [
+    "benchmark.py",
+    "README.md"
+  ],
+  "acceptance": [
+    "Benchmark report includes additional latency stability and execution health metrics.",
+    "Benchmark suite includes new inventory/fulfillment and risk/audit business phases.",
+    "Small benchmark run completes successfully against release server.",
+    "Generated report includes the new JSON fields."
+  ]
+}

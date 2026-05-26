@@ -1,0 +1,30 @@
+{
+  "session": "20260526-plan-benchmark-metrics-business-scenarios",
+  "created_at": "2026-05-26T16:52:45+08:00",
+  "objective": "Extend benchmark coverage with richer metrics and additional business workload phases.",
+  "scope": [
+    "benchmark.py",
+    "README.md"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui"
+  ],
+  "tasks": [
+    {
+      "id": "TASK-137",
+      "title": "Extend benchmark metrics and business scenarios",
+      "status": "planned",
+      "expected_changes": [
+        "Add latency stability metrics to BenchResult and JSON report output.",
+        "Track success/error counts and concurrent workload throughput metadata.",
+        "Add Inventory/Fulfillment and Risk/Audit benchmark phases.",
+        "Document the expanded benchmark suite."
+      ]
+    }
+  ],
+  "verification_plan": [
+    "python -m py_compile benchmark.py",
+    "BENCH_SCALE=small python benchmark.py against release fusiondb server"
+  ]
+}
