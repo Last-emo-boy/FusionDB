@@ -21,6 +21,10 @@ impl CompositeIndexMeta {
 }
 
 impl Executor {
+    fn composite_index_component_separator() -> &'static str {
+        "|"
+    }
+
     pub(crate) fn composite_index_meta_value(table: &str, columns: &[String]) -> String {
         format!("v2:{}:{}", table, columns.join(","))
     }
@@ -122,7 +126,7 @@ impl Executor {
             parts.push(self.encoded_index_component(value)?);
         }
 
-        Some(parts.join("|"))
+        Some(parts.join(Self::composite_index_component_separator()))
     }
 
     fn encoded_index_component(&self, value: &Value) -> Option<String> {
@@ -223,50 +227,51 @@ impl Executor {
         let predicates = Self::collect_conjunctive_predicates(expr);
         let equality_values = self.composite_index_equality_values(&predicates, schema, params)?;
 
-        let mut best: Option<(CompositeIndexMeta, String)> = None;
+        let mut best: Option<(CompositeIndexMeta, Vec<String>, bool)> = None;
         for index in indexes {
-            if !index
-                .columns
-                .iter()
-                .all(|column| equality_values.contains_key(&column.to_ascii_lowercase()))
-            {
-                continue;
-            }
-
             let mut components = Vec::with_capacity(index.columns.len());
             for column in &index.columns {
                 let Some(value) = equality_values.get(&column.to_ascii_lowercase()) else {
-                    continue;
+                    break;
                 };
                 let Some(component) = self.encoded_index_component(value) else {
-                    continue;
+                    break;
                 };
                 components.push(component);
             }
 
-            if components.len() != index.columns.len() {
+            if components.is_empty() {
                 continue;
             }
 
-            let value_key = components.join("|");
-            if best
-                .as_ref()
-                .is_none_or(|(current, _)| index.columns.len() > current.columns.len())
-            {
-                best = Some((index, value_key));
+            let exact = components.len() == index.columns.len();
+            if best.as_ref().is_none_or(|(_, current_components, _)| {
+                components.len() > current_components.len()
+            }) {
+                best = Some((index, components, exact));
             }
         }
 
-        let Some((index, value_key)) = best else {
+        let Some((index, components, all_index_columns_matched)) = best else {
             return Ok(None);
         };
 
-        let index_prefix = format!(
-            "{}{}:",
+        let mut index_prefix = format!(
+            "{}{}",
             Self::composite_index_prefix(table_name, &index.columns),
-            value_key
+            components.join(Self::composite_index_component_separator())
         );
-        let index_entries = txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
+        if all_index_columns_matched {
+            index_prefix.push(':');
+        } else {
+            index_prefix.push_str(Self::composite_index_component_separator());
+        }
+        let scan_limit = if all_index_columns_matched {
+            limit
+        } else {
+            None
+        };
+        let index_entries = txn.scan_prefix(index_prefix.as_bytes(), scan_limit).await?;
 
         let mut row_ids = std::collections::HashSet::with_capacity(index_entries.len());
         for (key, _) in index_entries {
@@ -277,7 +282,7 @@ impl Executor {
 
         Ok(Some(super::scan::IndexScanPlan {
             row_ids,
-            exact: predicates.len() == index.columns.len(),
+            exact: all_index_columns_matched && predicates.len() == index.columns.len(),
         }))
     }
 

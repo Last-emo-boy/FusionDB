@@ -1,0 +1,24 @@
+{
+  "id": "BENCHPROD-031",
+  "title": "TSBS ordered range and rollup optimization",
+  "status": "completed",
+  "area": "optimizer",
+  "priority": "P0",
+  "files": [
+    "src/execution/composite_index.rs",
+    "src/execution/query/column_scan.rs",
+    "tests/sql_index_cache.rs",
+    "tests/sql_group_aggregate.rs"
+  ],
+  "description": "Improve TSBS-like range/latest and rollup paths with reusable optimizer improvements.",
+  "result": {
+    "completed_at": "2026-05-27T01:49:21+08:00",
+    "baseline_report": "E:/Playground/FusionDB-bench/runs/matrix_production_medium_insert_20260527_012553/matrix_summary.md",
+    "after_report": "E:/Playground/FusionDB-bench/runs/matrix_production_medium_after_benchprod031_20260527/matrix_summary.md",
+    "improvements": [
+      "Tag-filtered time range p95: 68.715ms -> 2.914ms",
+      "Latest points for host p95: 67.151ms -> 2.779ms",
+      "Fleet rollup by region p95: 102.344ms -> 59.907ms"
+    ]
+  }
+}

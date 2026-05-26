@@ -26,13 +26,17 @@ pub(super) struct ColumnAggregateScanPlan {
     pub(super) output_name: String,
 }
 
-pub(super) struct ColumnPredicateScanPlan {
+struct ColumnPredicateTerm {
     column_index: usize,
     op: BinaryOperator,
     value: Value,
 }
 
-impl ColumnPredicateScanPlan {
+pub(super) struct ColumnPredicateScanPlan {
+    terms: Vec<ColumnPredicateTerm>,
+}
+
+impl ColumnPredicateTerm {
     fn matches(&self, value: &Value) -> bool {
         match self.op {
             BinaryOperator::Eq => value == &self.value,
@@ -43,6 +47,39 @@ impl ColumnPredicateScanPlan {
             BinaryOperator::LtEq => value.compare(&self.value) != Ordering::Greater,
             _ => false,
         }
+    }
+}
+
+impl ColumnPredicateScanPlan {
+    fn single_reusable_term(&self) -> Option<&ColumnPredicateTerm> {
+        if self.terms.len() == 1 {
+            self.terms.first()
+        } else {
+            None
+        }
+    }
+
+    fn matches_data(&self, data: &[u8], reusable_value: Option<&Value>) -> Result<bool> {
+        for term in &self.terms {
+            let value = if self
+                .single_reusable_term()
+                .is_some_and(|single| single.column_index == term.column_index)
+            {
+                reusable_value.cloned().unwrap_or(Value::Null)
+            } else {
+                crate::common::encoding::RowDecoder::decode_column(data, term.column_index)
+                    .map_err(|e| {
+                        FusionError::Execution(format!("Data deserialization error: {}", e))
+                    })?
+                    .unwrap_or(Value::Null)
+            };
+
+            if !term.matches(&value) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 }
 
@@ -313,10 +350,12 @@ impl Executor {
         let Some(predicate) = predicate else {
             return Ok(None);
         };
-        let value =
-            crate::common::encoding::RowDecoder::decode_column(data, predicate.column_index)
-                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-                .unwrap_or(Value::Null);
+        let Some(term) = predicate.single_reusable_term() else {
+            return Ok(None);
+        };
+        let value = crate::common::encoding::RowDecoder::decode_column(data, term.column_index)
+            .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+            .unwrap_or(Value::Null);
         Ok(Some(value))
     }
 
@@ -326,7 +365,10 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         predicate_value: Option<&Value>,
     ) -> Result<Value> {
-        if predicate.is_some_and(|predicate| predicate.column_index == column_index) {
+        if predicate
+            .and_then(ColumnPredicateScanPlan::single_reusable_term)
+            .is_some_and(|term| term.column_index == column_index)
+        {
             if let Some(value) = predicate_value {
                 return Ok(value.clone());
             }
@@ -409,7 +451,7 @@ impl Executor {
         for (_, data) in kv_pairs {
             let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
+                if !predicate.matches_data(&data, predicate_value.as_ref())? {
                     continue;
                 }
             }
@@ -434,61 +476,74 @@ impl Executor {
         schema: &TableSchema,
         params: &[Value],
     ) -> Option<ColumnPredicateScanPlan> {
-        let Expr::BinaryOp { left, op, right } = selection else {
-            return None;
-        };
+        let predicates = Self::collect_conjunctive_predicates(selection);
+        let mut terms = Vec::with_capacity(predicates.len());
 
-        let supported_op = matches!(
-            op,
-            BinaryOperator::Eq
-                | BinaryOperator::NotEq
-                | BinaryOperator::Gt
-                | BinaryOperator::Lt
-                | BinaryOperator::GtEq
-                | BinaryOperator::LtEq
-        );
-        if !supported_op {
-            return None;
-        }
-
-        if let Some(column_index) = Self::order_limit_column_name(left)
-            .and_then(|name| self.resolve_column_index(&name, schema).ok())
-        {
-            if !Self::simple_column_predicate_value_expr(right) {
+        for predicate in predicates {
+            let Expr::BinaryOp { left, op, right } = predicate else {
                 return None;
-            }
-            let value = self.evaluate_value(right, &[], schema, params).ok()?;
-            return Some(ColumnPredicateScanPlan {
-                column_index,
-                op: op.clone(),
-                value,
-            });
-        }
-
-        if let Some(column_index) = Self::order_limit_column_name(right)
-            .and_then(|name| self.resolve_column_index(&name, schema).ok())
-        {
-            if !Self::simple_column_predicate_value_expr(left) {
-                return None;
-            }
-            let value = self.evaluate_value(left, &[], schema, params).ok()?;
-            let op = match op {
-                BinaryOperator::Eq => BinaryOperator::Eq,
-                BinaryOperator::NotEq => BinaryOperator::NotEq,
-                BinaryOperator::Gt => BinaryOperator::Lt,
-                BinaryOperator::Lt => BinaryOperator::Gt,
-                BinaryOperator::GtEq => BinaryOperator::LtEq,
-                BinaryOperator::LtEq => BinaryOperator::GtEq,
-                _ => return None,
             };
-            return Some(ColumnPredicateScanPlan {
-                column_index,
+
+            let supported_op = matches!(
                 op,
-                value,
-            });
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Lt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::LtEq
+            );
+            if !supported_op {
+                return None;
+            }
+
+            if let Some(column_index) = Self::order_limit_column_name(&left)
+                .and_then(|name| self.resolve_column_index(&name, schema).ok())
+            {
+                if !Self::simple_column_predicate_value_expr(&right) {
+                    return None;
+                }
+                let value = self.evaluate_value(&right, &[], schema, params).ok()?;
+                terms.push(ColumnPredicateTerm {
+                    column_index,
+                    op,
+                    value,
+                });
+                continue;
+            }
+
+            if let Some(column_index) = Self::order_limit_column_name(&right)
+                .and_then(|name| self.resolve_column_index(&name, schema).ok())
+            {
+                if !Self::simple_column_predicate_value_expr(&left) {
+                    return None;
+                }
+                let value = self.evaluate_value(&left, &[], schema, params).ok()?;
+                let op = match op {
+                    BinaryOperator::Eq => BinaryOperator::Eq,
+                    BinaryOperator::NotEq => BinaryOperator::NotEq,
+                    BinaryOperator::Gt => BinaryOperator::Lt,
+                    BinaryOperator::Lt => BinaryOperator::Gt,
+                    BinaryOperator::GtEq => BinaryOperator::LtEq,
+                    BinaryOperator::LtEq => BinaryOperator::GtEq,
+                    _ => return None,
+                };
+                terms.push(ColumnPredicateTerm {
+                    column_index,
+                    op,
+                    value,
+                });
+                continue;
+            }
+
+            return None;
         }
 
-        None
+        if terms.is_empty() {
+            None
+        } else {
+            Some(ColumnPredicateScanPlan { terms })
+        }
     }
 
     fn simple_column_predicate_value_expr(expr: &Expr) -> bool {
@@ -551,7 +606,7 @@ impl Executor {
         for (_, data) in kv_pairs {
             let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
+                if !predicate.matches_data(&data, predicate_value.as_ref())? {
                     continue;
                 }
             }
@@ -636,7 +691,7 @@ impl Executor {
         for (_, data) in kv_pairs {
             let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
+                if !predicate.matches_data(&data, predicate_value.as_ref())? {
                     continue;
                 }
             }
@@ -735,7 +790,7 @@ impl Executor {
         for (_, data) in kv_pairs {
             let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
+                if !predicate.matches_data(&data, predicate_value.as_ref())? {
                     continue;
                 }
             }
@@ -909,7 +964,7 @@ impl Executor {
         for (_, data) in kv_pairs {
             let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
             if let Some(predicate) = predicate {
-                if !predicate.matches(predicate_value.as_ref().unwrap_or(&Value::Null)) {
+                if !predicate.matches_data(&data, predicate_value.as_ref())? {
                     continue;
                 }
             }

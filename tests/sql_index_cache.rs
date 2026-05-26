@@ -589,6 +589,68 @@ async fn test_create_composite_btree_index_and_lookup() {
 }
 
 #[tokio::test]
+async fn test_composite_index_prefix_scan_skips_nonmatching_row_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE ts_range (id INTEGER PRIMARY KEY, host_id INTEGER, ts INTEGER, metric TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO ts_range VALUES (1, 1, 1000, 'a'), (2, 1, 2000, 'b'), (3, 2, 1000, 'bad')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_ts_range_host_ts ON ts_range (host_id, ts)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(3),
+            Value::Integer(2),
+            Value::Integer(1000),
+            Value::String("bad".to_string()),
+        ]);
+        let corrupt_col_idx = 3usize;
+        let off_pos = 2 + corrupt_col_idx * 4;
+        let start =
+            u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        for byte in &mut corrupt_row[start..] {
+            *byte = 0xff;
+        }
+        let key = format!(
+            "data:ts_range:{}",
+            fusiondb::common::encoding::encode_i64_comparable(3)
+        );
+        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT ts, metric FROM ts_range WHERE host_id = 1 AND ts >= 1000 AND ts < 3000 ORDER BY ts",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["ts", "metric"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1000), Value::String("a".to_string())],
+            vec![Value::Integer(2000), Value::String("b".to_string())],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_show_indexes_reports_composite_columns() {
     let (executor, wal) = setup().await;
     exec_ok(

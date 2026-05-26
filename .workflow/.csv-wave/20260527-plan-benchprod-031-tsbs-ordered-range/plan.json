@@ -1,0 +1,55 @@
+{
+  "session": "20260527-plan-benchprod-031-tsbs-ordered-range",
+  "created_at": "2026-05-27T01:50:00+08:00",
+  "objective": "Optimize TSBS-like ordered range and rollup paths using production matrix evidence.",
+  "scope": [
+    "src/execution/composite_index.rs",
+    "src/execution/query/column_scan.rs",
+    "tests/sql_index_cache.rs",
+    "tests/sql_group_aggregate.rs"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-031",
+      "title": "TSBS ordered range and rollup optimization",
+      "status": "completed",
+      "expected_changes": [
+        "Use composite index equality prefixes for TSBS host/time candidate reduction.",
+        "Support simple AND predicates in column-scan aggregate fast paths.",
+        "Verify TSBS medium matrix improvement and production matrix stability."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache composite -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate group_by_aggregates -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate group_by_reuses -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite production --load-mode insert --allow-failures --run-name matrix_production_medium_after_benchprod031_20260527",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_production_medium_after_benchprod031_20260527/matrix_summary.md"
+    }
+  ]
+}
