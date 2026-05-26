@@ -1,0 +1,15 @@
+# Verify: GROUP BY aggregates with simple WHERE column scan
+
+## Result
+
+`TASK-146` passed focused verification.
+
+## Checks
+
+- `cargo fmt -- src/execution/query.rs tests/sql_integration.rs`
+- `cargo test group_by --test sql_integration`: 15 passed
+- `cargo test count_distinct --test sql_integration`: 5 passed
+- `cargo test select_distinct --test sql_integration`: 3 passed
+- `cargo test bare_aggregate --test sql_integration`: 2 passed
+
+All Cargo commands used `CARGO_TARGET_DIR=E:\Playground\FusionDB\target` and `CARGO_PROFILE_TEST_DEBUG=0`.

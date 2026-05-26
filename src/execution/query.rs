@@ -778,6 +778,7 @@ impl Executor {
         &self,
         table_name: &str,
         column_index: usize,
+        predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         let prefix = format!("data:{}:", table_name);
@@ -785,6 +786,18 @@ impl Executor {
         let mut counts: HashMap<Value, i64> = HashMap::with_capacity(kv_pairs.len().min(4096));
 
         for (_, data) in kv_pairs {
+            if let Some(predicate) = predicate {
+                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
+                    &data,
+                    predicate.column_index,
+                )
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+                if !predicate.matches(&predicate_value) {
+                    continue;
+                }
+            }
+
             let value = crate::common::encoding::RowDecoder::decode_column(&data, column_index)
                 .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
                 .unwrap_or(Value::Null);
@@ -940,6 +953,7 @@ impl Executor {
         table_name: &str,
         group_column_index: usize,
         aggregate_plans: &[GroupColumnAggregateScanPlan],
+        predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         let prefix = format!("data:{}:", table_name);
@@ -948,6 +962,18 @@ impl Executor {
             HashMap::with_capacity(kv_pairs.len().min(4096));
 
         for (_, data) in kv_pairs {
+            if let Some(predicate) = predicate {
+                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
+                    &data,
+                    predicate.column_index,
+                )
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+                if !predicate.matches(&predicate_value) {
+                    continue;
+                }
+            }
+
             let group_value =
                 crate::common::encoding::RowDecoder::decode_column(&data, group_column_index)
                     .map_err(|e| {
@@ -2055,7 +2081,6 @@ impl Executor {
             }
 
             if !is_join
-                && select.selection.is_none()
                 && select.having.is_none()
                 && select.from.len() == 1
                 && select.from[0].joins.is_empty()
@@ -2073,61 +2098,75 @@ impl Executor {
                                             e
                                         ))
                                     })?;
-                                if let Some((group_column_index, group_name, count_name)) =
-                                    Self::simple_group_by_count_projection(
-                                        &select.projection,
-                                        group_exprs,
-                                        &schema,
+                                let predicate = if let Some(selection) = select.selection.as_ref() {
+                                    self.simple_column_predicate_scan_plan(
+                                        selection, &schema, params,
                                     )
-                                {
-                                    let rows = self
-                                        .group_by_count_column_scan(
-                                            &table_name_str,
-                                            group_column_index,
-                                            txn,
+                                } else {
+                                    None
+                                };
+                                if select.selection.is_none() || predicate.is_some() {
+                                    if let Some((group_column_index, group_name, count_name)) =
+                                        Self::simple_group_by_count_projection(
+                                            &select.projection,
+                                            group_exprs,
+                                            &schema,
                                         )
-                                        .await?;
-                                    let mut rows = rows;
-                                    let columns = vec![group_name, count_name];
-                                    Self::apply_simple_group_by_order_limit(
-                                        &mut rows,
-                                        &columns,
-                                        query.order_by.as_ref(),
-                                        limit,
-                                        offset,
-                                    )?;
-                                    return Ok(QueryResult::Select { columns, rows });
-                                }
+                                    {
+                                        let rows = self
+                                            .group_by_count_column_scan(
+                                                &table_name_str,
+                                                group_column_index,
+                                                predicate.as_ref(),
+                                                txn,
+                                            )
+                                            .await?;
+                                        let mut rows = rows;
+                                        let columns = vec![group_name, count_name];
+                                        Self::apply_simple_group_by_order_limit(
+                                            &mut rows,
+                                            &columns,
+                                            query.order_by.as_ref(),
+                                            limit,
+                                            offset,
+                                        )?;
+                                        return Ok(QueryResult::Select { columns, rows });
+                                    }
 
-                                if let Some((group_column_index, group_name, aggregate_plans)) =
-                                    Self::simple_group_by_column_aggregate_projection(
-                                        &select.projection,
-                                        group_exprs,
-                                        &schema,
-                                    )
-                                {
-                                    let mut columns = Vec::with_capacity(aggregate_plans.len() + 1);
-                                    columns.push(group_name);
-                                    columns.extend(
-                                        aggregate_plans.iter().map(|plan| plan.output_name.clone()),
-                                    );
-                                    let rows = self
-                                        .group_by_column_aggregate_scan(
-                                            &table_name_str,
-                                            group_column_index,
-                                            &aggregate_plans,
-                                            txn,
+                                    if let Some((group_column_index, group_name, aggregate_plans)) =
+                                        Self::simple_group_by_column_aggregate_projection(
+                                            &select.projection,
+                                            group_exprs,
+                                            &schema,
                                         )
-                                        .await?;
-                                    let mut rows = rows;
-                                    Self::apply_simple_group_by_order_limit(
-                                        &mut rows,
-                                        &columns,
-                                        query.order_by.as_ref(),
-                                        limit,
-                                        offset,
-                                    )?;
-                                    return Ok(QueryResult::Select { columns, rows });
+                                    {
+                                        let mut columns =
+                                            Vec::with_capacity(aggregate_plans.len() + 1);
+                                        columns.push(group_name);
+                                        columns.extend(
+                                            aggregate_plans
+                                                .iter()
+                                                .map(|plan| plan.output_name.clone()),
+                                        );
+                                        let rows = self
+                                            .group_by_column_aggregate_scan(
+                                                &table_name_str,
+                                                group_column_index,
+                                                &aggregate_plans,
+                                                predicate.as_ref(),
+                                                txn,
+                                            )
+                                            .await?;
+                                        let mut rows = rows;
+                                        Self::apply_simple_group_by_order_limit(
+                                            &mut rows,
+                                            &columns,
+                                            query.order_by.as_ref(),
+                                            limit,
+                                            offset,
+                                        )?;
+                                        return Ok(QueryResult::Select { columns, rows });
+                                    }
                                 }
                             }
                         }

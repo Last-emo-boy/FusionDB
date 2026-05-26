@@ -1,0 +1,32 @@
+{
+  "id": "TASK-146",
+  "title": "GROUP BY aggregates with simple WHERE column scan",
+  "status": "completed",
+  "files": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "description": "Route simple filtered single-column GROUP BY count and aggregate workloads through column-level decoding.",
+  "scope": {
+    "included": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "excluded": [
+      "dashboard",
+      "ui"
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "group_by_count_column_scan accepts an optional ColumnPredicateScanPlan",
+      "group_by_column_aggregate_scan accepts an optional ColumnPredicateScanPlan",
+      "tests prove unused corrupt columns are not decoded for filtered GROUP BY workloads"
+    ]
+  },
+  "execution_directives": [
+    "Use E:\\\\Playground\\\\FusionDB\\\\target as CARGO_TARGET_DIR",
+    "Keep dashboard/UI untouched",
+    "Stage only files produced by TASK-146"
+  ]
+}

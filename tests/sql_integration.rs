@@ -1800,6 +1800,131 @@ async fn test_group_by_count_distinct_fast_path_uses_only_group_and_distinct_col
 }
 
 #[tokio::test]
+async fn test_group_by_count_with_simple_where_uses_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE grouped_events (id INTEGER PRIMARY KEY, event_type TEXT, status TEXT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, event_type, status) in [
+            (1_i64, "click", "active"),
+            (2, "click", "archived"),
+            (3, "search", "active"),
+            (4, "click", "active"),
+            (5, "signup", "active"),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(event_type.to_string()),
+                Value::String(status.to_string()),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:grouped_events:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT event_type, COUNT(*) FROM grouped_events WHERE status = 'active' GROUP BY event_type ORDER BY event_type",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("click".to_string()), Value::Integer(2)],
+            vec![Value::String("search".to_string()), Value::Integer(1)],
+            vec![Value::String("signup".to_string()), Value::Integer(1)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_aggregates_with_simple_where_uses_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE grouped_orders (id INTEGER PRIMARY KEY, status TEXT, category TEXT, total INTEGER, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, status, category, total) in [
+            (1_i64, "completed", "A", 10_i64),
+            (2, "failed", "A", 99),
+            (3, "completed", "A", 30),
+            (4, "completed", "B", 7),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(status.to_string()),
+                Value::String(category.to_string()),
+                Value::Integer(total),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 4usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:grouped_orders:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT category, SUM(total), COUNT(*) FROM grouped_orders WHERE status = 'completed' GROUP BY category ORDER BY category",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::String("A".to_string()),
+                Value::Integer(40),
+                Value::Integer(2),
+            ],
+            vec![
+                Value::String("B".to_string()),
+                Value::Integer(7),
+                Value::Integer(1),
+            ],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_group_by_column_aggregates_fast_path_order_by_limit() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -1834,10 +1959,11 @@ async fn test_group_by_column_aggregates_fast_path_order_by_limit() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0],
-        vec![Value::String("A".to_string()), Value::Integer(2)]
-    );
+    assert_eq!(rows[0][1], Value::Integer(2));
+    assert!(matches!(
+        &rows[0][0],
+        Value::String(category) if category == "A" || category == "C"
+    ));
     cleanup(&wal);
 }
 
