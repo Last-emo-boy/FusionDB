@@ -1,0 +1,35 @@
+{
+  "id": "BENCHPROD-035",
+  "title": "Full medium benchmark matrix evidence capture",
+  "status": "completed",
+  "area": "benchmark_ops",
+  "priority": "P0",
+  "files": [
+    ".workflow/.csv-wave/20260527-run-benchprod-035-full-medium/context.md",
+    ".workflow/.csv-wave/20260527-run-benchprod-035-full-medium/plan.json",
+    ".workflow/.csv-wave/20260527-run-benchprod-035-full-medium/.task/BENCHPROD-035.json"
+  ],
+  "description": "Run the full medium benchmark matrix and record what FusionDB can currently execute.",
+  "result": {
+    "completed_at": "2026-05-27T01:56:01+08:00",
+    "report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_20260527_full/matrix_summary.md",
+    "scale": "medium",
+    "load_mode": "insert",
+    "suites": [
+      "ycsb",
+      "tpcc",
+      "tpch",
+      "search",
+      "memtier",
+      "tsbs",
+      "ldbc",
+      "ann",
+      "chbench"
+    ],
+    "passed_suites": 8,
+    "failed_suites": 1,
+    "passed_cases": 34,
+    "failed_cases": 5,
+    "blocking_gap": "TPC-H setup/query phase reports missing bench_tpch_* tables after setup."
+  }
+}

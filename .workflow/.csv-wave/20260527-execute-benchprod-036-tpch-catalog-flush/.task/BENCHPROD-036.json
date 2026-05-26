@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-036",
+  "title": "TPC-H catalog setup persistence gap",
+  "status": "completed",
+  "area": "sql_storage",
+  "priority": "P0",
+  "files": [
+    "src/storage/fusion.rs",
+    ".workflow/.csv-wave/20260526-analyze-benchprod-production-gap/tasks.csv",
+    ".workflow/.csv-wave/20260527-execute-benchprod-036-tpch-catalog-flush/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-036-tpch-catalog-flush/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-036-tpch-catalog-flush/.task/BENCHPROD-036.json"
+  ],
+  "description": "Fix the FusionStorage flush visibility gap that made TPC-H schema keys temporarily disappear during medium benchmark setup.",
+  "result": {
+    "completed_at": "2026-05-27T02:12:15+08:00",
+    "baseline_report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_20260527_full/matrix_summary.md",
+    "tpch_after_report": "E:/Playground/FusionDB-bench/runs/matrix_tpch_medium_after_benchprod036_20260527/matrix_summary.md",
+    "full_after_report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_after_benchprod036_20260527/matrix_summary.md",
+    "improvements": [
+      "TPC-H medium: 5 missing-table case errors -> 0 case errors",
+      "Full medium matrix: 8/9 suites passing -> 9/9 suites passing",
+      "Full medium cases: 34/39 passing -> 39/39 passing"
+    ]
+  }
+}

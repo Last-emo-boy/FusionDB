@@ -1,0 +1,41 @@
+{
+  "session": "20260527-run-benchprod-035-full-medium",
+  "created_at": "2026-05-27T02:00:00+08:00",
+  "objective": "Run full medium benchmark matrix and record current FusionDB benchmark capabilities.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/fusiondb_matrix.py",
+    "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_20260527_full"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database code changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-035",
+      "title": "Full medium benchmark matrix evidence capture",
+      "status": "completed",
+      "expected_changes": [
+        "Run release FusionDB with all benchmark suites at medium scale.",
+        "Collect suite-level and case-level pass/fail, latency, throughput, and load metrics.",
+        "Record next TASK signals for production benchmark iteration."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite all --load-mode insert --allow-failures --run-name matrix_all_medium_insert_20260527_full",
+      "status": "completed_with_expected_failure",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_insert_20260527_full/matrix_summary.md",
+      "suite_passed": 8,
+      "suite_failed": 1,
+      "case_passed": 34,
+      "case_failed": 5
+    }
+  ]
+}

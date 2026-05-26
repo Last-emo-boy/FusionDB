@@ -1,0 +1,55 @@
+{
+  "session": "20260527-execute-benchprod-036-tpch-catalog-flush",
+  "created_at": "2026-05-27T02:12:30+08:00",
+  "objective": "Fix TPC-H missing-table benchmark failure caused by FusionStorage flush visibility gap.",
+  "scope": [
+    "src/storage/fusion.rs",
+    ".workflow/.csv-wave/20260526-analyze-benchprod-production-gap/tasks.csv",
+    ".workflow/.csv-wave/20260527-execute-benchprod-036-tpch-catalog-flush"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-036",
+      "title": "TPC-H catalog setup persistence gap",
+      "status": "completed",
+      "expected_changes": [
+        "Keep immutable memtables visible while they are being flushed to SSTables.",
+        "Add a regression test for flush candidate visibility.",
+        "Verify TPC-H medium and full medium benchmark matrices."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test fusion_flush_candidate_remains_visible_until_sstable_registration -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite tpch --load-mode insert --allow-failures --run-name matrix_tpch_medium_after_benchprod036_20260527",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_tpch_medium_after_benchprod036_20260527/matrix_summary.md"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite all --load-mode insert --allow-failures --run-name matrix_all_medium_after_benchprod036_20260527",
+      "status": "passed",
+      "report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_after_benchprod036_20260527/matrix_summary.md"
+    }
+  ]
+}

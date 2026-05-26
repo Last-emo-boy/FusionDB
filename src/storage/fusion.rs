@@ -544,16 +544,25 @@ impl FusionStorage {
         println!("Vector Index Rebuild Complete.");
     }
 
+    fn next_memtable_to_flush(&self) -> Option<MemTable> {
+        let imm = self.immutable_memtables.read().unwrap();
+        imm.last().cloned()
+    }
+
+    fn mark_memtable_flushed(&self, memtable_id: u64) {
+        let mut imm = self.immutable_memtables.write().unwrap();
+        if let Some(pos) = imm.iter().position(|candidate| candidate.id == memtable_id) {
+            imm.remove(pos);
+        }
+    }
+
     async fn flush_loop(&self) {
         let _ = tokio::fs::create_dir_all(&self.paths.sstable_dir).await;
 
         loop {
             self.flush_notify.notified().await;
 
-            let memtable_to_flush = {
-                let mut imm = self.immutable_memtables.write().unwrap();
-                imm.pop()
-            };
+            let memtable_to_flush = self.next_memtable_to_flush();
 
             if let Some(mem) = memtable_to_flush {
                 let sst_path = self.sstable_path_for(mem.id);
@@ -620,8 +629,11 @@ impl FusionStorage {
                 loop {
                     match SsTable::open(sst_path.clone(), mem.id, self.block_cache.clone()).await {
                         Ok(sst) => {
-                            let mut sstables = self.sstables.write().unwrap();
-                            sstables.push(Arc::new(sst));
+                            {
+                                let mut sstables = self.sstables.write().unwrap();
+                                sstables.push(Arc::new(sst));
+                            }
+                            self.mark_memtable_flushed(mem.id);
                             break;
                         }
                         Err(e) => {
@@ -1883,6 +1895,56 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![b"data:x:003".as_slice(), b"data:x:004".as_slice()]
             );
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_flush_candidate_remains_visible_until_sstable_registration() {
+        let data_dir = unique_storage_dir("flush_visibility");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        let candidate = MemTable::new(42);
+        candidate.insert(
+            FusionStorage::encode_key(b"schema:flush_visible", 1),
+            FusionStorage::encode_value(true, b"schema-bytes"),
+        );
+        candidate.insert(
+            FusionStorage::encode_key(b"data:flush_visible:001", 1),
+            FusionStorage::encode_value(true, b"row-bytes"),
+        );
+        storage.current_ts.store(1, Ordering::SeqCst);
+        storage.immutable_memtables.write().unwrap().push(candidate);
+
+        let candidate_id = storage
+            .next_memtable_to_flush()
+            .expect("queued memtable should be selected for flush")
+            .id;
+
+        {
+            let txn = storage.begin_transaction().await.unwrap();
+            assert_eq!(
+                txn.get(b"schema:flush_visible").await.unwrap(),
+                Some(b"schema-bytes".to_vec())
+            );
+            assert_eq!(
+                txn.get(b"data:flush_visible:001").await.unwrap(),
+                Some(b"row-bytes".to_vec())
+            );
+        }
+
+        storage.mark_memtable_flushed(candidate_id);
+
+        {
+            let txn = storage.begin_transaction().await.unwrap();
+            assert_eq!(txn.get(b"schema:flush_visible").await.unwrap(), None);
         }
 
         cleanup_storage_dir(&data_dir);
