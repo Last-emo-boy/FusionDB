@@ -12,6 +12,7 @@ use super::{AggregateAccumulator, Executor, QueryResult};
 
 #[derive(Clone, Copy)]
 enum ColumnAggregateKind {
+    CountColumn,
     Sum,
     Avg,
     Min,
@@ -70,6 +71,11 @@ impl ColumnAggregateState {
 
     fn update(&mut self, value: Value) {
         match self.kind {
+            ColumnAggregateKind::CountColumn => {
+                if value != Value::Null {
+                    self.count += 1;
+                }
+            }
             ColumnAggregateKind::Sum | ColumnAggregateKind::Avg => match value {
                 Value::Integer(value) => {
                     self.sum += value as f64;
@@ -119,6 +125,7 @@ impl ColumnAggregateState {
 
     fn finalize(&self) -> Value {
         match self.kind {
+            ColumnAggregateKind::CountColumn => Value::Integer(self.count),
             ColumnAggregateKind::Sum => {
                 if self.is_int {
                     Value::Integer(self.sum as i64)
@@ -378,6 +385,7 @@ impl Executor {
         projection: &[SelectItem],
         schema: &TableSchema,
         allowed_qualifiers: Option<&[String]>,
+        allow_non_nullable_count: bool,
     ) -> Option<Vec<ColumnAggregateScanPlan>> {
         let mut plans = Vec::with_capacity(projection.len());
 
@@ -392,15 +400,6 @@ impl Executor {
                 return None;
             };
 
-            let kind = match func.name.to_string().to_uppercase().as_str() {
-                "SUM" => ColumnAggregateKind::Sum,
-                "AVG" => ColumnAggregateKind::Avg,
-                "MIN" => ColumnAggregateKind::Min,
-                "MAX" => ColumnAggregateKind::Max,
-                "STRING_AGG" | "GROUP_CONCAT" => ColumnAggregateKind::StringAgg,
-                _ => return None,
-            };
-
             let FunctionArguments::List(args) = &func.args else {
                 return None;
             };
@@ -409,6 +408,20 @@ impl Executor {
             }
 
             let column_index = Self::column_arg_index(&args.args[0], schema, allowed_qualifiers)?;
+            let kind = match func.name.to_string().to_uppercase().as_str() {
+                "COUNT" => {
+                    if !allow_non_nullable_count && !schema.columns[column_index].is_nullable {
+                        return None;
+                    }
+                    ColumnAggregateKind::CountColumn
+                }
+                "SUM" => ColumnAggregateKind::Sum,
+                "AVG" => ColumnAggregateKind::Avg,
+                "MIN" => ColumnAggregateKind::Min,
+                "MAX" => ColumnAggregateKind::Max,
+                "STRING_AGG" | "GROUP_CONCAT" => ColumnAggregateKind::StringAgg,
+                _ => return None,
+            };
             plans.push(ColumnAggregateScanPlan {
                 kind,
                 column_index,
@@ -1794,6 +1807,7 @@ impl Executor {
                                     &select.projection,
                                     &schema,
                                     Some(&aggregate_qualifiers),
+                                    true,
                                 ),
                                 select.selection.as_ref().and_then(|selection| {
                                     self.simple_column_predicate_scan_plan(
@@ -1867,6 +1881,7 @@ impl Executor {
                                         &select.projection,
                                         &schema,
                                         Some(&aggregate_qualifiers),
+                                        false,
                                     ) {
                                         let columns = plans
                                             .iter()

@@ -1,0 +1,2 @@
+id,title,status,findings,files_modified,tests_passed,error
+TASK-142,Bare COUNT(nullable column) ordinary-column scan fast path,completed,"Added CountColumn to bare column aggregate state; nullable COUNT(column) now scans only the counted/predicate columns while prefix-count cases stay on existing fast paths.","src/execution/query.rs;tests/sql_integration.rs","cargo fmt; count_nullable; select_count; bare_aggregate; bare_sum_avg",

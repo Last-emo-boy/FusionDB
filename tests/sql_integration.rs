@@ -926,6 +926,106 @@ async fn test_select_count_not_null_column_uses_prefix_count() {
 }
 
 #[tokio::test]
+async fn test_select_count_nullable_column_uses_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE count_nullable (id INTEGER PRIMARY KEY, code TEXT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, code) in [(1_i64, Some("A")), (2, None), (3, Some("C"))] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                code.map(|value| Value::String(value.to_string()))
+                    .unwrap_or(Value::Null),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 2usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:count_nullable:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT COUNT(code) AS non_null_codes FROM count_nullable",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["non_null_codes"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_select_count_nullable_column_with_simple_where_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE count_filtered (id INTEGER PRIMARY KEY, status TEXT, code TEXT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, status, code) in [
+            (1_i64, "active", Some("A")),
+            (2, "active", None),
+            (3, "archived", Some("C")),
+            (4, "active", Some("D")),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(status.to_string()),
+                code.map(|value| Value::String(value.to_string()))
+                    .unwrap_or(Value::Null),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:count_filtered:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT COUNT(code) AS active_codes FROM count_filtered WHERE status = 'active'",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["active_codes"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_select_count_null_literal() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -1,0 +1,32 @@
+{
+  "id": "TASK-142",
+  "title": "Bare COUNT(nullable column) ordinary-column scan fast path",
+  "status": "completed",
+  "files": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "description": "Route bare COUNT(nullable_column) through the simple column aggregate scan path so counting non-null values does not require full-row materialization.",
+  "scope": {
+    "included": [
+      "src/execution/query.rs",
+      "tests/sql_integration.rs"
+    ],
+    "excluded": [
+      "dashboard",
+      "ui"
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "ColumnAggregateKind includes CountColumn",
+      "simple_column_aggregate_projection accepts COUNT(column) where prefix count is not the better path",
+      "tests prove unused corrupt columns are not decoded for nullable COUNT(column)"
+    ]
+  },
+  "execution_directives": [
+    "Use E:\\\\Playground\\\\FusionDB\\\\target as CARGO_TARGET_DIR",
+    "Keep dashboard/UI untouched",
+    "Stage only files produced by TASK-142"
+  ]
+}
