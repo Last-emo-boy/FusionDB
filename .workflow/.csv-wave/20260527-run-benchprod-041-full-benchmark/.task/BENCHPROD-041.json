@@ -1,0 +1,62 @@
+{
+  "id": "BENCHPROD-041",
+  "title": "Full benchmark capability and performance snapshot",
+  "status": "completed",
+  "area": "benchmark_ops",
+  "priority": "P0",
+  "files": [
+    ".workflow/.csv-wave/20260527-run-benchprod-041-full-benchmark/context.md",
+    ".workflow/.csv-wave/20260527-run-benchprod-041-full-benchmark/plan.json",
+    ".workflow/.csv-wave/20260527-run-benchprod-041-full-benchmark/.task/BENCHPROD-041.json"
+  ],
+  "description": "Run all current benchmark suites at medium scale and record capability plus performance data.",
+  "result": {
+    "completed_at": "2026-05-27T03:22:22+08:00",
+    "report": "E:/Playground/FusionDB-bench/runs/matrix_all_medium_full_benchmark_20260527/matrix_summary.md",
+    "scale": "medium",
+    "load_mode": "insert",
+    "suites": [
+      "ycsb",
+      "tpcc",
+      "tpch",
+      "search",
+      "memtier",
+      "tsbs",
+      "ldbc",
+      "ann",
+      "chbench"
+    ],
+    "passed_suites": 9,
+    "failed_suites": 0,
+    "passed_cases": 39,
+    "failed_cases": 0,
+    "slowest_cases": [
+      {
+        "suite": "tsbs",
+        "case": "Fleet rollup by region",
+        "p95_ms": 58.834
+      },
+      {
+        "suite": "ann",
+        "case": "HNSW nearest neighbor",
+        "p95_ms": 44.907
+      },
+      {
+        "suite": "chbench",
+        "case": "Customer order join",
+        "p95_ms": 27.557
+      },
+      {
+        "suite": "search",
+        "case": "Vector nearest neighbor",
+        "p95_ms": 22.237
+      },
+      {
+        "suite": "ycsb",
+        "case": "Short range scan",
+        "p95_ms": 11.167
+      }
+    ]
+  }
+}
+
