@@ -1,0 +1,21 @@
+{
+  "session_id": "maestro-20260526-160410",
+  "task_id": "TASK-134",
+  "title": "Optimize simple WHERE aggregates",
+  "status": "completed",
+  "started_at": "2026-05-26T16:04:10+08:00",
+  "completed_at": "2026-05-26T16:12:00+08:00",
+  "scope": [
+    "src/execution/query.rs",
+    "tests/sql_integration.rs"
+  ],
+  "non_goals": [
+    "dashboard/ui changes",
+    "complex WHERE predicates",
+    "GROUP BY filtered aggregate scan",
+    "expression aggregate arguments",
+    "cost-based optimizer"
+  ],
+  "verification": ".workflow/.csv-wave/20260526-verify-where-aggregate-column-scan/verification.json",
+  "benchmark_report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task134-where-agg-medium-20260526-160410\\benchmark_report_medium.json"
+}

@@ -1,0 +1,21 @@
+{
+  "session_id": "20260526-verify-where-aggregate-column-scan",
+  "task_id": "TASK-134",
+  "status": "passed",
+  "verified_at": "2026-05-26T16:12:00+08:00",
+  "commands": [
+    {"command": "cargo fmt --check", "status": "passed"},
+    {"command": "cargo check --lib", "status": "passed"},
+    {"command": "cargo test --test sql_integration test_bare_sum_avg_with_simple_where_column_scan -- --nocapture", "status": "passed", "tests": 1},
+    {"command": "cargo test --test sql_integration test_bare_aggregate_sum -- --nocapture", "status": "passed", "tests": 2},
+    {"command": "cargo test --test sql_integration -- --nocapture", "status": "passed", "tests": 161},
+    {"command": "cargo build --release", "status": "passed"},
+    {"command": "BENCH_SCALE=medium python benchmark.py", "status": "passed"}
+  ],
+  "benchmark_report": "C:\\Users\\ES&E\\AppData\\Local\\Temp\\fusiondb-task134-where-agg-medium-20260526-160410\\benchmark_report_medium.json",
+  "benchmark_comparison": [
+    {"name": "Total revenue", "before_ms": 5.344, "after_ms": 3.169, "speedup": 1.69},
+    {"name": "Avg order value", "before_ms": 2.684, "after_ms": 2.716, "speedup": 0.99},
+    {"name": "SUM(amount)", "before_ms": 4.035, "after_ms": 4.224, "speedup": 0.96}
+  ]
+}

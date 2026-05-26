@@ -3657,6 +3657,64 @@ async fn test_bare_sum_avg_column_scan_uses_only_aggregate_columns() {
 }
 
 #[tokio::test]
+async fn test_bare_sum_avg_with_simple_where_column_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, total INTEGER, note TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, status, total) in [
+            (1_i64, "delivered", 10_i64),
+            (2, "cancelled", 99),
+            (3, "delivered", 30),
+            (4, "shipped", 20),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(status.to_string()),
+                Value::Integer(total),
+                Value::String(format!("note-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:orders:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT SUM(total) AS revenue, AVG(total) AS avg_order FROM orders WHERE status != 'cancelled'",
+    )
+    .await;
+    assert_eq!(cols, vec!["revenue", "avg_order"]);
+    assert_eq!(rows, vec![vec![Value::Integer(60), Value::Float(20.0)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT AVG(total) FROM orders WHERE status = 'delivered'",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Float(20.0)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_bare_aggregate_sum_multiply_expr() {
     let (executor, wal) = setup().await;
     exec_ok(

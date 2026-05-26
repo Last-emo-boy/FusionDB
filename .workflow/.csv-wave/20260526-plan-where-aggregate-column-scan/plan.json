@@ -1,0 +1,22 @@
+{
+  "session_id": "20260526-plan-where-aggregate-column-scan",
+  "task_id": "TASK-134",
+  "title": "Plan simple WHERE aggregate column scan",
+  "status": "completed",
+  "created_at": "2026-05-26T16:04:10+08:00",
+  "problem": "Bare SUM/AVG aggregate queries with simple WHERE predicates still materialized rows even when only predicate and aggregate columns were required.",
+  "approach": [
+    "Detect single-table SUM/AVG column aggregates with a simple column-vs-constant predicate.",
+    "Support comparison operators =, !=, >, <, >=, <= and commuted constant-vs-column forms.",
+    "Decode only predicate and aggregate argument columns during table scan.",
+    "Keep complex predicates, subqueries, GROUP BY, HAVING, ORDER BY, LIMIT, joins, and expression aggregates on the generic path."
+  ],
+  "expected_impact": [
+    "Improve Total revenue benchmark.",
+    "Improve simple filtered SUM/AVG analytics on wide rows."
+  ],
+  "risk_controls": [
+    "No optimization for AND/OR, IN, BETWEEN, LIKE, subqueries, or column-vs-column predicates.",
+    "Integration test corrupts unused column bytes to prove the fast path only decodes needed columns."
+  ]
+}

@@ -2,8 +2,8 @@ use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use crate::storage::Transaction;
 use sqlparser::ast::{
-    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause,
-    OrderByKind, SelectItem, SetExpr, TableFactor,
+    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    LimitClause, OrderByKind, SelectItem, SetExpr, TableFactor,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -20,6 +20,26 @@ struct ColumnAggregateScanPlan {
     kind: ColumnAggregateKind,
     column_index: usize,
     output_name: String,
+}
+
+struct ColumnPredicateScanPlan {
+    column_index: usize,
+    op: BinaryOperator,
+    value: Value,
+}
+
+impl ColumnPredicateScanPlan {
+    fn matches(&self, value: &Value) -> bool {
+        match self.op {
+            BinaryOperator::Eq => value == &self.value,
+            BinaryOperator::NotEq => value != &self.value,
+            BinaryOperator::Gt => value.compare(&self.value) == Ordering::Greater,
+            BinaryOperator::Lt => value.compare(&self.value) == Ordering::Less,
+            BinaryOperator::GtEq => value.compare(&self.value) != Ordering::Less,
+            BinaryOperator::LtEq => value.compare(&self.value) != Ordering::Greater,
+            _ => false,
+        }
+    }
 }
 
 struct ColumnAggregateState {
@@ -317,6 +337,7 @@ impl Executor {
         &self,
         table_name: &str,
         plans: &[ColumnAggregateScanPlan],
+        predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Value>> {
         let prefix = format!("data:{}:", table_name);
@@ -327,6 +348,18 @@ impl Executor {
             .collect();
 
         for (_, data) in kv_pairs {
+            if let Some(predicate) = predicate {
+                let predicate_value = crate::common::encoding::RowDecoder::decode_column(
+                    &data,
+                    predicate.column_index,
+                )
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+                if !predicate.matches(&predicate_value) {
+                    continue;
+                }
+            }
+
             for (state, plan) in states.iter_mut().zip(plans.iter()) {
                 let value =
                     crate::common::encoding::RowDecoder::decode_column(&data, plan.column_index)
@@ -339,6 +372,82 @@ impl Executor {
         }
 
         Ok(states.iter().map(ColumnAggregateState::finalize).collect())
+    }
+
+    fn simple_column_predicate_scan_plan(
+        &self,
+        selection: &Expr,
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Option<ColumnPredicateScanPlan> {
+        let Expr::BinaryOp { left, op, right } = selection else {
+            return None;
+        };
+
+        let supported_op = matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Gt
+                | BinaryOperator::Lt
+                | BinaryOperator::GtEq
+                | BinaryOperator::LtEq
+        );
+        if !supported_op {
+            return None;
+        }
+
+        if let Some(column_index) = Self::order_limit_column_name(left)
+            .and_then(|name| self.resolve_column_index(&name, schema).ok())
+        {
+            if !Self::simple_column_predicate_value_expr(right) {
+                return None;
+            }
+            let value = self.evaluate_value(right, &[], schema, params).ok()?;
+            return Some(ColumnPredicateScanPlan {
+                column_index,
+                op: op.clone(),
+                value,
+            });
+        }
+
+        if let Some(column_index) = Self::order_limit_column_name(right)
+            .and_then(|name| self.resolve_column_index(&name, schema).ok())
+        {
+            if !Self::simple_column_predicate_value_expr(left) {
+                return None;
+            }
+            let value = self.evaluate_value(left, &[], schema, params).ok()?;
+            let op = match op {
+                BinaryOperator::Eq => BinaryOperator::Eq,
+                BinaryOperator::NotEq => BinaryOperator::NotEq,
+                BinaryOperator::Gt => BinaryOperator::Lt,
+                BinaryOperator::Lt => BinaryOperator::Gt,
+                BinaryOperator::GtEq => BinaryOperator::LtEq,
+                BinaryOperator::LtEq => BinaryOperator::GtEq,
+                _ => return None,
+            };
+            return Some(ColumnPredicateScanPlan {
+                column_index,
+                op,
+                value,
+            });
+        }
+
+        None
+    }
+
+    fn simple_column_predicate_value_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Value(_) => true,
+            Expr::Nested(inner) => Self::simple_column_predicate_value_expr(inner),
+            Expr::UnaryOp { expr, .. } => Self::simple_column_predicate_value_expr(expr),
+            Expr::BinaryOp { left, right, .. } => {
+                Self::simple_column_predicate_value_expr(left)
+                    && Self::simple_column_predicate_value_expr(right)
+            }
+            _ => false,
+        }
     }
 
     fn count_distinct_projection<'a>(
@@ -1449,6 +1558,59 @@ impl Executor {
 
             // Optimization: Aggregates on PK (COUNT(*), MIN(id), MAX(id)) and
             // single-column COUNT(DISTINCT col) without materializing full rows.
+            if !is_join
+                && !select.distinct.is_some()
+                && select.selection.is_some()
+                && is_group_by_none
+                && select.having.is_none()
+                && query.order_by.is_none()
+                && query.limit_clause.is_none()
+                && select.from.len() == 1
+                && select.from[0].joins.is_empty()
+            {
+                if let TableFactor::Table { name, alias, .. } = &select.from[0].relation {
+                    let table_name_str = name.to_string();
+                    let mut aggregate_qualifiers = Vec::with_capacity(2);
+                    aggregate_qualifiers.push(table_name_str.clone());
+                    if let Some(alias) = alias {
+                        aggregate_qualifiers.push(alias.name.value.clone());
+                    }
+
+                    let schema_key = format!("schema:{}", table_name_str);
+                    if let Ok(Some(schema_bytes)) = txn.get(schema_key.as_bytes()).await {
+                        if let Ok(schema) = bincode::deserialize::<TableSchema>(&schema_bytes) {
+                            if let (Some(plans), Some(predicate)) = (
+                                Self::simple_column_aggregate_projection(
+                                    &select.projection,
+                                    &schema,
+                                    Some(&aggregate_qualifiers),
+                                ),
+                                select.selection.as_ref().and_then(|selection| {
+                                    self.simple_column_predicate_scan_plan(
+                                        selection, &schema, params,
+                                    )
+                                }),
+                            ) {
+                                let columns =
+                                    plans.iter().map(|plan| plan.output_name.clone()).collect();
+                                let result_row = self
+                                    .simple_column_aggregate_scan(
+                                        &table_name_str,
+                                        &plans,
+                                        Some(&predicate),
+                                        txn,
+                                    )
+                                    .await?;
+                                return Ok(QueryResult::Select {
+                                    columns,
+                                    rows: vec![result_row],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
             if !is_join && select.selection.is_none() && is_group_by_none {
                 let mut supported = true;
                 let mut result_row = Vec::with_capacity(select.projection.len());
@@ -1504,6 +1666,7 @@ impl Executor {
                                             .simple_column_aggregate_scan(
                                                 &table_name_str,
                                                 &plans,
+                                                None,
                                                 txn,
                                             )
                                             .await?;
