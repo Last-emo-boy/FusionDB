@@ -728,6 +728,70 @@ async fn test_create_composite_btree_index_and_lookup() {
 }
 
 #[tokio::test]
+async fn test_index_equality_order_by_primary_desc_limit_fetches_top_row_only() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE order_status_fast (o_id INTEGER PRIMARY KEY, c_id INTEGER, status TEXT, total INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO order_status_fast VALUES (10, 1, 'old', 100, 'p10'), (20, 1, 'new', 200, 'p20'), (30, 2, 'other', 300, 'p30')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_order_status_fast_c_id ON order_status_fast (c_id)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(10),
+            Value::Integer(1),
+            Value::String("old".to_string()),
+            Value::Integer(100),
+            Value::String("p10".to_string()),
+        ]);
+        let corrupt_col_idx = 2usize;
+        let off_pos = 2 + corrupt_col_idx * 4;
+        let start =
+            u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        for byte in &mut corrupt_row[start..] {
+            *byte = 0xff;
+        }
+        let key = format!(
+            "data:order_status_fast:{}",
+            fusiondb::common::encoding::encode_i64_comparable(10)
+        );
+        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT o_id, status, total FROM order_status_fast WHERE c_id = 1 ORDER BY o_id DESC LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["o_id", "status", "total"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(20),
+            Value::String("new".to_string()),
+            Value::Integer(200)
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_composite_index_prefix_scan_skips_nonmatching_row_decode() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

@@ -1,0 +1,114 @@
+{
+  "id": "BENCHPROD-075",
+  "title": "Optimize TPC-C order-status indexed ORDER BY LIMIT",
+  "status": "completed",
+  "created_at": "2026-05-27T12:08:00+08:00",
+  "completed_at": "2026-05-27T12:19:00+08:00",
+  "scope": "database core secondary-index equality scan ordering",
+  "target_query": "SELECT o_id, status, total FROM bench_tpcc_orders WHERE c_id = ? ORDER BY o_id DESC LIMIT 1",
+  "baseline": {
+    "source": "BENCHPROD-074 production medium retry2 repeat",
+    "tpcc_suite_p95_median_ms": 2.419,
+    "tpcc_suite_ops_per_sec_median": 599.4,
+    "order_status_status": "stable",
+    "order_status_p95_median_ms": 1.909,
+    "order_status_p95_cv_pct": 1.42,
+    "order_status_p95_spread_pct": 2.74,
+    "order_status_ops_per_sec_median": 618.7
+  },
+  "implementation": {
+    "changed_files": [
+      "src/execution/scan/index_plan.rs",
+      "tests/sql_index_cache.rs"
+    ],
+    "summary": [
+      "Detect secondary-index equality scans whose ORDER BY column is the primary key.",
+      "Preserve row-id ordering from BTree index keys and mark the scan as satisfying ORDER BY.",
+      "For ascending primary-key order, push the ordered LIMIT into the index prefix scan.",
+      "For descending primary-key order, reverse the visible row-id order and truncate before fetching data rows.",
+      "Added a regression test proving ORDER BY primary-key DESC LIMIT 1 fetches only the top indexed candidate."
+    ]
+  },
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache test_index_equality_order_by_primary_desc_limit_fetches_top_row_only -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed",
+      "tests": "30 passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed",
+      "tests": "26 passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite tpcc --repeats 3 --threads 4 --run-name repeat_benchprod075_tpcc_medium_order_status_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 0
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod075_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod075_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod075_production_medium_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "results": {
+    "targeted_tpcc_repeat": {
+      "suite_status": "stable",
+      "unstable_cases": 0,
+      "order_status_status": "stable",
+      "order_status_p95_median_ms": 1.881,
+      "order_status_p95_cv_pct": 3.21,
+      "order_status_p95_spread_pct": 6.63,
+      "order_status_ops_per_sec_median": 623.8,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod075_tpcc_medium_order_status_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "suite_status": "all_stable",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1,
+      "chbench_p95_median_ms": 8.99,
+      "ldbc_p95_median_ms": 1.94,
+      "memtier_p95_median_ms": 0.56,
+      "tpcc_p95_median_ms": 2.48,
+      "tsbs_p95_median_ms": 11.44,
+      "order_status_status": "stable",
+      "order_status_p95_median_ms": 1.872,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod075_production_medium_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod075_production_medium_20260527/bench_gate_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "Investigate TSBS Tag-filtered time range variance and range-index ordering.",
+    "Consider storage-level reverse scans so DESC ordered index probes can avoid scanning the full matching prefix.",
+    "Keep collecting production medium repeat noise evidence before changing allowlists."
+  ]
+}

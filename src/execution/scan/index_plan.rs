@@ -3,7 +3,8 @@ use crate::common::{FusionError, Result, Value};
 use crate::monitor;
 use crate::storage::Transaction;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value as SqlValue,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind,
+    Value as SqlValue,
 };
 use std::collections::HashSet;
 
@@ -18,6 +19,28 @@ pub(crate) struct IndexScanPlan {
 }
 
 impl Executor {
+    fn order_by_primary_key_direction(
+        &self,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+        schema: &TableSchema,
+    ) -> Option<bool> {
+        let order_by = order_by?;
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return None;
+        };
+        let [order_expr] = exprs.as_slice() else {
+            return None;
+        };
+        let order_col = Self::order_limit_column_name(&order_expr.expr)?;
+        let order_idx = self.resolve_column_index(&order_col, schema).ok()?;
+
+        schema
+            .columns
+            .get(order_idx)
+            .is_some_and(|column| column.is_primary)
+            .then_some(order_expr.options.asc.unwrap_or(true))
+    }
+
     pub(crate) fn equality_schema_column_value_expr<'a>(
         &self,
         left: &'a Expr,
@@ -317,22 +340,48 @@ impl Executor {
                             )
                             .unwrap_or(Value::Null);
                             if let Some(val_str) = self.value_to_index_string(&val) {
+                                let primary_order_asc =
+                                    self.order_by_primary_key_direction(order_by, schema);
+                                let scan_limit = if primary_order_asc == Some(true) {
+                                    ordered_limit.or(limit)
+                                } else if primary_order_asc == Some(false) {
+                                    None
+                                } else {
+                                    limit
+                                };
                                 let index_prefix = format!(
                                     "index:{}:{}:{}:",
                                     table_name, storage_col_name, val_str
                                 );
                                 let index_entries =
-                                    txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
+                                    txn.scan_prefix(index_prefix.as_bytes(), scan_limit).await?;
 
                                 let mut row_ids = HashSet::with_capacity(index_entries.len());
+                                let mut ordered_row_ids = primary_order_asc
+                                    .map(|_| Vec::with_capacity(index_entries.len()));
                                 for (k, _) in index_entries {
                                     if let Some(row_id) = Self::row_id_from_key(&k) {
-                                        row_ids.insert(row_id.to_string());
+                                        let row_id = row_id.to_string();
+                                        if row_ids.insert(row_id.clone()) {
+                                            if let Some(ordered) = &mut ordered_row_ids {
+                                                ordered.push(row_id);
+                                            }
+                                        }
+                                    }
+                                }
+                                if let (Some(ordered), Some(asc)) =
+                                    (&mut ordered_row_ids, primary_order_asc)
+                                {
+                                    if !asc {
+                                        ordered.reverse();
+                                    }
+                                    if let Some(limit) = ordered_limit.or(limit) {
+                                        ordered.truncate(limit);
                                     }
                                 }
                                 return Ok(Some(IndexScanPlan {
                                     row_ids,
-                                    ordered_row_ids: None,
+                                    ordered_row_ids,
                                     exact: true,
                                 }));
                             }

@@ -1,0 +1,20 @@
+{
+  "id": "BENCHPROD-075",
+  "title": "TPC-C Order status indexed order-limit fast path",
+  "created_at": "2026-05-27T12:08:00+08:00",
+  "status": "completed",
+  "scope": "database core only",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-075"
+      ]
+    }
+  ],
+  "constraints": [
+    "Do not modify dashboard or UI",
+    "Keep benchmark artifacts under E:/Playground/FusionDB-bench/runs",
+    "Optimize database core execution without changing benchmark thresholds or gate profiles"
+  ]
+}
