@@ -45,6 +45,7 @@ impl Executor {
             .await?;
         let child_foreign_keys = self.load_child_foreign_keys(&table_name_str, txn).await?;
         let parent_foreign_keys = self.load_parent_foreign_keys(&table_name_str, txn).await?;
+        let trigram_column_indices = Self::indexed_trigram_text_columns(&schema);
 
         let kv_pairs = if let Some(row_id) = target_row_id {
             // Point Lookup
@@ -159,6 +160,15 @@ impl Executor {
                 }
 
                 let row_id = Self::row_id_from_data_key(&k)?;
+                self.update_trigram_index_for_update(
+                    &table_name_str,
+                    &schema,
+                    &old_row,
+                    &row,
+                    row_id,
+                    &trigram_column_indices,
+                    txn,
+                );
 
                 for (idx, col) in schema.columns.iter().enumerate() {
                     if col.is_indexed {

@@ -1,0 +1,130 @@
+{
+  "id": "BENCHPROD-076",
+  "title": "Optimize TSBS ingest by limiting trigram maintenance to indexed text columns",
+  "status": "completed",
+  "created_at": "2026-05-27T12:30:00+08:00",
+  "completed_at": "2026-05-27T13:02:00+08:00",
+  "scope": "database core DML and indexed wildcard LIKE trigram maintenance",
+  "target_case": "tsbs:Ingest one point",
+  "baseline": {
+    "source": "BENCHPROD-075 production medium repeat",
+    "tsbs_suite_p95_median_ms": 11.44,
+    "tsbs_suite_ops_per_sec_median": 669.9,
+    "ingest_status": "unstable",
+    "ingest_p95_median_ms": 0.949,
+    "ingest_p95_cv_pct": 14.5,
+    "ingest_p95_spread_pct": 33.06,
+    "ingest_ops_per_sec_median": 1245.5
+  },
+  "implementation": {
+    "changed_files": [
+      "src/execution/ddl/index.rs",
+      "src/execution/dml/delete.rs",
+      "src/execution/dml/insert.rs",
+      "src/execution/dml/mod.rs",
+      "src/execution/dml/update.rs",
+      "src/storage/trigram.rs",
+      "tests/sql_index_cache.rs"
+    ],
+    "summary": [
+      "Moved trigram DML maintenance behind indexed text column detection.",
+      "Skipped FusionStorage trigram lock/update work for non-indexed TEXT columns during INSERT.",
+      "Added CREATE INDEX backfill support for indexed TEXT trigram postings.",
+      "Added UPDATE and DELETE refresh/removal support for indexed TEXT trigram postings.",
+      "Added regression coverage for plain TEXT, indexed TEXT insert, CREATE INDEX backfill, UPDATE, and DELETE on FusionStorage."
+    ]
+  },
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache trigram -- --nocapture",
+      "status": "passed",
+      "tests": "5 passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed",
+      "tests": "35 passed"
+    },
+    {
+      "command": "cargo test --test sql_expr_functions test_like_full_patterns -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_dml -- --nocapture",
+      "status": "passed",
+      "tests": "23 passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite tsbs --repeats 3 --threads 4 --run-name repeat_benchprod076_tsbs_medium_ingest_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod076_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 4
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod076_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod076_production_medium_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "results": {
+    "targeted_tsbs_repeat": {
+      "suite_status": "stable",
+      "unstable_suites": 0,
+      "unstable_cases": 1,
+      "ingest_status": "unstable",
+      "ingest_p95_median_ms": 0.835,
+      "ingest_p95_cv_pct": 16.05,
+      "ingest_p95_spread_pct": 33.25,
+      "ingest_ops_per_sec_median": 1261.7,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod076_tsbs_medium_ingest_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "suite_status": "all_stable",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 4,
+      "chbench_p95_median_ms": 10.547,
+      "ldbc_p95_median_ms": 2.127,
+      "memtier_p95_median_ms": 0.607,
+      "tpcc_p95_median_ms": 2.645,
+      "tsbs_p95_median_ms": 11.875,
+      "ingest_status": "stable",
+      "ingest_p95_median_ms": 0.862,
+      "ingest_p95_cv_pct": 4.76,
+      "ingest_p95_spread_pct": 9.88,
+      "ingest_ops_per_sec_median": 1260.9,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod076_production_medium_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod076_production_medium_20260527/bench_gate_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "Production repeat still shows allowlisted low-latency noise in LDBC one-hop/two-hop, CH-benCHmark warehouse rollup, and TPC-C delivery.",
+    "Composite index metadata is still loaded by scanning index_meta on each INSERT/UPDATE/DELETE and is a candidate DML write-path optimization.",
+    "The TSBS targeted-only run still flagged ingest variance, while production repeat made ingest stable; keep using production repeat as the authoritative gate."
+  ]
+}

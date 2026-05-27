@@ -157,6 +157,7 @@ impl Executor {
                         txn.put(index_key.as_bytes(), &[]).await?;
                     }
                 }
+                self.update_trigram_index_for_value(&table_name_str, col_name, &val, row_id, txn);
             } else if index_type == IndexType::HNSW {
                 if let Value::Vector(vec) = &val {
                     let idx_name = format!("hnsw_{}_{}", table_name_str, col_name);
@@ -173,6 +174,7 @@ impl Executor {
                 } else {
                     continue;
                 }
+                self.update_trigram_index_for_value(&table_name_str, col_name, &val, row_id, txn);
             }
             count += 1;
         }

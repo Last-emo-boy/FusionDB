@@ -72,6 +72,28 @@ impl TrigramIndex {
         }
     }
 
+    pub fn remove_with_id(&mut self, table: &str, col: &str, row_id: u64, text: &str) {
+        let grams = trigrams_bytes(text);
+        let Some(table_map) = self.postings.get_mut(table) else {
+            return;
+        };
+        let Some(col_map) = table_map.get_mut(col) else {
+            return;
+        };
+
+        for tg in grams {
+            let should_remove = if let Some(bitmap) = col_map.get_mut(&tg) {
+                bitmap.remove(row_id);
+                bitmap.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                col_map.remove(&tg);
+            }
+        }
+    }
+
     pub fn search(&self, table: &str, col: &str, pattern: &str) -> Option<RoaringTreemap> {
         // Pattern processing: remove % and _
         let clean_pattern = if pattern.as_bytes().iter().any(|b| matches!(b, b'%' | b'_')) {

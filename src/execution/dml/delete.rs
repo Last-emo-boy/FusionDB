@@ -75,6 +75,7 @@ impl Executor {
             .load_composite_indexes_for_table(&table_name_str, txn)
             .await?;
         let parent_foreign_keys = self.load_parent_foreign_keys(&table_name_str, txn).await?;
+        let trigram_column_indices = Self::indexed_trigram_text_columns(&schema);
 
         if delete.returning.is_none() {
             let no_secondary_indexes = schema
@@ -173,6 +174,14 @@ impl Executor {
                 }
 
                 let row_id = Self::row_id_from_data_key(&k)?;
+                self.update_trigram_index_for_delete(
+                    &table_name_str,
+                    &schema,
+                    &row,
+                    row_id,
+                    &trigram_column_indices,
+                    txn,
+                );
 
                 for (idx, col) in schema.columns.iter().enumerate() {
                     if col.is_indexed {

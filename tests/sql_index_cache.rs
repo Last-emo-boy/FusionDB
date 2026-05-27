@@ -1,12 +1,37 @@
 use fusiondb::common::Value;
+use fusiondb::config::StorageConfig;
 use fusiondb::execution::{Executor, QueryResult};
-use fusiondb::storage::memory::MemoryStorage;
-use fusiondb::storage::Storage;
+use fusiondb::storage::{memory::MemoryStorage, FusionStorage, Storage};
 use std::sync::Arc;
 
 #[path = "sql/common.rs"]
 mod common;
 use common::{cleanup, exec_ok, query, setup};
+
+fn encoded_row_id(value: i64) -> String {
+    fusiondb::common::encoding::encode_i64_comparable(value)
+}
+
+async fn setup_fusion_storage(
+    test_name: &str,
+) -> (Arc<Executor>, FusionStorage, std::path::PathBuf) {
+    let data_dir =
+        std::env::temp_dir().join(format!("fusiondb_{}_{}", test_name, uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut config = StorageConfig::default();
+    config.data_dir = data_dir.to_string_lossy().to_string();
+    let wal_path = config.wal_path();
+    let fusion = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+        .await
+        .unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+    let executor = Arc::new(Executor::new(storage));
+    (executor, fusion, data_dir)
+}
+
+fn cleanup_storage_dir(path: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(path);
+}
 
 #[tokio::test]
 async fn test_full_table_scan_reuses_row_cache() {
@@ -975,6 +1000,214 @@ async fn test_fts_match_against_multi_token_intersects_index_hits() {
     assert_eq!(cols, vec!["id"]);
     assert_eq!(rows, vec![vec![Value::Integer(1)]]);
     cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_plain_text_insert_skips_trigram_index_on_fusion_storage() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("plain_text_no_trigram").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE plain_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO plain_docs VALUES (1, 'plain needle text'), (2, 'other text')",
+    )
+    .await;
+
+    let indexed_ids = fusion
+        .trigram_index
+        .read()
+        .unwrap()
+        .search("plain_docs", "body", "%needle%");
+    assert!(
+        indexed_ids.is_none(),
+        "plain non-indexed TEXT columns should not populate trigram postings"
+    );
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM plain_docs WHERE body LIKE '%needle%'",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+    cleanup_storage_dir(&data_dir);
+}
+
+#[tokio::test]
+async fn test_indexed_text_insert_updates_trigram_index_on_fusion_storage() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("indexed_text_trigram").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE indexed_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_indexed_docs_body ON indexed_docs (body)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO indexed_docs VALUES (1, 'indexed needle text'), (2, 'other text')",
+    )
+    .await;
+
+    let row_keys = {
+        let guard = fusion.trigram_index.read().unwrap();
+        let ids = guard
+            .search("indexed_docs", "body", "%needle%")
+            .expect("indexed TEXT should populate trigram postings");
+        guard.map_ids_to_row_keys("indexed_docs", &ids)
+    };
+    assert_eq!(row_keys, vec![encoded_row_id(1)]);
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM indexed_docs WHERE body LIKE '%needle%'",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+    cleanup_storage_dir(&data_dir);
+}
+
+#[tokio::test]
+async fn test_create_index_backfills_trigram_index_on_fusion_storage() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("create_index_backfills_trigram").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE backfill_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO backfill_docs VALUES (1, 'old needle text'), (2, 'other text')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_backfill_docs_body ON backfill_docs (body)",
+    )
+    .await;
+
+    let row_keys = {
+        let guard = fusion.trigram_index.read().unwrap();
+        let ids = guard
+            .search("backfill_docs", "body", "%needle%")
+            .expect("CREATE INDEX should backfill trigram postings");
+        guard.map_ids_to_row_keys("backfill_docs", &ids)
+    };
+    assert_eq!(row_keys, vec![encoded_row_id(1)]);
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM backfill_docs WHERE body LIKE '%needle%'",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+    cleanup_storage_dir(&data_dir);
+}
+
+#[tokio::test]
+async fn test_update_refreshes_trigram_index_on_fusion_storage() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("update_refreshes_trigram").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE update_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_update_docs_body ON update_docs (body)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO update_docs VALUES (1, 'old needle text'), (2, 'other text')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "UPDATE update_docs SET body = 'fresh target text' WHERE id = 1",
+    )
+    .await;
+
+    {
+        let guard = fusion.trigram_index.read().unwrap();
+        let old_ids = guard
+            .search("update_docs", "body", "%needle%")
+            .expect("old trigram lookup should still be searchable");
+        assert!(guard
+            .map_ids_to_row_keys("update_docs", &old_ids)
+            .is_empty());
+
+        let new_ids = guard
+            .search("update_docs", "body", "%target%")
+            .expect("updated TEXT should populate trigram postings");
+        assert_eq!(
+            guard.map_ids_to_row_keys("update_docs", &new_ids),
+            vec![encoded_row_id(1)]
+        );
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM update_docs WHERE body LIKE '%target%'",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM update_docs WHERE body LIKE '%needle%'",
+    )
+    .await;
+    assert!(rows.is_empty());
+    cleanup_storage_dir(&data_dir);
+}
+
+#[tokio::test]
+async fn test_delete_removes_trigram_index_on_fusion_storage() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("delete_removes_trigram").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE delete_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_delete_docs_body ON delete_docs (body)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO delete_docs VALUES (1, 'delete needle text'), (2, 'other text')",
+    )
+    .await;
+    exec_ok(&executor, "DELETE FROM delete_docs WHERE id = 1").await;
+
+    let row_keys = {
+        let guard = fusion.trigram_index.read().unwrap();
+        let ids = guard
+            .search("delete_docs", "body", "%needle%")
+            .expect("deleted trigram lookup should still be searchable");
+        guard.map_ids_to_row_keys("delete_docs", &ids)
+    };
+    assert!(row_keys.is_empty());
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM delete_docs WHERE body LIKE '%needle%'",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert!(rows.is_empty());
+    cleanup_storage_dir(&data_dir);
 }
 
 #[tokio::test]

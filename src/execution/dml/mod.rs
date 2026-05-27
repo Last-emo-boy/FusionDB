@@ -1,4 +1,4 @@
-use crate::catalog::TableSchema;
+use crate::catalog::{IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{BinaryOperator, Expr, TableFactor};
 use std::collections::HashSet;
@@ -12,6 +12,187 @@ mod returning;
 mod update;
 
 impl Executor {
+    pub(crate) fn indexed_trigram_text_columns(schema: &TableSchema) -> Vec<usize> {
+        schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                let upper = col.data_type.trim().to_ascii_uppercase();
+                let text_type = upper == "TEXT"
+                    || upper == "STRING"
+                    || upper == "VARCHAR"
+                    || upper == "CHAR"
+                    || upper.starts_with("VARCHAR(")
+                    || upper.starts_with("CHAR(")
+                    || upper.starts_with("CHARACTER");
+                (text_type
+                    && col.is_indexed
+                    && matches!(col.index_type, IndexType::BTree | IndexType::FTS))
+                .then_some(idx)
+            })
+            .collect()
+    }
+
+    pub(crate) fn update_trigram_index_for_insert(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        row_values: &[Value],
+        row_id: &str,
+        trigram_column_indices: &[usize],
+        txn: &mut dyn crate::storage::Transaction,
+    ) {
+        if trigram_column_indices.is_empty() {
+            return;
+        }
+
+        let Some(ftxn) = txn
+            .as_any()
+            .downcast_ref::<crate::storage::fusion::FusionTransaction>()
+        else {
+            return;
+        };
+
+        let storage = &ftxn.storage;
+        let mut idx_lock = storage.trigram_index.write().unwrap();
+        let numeric_id = Self::trigram_numeric_row_id(row_id);
+
+        for &idx in trigram_column_indices {
+            if let Some(Value::String(text)) = row_values.get(idx) {
+                idx_lock.add_with_id_str(
+                    table_name,
+                    &schema.columns[idx].name,
+                    numeric_id,
+                    row_id,
+                    text,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn update_trigram_index_for_value(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        value: &Value,
+        row_id: &str,
+        txn: &mut dyn crate::storage::Transaction,
+    ) {
+        let Value::String(text) = value else {
+            return;
+        };
+
+        let Some(ftxn) = txn
+            .as_any()
+            .downcast_ref::<crate::storage::fusion::FusionTransaction>()
+        else {
+            return;
+        };
+
+        let storage = &ftxn.storage;
+        let mut idx_lock = storage.trigram_index.write().unwrap();
+        idx_lock.add_with_id_str(
+            table_name,
+            column_name,
+            Self::trigram_numeric_row_id(row_id),
+            row_id,
+            text,
+        );
+    }
+
+    pub(crate) fn update_trigram_index_for_update(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        old_row: &[Value],
+        new_row: &[Value],
+        row_id: &str,
+        trigram_column_indices: &[usize],
+        txn: &mut dyn crate::storage::Transaction,
+    ) {
+        if trigram_column_indices.is_empty() {
+            return;
+        }
+
+        let Some(ftxn) = txn
+            .as_any()
+            .downcast_ref::<crate::storage::fusion::FusionTransaction>()
+        else {
+            return;
+        };
+
+        let storage = &ftxn.storage;
+        let mut idx_lock = storage.trigram_index.write().unwrap();
+        let numeric_id = Self::trigram_numeric_row_id(row_id);
+
+        for &idx in trigram_column_indices {
+            let old_val = old_row.get(idx);
+            let new_val = new_row.get(idx);
+            if old_val == new_val {
+                continue;
+            }
+
+            if let Some(Value::String(text)) = old_val {
+                idx_lock.remove_with_id(table_name, &schema.columns[idx].name, numeric_id, text);
+            }
+            if let Some(Value::String(text)) = new_val {
+                idx_lock.add_with_id_str(
+                    table_name,
+                    &schema.columns[idx].name,
+                    numeric_id,
+                    row_id,
+                    text,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn update_trigram_index_for_delete(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        row_values: &[Value],
+        row_id: &str,
+        trigram_column_indices: &[usize],
+        txn: &mut dyn crate::storage::Transaction,
+    ) {
+        if trigram_column_indices.is_empty() {
+            return;
+        }
+
+        let Some(ftxn) = txn
+            .as_any()
+            .downcast_ref::<crate::storage::fusion::FusionTransaction>()
+        else {
+            return;
+        };
+
+        let storage = &ftxn.storage;
+        let mut idx_lock = storage.trigram_index.write().unwrap();
+        let numeric_id = Self::trigram_numeric_row_id(row_id);
+
+        for &idx in trigram_column_indices {
+            if let Some(Value::String(text)) = row_values.get(idx) {
+                idx_lock.remove_with_id(table_name, &schema.columns[idx].name, numeric_id, text);
+            }
+        }
+    }
+
+    pub(crate) fn trigram_numeric_row_id(row_id: &str) -> u64 {
+        if let Some(n) = crate::common::encoding::decode_i64_comparable(row_id) {
+            n as u64
+        } else if let Ok(n) = row_id.parse::<u64>() {
+            n
+        } else {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            row_id.hash(&mut hasher);
+            hasher.finish()
+        }
+    }
+
     pub(super) fn row_id_from_data_key(key: &[u8]) -> Result<&str> {
         std::str::from_utf8(key)
             .ok()

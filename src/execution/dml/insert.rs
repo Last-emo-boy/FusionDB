@@ -31,6 +31,7 @@ impl Executor {
             .load_composite_indexes_for_table(&table_name_str, txn)
             .await?;
         let foreign_keys = self.load_child_foreign_keys(&table_name_str, txn).await?;
+        let trigram_column_indices = Self::indexed_trigram_text_columns(&schema);
 
         // Build column index mapping if explicit column list provided
         let col_mapping: Option<Vec<usize>> = if !columns.is_empty() {
@@ -240,6 +241,15 @@ impl Executor {
                                         crate::common::encoding::RowEncoder::encode(&existing_row);
                                     txn.put(key.as_bytes(), &value).await?;
                                     self.row_cache.invalidate(&key);
+                                    self.update_trigram_index_for_update(
+                                        &table_name_str,
+                                        &schema,
+                                        &old_existing_row,
+                                        &existing_row,
+                                        &row_id,
+                                        &trigram_column_indices,
+                                        txn,
+                                    );
                                     for (idx, col) in schema.columns.iter().enumerate() {
                                         if col.is_indexed && col.index_type == IndexType::HNSW {
                                             let idx_name =
@@ -299,43 +309,14 @@ impl Executor {
                     // Update Cache
                     // self.row_cache.insert(key.clone(), row_values.clone());
 
-                    // Update Trigram Index
-                    if let Some(ftxn) = txn
-                        .as_any()
-                        .downcast_ref::<crate::storage::fusion::FusionTransaction>()
-                    {
-                        let storage = &ftxn.storage;
-                        let mut idx_lock = storage.trigram_index.write().unwrap();
-
-                        let numeric_id = if let Some(n) =
-                            crate::common::encoding::decode_i64_comparable(&row_id)
-                        {
-                            Some(n as u64)
-                        } else if let Ok(n) = row_id.parse::<u64>() {
-                            Some(n)
-                        } else {
-                            // Fallback: Hash the ID
-                            use std::collections::hash_map::DefaultHasher;
-                            use std::hash::{Hash, Hasher};
-                            let mut hasher = DefaultHasher::new();
-                            row_id.hash(&mut hasher);
-                            Some(hasher.finish())
-                        };
-
-                        if let Some(rid) = numeric_id {
-                            for (i, val) in row_values.iter().enumerate() {
-                                if let Value::String(s) = val {
-                                    idx_lock.add_with_id_str(
-                                        &table_name_str,
-                                        &schema.columns[i].name,
-                                        rid,
-                                        &row_id,
-                                        s,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    self.update_trigram_index_for_insert(
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &row_id,
+                        &trigram_column_indices,
+                        txn,
+                    );
 
                     for (idx, col) in schema.columns.iter().enumerate() {
                         if col.is_indexed {
@@ -427,6 +408,14 @@ impl Executor {
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
                     monitor::inc_row_write();
+                    self.update_trigram_index_for_insert(
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &row_id,
+                        &trigram_column_indices,
+                        txn,
+                    );
 
                     for (idx, col) in schema.columns.iter().enumerate() {
                         if col.is_indexed && col.index_type == IndexType::HNSW {
