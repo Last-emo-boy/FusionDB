@@ -1187,6 +1187,47 @@ async fn test_primary_key_equality_projection_skips_unused_column_decode() {
     cleanup(&wal_path);
 }
 
+#[tokio::test]
+async fn test_primary_key_lookup_projection_skips_where_key_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_get (key_id INTEGER PRIMARY KEY, value TEXT, flags INTEGER)",
+    )
+    .await;
+
+    let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::String("value-1".to_string()),
+        Value::Integer(7),
+    ]);
+    let corrupt_col_idx = 0usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    let end = u32::from_le_bytes(row[off_pos + 4..off_pos + 8].try_into().unwrap()) as usize;
+    for byte in &mut row[start..end] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let key = format!(
+            "data:pk_get:{}",
+            fusiondb::common::encoding::encode_i64_comparable(1)
+        );
+        txn.put(key.as_bytes(), &row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(&executor, "SELECT value FROM pk_get WHERE key_id = 1").await;
+    assert_eq!(cols, vec!["value"]);
+    assert_eq!(rows, vec![vec![Value::String("value-1".to_string())]]);
+    cleanup(&wal_path);
+}
+
 // ==================== EXPLAIN Tests ====================
 
 #[tokio::test]

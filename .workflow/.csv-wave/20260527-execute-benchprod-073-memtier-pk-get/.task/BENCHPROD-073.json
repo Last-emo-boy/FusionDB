@@ -1,0 +1,112 @@
+{
+  "id": "BENCHPROD-073",
+  "title": "Optimize memtier GET primary-key lookup projection decode",
+  "status": "completed",
+  "created_at": "2026-05-27T11:29:00+08:00",
+  "completed_at": "2026-05-27T11:40:00+08:00",
+  "scope": "database core primary-key point lookup execution",
+  "target_query": "SELECT value FROM bench_kv WHERE key_id = ?",
+  "baseline": {
+    "source": "BENCHPROD-072 production medium repeat",
+    "memtier_suite_p95_median_ms": 0.62,
+    "memtier_suite_ops_per_sec_median": 1273.7,
+    "get_by_key_status": "unstable",
+    "get_by_key_p95_median_ms": 0.777,
+    "get_by_key_p95_cv_pct": 18.36,
+    "get_by_key_p95_spread_pct": 37.53,
+    "get_by_key_ops_per_sec_median": 1395.1
+  },
+  "implementation": {
+    "changed_files": [
+      "src/execution/scan/mod.rs",
+      "tests/sql_index_cache.rs"
+    ],
+    "summary": [
+      "Moved primary-key index discovery before key-only scan planning so the primary-key point lookup branch can reuse it.",
+      "For primary-key equality point lookups, trust the data-key lookup as satisfying the WHERE predicate and skip redundant selection evaluation.",
+      "Remove the primary-key column from partial decode when it was needed only for the WHERE predicate, then restore it from the data key if needed by later row semantics.",
+      "Added a memtier-like regression test proving SELECT value WHERE key_id = literal does not decode the primary-key column."
+    ]
+  },
+  "verification_results": [
+    {
+      "command": "cargo test --test sql_index_cache test_primary_key_lookup_projection_skips_where_key_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed",
+      "tests": "29 passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed",
+      "tests": "26 passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite memtier --repeats 3 --threads 4 --run-name repeat_benchprod073_memtier_medium_pk_get_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 0
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod073_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod073_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod073_production_medium_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "results": {
+    "targeted_memtier_repeat": {
+      "suite_status": "stable",
+      "unstable_cases": 0,
+      "get_by_key_status": "stable",
+      "get_by_key_p95_median_ms": 0.793,
+      "get_by_key_p95_cv_pct": 3.56,
+      "get_by_key_p95_spread_pct": 7.24,
+      "get_by_key_ops_per_sec_median": 1361.1,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod073_memtier_medium_pk_get_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "suite_status": "all_stable",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1,
+      "chbench_p95_median_ms": 9.82,
+      "ldbc_p95_median_ms": 2.18,
+      "memtier_p95_median_ms": 0.62,
+      "tpcc_p95_median_ms": 3.13,
+      "tsbs_p95_median_ms": 12.03,
+      "remaining_unstable_case": "tpcc:Stock level query",
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod073_production_medium_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod073_production_medium_20260527/bench_gate_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "Investigate TPC-C Stock level query variance, now the only unstable production case in BENCHPROD-073.",
+    "Add microbench instrumentation for primary-key point lookup decode columns to quantify skipped decode work.",
+    "Evaluate whether projection hint construction can distinguish WHERE-only columns earlier for other exact-index lookups."
+  ]
+}

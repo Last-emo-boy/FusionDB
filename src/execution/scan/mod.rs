@@ -189,8 +189,6 @@ impl Executor {
                 .as_ref()
                 .is_some_and(|indices| indices.is_empty());
 
-            // Determine if we can do Key-Only Scan (Projection Pushdown Optimization)
-            let mut key_only_scan = false;
             let mut pk_index = None;
             for (i, col) in schema.columns.iter().enumerate() {
                 if col.is_primary {
@@ -201,6 +199,9 @@ impl Executor {
             if pk_index.is_none() && !schema.columns.is_empty() {
                 pk_index = Some(0);
             }
+
+            // Determine if we can do Key-Only Scan (Projection Pushdown Optimization)
+            let mut key_only_scan = false;
 
             if let Some(pk_idx) = pk_index {
                 let projection_is_pk_only = if let Some(proj) = projection {
@@ -436,17 +437,26 @@ impl Executor {
 
                             if let Some(row) = self.row_cache.get(&key) {
                                 monitor::inc_row_cache_hit();
-                                if self.evaluate_expr(sel, &row, &schema, params)? {
-                                    return Ok((schema, vec![row], false));
-                                }
-                                return Ok((schema, vec![], false));
+                                return Ok((schema, vec![row], false));
                             }
 
                             if let Some(v) = txn.get(key.as_bytes()).await? {
                                 monitor::inc_row_read();
+                                let lookup_projection_indices =
+                                    projection_indices.as_ref().map(|indices| {
+                                        if let Some(pk_idx) = pk_index {
+                                            indices
+                                                .iter()
+                                                .copied()
+                                                .filter(|idx| *idx != pk_idx)
+                                                .collect::<Vec<_>>()
+                                        } else {
+                                            indices.clone()
+                                        }
+                                    });
                                 let row = Self::decode_row_for_projection(
                                     &v,
-                                    projection_indices.as_deref(),
+                                    lookup_projection_indices.as_deref(),
                                 )
                                 .map_err(|e| {
                                     FusionError::Execution(format!(
@@ -454,14 +464,23 @@ impl Executor {
                                         e
                                     ))
                                 })?;
+                                let mut row = row;
+                                if let Some(pk_idx) = pk_index {
+                                    if row.get(pk_idx).is_some_and(|value| value == &Value::Null) {
+                                        if let Some(value) =
+                                            Self::primary_key_row_from_id(&schema, pk_index, &id)
+                                                .get(pk_idx)
+                                        {
+                                            row[pk_idx] = value.clone();
+                                        }
+                                    }
+                                }
 
                                 if projection_indices.is_none() {
                                     self.row_cache.insert(key, row.clone());
                                 }
 
-                                if self.evaluate_expr(sel, &row, &schema, params)? {
-                                    return Ok((schema, vec![row], false));
-                                }
+                                return Ok((schema, vec![row], false));
                             }
                             return Ok((schema, vec![], false));
                         }
