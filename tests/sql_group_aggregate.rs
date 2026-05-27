@@ -1074,6 +1074,37 @@ async fn test_multi_column_group_by_aggregates_fast_path_order_by_limit() {
 }
 
 #[tokio::test]
+async fn test_group_by_aggregate_order_by_limit_offset_topn_window() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE topn_sales (id INTEGER PRIMARY KEY, category TEXT, amount INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO topn_sales VALUES (1, 'A', 10), (2, 'B', 90), (3, 'C', 50), (4, 'D', 70), (5, 'E', 30)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT category, SUM(amount) FROM topn_sales GROUP BY category ORDER BY SUM(amount) DESC LIMIT 2 OFFSET 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["category", "SUM(amount)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("D".to_string()), Value::Integer(70)],
+            vec![Value::String("C".to_string()), Value::Integer(50)],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_group_by_sum_multiply_expr() {
     let (executor, wal) = setup().await;
     exec_ok(

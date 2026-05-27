@@ -1,0 +1,141 @@
+{
+  "id": "BENCHPROD-064",
+  "title": "Top-N grouped aggregate ORDER BY LIMIT",
+  "status": "completed",
+  "created_at": "2026-05-27T08:35:00+08:00",
+  "completed_at": "2026-05-27T08:34:00+08:00",
+  "scope": "database core query execution only",
+  "description": "Grouped aggregate fast paths currently sort all groups even when only a small ORDER BY/LIMIT window is needed. Add conservative top-N selection before final ordering.",
+  "target_queries": [
+    "SELECT tag, COUNT(*) FROM bench_ldbc_post WHERE creation_day >= 30 GROUP BY tag ORDER BY COUNT(*) DESC LIMIT 10",
+    "SELECT w_id, status, SUM(total), COUNT(*) FROM bench_tpcc_orders GROUP BY w_id, status ORDER BY SUM(total) DESC LIMIT 20"
+  ],
+  "baseline": {
+    "source": "BENCHPROD-061 production medium repeat",
+    "ldbc_tag_popularity_p95_median_ms": 5.364,
+    "ldbc_tag_popularity_status": "unstable",
+    "ch_warehouse_rollup_p95_median_ms": 5.169,
+    "ch_warehouse_rollup_status": "unstable"
+  },
+  "verification_plan": [
+    "cargo fmt --check",
+    "cargo test --test sql_group_aggregate",
+    "cargo build --release --bin fusiondb",
+    "python bench_repeat.py --scale medium --suite ldbc --repeats 3 --threads 4 --run-name repeat_benchprod064_ldbc_medium_topn_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+    "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod064_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+    "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod064_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod064_production_medium_20260527"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes"
+  ],
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs",
+        "tests/sql_group_aggregate.rs"
+      ],
+      "summary": [
+        "Extracted reusable GROUP BY fast-path ORDER BY key parsing and row comparison.",
+        "Added top-N candidate pruning before final ORDER BY sort when LIMIT/OFFSET is present.",
+        "Preserved exact final LIMIT/OFFSET semantics by sorting the retained window after select_nth_unstable_by.",
+        "Added regression coverage for ORDER BY aggregate DESC LIMIT/OFFSET."
+      ]
+    },
+    "ldbc_repeat": {
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1,
+      "tag_popularity_status": "stable",
+      "tag_popularity_p95_median_ms": 5.724,
+      "tag_popularity_p95_cv_pct": 7.68,
+      "tag_popularity_p95_spread_pct": 16.59,
+      "tag_popularity_ops_per_sec_median": 183.5,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod064_ldbc_medium_topn_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 1,
+      "unstable_cases": 6,
+      "ldbc_suite_p95_median_ms": 2.124,
+      "ldbc_suite_ops_per_sec_median": 947.5,
+      "memtier_suite_p95_median_ms": 0.694,
+      "memtier_suite_ops_per_sec_median": 1228.0,
+      "tag_popularity_p95_median_ms": 5.801,
+      "tag_popularity_ops_per_sec_median": 174.8,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod064_production_medium_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "default_gate": {
+        "status": "failed_expected_noise_allowlist",
+        "checks": "21/22",
+        "reason": "New low-latency noise cases appeared outside the profile allowlist: ldbc:Recent posts by friends, memtier:GET by key, memtier:SET existing key. All suite thresholds and case-error checks passed.",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod064_production_medium_20260527/bench_gate_summary.md"
+      },
+      "current_noise_allowlist_gate": {
+        "status": "passed",
+        "checks": "22/22",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod064_production_medium_allow_current_noise_20260527/bench_gate_summary.md"
+      }
+    }
+  },
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed",
+      "tests": "39 passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed",
+      "tests": "26 passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed",
+      "tests": "10 passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite ldbc --repeats 3 --threads 4 --run-name repeat_benchprod064_ldbc_medium_topn_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod064_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 1,
+      "unstable_cases": 6
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod064_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod064_production_medium_20260527",
+      "status": "failed_expected_noise_allowlist",
+      "checks": "21/22"
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod064_production_medium_3x_20260527/bench_repeat_summary.json --allowed-unstable-case \"ldbc:Recent posts by friends\" --allowed-unstable-case \"memtier:GET by key\" --allowed-unstable-case \"memtier:SET existing key\" --run-name gate_benchprod064_production_medium_allow_current_noise_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "next_task_signals": [
+    "BENCHPROD-067: Update production_medium profile for newly observed low-latency LDBC/memtier noise.",
+    "BENCHPROD-068: Implement index-assisted latest/recent posts path for LDBC Recent posts by friends.",
+    "BENCHPROD-069: Investigate memtier GET/SET latency variance under HTTP SQL protocol."
+  ]
+}

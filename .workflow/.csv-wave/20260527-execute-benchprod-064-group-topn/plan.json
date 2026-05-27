@@ -1,0 +1,34 @@
+{
+  "session": "20260527-execute-benchprod-064-group-topn",
+  "created_at": "2026-05-27T08:35:00+08:00",
+  "objective": "Reduce grouped aggregate ORDER BY LIMIT overhead for LDBC Tag popularity and CH-benCHmark rollups by adding a conservative top-N fast path.",
+  "scope": [
+    "src/execution/query/column_scan.rs",
+    "tests/sql_group_aggregate.rs",
+    "E:/Playground/FusionDB-bench/runs/repeat_benchprod064_ldbc_medium_topn_3x_20260527",
+    "E:/Playground/FusionDB-bench/runs/repeat_benchprod064_production_medium_3x_20260527",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod064_production_medium_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-064-group-topn/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-064-group-topn/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-064-group-topn/.task/BENCHPROD-064.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes",
+    "gate profile changes unless current noise requires a separate task"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-064",
+      "title": "Top-N grouped aggregate ORDER BY LIMIT",
+      "status": "in_progress",
+      "expected_changes": [
+        "Optimize fast-path grouped aggregate ordering when ORDER BY is supported and LIMIT/OFFSET is present.",
+        "Avoid fully sorting every group for LDBC `ORDER BY COUNT(*) DESC LIMIT 10` and CH `ORDER BY SUM(total) DESC LIMIT 20` shapes.",
+        "Preserve exact final ordering and LIMIT/OFFSET semantics.",
+        "Verify with focused SQL tests, LDBC repeat, production repeat, and benchmark gate."
+      ]
+    }
+  ]
+}

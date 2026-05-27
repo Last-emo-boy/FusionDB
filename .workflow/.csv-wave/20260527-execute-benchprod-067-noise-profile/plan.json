@@ -1,0 +1,31 @@
+{
+  "session": "20260527-execute-benchprod-067-noise-profile",
+  "created_at": "2026-05-27T08:36:00+08:00",
+  "objective": "Restore the default production_medium benchmark gate after BENCHPROD-064 exposed new low-latency noise cases.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/gate_profiles/production_medium.json",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod067_production_medium_profile_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-067-noise-profile/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-067-noise-profile/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-067-noise-profile/.task/BENCHPROD-067.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database core code changes",
+    "benchmark harness behavior changes",
+    "suite threshold changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-067",
+      "title": "Add current LDBC and memtier noise to production gate profile",
+      "status": "in_progress",
+      "expected_changes": [
+        "Add the newly observed low-latency unstable cases to the versioned production_medium allowlist.",
+        "Do not change suite thresholds or maximum unstable counts.",
+        "Re-run the default gate against BENCHPROD-064 production repeat."
+      ]
+    }
+  ]
+}

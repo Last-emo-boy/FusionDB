@@ -1135,49 +1135,18 @@ impl Executor {
                 return Ok(());
             };
 
-            let mut order_keys = Vec::with_capacity(exprs.len());
-            for order_expr in exprs {
-                let index = match &order_expr.expr {
-                    Expr::Value(sqlparser::ast::ValueWithSpan {
-                        value: sqlparser::ast::Value::Number(n, _),
-                        ..
-                    }) => n
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|position| position.checked_sub(1)),
-                    Expr::Identifier(ident) => columns
-                        .iter()
-                        .position(|column| column.eq_ignore_ascii_case(&ident.value)),
-                    Expr::Function(func) => columns
-                        .iter()
-                        .position(|column| column.eq_ignore_ascii_case(&format!("{}", func))),
-                    _ => None,
+            let order_keys = Self::simple_group_by_order_keys(exprs, columns)?;
+            if let Some(window) = limit.and_then(|limit| limit.checked_add(offset)) {
+                if window > 0 && window < rows.len() {
+                    rows.select_nth_unstable_by(window, |left, right| {
+                        Self::compare_simple_group_by_rows(left, right, &order_keys)
+                    });
+                    rows.truncate(window);
                 }
-                .ok_or_else(|| {
-                    FusionError::Execution(format!(
-                        "Unsupported GROUP BY fast-path ORDER BY expression: {}",
-                        order_expr.expr
-                    ))
-                })?;
-
-                if index >= columns.len() {
-                    return Err(FusionError::Execution(format!(
-                        "ORDER BY position {} is out of range",
-                        index + 1
-                    )));
-                }
-
-                order_keys.push((index, order_expr.options.asc.unwrap_or(true)));
             }
 
             rows.sort_by(|left, right| {
-                for (index, asc) in &order_keys {
-                    let ordering = left[*index].compare(&right[*index]);
-                    if ordering != Ordering::Equal {
-                        return if *asc { ordering } else { ordering.reverse() };
-                    }
-                }
-                Ordering::Equal
+                Self::compare_simple_group_by_rows(left, right, &order_keys)
             });
         }
 
@@ -1201,7 +1170,15 @@ impl Executor {
             return false;
         };
 
-        exprs.iter().all(|order_expr| {
+        Self::simple_group_by_order_keys(exprs, columns).is_ok()
+    }
+
+    fn simple_group_by_order_keys(
+        exprs: &[sqlparser::ast::OrderByExpr],
+        columns: &[String],
+    ) -> Result<Vec<(usize, bool)>> {
+        let mut order_keys = Vec::with_capacity(exprs.len());
+        for order_expr in exprs {
             let index = match &order_expr.expr {
                 Expr::Value(sqlparser::ast::ValueWithSpan {
                     value: sqlparser::ast::Value::Number(n, _),
@@ -1217,9 +1194,37 @@ impl Executor {
                     .iter()
                     .position(|column| column.eq_ignore_ascii_case(&format!("{}", func))),
                 _ => None,
-            };
+            }
+            .ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "Unsupported GROUP BY fast-path ORDER BY expression: {}",
+                    order_expr.expr
+                ))
+            })?;
 
-            index.is_some_and(|index| index < columns.len())
-        })
+            if index >= columns.len() {
+                return Err(FusionError::Execution(format!(
+                    "ORDER BY position {} is out of range",
+                    index + 1
+                )));
+            }
+
+            order_keys.push((index, order_expr.options.asc.unwrap_or(true)));
+        }
+        Ok(order_keys)
+    }
+
+    fn compare_simple_group_by_rows(
+        left: &[Value],
+        right: &[Value],
+        order_keys: &[(usize, bool)],
+    ) -> Ordering {
+        for (index, asc) in order_keys {
+            let ordering = left[*index].compare(&right[*index]);
+            if ordering != Ordering::Equal {
+                return if *asc { ordering } else { ordering.reverse() };
+            }
+        }
+        Ordering::Equal
     }
 }
