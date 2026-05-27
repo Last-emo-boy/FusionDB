@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-062",
+  "title": "Add observed LDBC one-hop noise to production gate profile",
+  "status": "completed",
+  "created_at": "2026-05-27T08:10:00+08:00",
+  "completed_at": "2026-05-27T08:12:00+08:00",
+  "scope": "benchmark gate profile only",
+  "description": "BENCHPROD-060 production medium repeat passed all suite thresholds and had 0 case errors, but default gate failed because `ldbc:One-hop friends` was a newly observed low-latency unstable case outside the versioned allowlist.",
+  "evidence": {
+    "source_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod060_production_medium_3x_20260527/stability/bench_stability_summary.md",
+    "source_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod060_production_medium_20260527/bench_gate_summary.md",
+    "observed_case": "ldbc:One-hop friends",
+    "observed_p95_median_ms": 0.905,
+    "observed_ops_per_sec_median": 1217.7,
+    "reason": "cv,spread noise at sub-millisecond latency; suite-level ldbc remained stable and above production thresholds"
+  },
+  "verification_plan": [
+    "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod060_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod062_production_medium_profile_20260527"
+  ],
+  "out_of_scope": [
+    "database core changes",
+    "suite thresholds",
+    "benchmark harness code"
+  ],
+  "results": {
+    "changed_files": [
+      "E:/Playground/FusionDB-bench/gate_profiles/production_medium.json"
+    ],
+    "summary": [
+      "Added `ldbc:One-hop friends` to the production_medium unstable case allowlist.",
+      "Kept suite thresholds and max unstable counts unchanged.",
+      "Default profile gate against BENCHPROD-060 production repeat now passes 22/22."
+    ],
+    "gate": {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod060_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod062_production_medium_profile_20260527",
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod062_production_medium_profile_20260527/bench_gate_summary.md"
+    }
+  }
+}

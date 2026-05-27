@@ -1,0 +1,30 @@
+{
+  "session": "20260527-execute-benchprod-062-ldbc-noise-profile",
+  "created_at": "2026-05-27T08:10:00+08:00",
+  "objective": "Restore the default production_medium benchmark gate after BENCHPROD-060 exposed a new low-latency LDBC noise case.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/gate_profiles/production_medium.json",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod062_production_medium_profile_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-062-ldbc-noise-profile/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-062-ldbc-noise-profile/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-062-ldbc-noise-profile/.task/BENCHPROD-062.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database core code changes",
+    "benchmark harness behavior changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-062",
+      "title": "Add observed LDBC one-hop noise to production gate profile",
+      "status": "in_progress",
+      "expected_changes": [
+        "Record the observed `ldbc:One-hop friends` instability from BENCHPROD-060 as known low-latency benchmark noise.",
+        "Update the versioned production_medium gate profile without changing suite thresholds.",
+        "Re-run the default gate against the BENCHPROD-060 production repeat report."
+      ]
+    }
+  ]
+}

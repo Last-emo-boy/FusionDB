@@ -27,13 +27,14 @@ pub(super) struct ColumnAggregateScanPlan {
 }
 
 struct ColumnPredicateTerm {
-    column_index: usize,
+    value_slot: usize,
     op: BinaryOperator,
     value: Value,
 }
 
 pub(super) struct ColumnPredicateScanPlan {
     terms: Vec<ColumnPredicateTerm>,
+    column_indices: Vec<usize>,
 }
 
 impl ColumnPredicateTerm {
@@ -51,35 +52,39 @@ impl ColumnPredicateTerm {
 }
 
 impl ColumnPredicateScanPlan {
-    fn single_reusable_term(&self) -> Option<&ColumnPredicateTerm> {
-        if self.terms.len() == 1 {
-            self.terms.first()
-        } else {
-            None
-        }
-    }
-
-    fn matches_data(&self, data: &[u8], reusable_value: Option<&Value>) -> Result<bool> {
-        for term in &self.terms {
-            let value = if self
-                .single_reusable_term()
-                .is_some_and(|single| single.column_index == term.column_index)
-            {
-                reusable_value.cloned().unwrap_or(Value::Null)
-            } else {
-                crate::common::encoding::RowDecoder::decode_column(data, term.column_index)
+    fn decode_values(&self, data: &[u8], values: &mut Vec<Value>) -> Result<()> {
+        values.clear();
+        values.reserve(self.column_indices.len());
+        for &column_index in &self.column_indices {
+            values.push(
+                crate::common::encoding::RowDecoder::decode_column(data, column_index)
                     .map_err(|e| {
                         FusionError::Execution(format!("Data deserialization error: {}", e))
                     })?
-                    .unwrap_or(Value::Null)
-            };
+                    .unwrap_or(Value::Null),
+            );
+        }
+        Ok(())
+    }
 
-            if !term.matches(&value) {
-                return Ok(false);
+    fn value_for_column<'a>(&self, column_index: usize, values: &'a [Value]) -> Option<&'a Value> {
+        self.column_indices
+            .iter()
+            .position(|&idx| idx == column_index)
+            .and_then(|slot| values.get(slot))
+    }
+
+    fn matches_values(&self, values: &[Value]) -> bool {
+        for term in &self.terms {
+            let Some(value) = values.get(term.value_slot) else {
+                return false;
+            };
+            if !term.matches(value) {
+                return false;
             }
         }
 
-        Ok(true)
+        true
     }
 }
 
@@ -224,14 +229,15 @@ struct GroupAggregateScanVisitor<'a> {
     aggregate_plans: &'a [GroupColumnAggregateScanPlan],
     predicate: Option<&'a ColumnPredicateScanPlan>,
     groups: &'a mut HashMap<Value, Vec<GroupColumnAggregateState>>,
+    predicate_values: Vec<Value>,
     error: Option<FusionError>,
 }
 
 impl GroupAggregateScanVisitor<'_> {
     fn visit_row(&mut self, data: &[u8]) -> Result<()> {
-        let predicate_value = Executor::decoded_predicate_value(data, self.predicate)?;
+        Executor::decode_predicate_values(data, self.predicate, &mut self.predicate_values)?;
         if let Some(predicate) = self.predicate {
-            if !predicate.matches_data(data, predicate_value.as_ref())? {
+            if !predicate.matches_values(&self.predicate_values) {
                 return Ok(());
             }
         }
@@ -240,7 +246,7 @@ impl GroupAggregateScanVisitor<'_> {
             data,
             self.group_column_index,
             self.predicate,
-            predicate_value.as_ref(),
+            &self.predicate_values,
         )?;
 
         let states = self.groups.entry(group_value).or_insert_with(|| {
@@ -256,7 +262,7 @@ impl GroupAggregateScanVisitor<'_> {
                     data,
                     column_index,
                     self.predicate,
-                    predicate_value.as_ref(),
+                    &self.predicate_values,
                 )?;
                 state.update_value(value);
             } else {
@@ -284,14 +290,15 @@ struct GroupCountScanVisitor<'a> {
     group_column_index: usize,
     predicate: Option<&'a ColumnPredicateScanPlan>,
     counts: &'a mut HashMap<Value, i64>,
+    predicate_values: Vec<Value>,
     error: Option<FusionError>,
 }
 
 impl GroupCountScanVisitor<'_> {
     fn visit_row(&mut self, data: &[u8]) -> Result<()> {
-        let predicate_value = Executor::decoded_predicate_value(data, self.predicate)?;
+        Executor::decode_predicate_values(data, self.predicate, &mut self.predicate_values)?;
         if let Some(predicate) = self.predicate {
-            if !predicate.matches_data(data, predicate_value.as_ref())? {
+            if !predicate.matches_values(&self.predicate_values) {
                 return Ok(());
             }
         }
@@ -300,7 +307,7 @@ impl GroupCountScanVisitor<'_> {
             data,
             self.group_column_index,
             self.predicate,
-            predicate_value.as_ref(),
+            &self.predicate_values,
         )?;
         *self.counts.entry(value).or_insert(0) += 1;
         Ok(())
@@ -443,35 +450,31 @@ impl GroupColumnAggregateState {
 }
 
 impl Executor {
-    fn decoded_predicate_value(
+    fn decode_predicate_values(
         data: &[u8],
         predicate: Option<&ColumnPredicateScanPlan>,
-    ) -> Result<Option<Value>> {
-        let Some(predicate) = predicate else {
-            return Ok(None);
-        };
-        let Some(term) = predicate.single_reusable_term() else {
-            return Ok(None);
-        };
-        let value = crate::common::encoding::RowDecoder::decode_column(data, term.column_index)
-            .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
-            .unwrap_or(Value::Null);
-        Ok(Some(value))
+        values: &mut Vec<Value>,
+    ) -> Result<()> {
+        if let Some(predicate) = predicate {
+            predicate.decode_values(data, values)
+        } else {
+            values.clear();
+            Ok(())
+        }
     }
 
     fn decode_column_or_reuse_predicate(
         data: &[u8],
         column_index: usize,
         predicate: Option<&ColumnPredicateScanPlan>,
-        predicate_value: Option<&Value>,
+        predicate_values: &[Value],
     ) -> Result<Value> {
-        if predicate
-            .and_then(ColumnPredicateScanPlan::single_reusable_term)
-            .is_some_and(|term| term.column_index == column_index)
-        {
-            if let Some(value) = predicate_value {
-                return Ok(value.clone());
-            }
+        if let Some(value) = predicate.and_then(|predicate| {
+            predicate
+                .value_for_column(column_index, predicate_values)
+                .cloned()
+        }) {
+            return Ok(value);
         }
 
         crate::common::encoding::RowDecoder::decode_column(data, column_index)
@@ -547,11 +550,12 @@ impl Executor {
             .iter()
             .map(|plan| ColumnAggregateState::new(plan.kind))
             .collect();
+        let mut predicate_values = Vec::new();
 
         for (_, data) in kv_pairs {
-            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
+            Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
             if let Some(predicate) = predicate {
-                if !predicate.matches_data(&data, predicate_value.as_ref())? {
+                if !predicate.matches_values(&predicate_values) {
                     continue;
                 }
             }
@@ -561,7 +565,7 @@ impl Executor {
                     &data,
                     plan.column_index,
                     predicate,
-                    predicate_value.as_ref(),
+                    &predicate_values,
                 )?;
                 state.update(value);
             }
@@ -578,6 +582,7 @@ impl Executor {
     ) -> Option<ColumnPredicateScanPlan> {
         let predicates = Self::collect_conjunctive_predicates(selection);
         let mut terms = Vec::with_capacity(predicates.len());
+        let mut column_indices = Vec::new();
 
         for predicate in predicates {
             let Expr::BinaryOp { left, op, right } = predicate else {
@@ -604,8 +609,15 @@ impl Executor {
                     return None;
                 }
                 let value = self.evaluate_value(&right, &[], schema, params).ok()?;
+                let value_slot = match column_indices.iter().position(|&idx| idx == column_index) {
+                    Some(slot) => slot,
+                    None => {
+                        column_indices.push(column_index);
+                        column_indices.len() - 1
+                    }
+                };
                 terms.push(ColumnPredicateTerm {
-                    column_index,
+                    value_slot,
                     op,
                     value,
                 });
@@ -628,8 +640,15 @@ impl Executor {
                     BinaryOperator::LtEq => BinaryOperator::GtEq,
                     _ => return None,
                 };
+                let value_slot = match column_indices.iter().position(|&idx| idx == column_index) {
+                    Some(slot) => slot,
+                    None => {
+                        column_indices.push(column_index);
+                        column_indices.len() - 1
+                    }
+                };
                 terms.push(ColumnPredicateTerm {
-                    column_index,
+                    value_slot,
                     op,
                     value,
                 });
@@ -642,7 +661,10 @@ impl Executor {
         if terms.is_empty() {
             None
         } else {
-            Some(ColumnPredicateScanPlan { terms })
+            Some(ColumnPredicateScanPlan {
+                terms,
+                column_indices,
+            })
         }
     }
 
@@ -702,11 +724,12 @@ impl Executor {
         let prefix = format!("data:{}:", table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
+        let mut predicate_values = Vec::new();
 
         for (_, data) in kv_pairs {
-            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
+            Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
             if let Some(predicate) = predicate {
-                if !predicate.matches_data(&data, predicate_value.as_ref())? {
+                if !predicate.matches_values(&predicate_values) {
                     continue;
                 }
             }
@@ -715,7 +738,7 @@ impl Executor {
                 &data,
                 column_index,
                 predicate,
-                predicate_value.as_ref(),
+                &predicate_values,
             )?;
             if value != Value::Null {
                 seen.insert(value);
@@ -787,11 +810,12 @@ impl Executor {
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
         let mut rows = Vec::new();
+        let mut predicate_values = Vec::new();
 
         for (_, data) in kv_pairs {
-            let predicate_value = Self::decoded_predicate_value(&data, predicate)?;
+            Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
             if let Some(predicate) = predicate {
-                if !predicate.matches_data(&data, predicate_value.as_ref())? {
+                if !predicate.matches_values(&predicate_values) {
                     continue;
                 }
             }
@@ -800,7 +824,7 @@ impl Executor {
                 &data,
                 column_index,
                 predicate,
-                predicate_value.as_ref(),
+                &predicate_values,
             )?;
             if seen.insert(value.clone()) {
                 rows.push(vec![value]);
@@ -891,6 +915,7 @@ impl Executor {
                 group_column_index: column_index,
                 predicate,
                 counts: &mut counts,
+                predicate_values: Vec::new(),
                 error: None,
             };
             txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
@@ -1064,6 +1089,7 @@ impl Executor {
                 aggregate_plans,
                 predicate,
                 groups: &mut groups,
+                predicate_values: Vec::new(),
                 error: None,
             };
             txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)

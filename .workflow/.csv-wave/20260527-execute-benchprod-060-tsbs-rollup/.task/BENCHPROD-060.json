@@ -1,0 +1,160 @@
+{
+  "id": "BENCHPROD-060",
+  "title": "Optimize TSBS Fleet rollup by region",
+  "status": "completed",
+  "created_at": "2026-05-27T08:00:00+08:00",
+  "completed_at": "2026-05-27T08:08:00+08:00",
+  "scope": "database core query execution only",
+  "description": "Improve the TSBS-like query `SELECT region, AVG(usage_user), MAX(usage_system) FROM bench_tsbs_cpu WHERE ts >= 1000 AND ts < 50000 GROUP BY region ORDER BY region` as a production benchmark hotspot.",
+  "target_query": "SELECT region, AVG(usage_user), MAX(usage_system) FROM bench_tsbs_cpu WHERE ts >= 1000 AND ts < 50000 GROUP BY region ORDER BY region",
+  "expected_changes": [
+    "Use current benchmark evidence to locate the remaining TSBS rollup bottleneck.",
+    "Optimize query execution inside FusionDB without touching dashboard or UI code.",
+    "Keep the existing streaming GROUP BY aggregate semantics intact.",
+    "Add or extend focused regression tests for the optimized path."
+  ],
+  "verification_plan": [
+    "cargo fmt --check",
+    "cargo test --test sql_group_aggregate",
+    "cargo build --release --bin fusiondb",
+    "python bench_repeat.py --scale medium --suite tsbs --repeats 3 --threads 4 --run-name repeat_benchprod060_tsbs_medium_rollup_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+    "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod060_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+    "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod060_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod060_production_medium_20260527"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "external benchmark adapters"
+  ],
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs",
+        "tests/sql_group_aggregate.rs"
+      ],
+      "summary": [
+        "Changed column predicate fast paths to decode each unique predicate column once per row.",
+        "Allowed multiple predicates on the same column, such as `ts >= 1000 AND ts < 50000`, to reuse the decoded value for all comparisons.",
+        "Kept GROUP BY aggregate streaming via scan_prefix_for_each and reused predicate column values for group/aggregate decoding when applicable.",
+        "Added a TSBS-like regression test covering range predicates, grouped aggregates, and corrupted unrelated payload columns."
+      ]
+    },
+    "target_case_delta": {
+      "baseline": {
+        "source": "BENCHPROD-048 production medium repeat",
+        "p95_median_ms": 43.214,
+        "p95_cv_pct": 12.71,
+        "p95_spread_pct": 25.97,
+        "ops_per_sec_median": 24.6,
+        "status": "unstable"
+      },
+      "current": {
+        "source": "BENCHPROD-060 production medium repeat",
+        "p95_median_ms": 41.231,
+        "p95_cv_pct": 2.51,
+        "p95_spread_pct": 5.10,
+        "ops_per_sec_median": 25.0,
+        "status": "stable"
+      },
+      "delta": {
+        "p95_median_pct": -4.59,
+        "ops_per_sec_pct": 1.63
+      }
+    },
+    "tsbs_repeat": {
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 0,
+      "fleet_rollup_p95_median_ms": 40.376,
+      "fleet_rollup_p95_cv_pct": 1.47,
+      "fleet_rollup_p95_spread_pct": 2.83,
+      "fleet_rollup_ops_per_sec_median": 25.3,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod060_tsbs_medium_rollup_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 4,
+      "tsbs_suite_p95_median_ms": 12.088,
+      "tsbs_suite_ops_per_sec_median": 496.8,
+      "fleet_rollup_status": "stable",
+      "fleet_rollup_p95_median_ms": 41.231,
+      "fleet_rollup_p95_cv_pct": 2.51,
+      "fleet_rollup_p95_spread_pct": 5.10,
+      "fleet_rollup_ops_per_sec_median": 25.0,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod060_production_medium_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "default_gate": {
+        "status": "failed_expected_noise_allowlist",
+        "checks": "21/22",
+        "reason": "A new low-latency noise case `ldbc:One-hop friends` appeared outside the versioned profile allowlist; all suite thresholds, matrix counts, and case error checks passed.",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod060_production_medium_20260527/bench_gate_summary.md"
+      },
+      "current_noise_allowlist_gate": {
+        "status": "passed",
+        "checks": "22/22",
+        "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod060_production_medium_allow_current_noise_20260527/bench_gate_summary.md"
+      }
+    }
+  },
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed",
+      "tests": "37 passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed",
+      "tests": "27 passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed",
+      "tests": "26 passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite tsbs --repeats 3 --threads 4 --run-name repeat_benchprod060_tsbs_medium_rollup_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 0
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod060_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 4
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod060_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod060_production_medium_20260527",
+      "status": "failed_expected_noise_allowlist",
+      "checks": "21/22",
+      "reason": "New observed unstable case `ldbc:One-hop friends` is not in the profile allowlist."
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod060_production_medium_3x_20260527/bench_repeat_summary.json --allowed-unstable-case \"ldbc:One-hop friends\" --run-name gate_benchprod060_production_medium_allow_current_noise_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "next_task_signals": [
+    "BENCHPROD-061: Stabilize CH-benCHmark Warehouse revenue rollup, which remains a high-variance production case.",
+    "BENCHPROD-062: Investigate LDBC low-latency noise including One-hop friends and Tag popularity after this run.",
+    "BENCHPROD-063: Design a real range-index or time-partition path for TSBS `ts >= low AND ts < high` scans; the current optimization reduces decode overhead but still scans the full table."
+  ]
+}

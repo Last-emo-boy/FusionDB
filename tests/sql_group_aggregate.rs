@@ -854,6 +854,75 @@ async fn test_group_by_aggregates_with_multi_predicate_partial_decode() {
 }
 
 #[tokio::test]
+async fn test_group_by_aggregates_reuses_multi_predicate_column_values() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE tsbs_reuse (id INTEGER PRIMARY KEY, region TEXT, ts INTEGER, usage_user FLOAT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, region, ts, usage_user) in [
+            (1_i64, "east", 500_i64, 99.0_f64),
+            (2, "east", 1000, 10.0),
+            (3, "east", 2000, 30.0),
+            (4, "west", 2000, 7.0),
+            (5, "west", 50000, 100.0),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(region.to_string()),
+                Value::Integer(ts),
+                Value::Float(usage_user),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 4usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:tsbs_reuse:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT region, MIN(ts), MAX(ts), AVG(usage_user) FROM tsbs_reuse WHERE ts >= 1000 AND ts < 50000 GROUP BY region ORDER BY region",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::String("east".to_string()),
+                Value::Integer(1000),
+                Value::Integer(2000),
+                Value::Float(20.0),
+            ],
+            vec![
+                Value::String("west".to_string()),
+                Value::Integer(2000),
+                Value::Integer(2000),
+                Value::Float(7.0),
+            ],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_group_by_reuses_predicate_group_column_value() {
     let (executor, wal) = setup().await;
     exec_ok(

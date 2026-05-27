@@ -1,0 +1,41 @@
+{
+  "session": "20260527-execute-benchprod-060-tsbs-rollup",
+  "created_at": "2026-05-27T08:00:00+08:00",
+  "objective": "Optimize the TSBS Fleet rollup by region benchmark hotspot while preserving the production_medium benchmark gate.",
+  "scope": [
+    "src/execution/query/column_scan.rs",
+    "src/execution/query/mod.rs",
+    "tests/sql_group_aggregate.rs",
+    "E:/Playground/FusionDB-bench/runs/repeat_benchprod060_tsbs_medium_rollup_3x_20260527",
+    "E:/Playground/FusionDB-bench/runs/repeat_benchprod060_production_medium_3x_20260527",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod060_production_medium_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-060-tsbs-rollup/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-060-tsbs-rollup/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-060-tsbs-rollup/.task/BENCHPROD-060.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "external benchmark installation",
+    "benchmark harness behavior changes unless required for measurement"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-060",
+      "title": "Optimize TSBS Fleet rollup by region",
+      "status": "in_progress",
+      "expected_changes": [
+        "Inspect the TSBS rollup query and current GROUP BY aggregate fast path.",
+        "Reduce per-row work for `WHERE ts >= 1000 AND ts < 50000 GROUP BY region` without changing SQL semantics.",
+        "Add regression coverage for the optimized execution path.",
+        "Verify with focused SQL tests, release build, TSBS repeat benchmark, production repeat benchmark, and production benchmark gate."
+      ],
+      "acceptance": [
+        "No benchmark case errors.",
+        "TSBS suite remains below the production_medium profile P95 threshold.",
+        "Production medium gate passes with the versioned profile.",
+        "All changes are limited to database core/query execution and workflow records."
+      ]
+    }
+  ]
+}
