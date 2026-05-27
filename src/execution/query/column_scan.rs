@@ -12,6 +12,7 @@ use super::Executor;
 
 #[derive(Clone, Copy)]
 enum ColumnAggregateKind {
+    CountStar,
     CountColumn,
     Sum,
     Avg,
@@ -22,7 +23,7 @@ enum ColumnAggregateKind {
 
 pub(super) struct ColumnAggregateScanPlan {
     kind: ColumnAggregateKind,
-    column_index: usize,
+    column_index: Option<usize>,
     pub(super) output_name: String,
 }
 
@@ -113,6 +114,9 @@ impl ColumnAggregateState {
 
     fn update(&mut self, value: Value) {
         match self.kind {
+            ColumnAggregateKind::CountStar => {
+                self.count += 1;
+            }
             ColumnAggregateKind::CountColumn => {
                 if value != Value::Null {
                     self.count += 1;
@@ -167,6 +171,7 @@ impl ColumnAggregateState {
 
     fn finalize(&self) -> Value {
         match self.kind {
+            ColumnAggregateKind::CountStar => Value::Integer(self.count),
             ColumnAggregateKind::CountColumn => Value::Integer(self.count),
             ColumnAggregateKind::Sum => {
                 if self.is_int {
@@ -511,19 +516,64 @@ impl Executor {
                 return None;
             }
 
-            let column_index = Self::column_arg_index(&args.args[0], schema, allowed_qualifiers)?;
-            let kind = match func.name.to_string().to_uppercase().as_str() {
+            let func_name = func.name.to_string().to_uppercase();
+            let (kind, column_index) = match func_name.as_str() {
+                "COUNT"
+                    if matches!(
+                        args.args[0],
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                    ) =>
+                {
+                    (ColumnAggregateKind::CountStar, None)
+                }
                 "COUNT" => {
+                    let column_index =
+                        Self::column_arg_index(&args.args[0], schema, allowed_qualifiers)?;
                     if !allow_non_nullable_count && !schema.columns[column_index].is_nullable {
                         return None;
                     }
-                    ColumnAggregateKind::CountColumn
+                    (ColumnAggregateKind::CountColumn, Some(column_index))
                 }
-                "SUM" => ColumnAggregateKind::Sum,
-                "AVG" => ColumnAggregateKind::Avg,
-                "MIN" => ColumnAggregateKind::Min,
-                "MAX" => ColumnAggregateKind::Max,
-                "STRING_AGG" | "GROUP_CONCAT" => ColumnAggregateKind::StringAgg,
+                "SUM" => (
+                    ColumnAggregateKind::Sum,
+                    Some(Self::column_arg_index(
+                        &args.args[0],
+                        schema,
+                        allowed_qualifiers,
+                    )?),
+                ),
+                "AVG" => (
+                    ColumnAggregateKind::Avg,
+                    Some(Self::column_arg_index(
+                        &args.args[0],
+                        schema,
+                        allowed_qualifiers,
+                    )?),
+                ),
+                "MIN" => (
+                    ColumnAggregateKind::Min,
+                    Some(Self::column_arg_index(
+                        &args.args[0],
+                        schema,
+                        allowed_qualifiers,
+                    )?),
+                ),
+                "MAX" => (
+                    ColumnAggregateKind::Max,
+                    Some(Self::column_arg_index(
+                        &args.args[0],
+                        schema,
+                        allowed_qualifiers,
+                    )?),
+                ),
+                "STRING_AGG" | "GROUP_CONCAT" => (
+                    ColumnAggregateKind::StringAgg,
+                    Some(Self::column_arg_index(
+                        &args.args[0],
+                        schema,
+                        allowed_qualifiers,
+                    )?),
+                ),
                 _ => return None,
             };
             plans.push(ColumnAggregateScanPlan {
@@ -564,13 +614,17 @@ impl Executor {
             }
 
             for (state, plan) in states.iter_mut().zip(plans.iter()) {
-                let value = Self::decode_column_or_reuse_predicate(
-                    &data,
-                    plan.column_index,
-                    predicate,
-                    &predicate_values,
-                )?;
-                state.update(value);
+                if let Some(column_index) = plan.column_index {
+                    let value = Self::decode_column_or_reuse_predicate(
+                        &data,
+                        column_index,
+                        predicate,
+                        &predicate_values,
+                    )?;
+                    state.update(value);
+                } else {
+                    state.update(Value::Integer(1));
+                }
             }
         }
 
