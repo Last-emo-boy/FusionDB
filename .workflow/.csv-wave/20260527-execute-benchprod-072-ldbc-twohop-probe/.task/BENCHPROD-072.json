@@ -1,0 +1,113 @@
+{
+  "id": "BENCHPROD-072",
+  "title": "Optimize LDBC two-hop indexed join probe key decode",
+  "status": "completed",
+  "created_at": "2026-05-27T11:12:00+08:00",
+  "completed_at": "2026-05-27T11:24:00+08:00",
+  "scope": "database core join probe execution",
+  "target_query": "SELECT k2.person2_id FROM bench_ldbc_knows k1 INNER JOIN bench_ldbc_knows k2 ON k1.person2_id = k2.person1_id WHERE k1.person1_id = ? LIMIT 100",
+  "baseline": {
+    "source": "BENCHPROD-070 production medium repeat",
+    "ldbc_suite_p95_median_ms": 1.948,
+    "ldbc_suite_ops_per_sec_median": 968.7,
+    "two_hop_status": "unstable",
+    "two_hop_p95_median_ms": 0.864,
+    "two_hop_p95_cv_pct": 13.16,
+    "two_hop_p95_spread_pct": 25.86,
+    "two_hop_ops_per_sec_median": 1245.4
+  },
+  "implementation": {
+    "changed_files": [
+      "src/execution/scan/join.rs",
+      "tests/sql_join.rs"
+    ],
+    "summary": [
+      "Detect single-key left-driven indexed join probes where the right join key is guaranteed by the index lookup.",
+      "Skip redundant row key equality checks for guaranteed probe matches when no residual or right-side selection remains.",
+      "Remove the guaranteed right probe key from right-side partial decode when the final projection does not require it.",
+      "Restore the probe key value from the index lookup into partial rows before joining, preserving full joined-row schema semantics.",
+      "Tighten right-side projection requirement checks so qualified left columns do not force decoding homonymous right columns."
+    ]
+  },
+  "verification_results": [
+    {
+      "command": "cargo test --test sql_join test_two_hop_join_probe_skips_guaranteed_right_key_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed",
+      "tests": "13 passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed",
+      "tests": "26 passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite ldbc --repeats 3 --threads 4 --run-name repeat_benchprod072_ldbc_medium_twohop_probe_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 2
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod072_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod072_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod072_production_medium_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "results": {
+    "targeted_ldbc_repeat": {
+      "suite_status": "stable",
+      "suite_p95_median_ms": 2.022,
+      "suite_ops_per_sec_median": 948.7,
+      "two_hop_status": "unstable",
+      "two_hop_p95_median_ms": 0.886,
+      "two_hop_p95_cv_pct": 17.77,
+      "two_hop_p95_spread_pct": 39.98,
+      "two_hop_ops_per_sec_median": 1245.1,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod072_ldbc_medium_twohop_probe_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "suite_status": "all_stable",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 1,
+      "chbench_p95_median_ms": 9.90,
+      "ldbc_p95_median_ms": 2.07,
+      "memtier_p95_median_ms": 0.62,
+      "tpcc_p95_median_ms": 3.24,
+      "tsbs_p95_median_ms": 11.90,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod072_production_medium_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod072_production_medium_20260527/bench_gate_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "Investigate memtier GET by key variance; it is the only unstable case in BENCHPROD-072 production repeat.",
+    "Add lower-noise microbench counters around indexed join probe decode to quantify per-row decode savings beyond suite-level P95 noise.",
+    "Explore stronger LDBC Tag popularity GROUP BY stability after targeted LDBC-only repeats still show case-level variance."
+  ]
+}

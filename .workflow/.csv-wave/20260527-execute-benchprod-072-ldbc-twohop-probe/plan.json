@@ -1,0 +1,20 @@
+{
+  "id": "BENCHPROD-072",
+  "title": "LDBC two-hop indexed join probe decode reduction",
+  "created_at": "2026-05-27T11:12:00+08:00",
+  "status": "completed",
+  "scope": "database core only",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-072"
+      ]
+    }
+  ],
+  "constraints": [
+    "Do not modify dashboard or UI",
+    "Keep benchmark artifacts under E:/Playground/FusionDB-bench/runs",
+    "Preserve join result schema semantics while reducing right-side probe key decode work"
+  ]
+}

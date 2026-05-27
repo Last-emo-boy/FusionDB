@@ -517,6 +517,70 @@ async fn test_inner_join_multi_key_uses_indexed_probe_column() {
 }
 
 #[tokio::test]
+async fn test_two_hop_join_probe_skips_guaranteed_right_key_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE graph_two_hop (id INTEGER PRIMARY KEY, person1_id INTEGER, person2_id INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_graph_two_hop_person1 ON graph_two_hop (person1_id)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO graph_two_hop VALUES (1, 1, 2, 'left-a'), (2, 1, 3, 'left-b'), (3, 2, 20, 'right-a'), (4, 3, 30, 'right-b')",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, person1_id, person2_id, payload) in
+            [(3_i64, 2_i64, 20_i64, "right-a"), (4, 3, 30, "right-b")]
+        {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(person1_id),
+                Value::Integer(person2_id),
+                Value::String(payload.to_string()),
+            ]);
+            let corrupt_col_idx = 1usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            let end =
+                u32::from_le_bytes(row[off_pos + 4..off_pos + 8].try_into().unwrap()) as usize;
+            for byte in &mut row[start..end] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:graph_two_hop:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT k2.person2_id FROM graph_two_hop k1 INNER JOIN graph_two_hop k2 ON k1.person2_id = k2.person1_id WHERE k1.person1_id = 1 LIMIT 10",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["k2.person2_id"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(20)], vec![Value::Integer(30)]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_join_projection_pushdown_with_group_by() {
     let (executor, wal) = setup().await;
     exec_ok(

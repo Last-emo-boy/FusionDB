@@ -190,6 +190,7 @@ impl Executor {
         candidates: &[Vec<Value>],
         left_key_indices: &[usize],
         right_key_indices: &[usize],
+        probe_key_guaranteed: bool,
         residual_expr: &Option<Expr>,
         new_schema: &TableSchema,
         params: &[Value],
@@ -200,7 +201,9 @@ impl Executor {
     ) -> Result<bool> {
         let mut matched = false;
         for right_row in candidates {
-            if !Self::row_keys_equal(left_row, left_key_indices, right_row, right_key_indices) {
+            if !probe_key_guaranteed
+                && !Self::row_keys_equal(left_row, left_key_indices, right_row, right_key_indices)
+            {
                 continue;
             }
 
@@ -500,6 +503,59 @@ impl Executor {
         }
     }
 
+    fn projection_requires_column(
+        &self,
+        projection: &Option<Vec<String>>,
+        schema: &TableSchema,
+        column_idx: usize,
+    ) -> bool {
+        let Some(columns) = projection.as_ref() else {
+            return true;
+        };
+        let target_name = &schema.columns[column_idx].name;
+        columns.iter().any(|column| {
+            if column == target_name {
+                return true;
+            }
+            if column.contains('.') {
+                return false;
+            }
+            self.resolve_column_index(column, schema)
+                .is_ok_and(|index| index == column_idx)
+        })
+    }
+
+    fn remove_projection_column(
+        &self,
+        projection: &Option<Vec<String>>,
+        schema: &TableSchema,
+        column_idx: usize,
+    ) -> Option<Vec<String>> {
+        let columns = projection.as_ref()?;
+        let filtered = columns
+            .iter()
+            .filter(|column| {
+                self.resolve_column_index(column, schema)
+                    .map_or(true, |index| index != column_idx)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if filtered.len() == columns.len() {
+            projection.clone()
+        } else {
+            Some(filtered)
+        }
+    }
+
+    fn restore_probe_key_column(rows: &mut [Vec<Value>], column_idx: usize, key_value: &Value) {
+        for row in rows {
+            if let Some(value) = row.get_mut(column_idx) {
+                *value = key_value.clone();
+            }
+        }
+    }
+
     fn choose_indexed_join_probe_pair(
         &self,
         left_key_indices: &[usize],
@@ -684,6 +740,30 @@ impl Executor {
                         ) {
                             monitor::inc_plan();
                             let right_table_name = right_table_name.unwrap();
+                            let single_key_indexed_probe = left_key_indices.len() == 1
+                                && right_key_indices.len() == 1
+                                && residual_expr.is_none()
+                                && right_selection.is_none();
+                            let probe_key_guaranteed =
+                                single_key_indexed_probe && probe_right_idx == right_key_indices[0];
+                            let probe_projection_indices = if probe_key_guaranteed
+                                && !self.projection_requires_column(
+                                    stage_projection_hint,
+                                    &right_schema_for_probe,
+                                    probe_right_idx,
+                                ) {
+                                let reduced_projection = self.remove_projection_column(
+                                    &right_projection,
+                                    probe_schema,
+                                    probe_right_idx,
+                                );
+                                self.projection_indices_for_schema(
+                                    &reduced_projection,
+                                    probe_schema,
+                                )
+                            } else {
+                                right_projection_indices.clone()
+                            };
                             let probed_capacity =
                                 limit.map_or(left_rows.len(), |value| left_rows.len().min(value));
                             let mut probed_rows = Vec::with_capacity(probed_capacity);
@@ -698,6 +778,7 @@ impl Executor {
                                         candidates,
                                         &left_key_indices,
                                         &right_key_indices,
+                                        probe_key_guaranteed,
                                         &residual_expr,
                                         &new_schema,
                                         params,
@@ -717,10 +798,17 @@ impl Executor {
                                         probe_schema,
                                         probe_right_idx,
                                         &probe_key,
-                                        right_projection_indices.as_deref(),
+                                        probe_projection_indices.as_deref(),
                                         txn,
                                     )
                                     .await?;
+                                if probe_key_guaranteed {
+                                    Self::restore_probe_key_column(
+                                        &mut candidates,
+                                        probe_right_idx,
+                                        &probe_key,
+                                    );
+                                }
                                 if let Some(selection) = &right_selection {
                                     candidates = self.filter_rows_with_expr(
                                         candidates,
@@ -734,6 +822,7 @@ impl Executor {
                                     &candidates,
                                     &left_key_indices,
                                     &right_key_indices,
+                                    probe_key_guaranteed,
                                     &residual_expr,
                                     &new_schema,
                                     params,
