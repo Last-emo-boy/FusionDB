@@ -1,0 +1,1 @@
+{"ts":"2026-05-27T10:38:00+08:00","task":"BENCHPROD-071","type":"benchmark_noise","data":{"suite":"tpcc","case":"Payment transaction","p95_median_ms":2.39,"p95_cv_pct":15.73,"ops_per_sec_median":432.3,"gate_profile":"production_medium"}}
