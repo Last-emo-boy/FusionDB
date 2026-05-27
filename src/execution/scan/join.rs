@@ -352,6 +352,41 @@ impl Executor {
         }
     }
 
+    fn build_stage_join_base_projection(
+        &self,
+        relation: &TableFactor,
+        schema: &TableSchema,
+        projection: &Option<Vec<String>>,
+        pending_predicates: &[Expr],
+        join_column_refs: &HashSet<String>,
+    ) -> Option<Vec<String>> {
+        let mut prefixed_schema = schema.clone();
+        self.prefix_schema_columns(&mut prefixed_schema, relation)
+            .ok()?;
+
+        let stage_projection = self.build_stage_join_projection(
+            &prefixed_schema,
+            projection,
+            pending_predicates,
+            join_column_refs,
+        )?;
+
+        let base_projection: Vec<String> = stage_projection
+            .iter()
+            .filter_map(|column| {
+                self.resolve_column_index(column, schema)
+                    .ok()
+                    .map(|index| schema.columns[index].name.clone())
+            })
+            .collect();
+
+        if base_projection.is_empty() || base_projection.len() >= schema.columns.len() {
+            None
+        } else {
+            Some(base_projection)
+        }
+    }
+
     fn apply_stage_join_projection(
         &self,
         schema: TableSchema,
@@ -375,17 +410,32 @@ impl Executor {
         schema: &TableSchema,
         key_col_idx: usize,
         key_value: &Value,
+        projection_indices: Option<&[usize]>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         let column = &schema.columns[key_col_idx];
 
-        if column.is_primary {
+        if column.is_primary && projection_indices.is_none() {
             if let Some(row_id) = Self::value_to_primary_row_id(key_value) {
                 if let Some(row) = self.fetch_full_row_by_id(table_name, &row_id, txn).await? {
                     return Ok(vec![row]);
                 }
             }
             return Ok(Vec::new());
+        } else if column.is_primary {
+            let Some(row_id) = Self::value_to_primary_row_id(key_value) else {
+                return Ok(Vec::new());
+            };
+            let data_key = format!("data:{}:{}", table_name, row_id);
+            let Some(data_bytes) = txn.get(data_key.as_bytes()).await? else {
+                return Ok(Vec::new());
+            };
+            monitor::inc_row_read();
+            let row =
+                Self::decode_row_for_projection(&data_bytes, projection_indices).map_err(|e| {
+                    FusionError::Execution(format!("Data deserialization error: {}", e))
+                })?;
+            return Ok(vec![row]);
         }
 
         if !(column.is_indexed && column.index_type == IndexType::BTree) {
@@ -408,12 +458,44 @@ impl Executor {
             if !seen_row_ids.insert(row_id.to_string()) {
                 continue;
             }
-            if let Some(row) = self.fetch_full_row_by_id(table_name, row_id, txn).await? {
+            if projection_indices.is_none() {
+                if let Some(row) = self.fetch_full_row_by_id(table_name, row_id, txn).await? {
+                    rows.push(row);
+                }
+            } else {
+                let data_key = format!("data:{}:{}", table_name, row_id);
+                let Some(data_bytes) = txn.get(data_key.as_bytes()).await? else {
+                    continue;
+                };
+                monitor::inc_row_read();
+                let row = Self::decode_row_for_projection(&data_bytes, projection_indices)
+                    .map_err(|e| {
+                        FusionError::Execution(format!("Data deserialization error: {}", e))
+                    })?;
                 rows.push(row);
             }
         }
 
         Ok(rows)
+    }
+
+    fn projection_indices_for_schema(
+        &self,
+        projection: &Option<Vec<String>>,
+        schema: &TableSchema,
+    ) -> Option<Vec<usize>> {
+        let columns = projection.as_ref()?;
+        let mut indices = Vec::with_capacity(columns.len());
+        for column in columns {
+            if let Ok(index) = self.resolve_column_index(column, schema) {
+                indices.push(index);
+            }
+        }
+        if columns.is_empty() || !indices.is_empty() {
+            Some(indices)
+        } else {
+            None
+        }
     }
 
     fn choose_indexed_join_probe_pair(
@@ -492,6 +574,8 @@ impl Executor {
         join_operator: Option<&sqlparser::ast::JoinOperator>,
         pending_predicates: &mut Vec<Expr>,
         projection: &Option<Vec<String>>,
+        stage_projection_hint: &Option<Vec<String>>,
+        join_column_refs: &HashSet<String>,
         txn: &mut dyn Transaction,
         params: &[Value],
         limit: Option<usize>,
@@ -548,6 +632,25 @@ impl Executor {
         );
 
         let join_expr = Self::combine_predicates(join_predicates.clone());
+        let right_stage_predicates = right_selection
+            .as_ref()
+            .into_iter()
+            .chain(join_expr.iter())
+            .chain(pending_predicates.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let right_projection = schema_for_probe.as_ref().and_then(|schema| {
+            self.build_stage_join_base_projection(
+                relation,
+                schema,
+                stage_projection_hint,
+                &right_stage_predicates,
+                join_column_refs,
+            )
+        });
+        let right_projection_indices = schema_for_probe
+            .as_ref()
+            .and_then(|schema| self.projection_indices_for_schema(&right_projection, schema));
         if supports_left_driven_probe && right_table_name.is_some() {
             if let (Some(expr), Some(probe_schema)) = (&join_expr, schema_for_probe.as_ref()) {
                 let mut right_schema_for_probe = probe_schema.clone();
@@ -612,6 +715,7 @@ impl Executor {
                                         probe_schema,
                                         probe_right_idx,
                                         &probe_key,
+                                        right_projection_indices.as_deref(),
                                         txn,
                                     )
                                     .await?;
@@ -650,10 +754,26 @@ impl Executor {
         }
 
         let (right_schema_base, right_rows) = if right_selection.is_some() {
-            self.scan_single_table(relation, &right_selection, &None, txn, params, None, None)
-                .await?
+            self.scan_single_table(
+                relation,
+                &right_selection,
+                &right_projection,
+                txn,
+                params,
+                None,
+                None,
+            )
+            .await?
         } else {
-            self.scan_table_base(relation, txn).await?
+            self.scan_join_base(
+                relation,
+                stage_projection_hint,
+                &right_stage_predicates,
+                join_column_refs,
+                txn,
+                params,
+            )
+            .await?
         };
         let mut right_schema = right_schema_base.clone();
         self.prefix_schema_columns(&mut right_schema, relation)?;
@@ -827,11 +947,43 @@ impl Executor {
         let first_relation_names = self.relation_names(&first.relation);
         let first_selection =
             self.take_relation_predicate(&mut pending_predicates, &first_relation_names);
+        let first_projection = if first_selection.is_some() {
+            if let TableFactor::Table { name, .. } = &first.relation {
+                let schema_key = format!("schema:{}", name);
+                txn.get(schema_key.as_bytes())
+                    .await?
+                    .map(|schema_bytes| {
+                        bincode::deserialize::<TableSchema>(&schema_bytes).map_err(|e| {
+                            FusionError::Execution(format!("Schema deserialization error: {}", e))
+                        })
+                    })
+                    .transpose()?
+                    .and_then(|schema| {
+                        let local_predicates = first_selection
+                            .as_ref()
+                            .into_iter()
+                            .chain(pending_predicates.iter())
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        self.build_stage_join_base_projection(
+                            &first.relation,
+                            &schema,
+                            projection,
+                            &local_predicates,
+                            &join_column_refs,
+                        )
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let (mut schema, mut rows) = if first_selection.is_some() {
             self.scan_single_table(
                 &first.relation,
                 &first_selection,
-                &None,
+                &first_projection,
                 txn,
                 params,
                 None,
@@ -861,6 +1013,8 @@ impl Executor {
                     Some(&join.join_operator),
                     &mut pending_predicates,
                     &None,
+                    projection,
+                    &join_column_refs,
                     txn,
                     params,
                     limit,
@@ -884,6 +1038,8 @@ impl Executor {
                     None,
                     &mut pending_predicates,
                     &None,
+                    projection,
+                    &join_column_refs,
                     txn,
                     params,
                     limit,
@@ -906,6 +1062,8 @@ impl Executor {
                         Some(&join.join_operator),
                         &mut pending_predicates,
                         &None,
+                        projection,
+                        &join_column_refs,
                         txn,
                         params,
                         limit,

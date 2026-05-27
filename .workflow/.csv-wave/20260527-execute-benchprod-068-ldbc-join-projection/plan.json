@@ -1,0 +1,32 @@
+{
+  "session": "20260527-execute-benchprod-068-ldbc-join-projection",
+  "created_at": "2026-05-27T08:58:00+08:00",
+  "objective": "Reduce LDBC join latency and instability by carrying join-stage projection hints into filtered base scans and indexed join probes.",
+  "scope": [
+    "src/execution/scan/join.rs",
+    "tests/sql_join.rs",
+    "E:/Playground/FusionDB-bench/runs/repeat_benchprod068_ldbc_medium_join_projection_3x_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-068-ldbc-join-projection/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-068-ldbc-join-projection/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-068-ldbc-join-projection/.task/BENCHPROD-068.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes",
+    "gate profile changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-068",
+      "title": "LDBC join projection pushdown",
+      "status": "in_progress",
+      "expected_changes": [
+        "Use join projection hints when the first relation has a local WHERE predicate.",
+        "Use join projection hints for right-side relation scans inside join steps.",
+        "Decode only required right-side columns when indexed join probe is used.",
+        "Verify with corrupt-unused-column regression tests, join/select/group tests, release build, and LDBC medium repeat."
+      ]
+    }
+  ]
+}

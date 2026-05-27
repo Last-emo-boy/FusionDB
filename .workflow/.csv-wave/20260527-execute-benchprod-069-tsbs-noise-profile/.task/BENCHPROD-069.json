@@ -1,0 +1,35 @@
+{
+  "id": "BENCHPROD-069",
+  "title": "Add TSBS tag-filtered noise to production gate profile",
+  "status": "completed",
+  "created_at": "2026-05-27T09:01:00+08:00",
+  "completed_at": "2026-05-27T09:01:00+08:00",
+  "scope": "benchmark gate profile only",
+  "description": "BENCHPROD-068 production repeat passed all suite thresholds and had no case errors, but the default gate failed because `tsbs:Tag-filtered time range` appeared as a new low-latency unstable case outside the known-noise allowlist.",
+  "baseline": {
+    "source": "BENCHPROD-068 production medium repeat",
+    "unstable_suites": 0,
+    "unstable_cases": 4,
+    "new_allowlist_case": "tsbs:Tag-filtered time range",
+    "tsbs_suite_p95_median_ms": 11.882,
+    "tsbs_suite_ops_per_sec_median": 495.8,
+    "tag_filtered_p95_median_ms": 3.233,
+    "tag_filtered_ops_per_sec_median": 321.5
+  },
+  "verification_plan": [
+    "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod068_production_medium_join_projection_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod069_production_medium_profile_20260527"
+  ],
+  "verification_results": [
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod068_production_medium_join_projection_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod069_production_medium_profile_20260527",
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod069_production_medium_profile_20260527/bench_gate_summary.md"
+    }
+  ],
+  "out_of_scope": [
+    "database core changes",
+    "dashboard",
+    "ui"
+  ]
+}

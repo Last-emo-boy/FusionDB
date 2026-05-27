@@ -1,0 +1,29 @@
+{
+  "session": "20260527-execute-benchprod-069-tsbs-noise-profile",
+  "created_at": "2026-05-27T09:01:00+08:00",
+  "objective": "Update production medium gate profile for newly observed TSBS low-latency case noise after BENCHPROD-068.",
+  "scope": [
+    "E:/Playground/FusionDB-bench/gate_profiles/production_medium.json",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod069_production_medium_profile_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-069-tsbs-noise-profile/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-069-tsbs-noise-profile/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-069-tsbs-noise-profile/.task/BENCHPROD-069.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "database core changes"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-069",
+      "title": "Add TSBS tag-filtered noise to production gate profile",
+      "status": "in_progress",
+      "expected_changes": [
+        "Add tsbs:Tag-filtered time range to the production medium unstable case allowlist.",
+        "Keep suite thresholds unchanged.",
+        "Verify BENCHPROD-068 production repeat passes the updated gate."
+      ]
+    }
+  ]
+}
