@@ -790,6 +790,71 @@ async fn test_composite_index_prefix_scan_skips_nonmatching_row_decode() {
 }
 
 #[tokio::test]
+async fn test_composite_index_range_order_limit_skips_outside_range_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE tsbs_range (id INTEGER PRIMARY KEY, host_id INTEGER, ts INTEGER, usage_user INTEGER, usage_system INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO tsbs_range VALUES (1, 1, 60, 1, 10), (2, 1, 1000, 2, 20), (3, 1, 1060, 3, 30), (4, 1, 50000, 4, 40), (5, 2, 1000, 5, 50)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_tsbs_range_host_ts ON tsbs_range (host_id, ts)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, ts) in [(1, 60), (4, 50000), (5, 1000)] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(if id == 5 { 2 } else { 1 }),
+                Value::Integer(ts),
+                Value::Integer(999),
+                Value::Integer(999),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:tsbs_range:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT ts, usage_user, usage_system FROM tsbs_range WHERE host_id = 1 AND ts >= 1000 AND ts < 50000 ORDER BY ts LIMIT 2",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["ts", "usage_user", "usage_system"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1000), Value::Integer(2), Value::Integer(20)],
+            vec![Value::Integer(1060), Value::Integer(3), Value::Integer(30)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_show_indexes_reports_composite_columns() {
     let (executor, wal) = setup().await;
     exec_ok(

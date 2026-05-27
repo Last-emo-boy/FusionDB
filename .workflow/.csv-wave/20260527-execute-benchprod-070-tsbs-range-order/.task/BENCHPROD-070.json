@@ -1,0 +1,127 @@
+{
+  "id": "BENCHPROD-070",
+  "title": "Optimize TSBS tag-filtered range via ordered composite indexes",
+  "status": "completed",
+  "created_at": "2026-05-27T10:16:00+08:00",
+  "completed_at": "2026-05-27T10:27:00+08:00",
+  "scope": "database core index scan and query order/limit execution",
+  "target_query": "SELECT ts, usage_user, usage_system FROM bench_tsbs_cpu WHERE host_id = ? AND ts >= 1000 AND ts < 50000 ORDER BY ts LIMIT 100",
+  "baseline": {
+    "source": "BENCHPROD-068 production medium repeat",
+    "tsbs_suite_p95_median_ms": 11.882,
+    "tsbs_suite_ops_per_sec_median": 495.8,
+    "tag_filtered_status": "unstable",
+    "tag_filtered_p95_median_ms": 3.233,
+    "tag_filtered_p95_cv_pct": 24.48,
+    "tag_filtered_ops_per_sec_median": 321.5
+  },
+  "implementation": {
+    "changed_files": [
+      "src/execution/composite_index.rs",
+      "src/execution/query/mod.rs",
+      "src/execution/query/order.rs",
+      "src/execution/scan/index_plan.rs",
+      "src/execution/scan/join.rs",
+      "src/execution/scan/mod.rs",
+      "src/execution/scan/predicate.rs",
+      "tests/sql_index_cache.rs"
+    ],
+    "summary": [
+      "Introduced v3 composite index metadata and order-preserving components for numeric/date/time/boolean key parts.",
+      "Kept v2 composite index compatibility for existing metadata and DML maintenance.",
+      "Added equality-prefix plus next-column range bounds for ordered composite indexes.",
+      "Preserved index row-id order through IndexScanPlan so matching ORDER BY can skip resorting.",
+      "Allowed ORDER BY LIMIT windows to push into exact ordered composite range scans.",
+      "Added a TSBS-like regression test proving out-of-range/cross-host rows are not decoded for host_id + ts range + ORDER BY LIMIT."
+    ]
+  },
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed",
+      "tests": "28 passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed",
+      "tests": "26 passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed",
+      "tests": "12 passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed",
+      "tests": "39 passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite tsbs --repeats 3 --threads 4 --run-name repeat_benchprod070_tsbs_medium_range_order_final_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 0
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod070_production_medium_range_order_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 2
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod070_production_medium_range_order_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod070_production_medium_range_order_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "results": {
+    "targeted_tsbs_repeat": {
+      "suite_status": "stable",
+      "suite_p95_median_ms": 12.28,
+      "suite_ops_per_sec_median": 653.1,
+      "tag_filtered_status": "stable",
+      "tag_filtered_p95_median_ms": 1.14,
+      "tag_filtered_p95_cv_pct": 2.94,
+      "tag_filtered_ops_per_sec_median": 987.5,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod070_tsbs_medium_range_order_final_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "suite_status": "all_stable",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 2,
+      "chbench_p95_median_ms": 10.665,
+      "ldbc_p95_median_ms": 2.082,
+      "memtier_p95_median_ms": 0.596,
+      "tpcc_p95_median_ms": 3.236,
+      "tsbs_p95_median_ms": 12.061,
+      "tsbs_ops_per_sec_median": 648.8,
+      "tag_filtered_p95_median_ms": 1.08,
+      "tag_filtered_ops_per_sec_median": 975.8,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod070_production_medium_range_order_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod070_production_medium_range_order_20260527/bench_gate_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "Optimize CH-benCHmark Warehouse revenue rollup stability and throughput.",
+    "Investigate memtier SET existing key P95 variance.",
+    "Extend ordered composite range scans to DESC order when storage reverse scans are available."
+  ]
+}

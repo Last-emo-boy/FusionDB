@@ -13,6 +13,7 @@ pub(super) const SMALL_INDEX_FETCH_THRESHOLD: usize = 64;
 
 pub(crate) struct IndexScanPlan {
     pub(crate) row_ids: HashSet<String>,
+    pub(crate) ordered_row_ids: Option<Vec<String>>,
     pub(crate) exact: bool,
 }
 
@@ -104,7 +105,7 @@ impl Executor {
         }
     }
 
-    fn expr_has_column_reference(&self, expr: &Expr) -> bool {
+    pub(crate) fn expr_has_column_reference(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
             Expr::BinaryOp { left, right, .. } => {
@@ -273,12 +274,23 @@ impl Executor {
         txn: &'a mut dyn Transaction,
         params: &'a [Value],
         limit: Option<usize>,
+        order_by: Option<&'a sqlparser::ast::OrderBy>,
+        ordered_limit: Option<usize>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Option<IndexScanPlan>>> + Send + 'a>,
     > {
         Box::pin(async move {
             if let Some(plan) = self
-                .try_composite_index_scan(expr, table_name, schema, txn, params, limit)
+                .try_composite_index_scan(
+                    expr,
+                    table_name,
+                    schema,
+                    txn,
+                    params,
+                    limit,
+                    order_by,
+                    ordered_limit,
+                )
                 .await?
             {
                 return Ok(Some(plan));
@@ -320,6 +332,7 @@ impl Executor {
                                 }
                                 return Ok(Some(IndexScanPlan {
                                     row_ids,
+                                    ordered_row_ids: None,
                                     exact: true,
                                 }));
                             }
@@ -389,6 +402,7 @@ impl Executor {
                                             if candidate_row_ids.as_ref().unwrap().is_empty() {
                                                 return Ok(Some(IndexScanPlan {
                                                     row_ids: HashSet::new(),
+                                                    ordered_row_ids: Some(Vec::new()),
                                                     exact: true,
                                                 }));
                                             }
@@ -399,6 +413,7 @@ impl Executor {
                                         return Ok(candidate_row_ids.map(|row_ids| {
                                             IndexScanPlan {
                                                 row_ids,
+                                                ordered_row_ids: None,
                                                 exact: true,
                                             }
                                         }));
@@ -455,6 +470,7 @@ impl Executor {
                             }
                             return Ok(Some(IndexScanPlan {
                                 row_ids: all_row_ids,
+                                ordered_row_ids: None,
                                 exact: true,
                             }));
                         }
@@ -508,6 +524,7 @@ impl Executor {
                                     if !all_row_ids.is_empty() {
                                         return Ok(Some(IndexScanPlan {
                                             row_ids: all_row_ids,
+                                            ordered_row_ids: None,
                                             exact: true,
                                         }));
                                     }
@@ -535,6 +552,7 @@ impl Executor {
                                             }
                                             return Ok(Some(IndexScanPlan {
                                                 row_ids: set,
+                                                ordered_row_ids: None,
                                                 exact: false,
                                             }));
                                         }
@@ -586,6 +604,7 @@ impl Executor {
                                 }
                                 return Ok(Some(IndexScanPlan {
                                     row_ids,
+                                    ordered_row_ids: None,
                                     exact: true,
                                 }));
                             }
@@ -598,10 +617,10 @@ impl Executor {
                     right,
                 } => {
                     let left_res = self
-                        .try_index_scan(left, table_name, schema, txn, params, None)
+                        .try_index_scan(left, table_name, schema, txn, params, None, None, None)
                         .await?;
                     let right_res = self
-                        .try_index_scan(right, table_name, schema, txn, params, None)
+                        .try_index_scan(right, table_name, schema, txn, params, None, None, None)
                         .await?;
 
                     match (left_res, right_res) {
@@ -617,12 +636,14 @@ impl Executor {
 
                             return Ok(Some(IndexScanPlan {
                                 row_ids,
+                                ordered_row_ids: None,
                                 exact: l.exact && r.exact,
                             }));
                         }
                         (Some(s), None) | (None, Some(s)) => {
                             return Ok(Some(IndexScanPlan {
                                 row_ids: s.row_ids,
+                                ordered_row_ids: None,
                                 exact: false,
                             }))
                         }
@@ -635,10 +656,10 @@ impl Executor {
                     right,
                 } => {
                     let left_res = self
-                        .try_index_scan(left, table_name, schema, txn, params, None)
+                        .try_index_scan(left, table_name, schema, txn, params, None, None, None)
                         .await?;
                     let right_res = self
-                        .try_index_scan(right, table_name, schema, txn, params, None)
+                        .try_index_scan(right, table_name, schema, txn, params, None, None, None)
                         .await?;
 
                     // OR: both sides must have index results to be useful
@@ -646,13 +667,23 @@ impl Executor {
                         l.row_ids.extend(r.row_ids);
                         return Ok(Some(IndexScanPlan {
                             row_ids: l.row_ids,
+                            ordered_row_ids: None,
                             exact: l.exact && r.exact,
                         }));
                     }
                 }
                 Expr::Nested(inner) => {
                     return self
-                        .try_index_scan(inner, table_name, schema, txn, params, limit)
+                        .try_index_scan(
+                            inner,
+                            table_name,
+                            schema,
+                            txn,
+                            params,
+                            limit,
+                            order_by,
+                            ordered_limit,
+                        )
                         .await;
                 }
                 _ => {}

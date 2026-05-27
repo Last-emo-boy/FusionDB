@@ -2,7 +2,8 @@ use crate::catalog::TableSchema;
 use crate::common::{Result, Value};
 use crate::storage::Transaction;
 use base64::Engine;
-use sqlparser::ast::{BinaryOperator, Expr};
+use sqlparser::ast::{BinaryOperator, Expr, OrderByKind};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use super::Executor;
@@ -12,6 +13,18 @@ pub(crate) struct CompositeIndexMeta {
     pub name: String,
     pub table: String,
     pub columns: Vec<String>,
+    pub ordered_encoding: bool,
+}
+
+#[derive(Clone)]
+struct CompositeRangeBound {
+    component: String,
+    inclusive: bool,
+}
+
+struct CompositeRangeBounds {
+    lower: Option<CompositeRangeBound>,
+    upper: Option<CompositeRangeBound>,
 }
 
 impl CompositeIndexMeta {
@@ -26,11 +39,11 @@ impl Executor {
     }
 
     pub(crate) fn composite_index_meta_value(table: &str, columns: &[String]) -> String {
-        format!("v2:{}:{}", table, columns.join(","))
+        format!("v3:{}:{}", table, columns.join(","))
     }
 
     pub(crate) fn parse_index_meta(index_name: &str, meta_str: &str) -> Option<CompositeIndexMeta> {
-        if let Some(rest) = meta_str.strip_prefix("v2:") {
+        if let Some(rest) = meta_str.strip_prefix("v3:") {
             let (table, columns) = rest.split_once(':')?;
             let columns = columns
                 .split(',')
@@ -47,6 +60,26 @@ impl Executor {
                 name: index_name.to_string(),
                 table: table.to_string(),
                 columns,
+                ordered_encoding: true,
+            })
+        } else if let Some(rest) = meta_str.strip_prefix("v2:") {
+            let (table, columns) = rest.split_once(':')?;
+            let columns = columns
+                .split(',')
+                .map(str::trim)
+                .filter(|column| !column.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+
+            if table.is_empty() || columns.is_empty() {
+                return None;
+            }
+
+            Some(CompositeIndexMeta {
+                name: index_name.to_string(),
+                table: table.to_string(),
+                columns,
+                ordered_encoding: false,
             })
         } else {
             let (table, column) = meta_str.split_once(':')?;
@@ -58,6 +91,7 @@ impl Executor {
                 name: index_name.to_string(),
                 table: table.to_string(),
                 columns: vec![column.to_string()],
+                ordered_encoding: false,
             })
         }
     }
@@ -103,10 +137,28 @@ impl Executor {
         schema: &TableSchema,
         row_id: &str,
     ) -> Option<String> {
-        let value_key = self.composite_index_value_key(columns, row, schema)?;
+        let value_key = self.composite_index_value_key(columns, row, schema, true)?;
         Some(format!(
             "{}{}:{}",
             Self::composite_index_prefix(table_name, columns),
+            value_key,
+            row_id
+        ))
+    }
+
+    fn composite_index_key_for_meta(
+        &self,
+        meta: &CompositeIndexMeta,
+        table_name: &str,
+        row: &[Value],
+        schema: &TableSchema,
+        row_id: &str,
+    ) -> Option<String> {
+        let value_key =
+            self.composite_index_value_key(&meta.columns, row, schema, meta.ordered_encoding)?;
+        Some(format!(
+            "{}{}:{}",
+            Self::composite_index_prefix(table_name, &meta.columns),
             value_key,
             row_id
         ))
@@ -117,21 +169,82 @@ impl Executor {
         columns: &[String],
         row: &[Value],
         schema: &TableSchema,
+        ordered_encoding: bool,
     ) -> Option<String> {
         let mut parts = Vec::with_capacity(columns.len());
 
         for column in columns {
             let idx = schema.get_column_index(column)?;
             let value = row.get(idx)?;
-            parts.push(self.encoded_index_component(value)?);
+            let part = if ordered_encoding {
+                self.ordered_index_component(value)?
+            } else {
+                self.legacy_encoded_index_component(value)?
+            };
+            parts.push(part);
         }
 
         Some(parts.join(Self::composite_index_component_separator()))
     }
 
-    fn encoded_index_component(&self, value: &Value) -> Option<String> {
+    fn legacy_encoded_index_component(&self, value: &Value) -> Option<String> {
         let raw = self.value_to_index_string(value)?;
         Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes()))
+    }
+
+    fn ordered_index_component(&self, value: &Value) -> Option<String> {
+        Some(match value {
+            Value::Integer(value) => {
+                format!(
+                    "i{}",
+                    crate::common::encoding::encode_i64_comparable(*value)
+                )
+            }
+            Value::Date(days) => {
+                format!(
+                    "d{}",
+                    crate::common::encoding::encode_i64_comparable(*days as i64)
+                )
+            }
+            Value::Timestamp(micros) => {
+                format!(
+                    "t{}",
+                    crate::common::encoding::encode_i64_comparable(*micros)
+                )
+            }
+            Value::Interval(micros) => {
+                format!(
+                    "v{}",
+                    crate::common::encoding::encode_i64_comparable(*micros)
+                )
+            }
+            Value::Boolean(value) => {
+                if *value {
+                    "b1".to_string()
+                } else {
+                    "b0".to_string()
+                }
+            }
+            Value::String(value) => {
+                let encoded =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
+                format!("s{}", encoded)
+            }
+            Value::Decimal(value) => {
+                let encoded =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
+                format!("n{}", encoded)
+            }
+            _ => return None,
+        })
+    }
+
+    fn index_component_for_meta(&self, value: &Value, meta: &CompositeIndexMeta) -> Option<String> {
+        if meta.ordered_encoding {
+            self.ordered_index_component(value)
+        } else {
+            self.legacy_encoded_index_component(value)
+        }
     }
 
     pub(crate) async fn put_loaded_composite_indexes_for_row(
@@ -145,7 +258,7 @@ impl Executor {
     ) -> Result<()> {
         for index in indexes {
             if let Some(index_key) =
-                self.composite_index_key(table_name, &index.columns, row, schema, row_id)
+                self.composite_index_key_for_meta(index, table_name, row, schema, row_id)
             {
                 txn.put(index_key.as_bytes(), &[]).await?;
             }
@@ -164,7 +277,7 @@ impl Executor {
     ) -> Result<()> {
         for index in indexes {
             if let Some(index_key) =
-                self.composite_index_key(table_name, &index.columns, row, schema, row_id)
+                self.composite_index_key_for_meta(index, table_name, row, schema, row_id)
             {
                 txn.delete(index_key.as_bytes()).await?;
             }
@@ -194,13 +307,13 @@ impl Executor {
             }
 
             if let Some(old_key) =
-                self.composite_index_key(table_name, &index.columns, old_row, schema, row_id)
+                self.composite_index_key_for_meta(index, table_name, old_row, schema, row_id)
             {
                 txn.delete(old_key.as_bytes()).await?;
             }
 
             if let Some(new_key) =
-                self.composite_index_key(table_name, &index.columns, new_row, schema, row_id)
+                self.composite_index_key_for_meta(index, table_name, new_row, schema, row_id)
             {
                 txn.put(new_key.as_bytes(), &[]).await?;
             }
@@ -216,6 +329,8 @@ impl Executor {
         txn: &mut dyn Transaction,
         params: &[Value],
         limit: Option<usize>,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+        ordered_limit: Option<usize>,
     ) -> Result<Option<super::scan::IndexScanPlan>> {
         let indexes = self
             .load_composite_indexes_for_table(table_name, txn)
@@ -234,7 +349,7 @@ impl Executor {
                 let Some(value) = equality_values.get(&column.to_ascii_lowercase()) else {
                     break;
                 };
-                let Some(component) = self.encoded_index_component(value) else {
+                let Some(component) = self.index_component_for_meta(value, &index) else {
                     break;
                 };
                 components.push(component);
@@ -256,33 +371,112 @@ impl Executor {
             return Ok(None);
         };
 
-        let mut index_prefix = format!(
+        let range_column = index.columns.get(components.len());
+        let range_column_orderable = range_column
+            .and_then(|column| schema.get_column_index(column))
+            .is_some_and(|idx| {
+                Self::composite_column_type_is_orderable(&schema.columns[idx].data_type)
+            });
+
+        let range = if index.ordered_encoding
+            && components.len() < index.columns.len()
+            && range_column_orderable
+        {
+            self.composite_index_range_bounds(&predicates, schema, params, range_column.unwrap())?
+        } else {
+            None
+        };
+        let range_predicate_count = range
+            .as_ref()
+            .map(|range| usize::from(range.lower.is_some()) + usize::from(range.upper.is_some()))
+            .unwrap_or(0);
+
+        let order_matches = index.ordered_encoding
+            && range_column_orderable
+            && Self::composite_order_matches_next_column(
+                order_by,
+                range_column.map(String::as_str),
+            );
+
+        let index_prefix = format!(
             "{}{}",
             Self::composite_index_prefix(table_name, &index.columns),
             components.join(Self::composite_index_component_separator())
         );
-        if all_index_columns_matched {
-            index_prefix.push(':');
-        } else {
-            index_prefix.push_str(Self::composite_index_component_separator());
-        }
-        let scan_limit = if all_index_columns_matched {
+
+        let can_cover_predicates = all_index_columns_matched
+            && predicates.len() == index.columns.len()
+            || (range.is_some()
+                && predicates.len() == components.len().saturating_add(range_predicate_count));
+        let scan_limit = if order_matches && can_cover_predicates {
+            ordered_limit.or(limit)
+        } else if all_index_columns_matched {
             limit
         } else {
             None
         };
-        let index_entries = txn.scan_prefix(index_prefix.as_bytes(), scan_limit).await?;
+
+        let index_entries = if let Some(range) = range {
+            let range_prefix = format!(
+                "{}{}",
+                index_prefix,
+                Self::composite_index_component_separator()
+            );
+            let start = if let Some(lower) = range.lower {
+                format!(
+                    "{}{}:{}",
+                    range_prefix,
+                    lower.component,
+                    if lower.inclusive { "" } else { "\u{0}" }
+                )
+            } else {
+                range_prefix.clone()
+            };
+            if let Some(upper) = range.upper {
+                let end = format!(
+                    "{}{}:{}",
+                    range_prefix,
+                    upper.component,
+                    if upper.inclusive { "\u{0}" } else { "" }
+                );
+                txn.scan_range(start.as_bytes(), end.as_bytes(), scan_limit)
+                    .await?
+            } else {
+                let mut end = range_prefix.into_bytes();
+                end.push(0xFF);
+                txn.scan_range(start.as_bytes(), &end, scan_limit).await?
+            }
+        } else {
+            let mut prefix = index_prefix;
+            if all_index_columns_matched {
+                prefix.push(':');
+            } else {
+                prefix.push_str(Self::composite_index_component_separator());
+            }
+            txn.scan_prefix(prefix.as_bytes(), scan_limit).await?
+        };
 
         let mut row_ids = std::collections::HashSet::with_capacity(index_entries.len());
+        let mut ordered_row_ids = if order_matches {
+            Some(Vec::with_capacity(index_entries.len()))
+        } else {
+            None
+        };
         for (key, _) in index_entries {
             if let Some(row_id) = Self::row_id_from_key(&key) {
-                row_ids.insert(row_id.to_string());
+                let row_id = row_id.to_string();
+                if row_ids.insert(row_id.clone()) {
+                    if let Some(ordered) = &mut ordered_row_ids {
+                        ordered.push(row_id);
+                    }
+                }
             }
         }
 
         Ok(Some(super::scan::IndexScanPlan {
             row_ids,
-            exact: all_index_columns_matched && predicates.len() == index.columns.len(),
+            ordered_row_ids,
+            exact: can_cover_predicates,
         }))
     }
 
@@ -317,6 +511,163 @@ impl Executor {
         }
 
         Ok(values)
+    }
+
+    fn composite_index_range_bounds(
+        &self,
+        predicates: &[Expr],
+        schema: &TableSchema,
+        params: &[Value],
+        range_column: &str,
+    ) -> Result<Option<CompositeRangeBounds>> {
+        let mut lower: Option<CompositeRangeBound> = None;
+        let mut upper: Option<CompositeRangeBound> = None;
+
+        for predicate in predicates {
+            let Expr::BinaryOp { left, op, right } = predicate else {
+                continue;
+            };
+            let Some((range_op, value_expr)) =
+                self.composite_index_range_value_expr(left, op, right, schema, range_column)
+            else {
+                continue;
+            };
+
+            let value = self.evaluate_value(value_expr, &[], schema, params)?;
+            let Some(component) = self.ordered_index_component(&value) else {
+                continue;
+            };
+            let bound = CompositeRangeBound {
+                component,
+                inclusive: matches!(range_op, BinaryOperator::GtEq | BinaryOperator::LtEq),
+            };
+
+            match range_op {
+                BinaryOperator::Gt | BinaryOperator::GtEq => {
+                    if Self::range_lower_is_better(lower.as_ref(), &bound) {
+                        lower = Some(bound);
+                    }
+                }
+                BinaryOperator::Lt | BinaryOperator::LtEq => {
+                    if Self::range_upper_is_better(upper.as_ref(), &bound) {
+                        upper = Some(bound);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if lower.is_none() && upper.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(CompositeRangeBounds { lower, upper }))
+        }
+    }
+
+    fn composite_index_range_value_expr<'a>(
+        &self,
+        left: &'a Expr,
+        op: &BinaryOperator,
+        right: &'a Expr,
+        schema: &TableSchema,
+        range_column: &str,
+    ) -> Option<(BinaryOperator, &'a Expr)> {
+        let normalized_op = match op {
+            BinaryOperator::Gt => BinaryOperator::Gt,
+            BinaryOperator::GtEq => BinaryOperator::GtEq,
+            BinaryOperator::Lt => BinaryOperator::Lt,
+            BinaryOperator::LtEq => BinaryOperator::LtEq,
+            _ => return None,
+        };
+
+        let left_matches = self
+            .resolve_schema_column_name(left, schema)
+            .is_some_and(|(_, column)| column.eq_ignore_ascii_case(range_column));
+        if left_matches {
+            if self.expr_has_column_reference(right) {
+                None
+            } else {
+                Some((normalized_op, right))
+            }
+        } else {
+            let right_matches = self
+                .resolve_schema_column_name(right, schema)
+                .is_some_and(|(_, column)| column.eq_ignore_ascii_case(range_column));
+            if !right_matches || self.expr_has_column_reference(left) {
+                return None;
+            }
+            let flipped_op = match op {
+                BinaryOperator::Gt => BinaryOperator::Lt,
+                BinaryOperator::GtEq => BinaryOperator::LtEq,
+                BinaryOperator::Lt => BinaryOperator::Gt,
+                BinaryOperator::LtEq => BinaryOperator::GtEq,
+                _ => return None,
+            };
+            Some((flipped_op, left))
+        }
+    }
+
+    fn range_lower_is_better(
+        current: Option<&CompositeRangeBound>,
+        candidate: &CompositeRangeBound,
+    ) -> bool {
+        let Some(current) = current else {
+            return true;
+        };
+        match candidate.component.cmp(&current.component) {
+            Ordering::Greater => true,
+            Ordering::Equal => !candidate.inclusive && current.inclusive,
+            Ordering::Less => false,
+        }
+    }
+
+    fn range_upper_is_better(
+        current: Option<&CompositeRangeBound>,
+        candidate: &CompositeRangeBound,
+    ) -> bool {
+        let Some(current) = current else {
+            return true;
+        };
+        match candidate.component.cmp(&current.component) {
+            Ordering::Less => true,
+            Ordering::Equal => !candidate.inclusive && current.inclusive,
+            Ordering::Greater => false,
+        }
+    }
+
+    fn composite_order_matches_next_column(
+        order_by: Option<&sqlparser::ast::OrderBy>,
+        next_column: Option<&str>,
+    ) -> bool {
+        let (Some(order_by), Some(next_column)) = (order_by, next_column) else {
+            return false;
+        };
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return false;
+        };
+        let [order_expr] = exprs.as_slice() else {
+            return false;
+        };
+        if !order_expr.options.asc.unwrap_or(true) {
+            return false;
+        }
+        Self::order_limit_column_name(&order_expr.expr)
+            .is_some_and(|column| column.eq_ignore_ascii_case(next_column))
+    }
+
+    fn composite_column_type_is_orderable(data_type: &str) -> bool {
+        let upper = data_type.to_ascii_uppercase();
+        Self::is_integer_type_name(&upper)
+            || matches!(upper.as_str(), "BOOL" | "BOOLEAN" | "DATE" | "DATE32")
+            || upper == "TIMESTAMP"
+            || upper == "TIMESTAMP WITHOUT TIME ZONE"
+            || upper == "TIMESTAMP WITH TIME ZONE"
+            || upper == "TIMESTAMPTZ"
+            || upper == "DATETIME"
+            || upper.starts_with("TIMESTAMP(")
+            || upper.starts_with("DATETIME(")
+            || upper == "INTERVAL"
+            || upper.starts_with("INTERVAL ")
     }
 
     pub(crate) async fn delete_index_meta_for_table(

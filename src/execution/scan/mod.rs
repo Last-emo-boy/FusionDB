@@ -113,7 +113,8 @@ impl Executor {
         params: &[Value],
         limit: Option<usize>,
         order_by: Option<&sqlparser::ast::OrderBy>,
-    ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+        ordered_limit: Option<usize>,
+    ) -> Result<(TableSchema, Vec<Vec<Value>>, bool)> {
         if let TableFactor::Table { name, .. } = table {
             let table_name = name.to_string();
             let schema_key = format!("schema:{}", table_name);
@@ -146,7 +147,7 @@ impl Executor {
                                 })
                                 .collect();
                             let schema = TableSchema::new(table_name, cols);
-                            return Ok((schema, rows));
+                            return Ok((schema, rows, false));
                         }
                     }
                 }
@@ -281,6 +282,7 @@ impl Executor {
             let mut rows = Vec::new();
             let mut index_used = false;
             let mut selection_fully_applied = selection.is_none();
+            let mut rows_satisfy_order_by = false;
 
             // Optimization: Vector Search (HNSW)
             if let Some(order_by) = order_by {
@@ -427,17 +429,17 @@ impl Executor {
                             if key_only_scan {
                                 if txn.get(key.as_bytes()).await?.is_some() {
                                     let row = Self::primary_key_row_from_id(&schema, pk_index, &id);
-                                    return Ok((schema, vec![row]));
+                                    return Ok((schema, vec![row], false));
                                 }
-                                return Ok((schema, vec![]));
+                                return Ok((schema, vec![], false));
                             }
 
                             if let Some(row) = self.row_cache.get(&key) {
                                 monitor::inc_row_cache_hit();
                                 if self.evaluate_expr(sel, &row, &schema, params)? {
-                                    return Ok((schema, vec![row]));
+                                    return Ok((schema, vec![row], false));
                                 }
-                                return Ok((schema, vec![]));
+                                return Ok((schema, vec![], false));
                             }
 
                             if let Some(v) = txn.get(key.as_bytes()).await? {
@@ -458,10 +460,10 @@ impl Executor {
                                 }
 
                                 if self.evaluate_expr(sel, &row, &schema, params)? {
-                                    return Ok((schema, vec![row]));
+                                    return Ok((schema, vec![row], false));
                                 }
                             }
-                            return Ok((schema, vec![]));
+                            return Ok((schema, vec![], false));
                         }
                     }
                 }
@@ -615,13 +617,28 @@ impl Executor {
                             txn,
                             params,
                             Some(index_probe_limit),
+                            order_by,
+                            ordered_limit,
                         )
                         .await?
                     {
-                        let mut row_ids_vec: Vec<String> = index_plan.row_ids.into_iter().collect();
-                        row_ids_vec.sort_unstable();
+                        let ordered_index_rows = index_plan.ordered_row_ids.is_some();
+                        let mut row_ids_vec = if let Some(ordered) = index_plan.ordered_row_ids {
+                            ordered
+                        } else {
+                            let mut row_ids_vec: Vec<String> =
+                                index_plan.row_ids.into_iter().collect();
+                            row_ids_vec.sort_unstable();
+                            row_ids_vec
+                        };
 
                         if order_by.is_none() {
+                            if let Some(l) = limit {
+                                if row_ids_vec.len() > l {
+                                    row_ids_vec.truncate(l);
+                                }
+                            }
+                        } else if ordered_index_rows && index_plan.exact {
                             if let Some(l) = limit {
                                 if row_ids_vec.len() > l {
                                     row_ids_vec.truncate(l);
@@ -635,8 +652,11 @@ impl Executor {
                         } else if Self::should_use_index_plan(row_ids_vec.len(), limit, order_by) {
                             index_used = true;
                             selection_fully_applied = index_plan.exact;
+                            rows_satisfy_order_by = ordered_index_rows;
 
-                            if row_ids_vec.len() <= SMALL_INDEX_FETCH_THRESHOLD {
+                            if ordered_index_rows
+                                || row_ids_vec.len() <= SMALL_INDEX_FETCH_THRESHOLD
+                            {
                                 for row_id in row_ids_vec {
                                     let data_key = format!("data:{}:{}", table_name, row_id);
 
@@ -877,7 +897,7 @@ impl Executor {
                 }
             }
 
-            Ok((schema, rows))
+            Ok((schema, rows, rows_satisfy_order_by))
         } else {
             Err(FusionError::Execution(
                 "Unsupported table factor".to_string(),

@@ -1,0 +1,20 @@
+{
+  "id": "BENCHPROD-070",
+  "title": "TSBS composite index range order pushdown",
+  "created_at": "2026-05-27T10:16:00+08:00",
+  "status": "completed",
+  "scope": "database core only",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-070"
+      ]
+    }
+  ],
+  "constraints": [
+    "Do not modify dashboard or UI",
+    "Keep benchmark artifacts under E:/Playground/FusionDB-bench/runs",
+    "Preserve v2 composite index compatibility while introducing ordered v3 indexes"
+  ]
+}

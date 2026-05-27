@@ -178,7 +178,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn resolve_schema_column_name(
+    pub(crate) fn resolve_schema_column_name(
         &self,
         expr: &Expr,
         schema: &TableSchema,

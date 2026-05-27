@@ -70,8 +70,10 @@ impl Executor {
             params,
             None,
             None,
+            None,
         )
         .await
+        .map(|(schema, rows, _)| (schema, rows))
     }
 
     pub(crate) fn relation_names(&self, relation: &TableFactor) -> HashSet<String> {
@@ -754,16 +756,19 @@ impl Executor {
         }
 
         let (right_schema_base, right_rows) = if right_selection.is_some() {
-            self.scan_single_table(
-                relation,
-                &right_selection,
-                &right_projection,
-                txn,
-                params,
-                None,
-                None,
-            )
-            .await?
+            let (schema, rows, _) = self
+                .scan_single_table(
+                    relation,
+                    &right_selection,
+                    &right_projection,
+                    txn,
+                    params,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            (schema, rows)
         } else {
             self.scan_join_base(
                 relation,
@@ -980,16 +985,19 @@ impl Executor {
             None
         };
         let (mut schema, mut rows) = if first_selection.is_some() {
-            self.scan_single_table(
-                &first.relation,
-                &first_selection,
-                &first_projection,
-                txn,
-                params,
-                None,
-                None,
-            )
-            .await?
+            let (schema, rows, _) = self
+                .scan_single_table(
+                    &first.relation,
+                    &first_selection,
+                    &first_projection,
+                    txn,
+                    params,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            (schema, rows)
         } else {
             self.scan_join_base(
                 &first.relation,

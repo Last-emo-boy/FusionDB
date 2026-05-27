@@ -29,7 +29,7 @@ pub(super) struct SortOrderKey<'a> {
 }
 
 impl Executor {
-    pub(super) fn order_limit_column_name(expr: &Expr) -> Option<String> {
+    pub(crate) fn order_limit_column_name(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier(ident) => Some(ident.value.clone()),
             Expr::CompoundIdentifier(idents) => {

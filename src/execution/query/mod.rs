@@ -907,6 +907,11 @@ impl Executor {
             } else {
                 primary_key_order_limit
             };
+            let order_limit_window = if is_group_by_none && query.order_by.is_some() {
+                limit.map(|l| l + offset)
+            } else {
+                None
+            };
 
             let is_wildcard = select
                 .projection
@@ -1018,16 +1023,18 @@ impl Executor {
                 None
             };
 
-            let (mut schema, mut rows) = if is_join {
-                self.execute_join(
-                    &select.from,
-                    &sel_option,
-                    &projection_hint,
-                    txn,
-                    params,
-                    join_limit,
-                )
-                .await?
+            let (mut schema, mut rows, scan_satisfies_order_by) = if is_join {
+                let (schema, rows) = self
+                    .execute_join(
+                        &select.from,
+                        &sel_option,
+                        &projection_hint,
+                        txn,
+                        params,
+                        join_limit,
+                    )
+                    .await?;
+                (schema, rows, false)
             } else if let Some(table) = select.from.first() {
                 self.scan_single_table(
                     &table.relation,
@@ -1037,6 +1044,7 @@ impl Executor {
                     params,
                     push_down_limit,
                     query.order_by.as_ref(),
+                    order_limit_window,
                 )
                 .await?
             } else {
@@ -1293,6 +1301,7 @@ impl Executor {
                 }
             }
 
+            let mut rows_still_satisfy_order_by = scan_satisfies_order_by;
             if let Some(order_by) = &query.order_by {
                 if let OrderByKind::Expressions(exprs) = &order_by.kind {
                     let projection = &select.projection;
@@ -1324,13 +1333,18 @@ impl Executor {
                             offset.saturating_add(value)
                         }
                     });
-                    self.sort_rows_by_order_keys(
-                        &mut rows,
-                        &sort_keys,
-                        &schema,
-                        params,
-                        limit_window,
-                    );
+                    if rows_are_projected {
+                        rows_still_satisfy_order_by = false;
+                    }
+                    if !rows_still_satisfy_order_by {
+                        self.sort_rows_by_order_keys(
+                            &mut rows,
+                            &sort_keys,
+                            &schema,
+                            params,
+                            limit_window,
+                        );
+                    }
                 }
             }
 

@@ -1,0 +1,2 @@
+{"ts":"2026-05-27T10:16:00+08:00","task":"BENCHPROD-070","type":"code_pattern","data":{"name":"composite-index-v3-ordered-components","file":"src/execution/composite_index.rs","description":"Composite index v3 components preserve order for numeric/date/time/boolean values and keep v2 compatibility for older metadata."}}
+{"ts":"2026-05-27T10:16:00+08:00","task":"BENCHPROD-070","type":"benchmark_result","data":{"suite":"tsbs","case":"Tag-filtered time range","baseline_p95_ms":3.233,"final_p95_ms":1.14,"baseline_ops":321.5,"final_ops":987.5}}
