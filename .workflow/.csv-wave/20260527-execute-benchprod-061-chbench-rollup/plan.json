@@ -1,0 +1,35 @@
+{
+  "session": "20260527-execute-benchprod-061-chbench-rollup",
+  "created_at": "2026-05-27T08:20:00+08:00",
+  "objective": "Optimize the CH-benCHmark Warehouse revenue rollup hotspot by adding a streaming multi-column GROUP BY aggregate fast path.",
+  "scope": [
+    "src/execution/query/column_scan.rs",
+    "src/execution/query/mod.rs",
+    "tests/sql_group_aggregate.rs",
+    "E:/Playground/FusionDB-bench/runs/repeat_benchprod061_chbench_medium_rollup_3x_20260527",
+    "E:/Playground/FusionDB-bench/runs/repeat_benchprod061_production_medium_3x_20260527",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod061_production_medium_20260527",
+    ".workflow/.csv-wave/20260527-execute-benchprod-061-chbench-rollup/context.md",
+    ".workflow/.csv-wave/20260527-execute-benchprod-061-chbench-rollup/plan.json",
+    ".workflow/.csv-wave/20260527-execute-benchprod-061-chbench-rollup/.task/BENCHPROD-061.json"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes",
+    "gate profile changes unless current noise requires a separate task"
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-061",
+      "title": "Stream multi-column GROUP BY rollups for CH-benCHmark",
+      "status": "in_progress",
+      "expected_changes": [
+        "Support streaming column-scan aggregation for simple projections with multiple GROUP BY columns.",
+        "Target `GROUP BY w_id, status` with `SUM(total)` and `COUNT(*)`.",
+        "Avoid decoding unrelated row columns in the fast path.",
+        "Verify with focused SQL tests, CH-benCHmark repeat, production repeat, and benchmark gate."
+      ]
+    }
+  ]
+}

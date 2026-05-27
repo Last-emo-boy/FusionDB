@@ -997,6 +997,83 @@ async fn test_group_by_column_aggregates_fast_path_order_by_limit() {
 }
 
 #[tokio::test]
+async fn test_multi_column_group_by_aggregates_fast_path_order_by_limit() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE ch_orders (o_id INTEGER PRIMARY KEY, w_id INTEGER, status TEXT, total INTEGER, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (o_id, w_id, status, total) in [
+            (1_i64, 1_i64, "new", 10_i64),
+            (2, 1, "new", 30),
+            (3, 1, "paid", 100),
+            (4, 2, "paid", 40),
+            (5, 2, "paid", 70),
+            (6, 2, "new", 5),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(o_id),
+                Value::Integer(w_id),
+                Value::String(status.to_string()),
+                Value::Integer(total),
+                Value::String(format!("payload-{}", o_id)),
+            ]);
+            let corrupt_col_idx = 4usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:ch_orders:{}",
+                fusiondb::common::encoding::encode_i64_comparable(o_id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT w_id, status, SUM(total), COUNT(*) FROM ch_orders GROUP BY w_id, status ORDER BY SUM(total) DESC LIMIT 3",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["w_id", "status", "SUM(total)", "COUNT(*)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(2),
+                Value::String("paid".to_string()),
+                Value::Integer(110),
+                Value::Integer(2),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::String("paid".to_string()),
+                Value::Integer(100),
+                Value::Integer(1),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::String("new".to_string()),
+                Value::Integer(40),
+                Value::Integer(2),
+            ],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_group_by_sum_multiply_expr() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -225,10 +225,10 @@ struct GroupColumnAggregateState {
 }
 
 struct GroupAggregateScanVisitor<'a> {
-    group_column_index: usize,
+    group_column_indices: &'a [usize],
     aggregate_plans: &'a [GroupColumnAggregateScanPlan],
     predicate: Option<&'a ColumnPredicateScanPlan>,
-    groups: &'a mut HashMap<Value, Vec<GroupColumnAggregateState>>,
+    groups: &'a mut HashMap<Vec<Value>, Vec<GroupColumnAggregateState>>,
     predicate_values: Vec<Value>,
     error: Option<FusionError>,
 }
@@ -242,14 +242,17 @@ impl GroupAggregateScanVisitor<'_> {
             }
         }
 
-        let group_value = Executor::decode_column_or_reuse_predicate(
-            data,
-            self.group_column_index,
-            self.predicate,
-            &self.predicate_values,
-        )?;
+        let mut group_values = Vec::with_capacity(self.group_column_indices.len());
+        for &group_column_index in self.group_column_indices {
+            group_values.push(Executor::decode_column_or_reuse_predicate(
+                data,
+                group_column_index,
+                self.predicate,
+                &self.predicate_values,
+            )?);
+        }
 
-        let states = self.groups.entry(group_value).or_insert_with(|| {
+        let states = self.groups.entry(group_values).or_insert_with(|| {
             self.aggregate_plans
                 .iter()
                 .map(|plan| GroupColumnAggregateState::new(plan.kind))
@@ -937,32 +940,40 @@ impl Executor {
         projection: &[SelectItem],
         group_exprs: &[Expr],
         schema: &TableSchema,
-    ) -> Option<(usize, String, Vec<GroupColumnAggregateScanPlan>)> {
-        if projection.len() < 2 || group_exprs.len() != 1 {
+    ) -> Option<(Vec<usize>, Vec<String>, Vec<GroupColumnAggregateScanPlan>)> {
+        if projection.len() <= group_exprs.len() || group_exprs.is_empty() {
             return None;
         }
 
-        let group_column_name = Self::order_limit_column_name(&group_exprs[0])?;
-        let group_column_index = schema
-            .columns
-            .iter()
-            .position(|col| col.name.eq_ignore_ascii_case(&group_column_name))?;
+        let mut group_column_indices = Vec::with_capacity(group_exprs.len());
+        let mut output_group_names = Vec::with_capacity(group_exprs.len());
 
-        let output_group_name = match &projection[0] {
-            SelectItem::UnnamedExpr(expr) if expr == &group_exprs[0] => match expr {
-                Expr::Identifier(ident) => ident.value.clone(),
-                Expr::CompoundIdentifier(_) => schema.columns[group_column_index].name.clone(),
+        for (item, group_expr) in projection.iter().take(group_exprs.len()).zip(group_exprs) {
+            let group_column_name = Self::order_limit_column_name(group_expr)?;
+            let group_column_index = schema
+                .columns
+                .iter()
+                .position(|col| col.name.eq_ignore_ascii_case(&group_column_name))?;
+
+            let output_group_name = match item {
+                SelectItem::UnnamedExpr(expr) if expr == group_expr => match expr {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    Expr::CompoundIdentifier(_) => schema.columns[group_column_index].name.clone(),
+                    _ => return None,
+                },
+                SelectItem::ExprWithAlias { expr, alias } if expr == group_expr => {
+                    alias.value.clone()
+                }
                 _ => return None,
-            },
-            SelectItem::ExprWithAlias { expr, alias } if expr == &group_exprs[0] => {
-                alias.value.clone()
-            }
-            _ => return None,
-        };
+            };
 
-        let mut aggregate_plans = Vec::with_capacity(projection.len() - 1);
+            group_column_indices.push(group_column_index);
+            output_group_names.push(output_group_name);
+        }
 
-        for item in projection.iter().skip(1) {
+        let mut aggregate_plans = Vec::with_capacity(projection.len() - group_exprs.len());
+
+        for item in projection.iter().skip(group_exprs.len()) {
             let (func, output_name) = match item {
                 SelectItem::UnnamedExpr(Expr::Function(func)) => (func, format!("{}", func)),
                 SelectItem::ExprWithAlias {
@@ -1068,24 +1079,24 @@ impl Executor {
             });
         }
 
-        Some((group_column_index, output_group_name, aggregate_plans))
+        Some((group_column_indices, output_group_names, aggregate_plans))
     }
 
     pub(super) async fn group_by_column_aggregate_scan(
         &self,
         table_name: &str,
-        group_column_index: usize,
+        group_column_indices: &[usize],
         aggregate_plans: &[GroupColumnAggregateScanPlan],
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         let prefix = format!("data:{}:", table_name);
-        let mut groups: HashMap<Value, Vec<GroupColumnAggregateState>> =
+        let mut groups: HashMap<Vec<Value>, Vec<GroupColumnAggregateState>> =
             HashMap::with_capacity(4096);
 
         let scan_error = {
             let mut visitor = GroupAggregateScanVisitor {
-                group_column_index,
+                group_column_indices,
                 aggregate_plans,
                 predicate,
                 groups: &mut groups,
@@ -1103,9 +1114,9 @@ impl Executor {
 
         Ok(groups
             .into_iter()
-            .map(|(group_value, states)| {
-                let mut row = Vec::with_capacity(states.len() + 1);
-                row.push(group_value);
+            .map(|(group_values, states)| {
+                let mut row = Vec::with_capacity(group_values.len() + states.len());
+                row.extend(group_values);
                 row.extend(states.iter().map(GroupColumnAggregateState::finalize));
                 row
             })

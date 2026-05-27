@@ -859,16 +859,15 @@ impl Executor {
                                         return Ok(QueryResult::Select { columns, rows });
                                     }
 
-                                    if let Some((group_column_index, group_name, aggregate_plans)) =
-                                        Self::simple_group_by_column_aggregate_projection(
-                                            &select.projection,
-                                            group_exprs,
-                                            &schema,
-                                        )
-                                    {
-                                        let mut columns =
-                                            Vec::with_capacity(aggregate_plans.len() + 1);
-                                        columns.push(group_name);
+                                    if let Some((
+                                        group_column_indices,
+                                        mut columns,
+                                        aggregate_plans,
+                                    )) = Self::simple_group_by_column_aggregate_projection(
+                                        &select.projection,
+                                        group_exprs,
+                                        &schema,
+                                    ) {
                                         columns.extend(
                                             aggregate_plans
                                                 .iter()
@@ -877,7 +876,7 @@ impl Executor {
                                         let rows = self
                                             .group_by_column_aggregate_scan(
                                                 &table_name_str,
-                                                group_column_index,
+                                                &group_column_indices,
                                                 &aggregate_plans,
                                                 predicate.as_ref(),
                                                 txn,

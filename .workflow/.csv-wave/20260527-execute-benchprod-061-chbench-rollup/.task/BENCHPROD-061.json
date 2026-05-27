@@ -1,0 +1,150 @@
+{
+  "id": "BENCHPROD-061",
+  "title": "Stream multi-column GROUP BY rollups for CH-benCHmark",
+  "status": "completed",
+  "created_at": "2026-05-27T08:20:00+08:00",
+  "completed_at": "2026-05-27T08:23:00+08:00",
+  "scope": "database core query execution only",
+  "description": "Improve the CH-benCHmark-like `Warehouse revenue rollup` query by avoiding the generic full-row GROUP BY path for simple multi-column grouped aggregates.",
+  "target_query": "SELECT w_id, status, SUM(total), COUNT(*) FROM bench_tpcc_orders GROUP BY w_id, status ORDER BY SUM(total) DESC LIMIT 20",
+  "baseline": {
+    "source": "BENCHPROD-060 production medium repeat",
+    "p95_median_ms": 10.131,
+    "p95_cv_pct": 22.08,
+    "p95_spread_pct": 53.45,
+    "ops_per_sec_median": 114.3,
+    "status": "unstable"
+  },
+  "verification_plan": [
+    "cargo fmt --check",
+    "cargo test --test sql_group_aggregate",
+    "cargo build --release --bin fusiondb",
+    "python bench_repeat.py --scale medium --suite chbench --repeats 3 --threads 4 --run-name repeat_benchprod061_chbench_medium_rollup_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+    "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod061_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+    "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod061_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod061_production_medium_20260527"
+  ],
+  "out_of_scope": [
+    "dashboard",
+    "ui",
+    "benchmark harness changes"
+  ],
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs",
+        "src/execution/query/mod.rs",
+        "tests/sql_group_aggregate.rs"
+      ],
+      "summary": [
+        "Generalized the simple GROUP BY aggregate column-scan fast path from one group column to multiple group columns.",
+        "Allowed CH-benCHmark `GROUP BY w_id, status` rollups with `SUM(total)` and `COUNT(*)` to stream through scan_prefix_for_each.",
+        "Kept projection shape conservative: projected group columns must match the GROUP BY prefix and aggregate arguments must be simple columns or COUNT(*).",
+        "Added a CH-benCHmark-like regression test with a corrupted unrelated payload column to prove partial decoding."
+      ]
+    },
+    "target_case_delta": {
+      "baseline": {
+        "source": "BENCHPROD-060 production medium repeat",
+        "p95_median_ms": 10.131,
+        "p95_cv_pct": 22.08,
+        "p95_spread_pct": 53.45,
+        "ops_per_sec_median": 114.3,
+        "status": "unstable"
+      },
+      "current": {
+        "source": "BENCHPROD-061 production medium repeat",
+        "p95_median_ms": 5.169,
+        "p95_cv_pct": 20.84,
+        "p95_spread_pct": 45.64,
+        "ops_per_sec_median": 204.7,
+        "status": "unstable"
+      },
+      "delta": {
+        "p95_median_pct": -48.98,
+        "ops_per_sec_pct": 79.09
+      }
+    },
+    "chbench_repeat": {
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 0,
+      "warehouse_rollup_status": "stable",
+      "warehouse_rollup_p95_median_ms": 5.080,
+      "warehouse_rollup_p95_cv_pct": 9.55,
+      "warehouse_rollup_p95_spread_pct": 20.63,
+      "warehouse_rollup_ops_per_sec_median": 212.3,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod061_chbench_medium_rollup_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "production_repeat": {
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 1,
+      "unstable_cases": 2,
+      "chbench_suite_p95_median_ms": 11.939,
+      "chbench_suite_ops_per_sec_median": 377.1,
+      "warehouse_rollup_status": "unstable",
+      "warehouse_rollup_p95_median_ms": 5.169,
+      "warehouse_rollup_p95_cv_pct": 20.84,
+      "warehouse_rollup_p95_spread_pct": 45.64,
+      "warehouse_rollup_ops_per_sec_median": 204.7,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod061_production_medium_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod061_production_medium_20260527/bench_gate_summary.md"
+    }
+  },
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed",
+      "tests": "38 passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed",
+      "tests": "10 passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed",
+      "tests": "26 passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite chbench --repeats 3 --threads 4 --run-name repeat_benchprod061_chbench_medium_rollup_3x_20260527 --suite-timeout 1800 --matrix-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 0
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod061_production_medium_3x_20260527 --suite-timeout 3600 --matrix-timeout 7200",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 1,
+      "unstable_cases": 2
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod061_production_medium_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod061_production_medium_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "next_task_signals": [
+    "BENCHPROD-064: Stabilize the remaining LDBC Tag popularity variance in production repeat.",
+    "BENCHPROD-065: Add top-N grouped aggregate optimization so ORDER BY aggregate LIMIT can avoid sorting all groups.",
+    "BENCHPROD-066: Design multi-column GROUP BY support for expressions and aliases beyond conservative projection-prefix shapes."
+  ]
+}
