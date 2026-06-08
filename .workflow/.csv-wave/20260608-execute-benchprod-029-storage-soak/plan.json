@@ -3,7 +3,7 @@
   "objective": "Add compaction/VACUUM/crash-recovery soak benchmark loops and fix storage recovery defects exposed by the soak.",
   "status": "partial",
   "created_at": "2026-06-08T10:35:00+08:00",
-  "updated_at": "2026-06-08T10:50:00+08:00",
+  "updated_at": "2026-06-08T12:40:00+08:00",
   "tasks": [
     {
       "id": "BENCHPROD-029",
@@ -14,9 +14,10 @@
         "E:\\Playground\\FusionDB-bench\\README.md",
         "src/storage/fusion.rs",
         "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_tiny_20260608_fix\\storage_soak_summary.json",
-        "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_small_20260608_fix\\storage_soak_summary.json"
+        "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_small_20260608_fix\\storage_soak_summary.json",
+        "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_medium_700cycles_20260608_121332_deferreddelete\\storage_soak_summary.json"
       ],
-      "result": "Storage soak harness added; tiny and small checkpoint/compact/restart/forced-kill loops pass after FusionStorage recovery fixes. Medium multi-hour run remains pending."
+      "result": "Storage soak harness added; tiny, small, and targeted medium 700-cycle checkpoint/compact/restart/forced-kill loops pass after FusionStorage recovery, scan, and compaction reader-safety fixes. Medium multi-hour run remains pending."
     }
   ],
   "verification": [
@@ -34,7 +35,7 @@
     },
     {
       "command": "cargo test --lib storage::fusion::tests::",
-      "status": "passed"
+      "status": "passed: 13/13"
     },
     {
       "command": "cargo test --test sql_dml",
@@ -58,6 +59,10 @@
     },
     {
       "command": "python storage_soak.py --scale small --run-name storage_soak_benchprod029_small_20260608_fix --max-sstable-count 32 --fail-on-gap",
+      "status": "passed"
+    },
+    {
+      "command": "python storage_soak.py --scale medium --cycles 700 --checkpoint-every 2 --compact-every 4 --restart-every 30 --kill-every 90 --max-sstable-count 64 --fail-on-gap --run-name storage_soak_benchprod029_medium_700cycles_20260608_121332_deferreddelete",
       "status": "passed"
     }
   ],

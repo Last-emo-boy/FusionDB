@@ -18,6 +18,8 @@ Add a production storage soak loop that exercises checkpoint, VACUUM-equivalent 
   - Fixed reopened `FusionStorage` so active MemTable IDs start after the highest existing SSTable ID instead of reusing `1.sst`.
   - Restores `current_ts` by scanning loaded SSTable keys, not just first/last metadata keys.
   - Changed `FusionTransaction::get` to choose the latest visible MVCC timestamp across memtables and SSTables instead of trusting SSTable ID order after compaction.
+  - Changed immutable MemTable range scans to use `SkipMap.range(...)` as the correctness path instead of the optional FBTree read index.
+  - Serialized compaction with an async mutex, deferred obsolete SSTable file deletion until no reader holds the old `Arc<SsTable>`, and made SSTable iterator read errors propagate during range scans and compaction.
 
 ## Root Cause
 
@@ -34,6 +36,20 @@ Two storage recovery assumptions were unsafe:
 
 The timestamp restore path also only inspected first/last SSTable keys, which could restore a stale `current_ts` when the highest commit timestamp was in the middle of an SSTable.
 
+The first medium multi-hour run then failed at cycle 655:
+
+```text
+cycle_655 count mismatch: observed=143611; expected=144100
+```
+
+A targeted 700-cycle rerun after switching immutable MemTable scans away from FBTree crossed cycle 655 but failed at cycle 687:
+
+```text
+cycle_687 count mismatch: observed=150651; expected=151140
+```
+
+Both failed runs returned the correct row count after reopening the same data directory, which showed the rows were durable and the defect was runtime scan visibility. A storage-level diagnostic reproduced the issue while a scan held old SSTable handles during compaction. Compaction removed old SSTables from the live list and immediately deleted their files; a concurrent range scan could still hold `Arc<SsTable>` values for those files, and the scan path treated iterator read errors as end-of-iterator, producing a smaller count. The fix keeps retired SSTables in an obsolete list until readers release them and propagates iterator read errors instead of silently truncating scans.
+
 ## Verification
 
 - `cargo test fusion_reopen_uses_fresh_memtable_id_after_existing_sstables`
@@ -43,7 +59,7 @@ The timestamp restore path also only inspected first/last SSTable keys, which co
 - `cargo test fusion_reopen_restores_current_ts_from_all_sstable_keys`
   - Passed after the fix.
 - `cargo test --lib storage::fusion::tests::`
-  - Passed: 11/11.
+  - Passed: 13/13.
 - `cargo test --test sql_dml`
   - Passed: 43/43.
 - `cargo test --test sql_index_cache`
@@ -56,10 +72,12 @@ The timestamp restore path also only inspected first/last SSTable keys, which co
   - Passed: 4 cycles, 25/25 steps, final live rows 80, final SSTable count 3.
 - `python storage_soak.py --scale small --run-name storage_soak_benchprod029_small_20260608_fix --max-sstable-count 32 --fail-on-gap`
   - Passed: 30 cycles, 168/168 steps, final live rows 2640, final SSTable count 3, 30 checkpoint loops, 15 compact loops, 14 completed compactions, 8 graceful restarts, 7 forced kills.
+- `python storage_soak.py --scale medium --cycles 700 --checkpoint-every 2 --compact-every 4 --restart-every 30 --kill-every 90 --max-sstable-count 64 --fail-on-gap --run-name storage_soak_benchprod029_medium_700cycles_20260608_121332_deferreddelete`
+  - Passed: 700 cycles, final live rows 154000, final SSTable count 3, 350 checkpoint loops, 175 compact loops, 7 completed compactions, 16 graceful restarts, 7 forced kills, 724 visibility checks.
 
 ## Result
 
-This iteration adds the storage soak harness and fixes the recovery/compaction correctness issues exposed by the new tiny smoke. `BENCHPROD-029` remains open because the stated success criteria require a medium multi-hour run. The next step is to run:
+This iteration adds the storage soak harness and fixes the recovery/compaction correctness issues exposed by tiny, small, and targeted medium soak runs. `BENCHPROD-029` remains open because the stated success criteria require a medium multi-hour run. The next step is to run:
 
 ```powershell
 python storage_soak.py --scale medium --duration-seconds 7200 --checkpoint-every 2 --compact-every 4 --restart-every 30 --kill-every 90 --max-sstable-count 64 --fail-on-gap

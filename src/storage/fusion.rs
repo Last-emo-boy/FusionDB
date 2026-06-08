@@ -8,7 +8,7 @@ use crossbeam_skiplist::SkipMap;
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 // Fusion Storage Engine
 // Combines:
@@ -115,6 +115,7 @@ pub struct FusionStorage {
     active_memtable: Arc<RwLock<MemTable>>,
     immutable_memtables: Arc<RwLock<Vec<MemTable>>>,
     sstables: Arc<RwLock<Vec<Arc<SsTable>>>>,
+    obsolete_sstables: Arc<RwLock<Vec<Arc<SsTable>>>>,
     wal: Arc<WalManager>,
 
     // Global Clock for MVCC
@@ -141,6 +142,7 @@ pub struct FusionStorage {
     // Block Cache for SSTables (SST ID, Offset) -> Block Data
     block_cache: Arc<Cache<(u64, u64), Vec<u8>>>,
     memtable_threshold: usize,
+    compaction_lock: Arc<AsyncMutex<()>>,
     paths: Arc<FusionStoragePaths>,
 }
 
@@ -242,6 +244,7 @@ impl FusionStorage {
             active_memtable: Arc::new(RwLock::new(active)),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
             sstables: Arc::new(RwLock::new(sstables_vec)),
+            obsolete_sstables: Arc::new(RwLock::new(Vec::new())),
             wal: Arc::new(wal),
             current_ts: Arc::new(AtomicU64::new(0)), // Will be updated by replay
             next_memtable_id: Arc::new(AtomicU64::new(next_id)),
@@ -262,6 +265,7 @@ impl FusionStorage {
             )),
             block_cache,
             memtable_threshold,
+            compaction_lock: Arc::new(AsyncMutex::new(())),
             paths,
         };
 
@@ -704,17 +708,40 @@ impl FusionStorage {
     }
 
     async fn compact_once(&self) -> Result<bool> {
+        let _guard = self.compaction_lock.lock().await;
+        self.compact_once_inner().await
+    }
+
+    async fn collect_obsolete_sstables(&self) {
+        let mut ready_to_delete = Vec::new();
+        {
+            let mut obsolete = self.obsolete_sstables.write().unwrap();
+            let mut index = 0;
+            while index < obsolete.len() {
+                if Arc::strong_count(&obsolete[index]) == 1 {
+                    let sst = obsolete.remove(index);
+                    ready_to_delete.push(sst.path.clone());
+                } else {
+                    index += 1;
+                }
+            }
+        }
+
+        for path in ready_to_delete {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+
+    async fn compact_once_inner(&self) -> Result<bool> {
+        self.collect_obsolete_sstables().await;
+
         let Some(candidates) = self.compaction_candidates() else {
             return Ok(false);
         };
 
-        // Open iterators
         let mut iterators = Vec::with_capacity(COMPACTION_FANIN);
         for sst in &candidates {
-            match sst.new_iterator(None).await {
-                Ok(it) => iterators.push(it),
-                Err(e) => eprintln!("Failed to open SST iterator: {:?}", e),
-            }
+            iterators.push(sst.new_iterator(None).await?);
         }
 
         if iterators.is_empty() {
@@ -731,7 +758,7 @@ impl FusionStorage {
 
         // Init heap
         for (idx, it) in iterators.iter_mut().enumerate() {
-            if let Ok(Some((k, v))) = it.next().await {
+            if let Some((k, v)) = it.next().await? {
                 heap.push(MergeItem {
                     key: k,
                     val: v,
@@ -752,7 +779,7 @@ impl FusionStorage {
             let idx = item.iter_idx;
 
             if k.len() < TS_SIZE {
-                if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
+                if let Some((next_k, next_v)) = iterators[idx].next().await? {
                     heap.push(MergeItem {
                         key: next_k,
                         val: next_v,
@@ -770,7 +797,7 @@ impl FusionStorage {
             if is_dup {
                 dedup_count += 1;
                 // Skip this older version, but still advance the iterator
-                if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
+                if let Some((next_k, next_v)) = iterators[idx].next().await? {
                     heap.push(MergeItem {
                         key: next_k,
                         val: next_v,
@@ -808,7 +835,7 @@ impl FusionStorage {
             }
 
             // Advance iterator
-            if let Ok(Some((next_k, next_v))) = iterators[idx].next().await {
+            if let Some((next_k, next_v)) = iterators[idx].next().await? {
                 heap.push(MergeItem {
                     key: next_k,
                     val: next_v,
@@ -857,10 +884,13 @@ impl FusionStorage {
                     sstables.sort_by_key(|s| s.id);
                 } // Drop lock
 
-                // Delete old files
-                for sst in candidates {
-                    let _ = tokio::fs::remove_file(&sst.path).await;
+                {
+                    let mut obsolete = self.obsolete_sstables.write().unwrap();
+                    for sst in candidates {
+                        obsolete.push(sst);
+                    }
                 }
+                self.collect_obsolete_sstables().await;
 
                 Ok(true)
             }
@@ -1042,74 +1072,30 @@ impl FusionTransaction {
         // Helper Type for Iterators
         type BoxedIter<'a> = Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send + 'a>;
 
-        // 1. Collect FBTree Arcs first to ensure stability
-        // Defined BEFORE mem_iters so it outlives mem_iters (dropped last)
-        let mut fbtree_holders: Vec<Option<Arc<FBTree>>> = Vec::with_capacity(mem_tables.len());
-
-        for mem in &mem_tables {
-            let guard = mem.fbtree.read().unwrap();
-            fbtree_holders.push(guard.clone());
-        }
-
         let mut mem_iters: Vec<BoxedIter> = Vec::with_capacity(mem_tables.len());
 
         // 2. Create Iterators
         for (i, mem) in mem_tables.iter().enumerate() {
-            if let Some(tree) = &fbtree_holders[i] {
-                // FBTree Iterator
-                // We cast the iterator to BoxedIter.
-                // Note: tree.scan returns FBTreeIterator which holds reference to tree.
-                // tree is inside fbtree_holders.
-                let iter = Box::new(tree.scan(&start_ik)) as BoxedIter;
-
-                // We need to peek/advance
-                // But we can't easily peek BoxedIter without consuming.
-                // We wrap it in Peekable? No, Peekable is not Iterator of Item=(...).
-                // We just consume one.
-                // But we need to put it into mem_iters.
-                // We can't put `iter` into `mem_iters` AND use it.
-                // We have to consume it, store the item in Heap, and store the REST of iterator.
-                // `BoxedIter` is a Box. `next()` takes `&mut self`.
-                // So we can use it.
-
-                // Rust ownership: `iter` is owned by local var.
-                // We verify first item.
-                let mut iter = iter; // mutable
-                if let Some((k, v)) = iter.next() {
-                    let (user_k, _) = FusionStorage::decode_key(&k);
-                    if user_k < end {
-                        heap.push(MergeItem {
-                            key: k,
-                            val: v,
-                            iter_idx: 1 + i,
-                        });
-                        mem_iters.push(iter);
-                    } else {
-                        mem_iters.push(iter);
-                    }
-                } else {
-                    mem_iters.push(iter);
+            // Use the SkipMap as the source of truth for range scans. The optional FBTree is
+            // a read optimization, but its approximate child descent can skip keys under long
+            // mixed soak runs; correctness for MVCC visibility depends on complete iteration.
+            let mut iter = Box::new(
+                mem.map
+                    .range(start_ik.clone()..)
+                    .map(|e| (e.key().clone(), e.value().clone())),
+            ) as BoxedIter;
+            if let Some((k, v)) = iter.next() {
+                let (user_k, _) = FusionStorage::decode_key(&k);
+                if user_k < end {
+                    heap.push(MergeItem {
+                        key: k.clone(),
+                        val: v,
+                        iter_idx: 1 + i,
+                    });
                 }
+                mem_iters.push(iter);
             } else {
-                // SkipMap Iterator
-                let mut iter = Box::new(
-                    mem.map
-                        .range(start_ik.clone()..)
-                        .map(|e| (e.key().clone(), e.value().clone())),
-                ) as BoxedIter;
-                if let Some((k, v)) = iter.next() {
-                    let (user_k, _) = FusionStorage::decode_key(&k);
-                    if user_k < end {
-                        heap.push(MergeItem {
-                            key: k.clone(),
-                            val: v,
-                            iter_idx: 1 + i,
-                        });
-                    }
-                    mem_iters.push(iter);
-                } else {
-                    mem_iters.push(iter);
-                }
+                mem_iters.push(iter);
             }
         }
 
@@ -1207,7 +1193,7 @@ impl FusionTransaction {
             } else {
                 let sst_idx = idx - 1 - mem_tables.len();
                 if let Some(it) = &mut sst_iters[sst_idx] {
-                    while let Ok(Some((nk, nv))) = it.next().await {
+                    while let Some((nk, nv)) = it.next().await? {
                         let (nuk, _nts) = FusionStorage::decode_key(&nk);
                         if nuk >= end {
                             next_item = None;
@@ -2240,6 +2226,85 @@ mod tests {
         assert_eq!(
             txn.get(b"data:compact_get:001").await.unwrap(),
             Some(b"new".to_vec())
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_immutable_memtable_prefix_scan_covers_all_large_fbtree_keys() {
+        let data_dir = unique_storage_dir("large_immutable_prefix_scan");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        let mem = MemTable::new(42);
+        let prefix = b"data:fbtree_scan:";
+        for id in 0..10_000 {
+            let key = format!("data:fbtree_scan:{id:08}");
+            mem.insert(
+                FusionStorage::encode_key(key.as_bytes(), 1),
+                FusionStorage::encode_value(true, b"value"),
+            );
+        }
+        mem.build_fbtree();
+
+        storage.current_ts.store(1, Ordering::SeqCst);
+        storage.immutable_memtables.write().unwrap().push(mem);
+
+        let txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(txn.count_prefix(prefix).await.unwrap(), 10_000);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_compaction_defers_obsolete_sstable_delete_until_readers_drop() {
+        let data_dir = unique_storage_dir("obsolete_sstable_readers");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        for batch in 0..4 {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            for id in 0..32 {
+                let key = format!("data:obsolete:{batch}:{id:02}");
+                txn.put(key.as_bytes(), b"value").await.unwrap();
+            }
+            txn.commit().await.unwrap();
+            storage.create_snapshot_now().await.unwrap();
+        }
+
+        let held_sstable = storage.sstables.read().unwrap()[0].clone();
+        let held_id = held_sstable.id;
+        let held_path = held_sstable.path.clone();
+        assert!(held_path.exists());
+
+        assert!(storage.compact_once().await.unwrap());
+        assert!(!storage
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .any(|sst| sst.id == held_id));
+        assert!(
+            held_path.exists(),
+            "obsolete SSTable file must stay readable while a reader holds its Arc"
+        );
+
+        drop(held_sstable);
+        storage.collect_obsolete_sstables().await;
+        assert!(
+            !held_path.exists(),
+            "obsolete SSTable file should be deleted after readers release it"
         );
 
         cleanup_storage_dir(&data_dir);
