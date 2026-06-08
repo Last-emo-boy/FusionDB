@@ -31,19 +31,17 @@ impl Executor {
     }
 
     fn serial_default_candidate_column_indexes(schema: &TableSchema) -> Vec<usize> {
-        schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, column)| {
-                let ty = column.data_type.trim().to_ascii_uppercase();
-                matches!(
-                    ty.as_str(),
-                    "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL"
-                )
-                .then_some(idx)
-            })
-            .collect()
+        let mut indices = Vec::with_capacity(schema.columns.len());
+        for (idx, column) in schema.columns.iter().enumerate() {
+            let ty = column.data_type.trim().to_ascii_uppercase();
+            if matches!(
+                ty.as_str(),
+                "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL"
+            ) {
+                indices.push(idx);
+            }
+        }
+        indices
     }
 
     async fn next_serial_default_value(

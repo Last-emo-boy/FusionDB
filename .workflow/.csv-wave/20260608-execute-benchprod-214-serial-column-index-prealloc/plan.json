@@ -1,0 +1,40 @@
+{
+  "id": "benchprod-214-serial-column-index-prealloc",
+  "objective": "Preallocate SERIAL default column index vectors from schema column counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:08:00+08:00",
+  "completed_at": "2026-06-08T20:10:17+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-214",
+      "title": "Preallocate SERIAL column indices",
+      "status": "completed",
+      "evidence": [
+        "src/execution/dml/insert.rs"
+      ],
+      "result": "INSERT SERIAL default column discovery now preallocates candidate index vectors from the known schema column count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_insert_omitted_serial_primary_key_generates_ids -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml",
+      "status": "passed: 43/43"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "SERIAL type matching and schema column order were kept unchanged."
+  ]
+}
