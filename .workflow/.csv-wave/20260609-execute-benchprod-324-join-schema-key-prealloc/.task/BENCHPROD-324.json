@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-324",
+  "title": "Preallocate JOIN schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/scan/join.rs"
+  ],
+  "description": "Avoid generic format! allocation work when join paths build schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added join_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced join base scan schema lookup key construction.",
+    "Replaced comma-join reorder schema lookup key construction.",
+    "Replaced right probe schema lookup key construction.",
+    "Replaced first-relation projection pruning schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test join_schema_key -- --nocapture",
+    "cargo test --test sql_join test_join_base_scan_reuses_row_cache -- --nocapture",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Join schema-key construction now reserves capacity from known table-name length while preserving join planning, projection pruning, row-cache behavior, and SQL join results."
+}

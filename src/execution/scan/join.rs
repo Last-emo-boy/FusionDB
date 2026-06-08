@@ -14,6 +14,13 @@ fn join_match_bucket<T>() -> Vec<T> {
     Vec::with_capacity(1)
 }
 
+fn join_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 fn join_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
     key.push_str("data:");
@@ -120,7 +127,7 @@ impl Executor {
         };
 
         let table_name = name.to_string();
-        let schema_key = format!("schema:{}", table_name);
+        let schema_key = join_schema_key_for_table(&table_name);
         let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
             return self.scan_table_base(relation, txn, params).await;
         };
@@ -892,7 +899,7 @@ impl Executor {
                 return Ok(None);
             };
             let table_name = name.to_string();
-            let schema_key = format!("schema:{}", name);
+            let schema_key = join_schema_key_for_table(&table_name);
             let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
                 return Ok(None);
             };
@@ -1247,7 +1254,7 @@ impl Executor {
             _ => None,
         };
         let schema_for_probe = if let Some(table_name) = &right_table_name {
-            let schema_key = format!("schema:{}", table_name);
+            let schema_key = join_schema_key_for_table(table_name);
             txn.get(schema_key.as_bytes())
                 .await?
                 .map(|schema_bytes| {
@@ -1885,7 +1892,8 @@ impl Executor {
             self.take_relation_predicate(&mut pending_predicates, &first_relation_names);
         let first_projection = if first_selection.is_some() {
             if let TableFactor::Table { name, .. } = &first.relation {
-                let schema_key = format!("schema:{}", name);
+                let table_name = name.to_string();
+                let schema_key = join_schema_key_for_table(&table_name);
                 txn.get(schema_key.as_bytes())
                     .await?
                     .map(|schema_bytes| {
@@ -2052,6 +2060,14 @@ mod tests {
     fn join_match_bucket_preallocates_first_match() {
         let bucket: Vec<Vec<Value>> = join_match_bucket();
         assert!(bucket.capacity() >= 1);
+    }
+
+    #[test]
+    fn join_schema_key_for_table_preallocates_exact_key() {
+        let key = join_schema_key_for_table("orders");
+
+        assert_eq!(key, "schema:orders");
+        assert!(key.capacity() >= key.len());
     }
 
     #[test]
