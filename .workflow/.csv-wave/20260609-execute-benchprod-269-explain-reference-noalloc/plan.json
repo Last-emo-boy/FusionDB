@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-269-explain-reference-noalloc",
+  "objective": "Avoid temporary column-set allocation in EXPLAIN column-reference checks.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:52:00+08:00",
+  "completed_at": "2026-06-09T00:54:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-269",
+      "title": "Avoid EXPLAIN expression reference allocation",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/explain.rs"
+      ],
+      "result": "EXPLAIN expression column-reference checks now reuse the shared no-allocation predicate."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test predicate_schema_members_for_explain_tracks_local_and_join_predicates -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_create_composite_btree_index_and_lookup -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "explain_expr_has_column_reference now delegates to expr_has_column_reference.",
+    "The change avoids temporary HashSet allocation for EXPLAIN primary-key, composite-index, and index-usage expression checks."
+  ]
+}

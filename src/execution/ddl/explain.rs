@@ -922,9 +922,7 @@ impl Executor {
     }
 
     fn explain_expr_has_column_reference(&self, expr: &Expr) -> bool {
-        let mut cols = HashSet::new();
-        self.extract_columns_from_expr(expr, &mut cols);
-        !cols.is_empty()
+        self.expr_has_column_reference(expr)
     }
 
     fn explain_primary_key_range(
