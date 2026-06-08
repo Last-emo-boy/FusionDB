@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-175",
+  "title": "Preallocate limited base scan rows",
+  "status": "completed",
+  "created_at": "2026-06-08T17:27:30+08:00",
+  "completed_at": "2026-06-08T17:30:10+08:00",
+  "scope": "Base table scan result row allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/mod.rs"
+      ],
+      "summary": [
+        "Changed base scan rows initialization from Vec::new to Vec::with_capacity when a query limit is available.",
+        "Uses effective_limit when storage pushdown is safe, otherwise falls back to the query limit.",
+        "Caps preallocation at 4096 rows and leaves unlimited scans at zero initial capacity.",
+        "Kept scan ordering, index usage, and row filtering behavior unchanged."
+      ]
+    },
+    "tests": {
+      "select_with_limit_offset": "passed",
+      "select_order_by_limit_offset": "passed",
+      "select_order_by_primary_key_limit_offset": "passed",
+      "primary_key_range_order_limit_offset_pushdown": "passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}

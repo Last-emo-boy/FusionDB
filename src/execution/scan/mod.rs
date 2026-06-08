@@ -638,7 +638,8 @@ impl Executor {
                     limit
                 };
 
-                let mut rows = Vec::new();
+                let row_capacity = effective_limit.or(limit).unwrap_or(0).min(4096);
+                let mut rows = Vec::with_capacity(row_capacity);
                 let mut index_used = false;
                 let mut selection_fully_applied = selection.is_none();
                 let mut rows_satisfy_order_by = false;
