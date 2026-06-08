@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-303",
+  "title": "Preallocate single-table scan data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/scan/mod.rs"
+  ],
+  "description": "Avoid generic format! allocation work when single-table scan paths build data:<table>: scan prefixes from known table-name length.",
+  "implementation": [
+    "Added scan_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Replaced materialized query scan data-prefix construction.",
+    "Replaced statistics-driven primary-key range prefix construction.",
+    "Replaced key-only stream projection prefix stripping construction.",
+    "Replaced full table scan data-prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test scan_data_ -- --nocapture",
+    "cargo test --test sql_index_cache -- --nocapture",
+    "cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Single-table scan data-prefix construction now reserves capacity from known table-name length while preserving scan, cache, range, stream, and vector query behavior."
+}

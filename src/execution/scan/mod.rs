@@ -165,6 +165,14 @@ impl Executor {
         key
     }
 
+    fn scan_data_prefix_for_table(table_name: &str) -> String {
+        let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+        prefix.push_str("data:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
     fn projection_indices_for_scan(
         projection: &Option<Vec<String>>,
         schema: &TableSchema,
@@ -261,7 +269,7 @@ impl Executor {
                         FusionError::Execution(format!("Schema deserialization error: {}", e))
                     })?;
 
-                    let prefix = format!("data:{}:", table_name);
+                    let prefix = Self::scan_data_prefix_for_table(&table_name);
                     let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
                     let mut rows = Vec::with_capacity(kv_pairs.len());
                     for (k, v) in kv_pairs {
@@ -906,7 +914,8 @@ impl Executor {
                                     Value::Timestamp(micros) => Some(micros),
                                     _ => None,
                                 } {
-                                    let table_prefix = format!("data:{}:", table_name);
+                                    let table_prefix =
+                                        Self::scan_data_prefix_for_table(&table_name);
                                     let min_key = table_prefix.as_bytes().to_vec();
                                     let mut max_key = table_prefix.as_bytes().to_vec();
                                     max_key.push(0xFF);
@@ -960,7 +969,8 @@ impl Executor {
                                         for (k, v) in kv_pairs {
                                             let row = if key_only_scan {
                                                 let k_str = String::from_utf8_lossy(&k);
-                                                let prefix = format!("data:{}:", table_name);
+                                                let prefix =
+                                                    Self::scan_data_prefix_for_table(&table_name);
                                                 if let Some(pk_str) = k_str.strip_prefix(&prefix) {
                                                     Self::primary_key_row_from_id(
                                                         &schema, pk_index, pk_str,
@@ -1263,7 +1273,7 @@ impl Executor {
 
                 // Full Table Scan
                 if !index_used {
-                    let prefix_str = format!("data:{}:", table_name);
+                    let prefix_str = Self::scan_data_prefix_for_table(&table_name);
                     let prefix = prefix_str.as_bytes().to_vec();
 
                     let scan_limit = if selection.is_none() {
@@ -1377,5 +1387,13 @@ mod tests {
 
         assert_eq!(key, "data:lineitem:00000042");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn scan_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = Executor::scan_data_prefix_for_table("lineitem");
+
+        assert_eq!(prefix, "data:lineitem:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }
