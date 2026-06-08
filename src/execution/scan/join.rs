@@ -14,6 +14,15 @@ fn join_match_bucket<T>() -> Vec<T> {
     Vec::with_capacity(1)
 }
 
+fn join_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
+    key.push_str("data:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 struct ExprJoinProbePlan {
     left_expr: Expr,
     right_key_index: usize,
@@ -654,7 +663,7 @@ impl Executor {
             let Some(row_id) = Self::value_to_primary_row_id(key_value) else {
                 return Ok(Vec::new());
             };
-            let data_key = format!("data:{}:{}", table_name, row_id);
+            let data_key = join_data_key_for_row_id(table_name, &row_id);
             if let Some(row) = self.row_cache.get(&data_key) {
                 monitor::inc_row_cache_hit();
                 return Ok(vec![row]);
@@ -696,7 +705,7 @@ impl Executor {
                     rows.push(row);
                 }
             } else {
-                let data_key = format!("data:{}:{}", table_name, row_id);
+                let data_key = join_data_key_for_row_id(table_name, row_id);
                 if let Some(row) = self.row_cache.get(&data_key) {
                     monitor::inc_row_cache_hit();
                     rows.push(row);
@@ -2021,5 +2030,13 @@ mod tests {
     fn join_match_bucket_preallocates_first_match() {
         let bucket: Vec<Vec<Value>> = join_match_bucket();
         assert!(bucket.capacity() >= 1);
+    }
+
+    #[test]
+    fn join_data_key_for_row_id_preallocates_exact_key() {
+        let key = join_data_key_for_row_id("orders", "00042");
+
+        assert_eq!(key, "data:orders:00042");
+        assert!(key.capacity() >= key.len());
     }
 }

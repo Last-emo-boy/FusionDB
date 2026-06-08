@@ -1,0 +1,42 @@
+{
+  "id": "benchprod-296-join-data-key-prealloc",
+  "objective": "Preallocate join-probe data keys from table and row-id lengths.",
+  "status": "completed",
+  "created_at": "2026-06-09T03:06:00+08:00",
+  "completed_at": "2026-06-09T03:09:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-296",
+      "title": "Preallocate join-probe data keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "Join probe data-key construction now uses an explicit-capacity helper instead of format!."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test join_data_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_join -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The join data-key helper reserves exactly enough capacity for data:<table>:<row_id>.",
+    "The optimization replaces format! in primary-key join probe and indexed join probe projection paths.",
+    "Generated key bytes, row-cache keys, storage lookups, row decoding, projection behavior, join ordering, and SQL results are unchanged."
+  ]
+}
