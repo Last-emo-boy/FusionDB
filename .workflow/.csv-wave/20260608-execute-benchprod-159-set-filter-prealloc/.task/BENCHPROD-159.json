@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-159",
+  "title": "Preallocate INTERSECT/EXCEPT filtered rows",
+  "status": "completed",
+  "created_at": "2026-06-08T16:09:00+08:00",
+  "completed_at": "2026-06-08T16:12:19+08:00",
+  "scope": "INTERSECT and EXCEPT left-row filtering allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Added filter_rows_by_membership to preallocate filtered set-operation rows using the left input length.",
+        "Replaced INTERSECT and EXCEPT filter(...).collect() with the preallocated helper.",
+        "Added coverage where INTERSECT keeps all left rows and EXCEPT filters all left rows away."
+      ]
+    },
+    "tests": {
+      "intersect_except_with_all_left_rows_matched": "passed",
+      "sql_set_subquery": "43/43 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, set-operation, recursive CTE, or scan hot path."
+  ]
+}

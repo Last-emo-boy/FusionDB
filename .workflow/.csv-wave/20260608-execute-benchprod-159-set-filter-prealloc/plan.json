@@ -1,0 +1,37 @@
+{
+  "id": "benchprod-159-set-filter-prealloc",
+  "objective": "Preallocate filtered row vectors for INTERSECT and EXCEPT set operations.",
+  "status": "completed",
+  "created_at": "2026-06-08T16:09:00+08:00",
+  "completed_at": "2026-06-08T16:12:19+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-159",
+      "title": "Preallocate INTERSECT/EXCEPT filtered rows",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "result": "INTERSECT and EXCEPT now build filtered row results through a preallocated Vec sized from the left input."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_intersect_except_with_all_left_rows_matched -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 43/43"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

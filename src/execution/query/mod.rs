@@ -115,6 +115,20 @@ impl Executor {
         set
     }
 
+    fn filter_rows_by_membership(
+        rows: Vec<Vec<Value>>,
+        right_set: &HashSet<Vec<Value>>,
+        keep_matches: bool,
+    ) -> Vec<Vec<Value>> {
+        let mut filtered = Vec::with_capacity(rows.len());
+        for row in rows {
+            if right_set.contains(&row) == keep_matches {
+                filtered.push(row);
+            }
+        }
+        filtered
+    }
+
     fn trim_set_rows_in_place(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<usize>) {
         if offset >= rows.len() {
             rows.clear();
@@ -2932,17 +2946,11 @@ impl Executor {
                 }
                 SetOperator::Intersect => {
                     let right_set = Self::row_hash_set(right_rows);
-                    left_rows
-                        .into_iter()
-                        .filter(|row| right_set.contains(row))
-                        .collect()
+                    Self::filter_rows_by_membership(left_rows, &right_set, true)
                 }
                 SetOperator::Except => {
                     let right_set = Self::row_hash_set(right_rows);
-                    left_rows
-                        .into_iter()
-                        .filter(|row| !right_set.contains(row))
-                        .collect()
+                    Self::filter_rows_by_membership(left_rows, &right_set, false)
                 }
                 _ => {
                     return Err(FusionError::Execution(format!(

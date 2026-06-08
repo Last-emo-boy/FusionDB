@@ -506,6 +506,53 @@ async fn test_intersect_except_with_duplicate_right_rows() {
 }
 
 #[tokio::test]
+async fn test_intersect_except_with_all_left_rows_matched() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE set_left_all_match (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE set_right_all_match (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO set_left_all_match VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO set_right_all_match VALUES (1, 'c'), (2, 'b'), (3, 'a')",
+    )
+    .await;
+
+    let (_, intersect_rows) = query(
+        &executor,
+        "SELECT name FROM set_left_all_match INTERSECT SELECT name FROM set_right_all_match ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        intersect_rows,
+        vec![
+            vec![Value::String("a".to_string())],
+            vec![Value::String("b".to_string())],
+            vec![Value::String("c".to_string())],
+        ]
+    );
+
+    let (_, except_rows) = query(
+        &executor,
+        "SELECT name FROM set_left_all_match EXCEPT SELECT name FROM set_right_all_match",
+    )
+    .await;
+    assert!(except_rows.is_empty());
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_subquery_in() {
     let (executor, wal) = setup().await;
     exec_ok(
