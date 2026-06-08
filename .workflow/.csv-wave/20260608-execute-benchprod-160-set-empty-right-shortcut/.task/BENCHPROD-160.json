@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-160",
+  "title": "Short-circuit empty-right INTERSECT/EXCEPT",
+  "status": "completed",
+  "created_at": "2026-06-08T16:13:00+08:00",
+  "completed_at": "2026-06-08T16:16:26+08:00",
+  "scope": "INTERSECT and EXCEPT handling when the right input is empty",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Added an empty-right INTERSECT branch that returns an empty Vec directly.",
+        "Added an empty-right EXCEPT branch that returns left_rows directly and lets existing DISTINCT/LIMIT/ORDER logic continue.",
+        "Added coverage for empty-right INTERSECT and EXCEPT with duplicate left-side values."
+      ]
+    },
+    "tests": {
+      "intersect_except_with_empty_right_side": "passed",
+      "sql_set_subquery": "44/44 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, set-operation, recursive CTE, or scan hot path."
+  ]
+}

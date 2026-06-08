@@ -553,6 +553,47 @@ async fn test_intersect_except_with_all_left_rows_matched() {
 }
 
 #[tokio::test]
+async fn test_intersect_except_with_empty_right_side() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE set_left_empty_right (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE set_right_empty (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO set_left_empty_right VALUES (1, 'a'), (2, 'b'), (3, 'a')",
+    )
+    .await;
+
+    let (_, intersect_rows) = query(
+        &executor,
+        "SELECT name FROM set_left_empty_right INTERSECT SELECT name FROM set_right_empty",
+    )
+    .await;
+    assert!(intersect_rows.is_empty());
+
+    let (_, except_rows) = query(
+        &executor,
+        "SELECT name FROM set_left_empty_right EXCEPT SELECT name FROM set_right_empty ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        except_rows,
+        vec![
+            vec![Value::String("a".to_string())],
+            vec![Value::String("b".to_string())],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_subquery_in() {
     let (executor, wal) = setup().await;
     exec_ok(
