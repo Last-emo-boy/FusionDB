@@ -2533,22 +2533,23 @@ impl Executor {
                                 group_index,
                                 &simple_plans,
                             );
+                            let mut schema_columns = Vec::with_capacity(simple_columns.len());
+                            for name in &simple_columns {
+                                schema_columns.push(Column {
+                                    name: name.clone(),
+                                    data_type: "UNKNOWN".to_string(),
+                                    is_primary: false,
+                                    is_indexed: false,
+                                    index_type: IndexType::None,
+                                    default_value: None,
+                                    is_nullable: true,
+                                    is_unique: false,
+                                    check_expr: None,
+                                });
+                            }
                             schema = TableSchema::new(
                                 "temp_group_by_result".to_string(),
-                                simple_columns
-                                    .iter()
-                                    .map(|name| Column {
-                                        name: name.clone(),
-                                        data_type: "UNKNOWN".to_string(),
-                                        is_primary: false,
-                                        is_indexed: false,
-                                        index_type: IndexType::None,
-                                        default_value: None,
-                                        is_nullable: true,
-                                        is_unique: false,
-                                        check_expr: None,
-                                    })
-                                    .collect(),
+                                schema_columns,
                             );
                             columns = simple_columns;
                             true
