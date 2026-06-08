@@ -558,18 +558,17 @@ impl Executor {
                             if let Some(prefix) = Self::like_fixed_prefix(pattern_str) {
                                 let col = &schema.columns[col_idx];
                                 if col.is_indexed {
-                                    let mut all_row_ids = HashSet::new();
-
-                                    if col.is_primary {
+                                    let all_row_ids = if col.is_primary {
                                         let key_prefix = format!("data:{}:{}", table_name, prefix);
                                         let kv =
                                             txn.scan_prefix(key_prefix.as_bytes(), limit).await?;
-                                        all_row_ids.reserve(kv.len());
+                                        let mut row_ids = HashSet::with_capacity(kv.len());
                                         for (k, _) in kv {
                                             if let Some(row_id) = Self::row_id_from_key(&k) {
-                                                all_row_ids.insert(row_id.to_string());
+                                                row_ids.insert(row_id.to_string());
                                             }
                                         }
+                                        row_ids
                                     } else {
                                         let index_prefix = format!(
                                             "index:{}:{}:{}",
@@ -577,13 +576,14 @@ impl Executor {
                                         );
                                         let kv =
                                             txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
-                                        all_row_ids.reserve(kv.len());
+                                        let mut row_ids = HashSet::with_capacity(kv.len());
                                         for (k, _) in kv {
                                             if let Some(row_id) = Self::row_id_from_key(&k) {
-                                                all_row_ids.insert(row_id.to_string());
+                                                row_ids.insert(row_id.to_string());
                                             }
                                         }
-                                    }
+                                        row_ids
+                                    };
 
                                     if !all_row_ids.is_empty() {
                                         return Ok(Some(IndexScanPlan {

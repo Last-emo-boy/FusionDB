@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-179-like-prefix-rowids-prealloc",
+  "objective": "Preallocate LIKE prefix row id sets from scan_prefix results.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:41:00+08:00",
+  "completed_at": "2026-06-08T17:43:59+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-179",
+      "title": "Preallocate LIKE prefix row ids",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/index_plan.rs"
+      ],
+      "result": "LIKE prefix index planning now initializes row id sets with the scan_prefix result count in both primary and secondary index branches."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_expr_functions test_like_pattern -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_expr_functions test_like_full_patterns -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_or_branch_common_join_key_matches_chbenchmark_q19_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed: 37/37"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
