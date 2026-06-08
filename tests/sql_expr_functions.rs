@@ -23,6 +23,32 @@ async fn test_arithmetic_expression() {
 }
 
 #[tokio::test]
+async fn test_json_literal_preserves_nested_arrays_and_objects() {
+    let (executor, wal) = setup().await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT '{\"items\":[1,2,3],\"meta\":{\"ok\":true}}'",
+    )
+    .await;
+
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("ok".to_string(), Value::Boolean(true));
+    let mut expected = std::collections::HashMap::new();
+    expected.insert(
+        "items".to_string(),
+        Value::Array(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Integer(3),
+        ]),
+    );
+    expected.insert("meta".to_string(), Value::Object(meta));
+
+    assert_eq!(rows, vec![vec![Value::Object(expected)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_timestamp_interval_arithmetic_matches_ldbc_q4_shape() {
     let (executor, wal) = setup().await;
     let (_, rows) = query(

@@ -760,13 +760,15 @@ impl Executor {
                 }
             }
             serde_json::Value::String(s) => Value::String(s.clone()),
-            serde_json::Value::Array(arr) => Value::Array(
-                arr.iter()
-                    .map(|x| self.json_value_to_fusion_value(x))
-                    .collect(),
-            ),
+            serde_json::Value::Array(arr) => {
+                let mut values = Vec::with_capacity(arr.len());
+                for value in arr {
+                    values.push(self.json_value_to_fusion_value(value));
+                }
+                Value::Array(values)
+            }
             serde_json::Value::Object(obj) => {
-                let mut map = std::collections::HashMap::new();
+                let mut map = std::collections::HashMap::with_capacity(obj.len());
                 for (k, v) in obj {
                     map.insert(k.clone(), self.json_value_to_fusion_value(v));
                 }

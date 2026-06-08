@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-224",
+  "title": "Preallocate JSON conversion containers",
+  "status": "completed",
+  "created_at": "2026-06-08T20:52:00+08:00",
+  "completed_at": "2026-06-08T20:57:00+08:00",
+  "scope": "JSON literal to Fusion value conversion",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/value.rs",
+        "tests/sql_expr_functions.rs"
+      ],
+      "summary": [
+        "Replaced JSON array iterator collect with Vec::with_capacity(arr.len()) and explicit recursive pushes.",
+        "Replaced JSON object HashMap::new with HashMap::with_capacity(obj.len()).",
+        "Added a SQL regression test covering nested JSON object and array literal conversion."
+      ]
+    },
+    "tests": {
+      "json_literal_nested_arrays_objects": "passed",
+      "sql_expr_functions": "22/22 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

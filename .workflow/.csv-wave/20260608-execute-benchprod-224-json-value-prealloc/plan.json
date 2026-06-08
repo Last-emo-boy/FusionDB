@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-224-json-value-prealloc",
+  "objective": "Preallocate JSON value conversion containers for expression evaluation.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:52:00+08:00",
+  "completed_at": "2026-06-08T20:57:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-224",
+      "title": "Preallocate JSON conversion containers",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/value.rs",
+        "tests/sql_expr_functions.rs"
+      ],
+      "result": "JSON array and object literal conversion now preallocates target Value containers from the known serde_json input length."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_expr_functions test_json_literal_preserves_nested_arrays_and_objects -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_expr_functions",
+      "status": "passed: 22/22"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The conversion preserves recursive JSON value handling, array element order, and object key/value mapping."
+  ]
+}
