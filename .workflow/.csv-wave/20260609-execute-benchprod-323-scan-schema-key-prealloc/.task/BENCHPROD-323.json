@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-323",
+  "title": "Preallocate scan schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/scan/mod.rs"
+  ],
+  "description": "Avoid generic format! allocation work when scan paths build schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added scan_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced scan_table_base() schema lookup key construction.",
+    "Replaced scan_table_filtered() schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test scan_schema_key -- --nocapture",
+    "cargo test --test sql_index_cache test_full_table_scan_reuses_row_cache -- --nocapture",
+    "cargo test --test sql_select -- --nocapture",
+    "cargo test --test sql_index_cache -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Scan schema-key construction now reserves capacity from known table-name length while preserving table/view resolution, full scans, index fallbacks, row-cache behavior, and SQL query results."
+}

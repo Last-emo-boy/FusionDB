@@ -173,6 +173,13 @@ impl Executor {
         prefix
     }
 
+    fn scan_schema_key_for_table(table_name: &str) -> String {
+        let mut key = String::with_capacity("schema:".len() + table_name.len());
+        key.push_str("schema:");
+        key.push_str(table_name);
+        key
+    }
+
     fn projection_indices_for_scan(
         projection: &Option<Vec<String>>,
         schema: &TableSchema,
@@ -261,7 +268,7 @@ impl Executor {
                 }
 
                 let table_name = name.to_string();
-                let schema_key = format!("schema:{}", table_name);
+                let schema_key = Self::scan_schema_key_for_table(&table_name);
 
                 // Try table first
                 if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
@@ -534,7 +541,7 @@ impl Executor {
                 }
 
                 let table_name = name.to_string();
-                let schema_key = format!("schema:{}", table_name);
+                let schema_key = Self::scan_schema_key_for_table(&table_name);
 
                 // Check for view — if no table schema exists, try view expansion
                 let schema_bytes_opt = txn.get(schema_key.as_bytes()).await?;
@@ -1395,5 +1402,13 @@ mod tests {
 
         assert_eq!(prefix, "data:lineitem:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn scan_schema_key_for_table_preallocates_exact_key() {
+        let key = Executor::scan_schema_key_for_table("lineitem");
+
+        assert_eq!(key, "schema:lineitem");
+        assert!(key.capacity() >= key.len());
     }
 }
