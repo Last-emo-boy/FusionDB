@@ -263,7 +263,26 @@ impl Executor {
     }
 
     pub(crate) fn composite_index_prefix(table_name: &str, columns: &[String]) -> String {
-        format!("index:{}:{}:", table_name, columns.join(","))
+        let columns_len = columns.iter().map(String::len).sum::<usize>();
+        let mut prefix = String::with_capacity(
+            "index:".len()
+                + table_name.len()
+                + 1
+                + columns_len
+                + columns.len().saturating_sub(1)
+                + 1,
+        );
+        prefix.push_str("index:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        for (idx, column) in columns.iter().enumerate() {
+            if idx > 0 {
+                prefix.push(',');
+            }
+            prefix.push_str(column);
+        }
+        prefix.push(':');
+        prefix
     }
 
     pub(crate) fn composite_index_key(
@@ -943,5 +962,23 @@ impl Executor {
         let table = meta.table.clone();
         let encoded_columns = meta.encoded_columns();
         Some((table, encoded_columns, meta.columns))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    #[test]
+    fn composite_index_prefix_preallocates_exact_prefix() {
+        let columns = vec![
+            "warehouse_id".to_string(),
+            "district_id".to_string(),
+            "customer_id".to_string(),
+        ];
+        let prefix = Executor::composite_index_prefix("orders", &columns);
+
+        assert_eq!(prefix, "index:orders:warehouse_id,district_id,customer_id:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }

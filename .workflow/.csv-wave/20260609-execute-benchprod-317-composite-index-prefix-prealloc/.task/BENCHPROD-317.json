@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-317",
+  "title": "Preallocate composite index prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/composite_index.rs"
+  ],
+  "description": "Avoid intermediate joined-column allocation when composite index key and scan paths build index:<table>:<columns>: prefixes from known name lengths.",
+  "implementation": [
+    "Replaced composite_index_prefix() format! plus columns.join(\",\") with one explicit-capacity String.",
+    "Pushed comma-separated columns directly into the prefix buffer.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test composite_index_prefix -- --nocapture",
+    "cargo test --test sql_index_cache -- --nocapture",
+    "cargo test --test sql_ddl test_create_table_table_level_composite_primary_key -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Composite index prefix construction now reserves capacity from known table and column name lengths while preserving composite index key generation, prefix/range scans, and SQL results."
+}
