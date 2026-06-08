@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-240",
+  "title": "Preallocate GROUP BY result schema columns",
+  "status": "completed",
+  "created_at": "2026-06-08T22:09:24+08:00",
+  "completed_at": "2026-06-08T22:09:24+08:00",
+  "scope": "GROUP BY projected-result temporary schema construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced GROUP BY projected-result schema column collect with Vec::with_capacity(columns.len()).",
+        "Kept temporary column metadata fields unchanged.",
+        "Preserved projected row construction, output names, and downstream ORDER BY schema behavior."
+      ]
+    },
+    "tests": {
+      "group_by_projection_alias_ordinal": "passed",
+      "group_by_order_limit": "passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, projection, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

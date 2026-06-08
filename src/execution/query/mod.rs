@@ -2683,9 +2683,9 @@ impl Executor {
                         }
                         rows = grouped_rows;
 
-                        let new_cols: Vec<Column> = columns
-                            .iter()
-                            .map(|name| Column {
+                        let mut new_cols = Vec::with_capacity(columns.len());
+                        for name in &columns {
+                            new_cols.push(Column {
                                 name: name.clone(),
                                 data_type: "UNKNOWN".to_string(),
                                 is_primary: false,
@@ -2695,8 +2695,8 @@ impl Executor {
                                 is_nullable: true,
                                 is_unique: false,
                                 check_expr: None,
-                            })
-                            .collect();
+                            });
+                        }
                         schema = TableSchema::new("temp_group_by_result".to_string(), new_cols);
                     }
                 }
