@@ -1,7 +1,7 @@
 {
   "id": "benchprod-142-production-hardening",
   "created_at": "2026-05-30",
-  "status": "planned",
+  "status": "completed",
   "baseline": {
     "medium_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod140_medium_explicit_q1_q22_20260529\\bench_gate_summary.json",
     "strict_native_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod140_strict_explicit_q1_q22_20260529\\bench_gate_summary.json",
