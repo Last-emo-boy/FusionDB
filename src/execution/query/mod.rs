@@ -1607,10 +1607,11 @@ impl Executor {
                 .unwrap_or(Value::Null);
 
                 let accs = groups.entry(group_key).or_insert_with(|| {
-                    aggregate_plans
-                        .iter()
-                        .map(|plan| AggregateAccumulator::new(&plan.func_name))
-                        .collect()
+                    let mut accs = Vec::with_capacity(aggregate_plans.len());
+                    for plan in &aggregate_plans {
+                        accs.push(AggregateAccumulator::new(&plan.func_name));
+                    }
+                    accs
                 });
 
                 for (acc, plan) in accs.iter_mut().zip(aggregate_plans.iter()) {
@@ -1625,15 +1626,13 @@ impl Executor {
             }
         }
 
-        let mut rows: Vec<Vec<Value>> = groups
-            .into_iter()
-            .map(|(group_value, accs)| {
-                let mut row = Vec::with_capacity(accs.len() + 1);
-                row.push(group_value);
-                row.extend(accs.iter().map(AggregateAccumulator::finalize));
-                row
-            })
-            .collect();
+        let mut rows = Vec::with_capacity(groups.len());
+        for (group_value, accs) in groups {
+            let mut row = Vec::with_capacity(accs.len() + 1);
+            row.push(group_value);
+            row.extend(accs.iter().map(AggregateAccumulator::finalize));
+            rows.push(row);
+        }
 
         let result_schema = TableSchema::new(
             "temp_join_group_by_result".to_string(),

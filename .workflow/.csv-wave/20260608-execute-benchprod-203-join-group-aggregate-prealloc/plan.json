@@ -1,0 +1,47 @@
+{
+  "id": "benchprod-203-join-group-aggregate-prealloc",
+  "objective": "Preallocate join GROUP BY aggregate accumulators and result rows from known plan/group counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T19:22:00+08:00",
+  "completed_at": "2026-06-08T19:25:40+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-203",
+      "title": "Preallocate join GROUP BY aggregates",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Join GROUP BY aggregate fast path now builds per-group accumulator vectors and final result rows with explicit capacities."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_join_group_by_count_sum_fast_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_join_group_by_aggregate_fast_path_order_limit_offset -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_join_group_by_aggregate_fast_path_matches_chbench_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full."
+  ]
+}
