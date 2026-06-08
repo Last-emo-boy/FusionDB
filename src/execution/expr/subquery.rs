@@ -537,8 +537,14 @@ impl Executor {
                 params,
             )?;
 
-            let mut matching_left_keys = HashSet::new();
-            let mut matching_right_keys = HashSet::new();
+            let mut matching_left_keys = HashSet::with_capacity(match plan.filter_side {
+                ExistsJoinSide::Left => left_rows.len(),
+                ExistsJoinSide::Right => 0,
+            });
+            let mut matching_right_keys = HashSet::with_capacity(match plan.filter_side {
+                ExistsJoinSide::Left => 0,
+                ExistsJoinSide::Right => right_rows.len(),
+            });
             match plan.filter_side {
                 ExistsJoinSide::Left => {
                     for row in &left_rows {

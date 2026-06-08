@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-182",
+  "title": "Preallocate EXISTS join matching keys",
+  "status": "completed",
+  "created_at": "2026-06-08T17:57:00+08:00",
+  "completed_at": "2026-06-08T18:01:09+08:00",
+  "scope": "EXISTS join membership matching-key allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "summary": [
+        "Changed matching_left_keys and matching_right_keys initialization from empty HashSet construction to side-aware HashSet::with_capacity.",
+        "Sized the filtered side from its scanned row count and left the unused side at capacity zero.",
+        "Kept filter evaluation, join-key collection, probe-side filtering, and cache insertion behavior unchanged."
+      ]
+    },
+    "tests": {
+      "correlated_exists_two_table_membership_matches_ldbc_q6_shape": "passed",
+      "correlated_not_exists_membership_filter_with_alias": "passed",
+      "ldbc_q4_deferred_exists_join": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused subquery, join, predicate, or scan hot path."
+  ]
+}

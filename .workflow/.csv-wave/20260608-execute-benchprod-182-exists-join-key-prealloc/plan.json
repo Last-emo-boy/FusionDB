@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-182-exists-join-key-prealloc",
+  "objective": "Preallocate matching key sets for EXISTS join membership evaluation.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:57:00+08:00",
+  "completed_at": "2026-06-08T18:01:09+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-182",
+      "title": "Preallocate EXISTS join matching keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "result": "EXISTS join membership now sizes the filtered matching-key set from the corresponding scanned side row count while leaving the unused side at capacity zero."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_exists_two_table_membership_matches_ldbc_q6_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_not_exists_membership_filter_with_alias -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_comma_join_reorder_preserves_ldbc_q4_shape_with_deferred_exists -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
