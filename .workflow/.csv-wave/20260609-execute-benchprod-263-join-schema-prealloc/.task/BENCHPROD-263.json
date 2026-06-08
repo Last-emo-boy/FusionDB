@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-263",
+  "title": "Preallocate join schema predicate column sets",
+  "status": "completed",
+  "created_at": "2026-06-09T00:14:00+08:00",
+  "completed_at": "2026-06-09T00:16:00+08:00",
+  "scope": "Join predicate schema-membership analysis",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Changed expr_uses_only_schema to preallocate extracted columns from the target/other schema pair size.",
+        "Changed predicate_schema_members to preallocate extracted columns from the participating schema column total.",
+        "Changed predicate_schema_membership to preallocate extracted columns from the single schema column count.",
+        "Changed predicate_uses_only_target_schema to preallocate extracted columns from the target/other schema pair size."
+      ]
+    },
+    "tests": {
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

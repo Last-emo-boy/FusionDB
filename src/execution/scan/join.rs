@@ -364,7 +364,12 @@ impl Executor {
         target_schema: &TableSchema,
         other_schema: &TableSchema,
     ) -> bool {
-        let mut columns = HashSet::new();
+        let mut columns = HashSet::with_capacity(
+            target_schema
+                .columns
+                .len()
+                .saturating_add(other_schema.columns.len()),
+        );
         self.extract_columns_from_expr(expr, &mut columns);
         if columns.is_empty() {
             return false;
@@ -986,7 +991,10 @@ impl Executor {
     }
 
     fn predicate_schema_members(&self, expr: &Expr, schemas: &[TableSchema]) -> Option<Vec<usize>> {
-        let mut columns = HashSet::new();
+        let column_capacity = schemas.iter().fold(0usize, |capacity, schema| {
+            capacity.saturating_add(schema.columns.len())
+        });
+        let mut columns = HashSet::with_capacity(column_capacity);
         self.extract_columns_from_expr(expr, &mut columns);
         if columns.is_empty() {
             return None;
@@ -1024,7 +1032,7 @@ impl Executor {
     }
 
     fn predicate_schema_membership(&self, expr: &Expr, schema: &TableSchema) -> Option<bool> {
-        let mut columns = HashSet::new();
+        let mut columns = HashSet::with_capacity(schema.columns.len());
         self.extract_columns_from_expr(expr, &mut columns);
         if columns.is_empty() {
             return None;
@@ -1043,7 +1051,12 @@ impl Executor {
         target_schema: &TableSchema,
         other_schema: &TableSchema,
     ) -> bool {
-        let mut columns = HashSet::new();
+        let mut columns = HashSet::with_capacity(
+            target_schema
+                .columns
+                .len()
+                .saturating_add(other_schema.columns.len()),
+        );
         self.extract_columns_from_expr(expr, &mut columns);
         if columns.is_empty() {
             return false;

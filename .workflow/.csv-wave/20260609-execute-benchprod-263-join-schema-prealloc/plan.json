@@ -1,0 +1,38 @@
+{
+  "id": "benchprod-263-join-schema-prealloc",
+  "objective": "Preallocate join predicate schema-membership column extraction sets from known schema sizes.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:14:00+08:00",
+  "completed_at": "2026-06-09T00:16:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-263",
+      "title": "Preallocate join schema predicate column sets",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "Join predicate schema-membership helpers now preallocate temporary column sets from known schema bounds."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "Schema-pair predicate checks use a saturating sum of the two schema column counts.",
+    "Multi-schema predicate membership uses a saturating sum across participating schemas.",
+    "Single-schema membership uses schema.columns.len() as the capacity hint."
+  ]
+}
