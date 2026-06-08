@@ -1,0 +1,51 @@
+{
+  "id": "benchprod-204-materialized-schema-prealloc",
+  "objective": "Preallocate materialized query schema columns from known result column counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T19:27:00+08:00",
+  "completed_at": "2026-06-08T19:31:05+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-204",
+      "title": "Preallocate materialized query schema columns",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/mod.rs"
+      ],
+      "result": "Materialized query schema construction now builds schema column vectors with explicit capacity from the materialized column count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_cte_basic -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_derived_table_join_matches_chbenchmark_q17_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_group_by_projection_can_materialize_correlated_scalar_array_subquery -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full."
+  ]
+}

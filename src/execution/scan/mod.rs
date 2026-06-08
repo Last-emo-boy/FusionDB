@@ -139,23 +139,21 @@ impl Executor {
     }
 
     fn materialized_query_schema(table_name: String, columns: Vec<String>) -> TableSchema {
-        TableSchema::new(
-            table_name,
-            columns
-                .into_iter()
-                .map(|name| Column {
-                    name,
-                    data_type: "UNKNOWN".to_string(),
-                    is_primary: false,
-                    is_indexed: false,
-                    index_type: IndexType::None,
-                    default_value: None,
-                    is_nullable: true,
-                    is_unique: false,
-                    check_expr: None,
-                })
-                .collect(),
-        )
+        let mut schema_columns = Vec::with_capacity(columns.len());
+        for name in columns {
+            schema_columns.push(Column {
+                name,
+                data_type: "UNKNOWN".to_string(),
+                is_primary: false,
+                is_indexed: false,
+                index_type: IndexType::None,
+                default_value: None,
+                is_nullable: true,
+                is_unique: false,
+                check_expr: None,
+            });
+        }
+        TableSchema::new(table_name, schema_columns)
     }
 
     fn projection_indices_for_scan(

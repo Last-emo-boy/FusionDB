@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-204",
+  "title": "Preallocate materialized query schema columns",
+  "status": "completed",
+  "created_at": "2026-06-08T19:27:00+08:00",
+  "completed_at": "2026-06-08T19:31:05+08:00",
+  "scope": "Materialized query schema column vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/mod.rs"
+      ],
+      "summary": [
+        "Replaced materialized query schema column collect with a vector preallocated from columns.len().",
+        "Preserved generated column metadata and materialized table schema behavior."
+      ]
+    },
+    "tests": {
+      "cte_basic": "passed",
+      "derived_table_join_matches_chbenchmark_q17_shape": "passed",
+      "group_by_projection_can_materialize_correlated_scalar_array_subquery": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused materialization, scan, projection, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
