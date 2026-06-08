@@ -3,4 +3,4 @@ BENCHPROD-142,Recovery gate smoke,done,Recovery smoke passed and medium gate con
 BENCHPROD-143,CH-benCHmark longer mixed HTAP,done,300s t1 passed; t2 exposed write-conflict SQLSTATE gap; 40001 fix verified by full 300s t2 and tightened medium gate
 BENCHPROD-144,Native memtier completion,done,WSL memtier_benchmark detected; native Redis protocol probe passed through FusionDB RESP endpoint and production medium gate consumed the passed evidence
 BENCHPROD-145,LDBC official-shape gap reduction,done,120-op non-isolation LDBC command-mode smoke passed with Q12/Q13/Q14 sampled; production medium gate consumed the passed evidence
-BENCHPROD-146,Larger-scale production repeat,pending,Run 3x larger-scale repeat and create thresholded gate evidence
+BENCHPROD-146,Larger-scale production repeat,done,Large production 3x repeat passed and large-profile gate consumed repeat/external/recovery evidence

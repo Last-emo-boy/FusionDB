@@ -29,17 +29,32 @@
     {
       "id": "BENCHPROD-144",
       "title": "Native memtier completion",
-      "status": "pending"
+      "status": "done",
+      "evidence": {
+        "memtier_native": "E:\\Playground\\FusionDB-bench\\runs\\memtier_native_benchprod144_wsl_probe_bind_all_20260608\\memtier_native_smoke_summary.json",
+        "external_smoke": "E:\\Playground\\FusionDB-bench\\runs\\external_smoke_benchprod144_native_memtier_pass_20260608\\external_smoke_summary.json",
+        "gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod144_medium_native_memtier_pass_20260608\\bench_gate_summary.json"
+      }
     },
     {
       "id": "BENCHPROD-145",
       "title": "LDBC official-shape gap reduction",
-      "status": "pending"
+      "status": "done",
+      "evidence": {
+        "ldbc_native": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod145_q12_q14_reduction_120ops_20260608\\ldbc_snb_native_smoke_summary.json",
+        "external_smoke": "E:\\Playground\\FusionDB-bench\\runs\\external_smoke_benchprod145_ldbc_120ops_pass_20260608\\external_smoke_summary.json",
+        "gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod145_medium_ldbc_120ops_pass_20260608\\bench_gate_summary.json"
+      }
     },
     {
       "id": "BENCHPROD-146",
       "title": "Larger-scale production repeat",
-      "status": "pending"
+      "status": "done",
+      "evidence": {
+        "repeat": "E:\\Playground\\FusionDB-bench\\runs\\benchprod146_large_production_3x_20260608\\bench_repeat_summary.json",
+        "stability": "E:\\Playground\\FusionDB-bench\\runs\\benchprod146_large_production_3x_20260608\\stability\\bench_stability_summary.json",
+        "gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod146_large_profile_20260608\\bench_gate_summary.json"
+      }
     }
   ]
 }
