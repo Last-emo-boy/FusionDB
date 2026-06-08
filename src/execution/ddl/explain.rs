@@ -31,6 +31,72 @@ impl ExplainAccessPath {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{Column, IndexType};
+    use crate::storage::memory::MemoryStorage;
+    use crate::storage::Storage;
+    use sqlparser::ast::Ident;
+    use std::sync::Arc;
+
+    fn test_column(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: "INTEGER".to_string(),
+            is_primary: false,
+            is_indexed: false,
+            index_type: IndexType::None,
+            default_value: None,
+            is_nullable: true,
+            is_unique: false,
+            check_expr: None,
+        }
+    }
+
+    fn test_executor() -> (Executor, String) {
+        let wal_path = format!("test_explain_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+        (Executor::new(storage), wal_path)
+    }
+
+    fn compound(name: &str, column: &str) -> Expr {
+        Expr::CompoundIdentifier(vec![Ident::new(name), Ident::new(column)])
+    }
+
+    #[test]
+    fn predicate_schema_members_for_explain_tracks_local_and_join_predicates() {
+        let (executor, wal_path) = test_executor();
+        let schemas = vec![
+            TableSchema::new(
+                "a".to_string(),
+                vec![test_column("a.id"), test_column("a.name")],
+            ),
+            TableSchema::new(
+                "b".to_string(),
+                vec![test_column("b.id"), test_column("b.a_id")],
+            ),
+        ];
+
+        assert_eq!(
+            executor.predicate_schema_members_for_explain(&compound("a", "id"), &schemas),
+            Some(vec![0])
+        );
+
+        let join_predicate = Expr::BinaryOp {
+            left: Box::new(compound("a", "id")),
+            op: BinaryOperator::Eq,
+            right: Box::new(compound("b", "a_id")),
+        };
+        assert_eq!(
+            executor.predicate_schema_members_for_explain(&join_predicate, &schemas),
+            Some(vec![0, 1])
+        );
+        drop(executor);
+        let _ = std::fs::remove_file(wal_path);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ExplainEstimate {
     rows: usize,
@@ -731,13 +797,16 @@ impl Executor {
         expr: &Expr,
         schemas: &[TableSchema],
     ) -> Option<Vec<usize>> {
-        let mut columns = HashSet::new();
+        let column_capacity = schemas.iter().fold(0usize, |capacity, schema| {
+            capacity.saturating_add(schema.columns.len())
+        });
+        let mut columns = HashSet::with_capacity(column_capacity);
         self.extract_columns_from_expr(expr, &mut columns);
         if columns.is_empty() {
             return None;
         }
 
-        let mut members = HashSet::new();
+        let mut members = HashSet::with_capacity(schemas.len());
         for column in columns {
             let mut matched = false;
             for (index, schema) in schemas.iter().enumerate() {

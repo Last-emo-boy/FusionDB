@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-268",
+  "title": "Preallocate EXPLAIN schema membership sets",
+  "status": "completed",
+  "created_at": "2026-06-09T00:46:00+08:00",
+  "completed_at": "2026-06-09T00:51:00+08:00",
+  "scope": "EXPLAIN predicate schema-membership analysis",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/ddl/explain.rs"
+      ],
+      "summary": [
+        "Changed predicate_schema_members_for_explain to preallocate extracted columns from the total participating schema width.",
+        "Changed the schema member set to preallocate from schemas.len().",
+        "Added direct unit coverage for single-relation and join predicate membership."
+      ]
+    },
+    "tests": {
+      "predicate_schema_members_for_explain_unit": "passed",
+      "composite_index_explain": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
