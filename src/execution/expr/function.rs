@@ -429,9 +429,15 @@ impl Executor {
 
     pub(crate) fn extract_vector(&self, v: &Value) -> Result<Vec<f64>> {
         match v {
-            Value::Vector(vec) => Ok(vec.iter().map(|&x| x as f64).collect()),
+            Value::Vector(vec) => {
+                let mut res = Vec::with_capacity(vec.len());
+                for &item in vec {
+                    res.push(item as f64);
+                }
+                Ok(res)
+            }
             Value::Array(arr) => {
-                let mut res = Vec::new();
+                let mut res = Vec::with_capacity(arr.len());
                 for item in arr {
                     match item {
                         Value::Integer(i) => res.push(*i as f64),

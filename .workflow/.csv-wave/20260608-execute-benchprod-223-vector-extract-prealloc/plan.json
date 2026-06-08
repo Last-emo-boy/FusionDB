@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-223-vector-extract-prealloc",
+  "objective": "Preallocate vector extraction buffers for vector function execution.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:45:00+08:00",
+  "completed_at": "2026-06-08T20:51:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-223",
+      "title": "Preallocate vector extraction buffers",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/function.rs",
+        "tests/sql_returning_upsert_vector_rbac.rs"
+      ],
+      "result": "Vector function argument extraction now preallocates f64 output buffers from the known vector or array length before numeric conversion."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_returning_upsert_vector_rbac test_vector_distance_accepts_numeric_array_literals -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_returning_upsert_vector_rbac test_hnsw_order_by_projection -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_returning_upsert_vector_rbac",
+      "status": "passed: 14/14"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The conversion preserves Value::Vector f32-to-f64 conversion, numeric Value::Array conversion, and existing non-numeric array error behavior."
+  ]
+}

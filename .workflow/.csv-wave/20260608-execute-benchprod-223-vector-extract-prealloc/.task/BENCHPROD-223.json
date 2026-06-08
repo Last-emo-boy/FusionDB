@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-223",
+  "title": "Preallocate vector extraction buffers",
+  "status": "completed",
+  "created_at": "2026-06-08T20:45:00+08:00",
+  "completed_at": "2026-06-08T20:51:00+08:00",
+  "scope": "Vector function argument extraction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/function.rs",
+        "tests/sql_returning_upsert_vector_rbac.rs"
+      ],
+      "summary": [
+        "Replaced Value::Vector collect conversion with an explicitly preallocated f64 vector sized from vec.len().",
+        "Replaced Value::Array Vec::new conversion with Vec::with_capacity(arr.len()).",
+        "Added a SQL regression test covering VECTOR_DISTANCE over numeric array literals."
+      ]
+    },
+    "tests": {
+      "vector_distance_array_literals": "passed",
+      "hnsw_order_by_projection": "passed",
+      "sql_returning_upsert_vector_rbac": "14/14 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

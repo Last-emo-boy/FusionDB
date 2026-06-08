@@ -333,6 +333,22 @@ async fn test_hnsw_order_by_projection() {
 }
 
 #[tokio::test]
+async fn test_vector_distance_accepts_numeric_array_literals() {
+    let (executor, wal) = setup().await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT VECTOR_DISTANCE(ARRAY[1, 2, 3], ARRAY[1, 4, 3])",
+    )
+    .await;
+
+    match &rows[0][0] {
+        Value::Float(distance) => assert!((*distance - 2.0).abs() < f64::EPSILON),
+        other => panic!("Expected float vector distance, got {:?}", other),
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_rbac_create_drop_user() {
     let (executor, wal) = setup().await;
     // Create user
