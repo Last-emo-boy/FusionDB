@@ -62,9 +62,17 @@ impl TrigramIndex {
         text: &str,
     ) {
         let grams = trigrams_bytes(text);
-        let table_map = self.postings.entry(table.to_string()).or_default();
-        let col_map = table_map.entry(col.to_string()).or_default();
-        let map = self.id_map.entry(table.to_string()).or_default();
+        let table_map = self
+            .postings
+            .entry(table.to_string())
+            .or_insert_with(|| HashMap::with_capacity(1));
+        let col_map = table_map
+            .entry(col.to_string())
+            .or_insert_with(|| HashMap::with_capacity(grams.len()));
+        let map = self
+            .id_map
+            .entry(table.to_string())
+            .or_insert_with(|| HashMap::with_capacity(1));
         map.insert(row_id, row_id_str.to_string());
 
         for tg in grams {

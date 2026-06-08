@@ -1,0 +1,57 @@
+{
+  "id": "benchprod-271-trigram-posting-prealloc",
+  "objective": "Preallocate trigram posting maps when first indexing a table column.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:01:00+08:00",
+  "completed_at": "2026-06-09T01:04:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-271",
+      "title": "Preallocate trigram posting maps",
+      "status": "completed",
+      "evidence": [
+        "src/storage/trigram.rs"
+      ],
+      "result": "Trigram indexing now preallocates newly-created table, column, and id maps from known first-row shape."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::trigram::tests -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_indexed_text_insert_updates_trigram_index_on_fusion_storage -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_create_index_backfills_trigram_index_on_fusion_storage -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_update_refreshes_trigram_index_on_fusion_storage -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_delete_removes_trigram_index_on_fusion_storage -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The new column posting map uses the first row's deduplicated trigram count as its initial capacity.",
+    "New table and id maps use capacity 1 because the first insert creates exactly one entry."
+  ]
+}
