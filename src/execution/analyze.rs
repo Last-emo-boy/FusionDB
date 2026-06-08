@@ -20,6 +20,13 @@ fn analyze_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn analyze_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct TableStats {
     pub table_name: String,
@@ -138,7 +145,7 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<TableSchema> {
-        let schema_key = format!("schema:{}", table_name);
+        let schema_key = analyze_schema_key_for_table(table_name);
         let schema_bytes = txn
             .get(schema_key.as_bytes())
             .await?
@@ -226,5 +233,13 @@ mod tests {
 
         assert_eq!(prefix, "data:items:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn analyze_schema_key_for_table_preallocates_exact_key() {
+        let key = analyze_schema_key_for_table("items");
+
+        assert_eq!(key, "schema:items");
+        assert!(key.capacity() >= key.len());
     }
 }

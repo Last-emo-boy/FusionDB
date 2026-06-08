@@ -1,0 +1,47 @@
+{
+  "id": "benchprod-325-analyze-schema-key-prealloc",
+  "objective": "Preallocate ANALYZE schema lookup keys from table-name length.",
+  "status": "completed",
+  "created_at": "2026-06-09T07:24:00+08:00",
+  "completed_at": "2026-06-09T07:24:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-325",
+      "title": "Preallocate ANALYZE schema keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/analyze.rs"
+      ],
+      "result": "ANALYZE schema lookup now uses an explicit-capacity helper instead of format! for schema:<table> keys."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test analyze_schema_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_analyze_table_collects_statistics -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 33/33"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for schema:<table> before pushing known components.",
+    "The optimization replaces format! in load_analyze_schema() schema lookup key construction.",
+    "Generated schema key bytes, ANALYZE statistics collection, EXPLAIN statistics consumption, and DDL behavior are unchanged.",
+    "git diff --check printed the existing CRLF normalization warning for src/execution/analyze.rs while exiting successfully."
+  ]
+}
