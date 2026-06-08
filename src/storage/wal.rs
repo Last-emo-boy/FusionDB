@@ -9,6 +9,8 @@ use std::thread;
 use tokio::sync::oneshot;
 
 const MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MB per segment
+const MIN_WAL_REPLAY_RECORD_BYTES: u64 = 1 + 4;
+const MAX_WAL_REPLAY_PREALLOC_ENTRIES: usize = 8192;
 
 #[derive(Debug)]
 pub enum WalEntry {
@@ -371,7 +373,7 @@ impl WalManager {
             FusionError::Storage(format!("Failed to open WAL segment for replay: {}", e))
         })?;
         let mut reader = BufReader::new(file);
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(Self::replay_entry_capacity_hint(file_len));
         let mut valid_pos = 0u64;
 
         loop {
@@ -454,6 +456,11 @@ impl WalManager {
         }
 
         Ok(entries)
+    }
+
+    fn replay_entry_capacity_hint(file_len: u64) -> usize {
+        (file_len / MIN_WAL_REPLAY_RECORD_BYTES).min(MAX_WAL_REPLAY_PREALLOC_ENTRIES as u64)
+            as usize
     }
 
     /// Truncate all WAL segments — delete old segments and reset the active segment.
@@ -621,6 +628,23 @@ mod tests {
 
         wal2.truncate().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_replay_entry_capacity_hint_is_bounded() {
+        assert_eq!(WalManager::replay_entry_capacity_hint(0), 0);
+        assert_eq!(
+            WalManager::replay_entry_capacity_hint(MIN_WAL_REPLAY_RECORD_BYTES),
+            1
+        );
+        assert_eq!(
+            WalManager::replay_entry_capacity_hint(MIN_WAL_REPLAY_RECORD_BYTES * 3),
+            3
+        );
+        assert_eq!(
+            WalManager::replay_entry_capacity_hint(MAX_SEGMENT_SIZE),
+            MAX_WAL_REPLAY_PREALLOC_ENTRIES
+        );
     }
 
     #[test]

@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-260",
+  "title": "Preallocate WAL replay entries",
+  "status": "completed",
+  "created_at": "2026-06-09T00:06:00+08:00",
+  "completed_at": "2026-06-09T00:10:00+08:00",
+  "scope": "WAL segment replay entry buffering",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/wal.rs"
+      ],
+      "summary": [
+        "Added a bounded replay_entry_capacity_hint based on WAL file length and minimum record bytes.",
+        "Changed replay_single_file to initialize entries with Vec::with_capacity using that hint.",
+        "Added unit coverage for empty, small, and max-segment capacity hints."
+      ]
+    },
+    "tests": {
+      "wal_unit_tests": "6/6 passed",
+      "fusion_reopen_replay_path": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

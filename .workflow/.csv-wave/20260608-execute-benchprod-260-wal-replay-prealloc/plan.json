@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-260-wal-replay-prealloc",
+  "objective": "Preallocate WAL replay entry buffers with a bounded file-size capacity hint.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:06:00+08:00",
+  "completed_at": "2026-06-09T00:10:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-260",
+      "title": "Preallocate WAL replay entries",
+      "status": "completed",
+      "evidence": [
+        "src/storage/wal.rs"
+      ],
+      "result": "WAL segment replay now initializes its entry vector from a bounded file-size capacity hint."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::wal::tests -- --nocapture",
+      "status": "passed: 6/6"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fusion::tests::fusion_reopen_restores_current_ts_from_all_sstable_keys -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The capacity hint is bounded at 8192 entries to avoid oversized allocation for large 64 MB WAL segments.",
+    "The change preserves replay parsing, partial-tail truncation, and segment ordering behavior."
+  ]
+}
