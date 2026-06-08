@@ -1207,17 +1207,18 @@ impl Executor {
             let OrderByKind::Expressions(order_exprs) = &order_by.kind else {
                 return Ok(None);
             };
+            let output_column_names: Vec<String> = output_schema
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect();
             let sort_keys: Vec<SortOrderKey<'_>> = order_exprs
                 .iter()
                 .map(|order_expr| SortOrderKey {
                     source: self.resolve_order_value_source(
                         &order_expr.expr,
                         &select.projection,
-                        &output_schema
-                            .columns
-                            .iter()
-                            .map(|column| column.name.clone())
-                            .collect::<Vec<_>>(),
+                        &output_column_names,
                         &output_schema,
                         false,
                         true,

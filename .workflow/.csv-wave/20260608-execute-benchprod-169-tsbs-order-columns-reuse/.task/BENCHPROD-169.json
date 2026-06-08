@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-169",
+  "title": "Reuse TSBS lateral ORDER BY column names",
+  "status": "completed",
+  "created_at": "2026-06-08T17:00:00+08:00",
+  "completed_at": "2026-06-08T17:07:08+08:00",
+  "scope": "TSBS lastpoint lateral ORDER BY sort-key construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Collected output schema column names once before building TSBS lastpoint lateral sort keys.",
+        "Reused the collected column names for each ORDER BY expression.",
+        "Kept sort-key resolution, row ordering, DISTINCT ON, and limit behavior unchanged."
+      ]
+    },
+    "tests": {
+      "tsbs_lastpoint_distinct_on_lateral_join": "passed",
+      "sql_join": "30/30 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}

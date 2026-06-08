@@ -1,0 +1,36 @@
+{
+  "id": "benchprod-169-tsbs-order-columns-reuse",
+  "objective": "Reuse TSBS lateral ORDER BY output column names when building sort keys.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:00:00+08:00",
+  "completed_at": "2026-06-08T17:07:08+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-169",
+      "title": "Reuse TSBS lateral ORDER BY column names",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "TSBS lastpoint lateral ORDER BY sort-key construction now collects output column names once and reuses them across order expressions."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_tsbs_lastpoint_distinct_on_lateral_join -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 30/30"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
