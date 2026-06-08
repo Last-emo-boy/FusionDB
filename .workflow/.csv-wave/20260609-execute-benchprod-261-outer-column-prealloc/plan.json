@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-261-outer-column-prealloc",
+  "objective": "Preallocate deferred subquery outer-column extraction buffers from SELECT AST shape.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:16:00+08:00",
+  "completed_at": "2026-06-09T00:20:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-261",
+      "title": "Preallocate outer column extraction buffers",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Deferred subquery outer-column extraction now preallocates local relation and referenced-column sets from the SELECT AST."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_correlated_not_exists_with_join_alias_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_correlated_exists_two_table_membership_matches_ldbc_q6_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery -- --nocapture",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The local relation capacity uses FROM plus JOIN relation count with room for table aliases.",
+    "The referenced column capacity uses selection, having, and projection expression counts."
+  ]
+}

@@ -564,7 +564,8 @@ impl Executor {
         select: &sqlparser::ast::Select,
         cols: &mut HashSet<String>,
     ) {
-        let mut local_relations = HashSet::new();
+        let mut local_relations =
+            HashSet::with_capacity(Self::select_relation_name_capacity(select));
         for table in &select.from {
             local_relations.extend(self.relation_names(&table.relation));
             for join in &table.joins {
@@ -572,7 +573,7 @@ impl Executor {
             }
         }
 
-        let mut referenced = HashSet::new();
+        let mut referenced = HashSet::with_capacity(Self::select_outer_reference_capacity(select));
         if let Some(selection) = &select.selection {
             self.extract_columns_from_expr(selection, &mut referenced);
         }
@@ -601,6 +602,32 @@ impl Executor {
                 cols.insert(column);
             }
         }
+    }
+
+    fn select_relation_name_capacity(select: &sqlparser::ast::Select) -> usize {
+        select
+            .from
+            .iter()
+            .map(|table| 1usize.saturating_add(table.joins.len()).saturating_mul(2))
+            .sum()
+    }
+
+    fn select_outer_reference_capacity(select: &sqlparser::ast::Select) -> usize {
+        let selection_count = usize::from(select.selection.is_some());
+        let having_count = usize::from(select.having.is_some());
+        let projection_expr_count = select
+            .projection
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }
+                )
+            })
+            .count();
+        selection_count
+            .saturating_add(having_count)
+            .saturating_add(projection_expr_count)
     }
 
     fn compile_group_aggregate_plans<'a>(

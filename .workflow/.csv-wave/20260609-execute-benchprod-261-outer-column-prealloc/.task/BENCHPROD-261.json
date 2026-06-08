@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-261",
+  "title": "Preallocate outer column extraction buffers",
+  "status": "completed",
+  "created_at": "2026-06-09T00:16:00+08:00",
+  "completed_at": "2026-06-09T00:20:00+08:00",
+  "scope": "Deferred EXISTS outer-column extraction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Added select_relation_name_capacity for local relation set preallocation.",
+        "Added select_outer_reference_capacity for referenced-column set preallocation.",
+        "Used both hints in extract_select_outer_columns without changing extraction rules."
+      ]
+    },
+    "tests": {
+      "correlated_not_exists_join_alias_shape": "passed",
+      "correlated_exists_two_table_membership": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
