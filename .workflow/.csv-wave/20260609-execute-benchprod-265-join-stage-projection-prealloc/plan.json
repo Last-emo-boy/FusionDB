@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-265-join-stage-projection-prealloc",
+  "objective": "Preallocate join stage-projection predicate column extraction sets from schema size.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:27:00+08:00",
+  "completed_at": "2026-06-09T00:28:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-265",
+      "title": "Preallocate join stage projection predicate columns",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "Join stage projection now preallocates pending-predicate column extraction sets from the active schema width."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_join_projection_pushdown_with_group_by -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "Pending predicate column extraction in build_stage_join_projection now uses schema.columns.len() as its capacity hint.",
+    "Projection membership and required index selection behavior are unchanged."
+  ]
+}

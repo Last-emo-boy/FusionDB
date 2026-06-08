@@ -545,7 +545,7 @@ impl Executor {
         }
 
         for predicate in pending_predicates {
-            let mut columns = HashSet::new();
+            let mut columns = HashSet::with_capacity(schema.columns.len());
             self.extract_columns_from_expr(predicate, &mut columns);
             for column in columns {
                 if let Ok(index) = self.resolve_column_index(&column, schema) {
