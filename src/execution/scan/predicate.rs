@@ -53,6 +53,22 @@ impl Executor {
         }
     }
 
+    fn disjunctive_predicate_count(expr: &Expr) -> usize {
+        if let Expr::Nested(inner) = expr {
+            Self::disjunctive_predicate_count(inner)
+        } else if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } = expr
+        {
+            Self::disjunctive_predicate_count(left)
+                .saturating_add(Self::disjunctive_predicate_count(right))
+        } else {
+            1
+        }
+    }
+
     fn combine_disjunctive_predicates(predicates: Vec<Expr>) -> Option<Expr> {
         let mut iter = predicates.into_iter();
         let first = iter.next()?;
@@ -76,7 +92,7 @@ impl Executor {
     }
 
     fn extract_common_or_conjunctive_predicates(expr: &Expr) -> Option<Vec<Expr>> {
-        let mut branches = Vec::new();
+        let mut branches = Vec::with_capacity(Self::disjunctive_predicate_count(expr));
         Self::split_disjunctive_predicates(expr, &mut branches);
         if branches.len() < 2 {
             return None;

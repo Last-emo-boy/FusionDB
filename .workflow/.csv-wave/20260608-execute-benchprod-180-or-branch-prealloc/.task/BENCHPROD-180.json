@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-180",
+  "title": "Preallocate OR predicate branches",
+  "status": "completed",
+  "created_at": "2026-06-08T17:45:00+08:00",
+  "completed_at": "2026-06-08T17:52:49+08:00",
+  "scope": "OR predicate branch allocation in scan predicate extraction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/predicate.rs"
+      ],
+      "summary": [
+        "Added disjunctive_predicate_count as the OR counterpart to conjunctive_predicate_count.",
+        "Changed extract_common_or_conjunctive_predicates to initialize its branch vector with Vec::with_capacity(Self::disjunctive_predicate_count(expr)).",
+        "Kept nested expression unwrapping, OR branch flattening, common predicate lifting, and residual predicate recombination behavior unchanged."
+      ]
+    },
+    "tests": {
+      "common_or_join_key_unit": "passed",
+      "or_branch_common_join_key_matches_chbenchmark_q19_shape": "passed",
+      "implicit_join_common_or_equi_predicate_matches_chbenchmark_q19_shape": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused predicate, scan, join, or query hot path."
+  ]
+}

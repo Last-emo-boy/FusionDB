@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-180-or-branch-prealloc",
+  "objective": "Preallocate OR predicate branch collection before common conjunctive extraction.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:45:00+08:00",
+  "completed_at": "2026-06-08T17:52:49+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-180",
+      "title": "Preallocate OR predicate branches",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/predicate.rs"
+      ],
+      "result": "OR predicate common-conjunct extraction now sizes the branch vector from the disjunctive predicate count before splitting."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --lib collect_conjunctive_predicates_lifts_common_or_join_key",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_or_branch_common_join_key_matches_chbenchmark_q19_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_implicit_join_common_or_equi_predicate_matches_chbenchmark_q19_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
