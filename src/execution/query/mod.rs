@@ -363,47 +363,48 @@ impl Executor {
         schema: &TableSchema,
         params: &[Value],
     ) -> Vec<RowValueSource<'a>> {
-        group_exprs
-            .iter()
-            .map(|expr| self.row_value_source_for_expr(expr, schema, params))
-            .collect()
+        let mut sources = Vec::with_capacity(group_exprs.len());
+        for expr in group_exprs {
+            sources.push(self.row_value_source_for_expr(expr, schema, params));
+        }
+        sources
     }
 
     fn group_output_scope(&self, group_exprs: &[Expr], group_key: &[Value]) -> TableSchema {
-        TableSchema::new(
-            "__group_output".to_string(),
-            group_exprs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, expr)| {
-                    let name = Self::order_limit_column_name(expr).or_else(|| match expr {
-                        Expr::Identifier(ident) => Some(ident.value.clone()),
-                        _ => None,
-                    })?;
-                    group_key.get(index)?;
-                    Some(Column {
-                        name,
-                        data_type: "UNKNOWN".to_string(),
-                        is_primary: false,
-                        is_indexed: false,
-                        index_type: IndexType::None,
-                        default_value: None,
-                        is_nullable: true,
-                        is_unique: false,
-                        check_expr: None,
-                    })
-                })
-                .collect(),
-        )
+        let mut columns = Vec::with_capacity(group_exprs.len());
+        for (index, expr) in group_exprs.iter().enumerate() {
+            let Some(name) = Self::order_limit_column_name(expr).or_else(|| match expr {
+                Expr::Identifier(ident) => Some(ident.value.clone()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if group_key.get(index).is_none() {
+                continue;
+            }
+            columns.push(Column {
+                name,
+                data_type: "UNKNOWN".to_string(),
+                is_primary: false,
+                is_indexed: false,
+                index_type: IndexType::None,
+                default_value: None,
+                is_nullable: true,
+                is_unique: false,
+                check_expr: None,
+            });
+        }
+
+        TableSchema::new("__group_output".to_string(), columns)
     }
 
     fn resolve_group_by_projection_aliases(
         group_exprs: &[Expr],
         projection: &[SelectItem],
     ) -> Vec<Expr> {
-        group_exprs
-            .iter()
-            .map(|group_expr| match group_expr {
+        let mut resolved = Vec::with_capacity(group_exprs.len());
+        for group_expr in group_exprs {
+            let expr = match group_expr {
                 Expr::Identifier(ident) => projection
                     .iter()
                     .find_map(|item| match item {
@@ -416,24 +417,27 @@ impl Executor {
                     })
                     .unwrap_or_else(|| group_expr.clone()),
                 Expr::Value(value) => {
-                    let sqlparser::ast::Value::Number(number, _) = &value.value else {
-                        return group_expr.clone();
-                    };
-                    number
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|position| position.checked_sub(1))
-                        .and_then(|index| projection.get(index))
-                        .and_then(|item| match item {
-                            SelectItem::UnnamedExpr(expr) => Some(expr.clone()),
-                            SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| group_expr.clone())
+                    if let sqlparser::ast::Value::Number(number, _) = &value.value {
+                        number
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|position| position.checked_sub(1))
+                            .and_then(|index| projection.get(index))
+                            .and_then(|item| match item {
+                                SelectItem::UnnamedExpr(expr) => Some(expr.clone()),
+                                SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| group_expr.clone())
+                    } else {
+                        group_expr.clone()
+                    }
                 }
                 _ => group_expr.clone(),
-            })
-            .collect()
+            };
+            resolved.push(expr);
+        }
+        resolved
     }
 
     fn order_expr_is_projection_reference(expr: &Expr, projection: &[SelectItem]) -> bool {
