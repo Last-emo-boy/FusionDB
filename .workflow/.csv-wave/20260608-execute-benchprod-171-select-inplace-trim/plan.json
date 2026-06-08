@@ -1,0 +1,40 @@
+{
+  "id": "benchprod-171-select-inplace-trim",
+  "objective": "Trim ordinary SELECT result windows in place.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:13:00+08:00",
+  "completed_at": "2026-06-08T17:15:25+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-171",
+      "title": "In-place trim ordinary SELECT results",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Ordinary SELECT LIMIT/OFFSET handling now trims the result vector in place instead of rebuilding it with skip/take/collect."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_select test_select_with_limit_offset -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_select test_select_order_by_limit_offset -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

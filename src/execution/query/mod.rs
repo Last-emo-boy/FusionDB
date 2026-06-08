@@ -2711,12 +2711,7 @@ impl Executor {
                 }
             }
 
-            let rows = rows.into_iter().skip(offset);
-            let rows: Vec<Vec<Value>> = if let Some(limit) = limit {
-                rows.take(limit).collect()
-            } else {
-                rows.collect()
-            };
+            Self::trim_query_rows_in_place(&mut rows, offset, limit);
 
             if is_count_star {
                 let count = rows.len();

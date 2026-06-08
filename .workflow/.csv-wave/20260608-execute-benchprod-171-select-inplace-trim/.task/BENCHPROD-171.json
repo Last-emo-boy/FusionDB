@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-171",
+  "title": "In-place trim ordinary SELECT results",
+  "status": "completed",
+  "created_at": "2026-06-08T17:13:00+08:00",
+  "completed_at": "2026-06-08T17:15:25+08:00",
+  "scope": "Ordinary SELECT LIMIT/OFFSET result trimming",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced ordinary SELECT result skip/take/collect trimming with trim_query_rows_in_place.",
+        "Kept LIMIT/OFFSET, ORDER BY, and COUNT(*) post-trim behavior unchanged."
+      ]
+    },
+    "tests": {
+      "select_with_limit_offset": "passed",
+      "select_order_by_limit_offset": "passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}
