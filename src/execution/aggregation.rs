@@ -20,14 +20,14 @@ impl AggregateAccumulator {
     pub(crate) fn new(func_name: &str) -> Self {
         match func_name.to_uppercase().as_str() {
             "COUNT" => AggregateAccumulator::Count(0),
-            "COUNT_DISTINCT" => AggregateAccumulator::CountDistinct(HashSet::new()),
+            "COUNT_DISTINCT" => AggregateAccumulator::CountDistinct(HashSet::with_capacity(1)),
             "SUM" => AggregateAccumulator::Sum(0.0, true),
             "AVG" => AggregateAccumulator::Avg(0.0, 0),
             "MIN" => AggregateAccumulator::Min(None),
             "MAX" => AggregateAccumulator::Max(None),
-            "ARRAY_AGG" => AggregateAccumulator::ArrayAgg(Vec::new()),
+            "ARRAY_AGG" => AggregateAccumulator::ArrayAgg(Vec::with_capacity(1)),
             "STRING_AGG" | "GROUP_CONCAT" => {
-                AggregateAccumulator::StringAgg(Vec::new(), ",".to_string())
+                AggregateAccumulator::StringAgg(Vec::with_capacity(1), ",".to_string())
             }
             _ => AggregateAccumulator::Count(0),
         }
@@ -220,6 +220,22 @@ mod tests {
         }
         match AggregateAccumulator::with_input_capacity("COUNT", 3) {
             AggregateAccumulator::Count(0) => {}
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_collecting_accumulators_preallocate_first_input() {
+        match AggregateAccumulator::new("COUNT_DISTINCT") {
+            AggregateAccumulator::CountDistinct(set) => assert!(set.capacity() >= 1),
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
+        match AggregateAccumulator::new("ARRAY_AGG") {
+            AggregateAccumulator::ArrayAgg(values) => assert!(values.capacity() >= 1),
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
+        match AggregateAccumulator::new("STRING_AGG") {
+            AggregateAccumulator::StringAgg(values, _) => assert!(values.capacity() >= 1),
             other => panic!("unexpected accumulator: {:?}", other),
         }
     }
