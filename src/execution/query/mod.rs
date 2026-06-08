@@ -114,6 +114,40 @@ impl Executor {
         }
     }
 
+    fn concat_set_rows_window(
+        mut left_rows: Vec<Vec<Value>>,
+        mut right_rows: Vec<Vec<Value>>,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Vec<Vec<Value>> {
+        let total_len = left_rows.len().saturating_add(right_rows.len());
+        if offset >= total_len {
+            return Vec::new();
+        }
+
+        let available = total_len - offset;
+        let take = limit.map_or(available, |limit| limit.min(available));
+        let mut rows = Vec::with_capacity(take);
+        if take == 0 {
+            return rows;
+        }
+
+        let left_len = left_rows.len();
+        if offset < left_len {
+            let left_take = (left_len - offset).min(take);
+            rows.extend(left_rows.drain(offset..offset + left_take));
+            let right_take = take - left_take;
+            if right_take > 0 {
+                rows.extend(right_rows.drain(..right_take));
+            }
+        } else {
+            let right_offset = offset - left_len;
+            rows.extend(right_rows.drain(right_offset..right_offset + take));
+        }
+
+        rows
+    }
+
     fn compound_identifier_prefix(idents: &[sqlparser::ast::Ident]) -> String {
         let prefix_len = idents.len().saturating_sub(1);
         let capacity = idents
@@ -2832,7 +2866,42 @@ impl Executor {
                 }
             };
 
+            let (set_offset, set_limit) =
+                if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
+                    let off = offset
+                        .as_ref()
+                        .and_then(|os| match &os.value {
+                            Expr::Value(sqlparser::ast::ValueWithSpan {
+                                value: sqlparser::ast::Value::Number(n, _),
+                                ..
+                            }) => n.parse::<usize>().ok(),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let lim = limit.as_ref().and_then(|e| match e {
+                        Expr::Value(sqlparser::ast::ValueWithSpan {
+                            value: sqlparser::ast::Value::Number(n, _),
+                            ..
+                        }) => n.parse::<usize>().ok(),
+                        _ => None,
+                    });
+                    (off, lim)
+                } else {
+                    (0, None)
+                };
+            let is_all = matches!(
+                set_quantifier,
+                SetQuantifier::All | SetQuantifier::AllByName
+            );
+            let union_all_window_pushed = matches!(op, SetOperator::Union)
+                && is_all
+                && query.order_by.is_none()
+                && query.limit_clause.is_some();
+
             let mut combined = match op {
+                SetOperator::Union if union_all_window_pushed => {
+                    Self::concat_set_rows_window(left_rows, right_rows, set_offset, set_limit)
+                }
                 SetOperator::Union => {
                     let mut all_rows = left_rows;
                     all_rows.extend(right_rows);
@@ -2861,37 +2930,9 @@ impl Executor {
             };
 
             // Deduplicate unless ALL
-            let is_all = matches!(
-                set_quantifier,
-                SetQuantifier::All | SetQuantifier::AllByName
-            );
             if !is_all {
                 combined = Self::deduplicate_rows(combined);
             }
-
-            let (set_offset, set_limit) =
-                if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
-                    let off = offset
-                        .as_ref()
-                        .and_then(|os| match &os.value {
-                            Expr::Value(sqlparser::ast::ValueWithSpan {
-                                value: sqlparser::ast::Value::Number(n, _),
-                                ..
-                            }) => n.parse::<usize>().ok(),
-                            _ => None,
-                        })
-                        .unwrap_or(0);
-                    let lim = limit.as_ref().and_then(|e| match e {
-                        Expr::Value(sqlparser::ast::ValueWithSpan {
-                            value: sqlparser::ast::Value::Number(n, _),
-                            ..
-                        }) => n.parse::<usize>().ok(),
-                        _ => None,
-                    });
-                    (off, lim)
-                } else {
-                    (0, None)
-                };
 
             // Apply ORDER BY from the outer query
             if let Some(order_by) = &query.order_by {
@@ -2954,7 +2995,7 @@ impl Executor {
             }
 
             // Apply LIMIT/OFFSET from the outer query
-            if query.limit_clause.is_some() {
+            if query.limit_clause.is_some() && !union_all_window_pushed {
                 Self::trim_set_rows_in_place(&mut combined, set_offset, set_limit);
             }
 

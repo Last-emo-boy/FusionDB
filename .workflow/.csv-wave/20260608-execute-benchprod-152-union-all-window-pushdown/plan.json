@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-152-union-all-window-pushdown",
+  "objective": "Avoid materializing full UNION ALL concatenations when an outer LIMIT/OFFSET window can be applied before concatenating unordered set results.",
+  "status": "completed",
+  "created_at": "2026-06-08T15:23:00+08:00",
+  "completed_at": "2026-06-08T15:26:20+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-152",
+      "title": "UNION ALL unordered window pushdown",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "result": "UNION ALL without ORDER BY now applies outer LIMIT/OFFSET while concatenating left/right rows, avoiding full result materialization before trimming."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_union_all_limit_offset_without_order_by -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_union_all_order_by_limit_offset -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 37/37"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    }
+  ]
+}

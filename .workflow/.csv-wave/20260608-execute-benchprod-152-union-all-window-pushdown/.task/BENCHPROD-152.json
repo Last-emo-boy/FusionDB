@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-152",
+  "title": "UNION ALL unordered window pushdown",
+  "status": "completed",
+  "created_at": "2026-06-08T15:23:00+08:00",
+  "completed_at": "2026-06-08T15:26:20+08:00",
+  "scope": "UNION ALL without ORDER BY and outer LIMIT/OFFSET",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Added concat_set_rows_window to copy only the requested unordered UNION ALL result window from left/right inputs.",
+        "Moved set-operation LIMIT/OFFSET parsing before set result construction so UNION ALL can push the window into concatenation.",
+        "Kept ORDER BY, UNION DISTINCT, INTERSECT, and EXCEPT on the existing materialize-then-sort/deduplicate paths.",
+        "Added a no-ORDER-BY UNION ALL LIMIT/OFFSET regression."
+      ]
+    },
+    "tests": {
+      "union_all_limit_offset_without_order_by": "passed",
+      "union_all_order_by_limit_offset": "passed",
+      "fmt_check": "passed",
+      "sql_set_subquery": "37/37 passed",
+      "sql_select": "27/27 passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused set/query/scan hot path."
+  ]
+}
