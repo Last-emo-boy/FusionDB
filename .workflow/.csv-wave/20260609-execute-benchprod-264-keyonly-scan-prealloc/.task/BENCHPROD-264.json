@@ -1,0 +1,35 @@
+{
+  "id": "BENCHPROD-264",
+  "title": "Preallocate key-only scan column sets",
+  "status": "completed",
+  "created_at": "2026-06-09T00:20:00+08:00",
+  "completed_at": "2026-06-09T00:25:00+08:00",
+  "scope": "scan_single_table key-only scan eligibility checks",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/mod.rs",
+        "tests/sql_index_cache.rs"
+      ],
+      "summary": [
+        "Changed the key-only WHERE column extraction set to use schema.columns.len() capacity.",
+        "Changed the key-only ORDER BY column extraction set to use schema.columns.len() capacity.",
+        "Added coverage for primary-key-only projection with primary-key WHERE and ORDER BY clauses."
+      ]
+    },
+    "tests": {
+      "wide_select_projection": "passed",
+      "primary_key_only_projection_with_pk_order": "passed",
+      "primary_key_only_equality_projection": "passed",
+      "primary_key_in_projection_stream": "passed",
+      "primary_key_equality_projection_skip_decode": "passed",
+      "sql_index_cache": "38/38 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

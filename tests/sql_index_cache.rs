@@ -1410,6 +1410,30 @@ async fn test_primary_key_only_equality_projection() {
 }
 
 #[tokio::test]
+async fn test_primary_key_only_projection_with_pk_order() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_order_projection (id INTEGER PRIMARY KEY, payload TEXT, score INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO pk_order_projection VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM pk_order_projection WHERE id >= 2 ORDER BY id DESC LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(3)], vec![Value::Integer(2)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_primary_key_in_projection_stream_skips_payload_decode() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

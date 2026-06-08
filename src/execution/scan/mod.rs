@@ -579,7 +579,7 @@ impl Executor {
 
                     if projection_is_pk_only {
                         let selection_is_pk_only = if let Some(sel) = selection {
-                            let mut cols = HashSet::new();
+                            let mut cols = HashSet::with_capacity(schema.columns.len());
                             self.extract_columns_from_expr(sel, &mut cols);
                             cols.iter().all(|name| {
                                 self.resolve_column_index(name, &schema)
@@ -593,7 +593,7 @@ impl Executor {
 
                         if selection_is_pk_only {
                             let order_by_is_pk_only = if let Some(ob) = order_by {
-                                let mut cols = HashSet::new();
+                                let mut cols = HashSet::with_capacity(schema.columns.len());
                                 if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
                                     for expr in exprs {
                                         self.extract_columns_from_expr(&expr.expr, &mut cols);

@@ -1,0 +1,59 @@
+{
+  "id": "benchprod-264-keyonly-scan-prealloc",
+  "objective": "Preallocate key-only scan predicate and ordering column extraction sets from schema size.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:20:00+08:00",
+  "completed_at": "2026-06-09T00:25:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-264",
+      "title": "Preallocate key-only scan column sets",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/mod.rs",
+        "tests/sql_index_cache.rs"
+      ],
+      "result": "Key-only scan eligibility checks now preallocate WHERE and ORDER BY column sets from the table schema width."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_select test_wide_select_projection_skips_unused_tail_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_primary_key_only_projection_with_pk_order -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_primary_key_only_equality_projection -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_primary_key_in_projection_stream_skips_payload_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_primary_key_equality_projection_skips_unused_column_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The WHERE key-only check now uses schema.columns.len() as the extracted-column set capacity.",
+    "The ORDER BY key-only check now uses schema.columns.len() as the extracted-column set capacity.",
+    "Added a regression test for primary-key-only projection with primary-key filtering and ordering."
+  ]
+}
