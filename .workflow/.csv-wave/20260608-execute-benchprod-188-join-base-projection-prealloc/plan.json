@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-188-join-base-projection-prealloc",
+  "objective": "Preallocate join base projection vector from stage projection count.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:20:00+08:00",
+  "completed_at": "2026-06-08T18:23:18+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-188",
+      "title": "Preallocate join base projection",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "Join base projection construction now uses a vector sized from the derived stage projection count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_join_projection_pushdown_with_group_by -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_join_left_filter_projection_skips_unused_left_column_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_join_index_probe_projection_skips_unused_right_column_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

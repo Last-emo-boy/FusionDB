@@ -593,13 +593,12 @@ impl Executor {
             join_column_refs,
         )?;
 
-        let base_projection: Vec<String> = stage_projection
-            .iter()
-            .filter_map(|column| {
-                Self::resolve_base_projection_column_index(column, schema)
-                    .map(|index| schema.columns[index].name.clone())
-            })
-            .collect();
+        let mut base_projection = Vec::with_capacity(stage_projection.len());
+        for column in &stage_projection {
+            if let Some(index) = Self::resolve_base_projection_column_index(column, schema) {
+                base_projection.push(schema.columns[index].name.clone());
+            }
+        }
 
         if base_projection.is_empty() || base_projection.len() >= schema.columns.len() {
             None

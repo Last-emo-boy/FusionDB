@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-188",
+  "title": "Preallocate join base projection",
+  "status": "completed",
+  "created_at": "2026-06-08T18:20:00+08:00",
+  "completed_at": "2026-06-08T18:23:18+08:00",
+  "scope": "Join base projection vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Replaced iterator collect for base_projection with an explicit Vec::with_capacity(stage_projection.len()) loop.",
+        "Kept base column resolution, filtering of unresolved projected columns, and output ordering unchanged."
+      ]
+    },
+    "tests": {
+      "join_projection_pushdown_with_group_by": "passed",
+      "join_left_filter_projection_skips_unused_left_column_decode": "passed",
+      "join_index_probe_projection_skips_unused_right_column_decode": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused join, scan, expression, or predicate hot path."
+  ]
+}
