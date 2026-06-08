@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-250-explain-qualified-name-prealloc",
+  "objective": "Build EXPLAIN qualified column names directly into a preallocated String instead of collecting parts into a temporary Vec.",
+  "status": "completed",
+  "created_at": "2026-06-08T23:05:03+08:00",
+  "completed_at": "2026-06-08T23:05:03+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-250",
+      "title": "Preallocate EXPLAIN qualified column names",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/explain.rs",
+        "tests/sql_ddl.rs"
+      ],
+      "result": "EXPLAIN now builds compound identifier column names into a preallocated String and has direct qualified primary-key lookup coverage."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl test_explain_qualified_primary_key_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 30/30"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves compound identifier segment order, dot separators, and resolve_column_index behavior."
+  ]
+}

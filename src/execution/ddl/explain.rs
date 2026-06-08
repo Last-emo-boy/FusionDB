@@ -837,11 +837,15 @@ impl Executor {
         match expr {
             Expr::Identifier(ident) => self.resolve_column_index(&ident.value, schema).ok(),
             Expr::CompoundIdentifier(idents) => {
-                let col_name = idents
-                    .iter()
-                    .map(|ident| ident.value.clone())
-                    .collect::<Vec<_>>()
-                    .join(".");
+                let capacity = idents.iter().map(|ident| ident.value.len()).sum::<usize>()
+                    + idents.len().saturating_sub(1);
+                let mut col_name = String::with_capacity(capacity);
+                for (index, ident) in idents.iter().enumerate() {
+                    if index > 0 {
+                        col_name.push('.');
+                    }
+                    col_name.push_str(&ident.value);
+                }
                 self.resolve_column_index(&col_name, schema).ok()
             }
             _ => None,

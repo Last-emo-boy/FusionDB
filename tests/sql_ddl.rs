@@ -247,6 +247,27 @@ async fn test_explain_commuted_primary_key_lookup() {
 }
 
 #[tokio::test]
+async fn test_explain_qualified_primary_key_lookup() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_pk_qualified (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT * FROM explain_pk_qualified WHERE explain_pk_qualified.id = 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Primary Key Lookup"));
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_explain_commuted_btree_index_scan() {
     let (executor, wal) = setup().await;
     exec_ok(

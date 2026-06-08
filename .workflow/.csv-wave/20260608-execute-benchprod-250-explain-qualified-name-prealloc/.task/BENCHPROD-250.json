@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-250",
+  "title": "Preallocate EXPLAIN qualified column names",
+  "status": "completed",
+  "created_at": "2026-06-08T23:05:03+08:00",
+  "completed_at": "2026-06-08T23:05:03+08:00",
+  "scope": "EXPLAIN compound identifier column-name construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/ddl/explain.rs",
+        "tests/sql_ddl.rs"
+      ],
+      "summary": [
+        "Replaced CompoundIdentifier Vec collection and join with a preallocated String.",
+        "Precomputed capacity from identifier segment lengths and dot separators.",
+        "Added a qualified primary-key EXPLAIN test covering table.column lookup."
+      ]
+    },
+    "tests": {
+      "explain_qualified_primary_key_lookup": "passed",
+      "sql_ddl": "30/30 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, storage, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
