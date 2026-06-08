@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-248",
+  "title": "Preallocate hybrid RRF result buffer",
+  "status": "completed",
+  "created_at": "2026-06-08T22:56:13+08:00",
+  "completed_at": "2026-06-08T22:56:13+08:00",
+  "scope": "Hybrid search RRF result vector construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs"
+      ],
+      "summary": [
+        "Replaced rrf_scores.into_iter().collect() with Vec::with_capacity(rrf_scores.len()).",
+        "Moved RRF score entries into the result buffer with explicit pushes.",
+        "Preserved existing top-k truncation and final RRF score sorting."
+      ]
+    },
+    "tests": {
+      "hybrid_search_limited_results": "passed",
+      "hybrid_search_zero_limit": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

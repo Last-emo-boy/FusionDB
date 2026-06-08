@@ -407,7 +407,10 @@ impl FusionStorage {
             *rrf_scores.entry(id.clone()).or_insert(0.0) += s;
         }
 
-        let mut final_results: Vec<_> = rrf_scores.into_iter().collect();
+        let mut final_results = Vec::with_capacity(rrf_scores.len());
+        for score in rrf_scores {
+            final_results.push(score);
+        }
         if final_results.len() > limit {
             let _ = final_results.select_nth_unstable_by(limit, rrf_score_order);
             final_results.truncate(limit);

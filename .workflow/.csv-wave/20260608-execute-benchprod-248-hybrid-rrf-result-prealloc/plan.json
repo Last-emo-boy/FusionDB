@@ -1,0 +1,40 @@
+{
+  "id": "benchprod-248-hybrid-rrf-result-prealloc",
+  "objective": "Preallocate hybrid-search RRF result vectors from the known score map size before sorting and limiting.",
+  "status": "completed",
+  "created_at": "2026-06-08T22:56:13+08:00",
+  "completed_at": "2026-06-08T22:56:13+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-248",
+      "title": "Preallocate hybrid RRF result buffer",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "Hybrid search now preallocates the RRF result vector from rrf_scores.len() before moving score entries into the sortable result buffer."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fusion::tests::hybrid_search_limited_results_are_sorted_by_rrf_score -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fusion::tests::hybrid_search_zero_limit_skips_work -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves RRF scoring, HashMap iteration semantics, select_nth_unstable_by limiting, and final RRF score sort order."
+  ]
+}
