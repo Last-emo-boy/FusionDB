@@ -1,0 +1,35 @@
+{
+  "id": "BENCHPROD-274",
+  "title": "Preallocate bare aggregate collectors",
+  "status": "completed",
+  "created_at": "2026-06-09T01:17:00+08:00",
+  "completed_at": "2026-06-09T01:22:00+08:00",
+  "scope": "Bare aggregate accumulator allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/aggregation.rs",
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Added a bounded input capacity hint for AggregateAccumulator.",
+        "Added with_input_capacity for collecting accumulators: COUNT_DISTINCT, ARRAY_AGG, STRING_AGG, and GROUP_CONCAT.",
+        "Changed bare aggregate execution to initialize accumulators from rows.len() through the bounded helper.",
+        "Left group-by accumulator initialization unchanged to avoid per-group over-preallocation.",
+        "Added unit coverage for the bounded capacity helper and collector preallocation."
+      ]
+    },
+    "tests": {
+      "aggregation_accumulator_filter": "10/10 passed",
+      "sql_group_aggregate_count_distinct": "5/5 passed",
+      "sql_group_aggregate_bare": "10/10 passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

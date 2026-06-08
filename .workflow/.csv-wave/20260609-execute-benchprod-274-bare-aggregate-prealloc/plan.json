@@ -1,0 +1,50 @@
+{
+  "id": "benchprod-274-bare-aggregate-prealloc",
+  "objective": "Preallocate collecting bare aggregate accumulators from the bounded input row count.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:17:00+08:00",
+  "completed_at": "2026-06-09T01:22:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-274",
+      "title": "Preallocate bare aggregate collectors",
+      "status": "completed",
+      "evidence": [
+        "src/execution/aggregation.rs",
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Bare aggregate execution now initializes collecting accumulators with a bounded input-row capacity hint."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test accumulator -- --nocapture",
+      "status": "passed: 10/10"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate count_distinct -- --nocapture",
+      "status": "passed: 5/5"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate bare -- --nocapture",
+      "status": "passed: 10/10"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate -- --nocapture",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The input capacity hint is bounded by AGGREGATE_PREALLOC_LIMIT to avoid large eager allocations.",
+    "Group-by accumulator initialization remains unchanged to avoid overallocating per group."
+  ]
+}

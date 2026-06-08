@@ -2815,7 +2815,7 @@ impl Executor {
                         self.compile_group_aggregate_plans(&bare_aggs, &schema, params);
                     let mut accs = Vec::with_capacity(bare_aggs.len());
                     for (_, name) in &bare_aggs {
-                        accs.push(AggregateAccumulator::new(name));
+                        accs.push(AggregateAccumulator::with_input_capacity(name, rows.len()));
                     }
                     for row in &rows {
                         for (i, plan) in aggregate_plans.iter().enumerate() {

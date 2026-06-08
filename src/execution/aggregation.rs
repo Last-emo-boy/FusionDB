@@ -2,6 +2,8 @@ use crate::common::Value;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
+const AGGREGATE_PREALLOC_LIMIT: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub(crate) enum AggregateAccumulator {
     Count(i64),
@@ -29,6 +31,24 @@ impl AggregateAccumulator {
             }
             _ => AggregateAccumulator::Count(0),
         }
+    }
+
+    pub(crate) fn with_input_capacity(func_name: &str, input_len: usize) -> Self {
+        let capacity = Self::input_capacity_hint(input_len);
+        match func_name.to_uppercase().as_str() {
+            "COUNT_DISTINCT" => {
+                AggregateAccumulator::CountDistinct(HashSet::with_capacity(capacity))
+            }
+            "ARRAY_AGG" => AggregateAccumulator::ArrayAgg(Vec::with_capacity(capacity)),
+            "STRING_AGG" | "GROUP_CONCAT" => {
+                AggregateAccumulator::StringAgg(Vec::with_capacity(capacity), ",".to_string())
+            }
+            _ => Self::new(func_name),
+        }
+    }
+
+    fn input_capacity_hint(input_len: usize) -> usize {
+        input_len.min(AGGREGATE_PREALLOC_LIMIT)
     }
 
     pub(crate) fn update(&mut self, val: &Value) {
@@ -172,6 +192,36 @@ mod tests {
         acc.update(&Value::String("red".to_string()));
         acc.update(&Value::Null);
         assert_eq!(acc.finalize(), Value::Integer(2));
+    }
+
+    #[test]
+    fn test_accumulator_input_capacity_hint_is_bounded() {
+        assert_eq!(AggregateAccumulator::input_capacity_hint(0), 0);
+        assert_eq!(AggregateAccumulator::input_capacity_hint(3), 3);
+        assert_eq!(
+            AggregateAccumulator::input_capacity_hint(AGGREGATE_PREALLOC_LIMIT + 1),
+            AGGREGATE_PREALLOC_LIMIT
+        );
+    }
+
+    #[test]
+    fn test_collecting_accumulators_preallocate_from_input_len() {
+        match AggregateAccumulator::with_input_capacity("COUNT_DISTINCT", 3) {
+            AggregateAccumulator::CountDistinct(set) => assert!(set.capacity() >= 3),
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
+        match AggregateAccumulator::with_input_capacity("ARRAY_AGG", 3) {
+            AggregateAccumulator::ArrayAgg(values) => assert!(values.capacity() >= 3),
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
+        match AggregateAccumulator::with_input_capacity("STRING_AGG", 3) {
+            AggregateAccumulator::StringAgg(values, _) => assert!(values.capacity() >= 3),
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
+        match AggregateAccumulator::with_input_capacity("COUNT", 3) {
+            AggregateAccumulator::Count(0) => {}
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
     }
 
     #[test]
