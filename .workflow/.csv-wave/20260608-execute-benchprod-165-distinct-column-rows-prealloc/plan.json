@@ -1,0 +1,36 @@
+{
+  "id": "benchprod-165-distinct-column-rows-prealloc",
+  "objective": "Preallocate output rows for distinct single-column scans.",
+  "status": "completed",
+  "created_at": "2026-06-08T16:37:00+08:00",
+  "completed_at": "2026-06-08T16:40:36+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-165",
+      "title": "Preallocate distinct column scan rows",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "result": "distinct_column_scan now reuses the bounded distinct capacity for its output row vector."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_select test_select_distinct_with_simple_where_uses_column_scan -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

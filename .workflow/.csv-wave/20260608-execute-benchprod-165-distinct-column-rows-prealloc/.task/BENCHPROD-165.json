@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-165",
+  "title": "Preallocate distinct column scan rows",
+  "status": "completed",
+  "created_at": "2026-06-08T16:37:00+08:00",
+  "completed_at": "2026-06-08T16:40:36+08:00",
+  "scope": "SELECT DISTINCT single-column scan output allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "summary": [
+        "Introduced distinct_capacity from kv_pairs.len().min(4096).",
+        "Reused distinct_capacity for both the seen HashSet and output rows Vec.",
+        "Kept predicate filtering and column decoding behavior unchanged."
+      ]
+    },
+    "tests": {
+      "select_distinct_with_simple_where_uses_column_scan": "passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}

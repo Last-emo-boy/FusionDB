@@ -1096,8 +1096,9 @@ impl Executor {
     ) -> Result<Vec<Vec<Value>>> {
         let prefix = format!("data:{}:", table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
-        let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
-        let mut rows = Vec::new();
+        let distinct_capacity = kv_pairs.len().min(4096);
+        let mut seen = HashSet::with_capacity(distinct_capacity);
+        let mut rows = Vec::with_capacity(distinct_capacity);
         let mut predicate_values = Vec::new();
 
         for (_, data) in kv_pairs {
