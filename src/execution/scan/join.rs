@@ -835,7 +835,7 @@ impl Executor {
         }
 
         let mut relations = Vec::with_capacity(from.len());
-        let mut passthrough = Vec::new();
+        let mut passthrough = Vec::with_capacity(from.len());
         for (original_index, table) in from.iter().enumerate() {
             let TableFactor::Table { name, args, .. } = &table.relation else {
                 passthrough.push((original_index, table.clone()));

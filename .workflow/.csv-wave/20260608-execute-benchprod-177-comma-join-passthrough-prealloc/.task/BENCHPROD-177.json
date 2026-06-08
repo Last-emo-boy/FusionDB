@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-177",
+  "title": "Preallocate comma join passthrough",
+  "status": "completed",
+  "created_at": "2026-06-08T17:34:30+08:00",
+  "completed_at": "2026-06-08T17:36:45+08:00",
+  "scope": "Comma join reorder passthrough allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Changed reorder_comma_join_from passthrough from Vec::new to Vec::with_capacity(from.len()).",
+        "Kept relation analysis, ordering, sorting, and fallback behavior unchanged."
+      ]
+    },
+    "tests": {
+      "comma_join_reorder_preserves_ldbc_q4_shape_with_deferred_exists": "passed",
+      "implicit_join_where_equi_predicate_matches_chbenchmark_q16_shape": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}
