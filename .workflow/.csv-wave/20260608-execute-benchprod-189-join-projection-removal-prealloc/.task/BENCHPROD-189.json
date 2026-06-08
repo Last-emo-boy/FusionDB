@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-189",
+  "title": "Preallocate join projection removal",
+  "status": "completed",
+  "created_at": "2026-06-08T18:24:00+08:00",
+  "completed_at": "2026-06-08T18:27:37+08:00",
+  "scope": "Join probe projection column removal allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Replaced collect-based projection removal with explicit preallocated vectors.",
+        "Sized full-schema removal from schema width minus one and existing-projection removal from projection width.",
+        "Kept column filtering, unresolved-column retention, and projection clone fallback behavior unchanged."
+      ]
+    },
+    "tests": {
+      "primary_key_join_probe_projection_reuses_right_row_cache": "passed",
+      "join_index_probe_projection_skips_unused_right_column_decode": "passed",
+      "two_hop_join_probe_skips_guaranteed_right_key_decode": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused join, scan, expression, or predicate hot path."
+  ]
+}

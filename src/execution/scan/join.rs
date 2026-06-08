@@ -736,23 +736,22 @@ impl Executor {
         column_idx: usize,
     ) -> Option<Vec<String>> {
         let Some(columns) = projection.as_ref() else {
-            let filtered = schema
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != column_idx)
-                .map(|(_, column)| column.name.clone())
-                .collect::<Vec<_>>();
+            let mut filtered = Vec::with_capacity(schema.columns.len().saturating_sub(1));
+            for (index, column) in schema.columns.iter().enumerate() {
+                if index != column_idx {
+                    filtered.push(column.name.clone());
+                }
+            }
             return Some(filtered);
         };
-        let filtered = columns
-            .iter()
-            .filter(|column| {
-                Self::resolve_base_projection_column_index(column, schema)
-                    .is_none_or(|index| index != column_idx)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut filtered = Vec::with_capacity(columns.len());
+        for column in columns {
+            if Self::resolve_base_projection_column_index(column, schema)
+                .is_none_or(|index| index != column_idx)
+            {
+                filtered.push(column.clone());
+            }
+        }
 
         if filtered.len() == columns.len() {
             projection.clone()
