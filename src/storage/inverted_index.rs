@@ -141,7 +141,10 @@ impl InvertedIndex {
             }
         }
 
-        let mut result: Vec<_> = scores.into_iter().collect();
+        let mut result = Vec::with_capacity(scores.len());
+        for score in scores {
+            result.push(score);
+        }
         if result.len() > limit {
             let _ = result.select_nth_unstable_by(limit, bm25_score_order);
             result.truncate(limit);

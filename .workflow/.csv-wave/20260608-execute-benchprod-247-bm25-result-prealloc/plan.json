@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-247-bm25-result-prealloc",
+  "objective": "Preallocate BM25 result vectors from the known score map size before sorting and limiting.",
+  "status": "completed",
+  "created_at": "2026-06-08T22:52:48+08:00",
+  "completed_at": "2026-06-08T22:52:48+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-247",
+      "title": "Preallocate BM25 result buffer",
+      "status": "completed",
+      "evidence": [
+        "src/storage/inverted_index.rs"
+      ],
+      "result": "BM25 search now preallocates the result vector from scores.len() before moving score entries into the sortable result buffer."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::inverted_index::tests -- --nocapture",
+      "status": "passed: 5/5 target module tests"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fusion::tests::hybrid_search_limited_results_are_sorted_by_rrf_score -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fusion::tests::hybrid_search_zero_limit_skips_work -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "A combined cargo test command with two filters was rejected by Cargo before running tests; the two hybrid-search filters were then run separately and passed.",
+    "The change preserves BM25 scoring, HashMap iteration semantics, select_nth_unstable_by limiting, and final score sort order."
+  ]
+}

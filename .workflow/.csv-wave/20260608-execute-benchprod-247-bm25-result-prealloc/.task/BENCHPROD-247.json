@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-247",
+  "title": "Preallocate BM25 result buffer",
+  "status": "completed",
+  "created_at": "2026-06-08T22:52:48+08:00",
+  "completed_at": "2026-06-08T22:52:48+08:00",
+  "scope": "BM25 search result vector construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/inverted_index.rs"
+      ],
+      "summary": [
+        "Replaced scores.into_iter().collect() with Vec::with_capacity(scores.len()).",
+        "Moved score entries into the result buffer with explicit pushes.",
+        "Preserved existing top-k truncation and final BM25 score sorting."
+      ]
+    },
+    "tests": {
+      "inverted_index_module": "5/5 passed",
+      "hybrid_search_limited_results": "passed",
+      "hybrid_search_zero_limit": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
