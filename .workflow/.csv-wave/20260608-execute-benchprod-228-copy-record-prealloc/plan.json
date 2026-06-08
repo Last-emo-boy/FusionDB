@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-228-copy-record-prealloc",
+  "objective": "Preallocate COPY CSV record value rows from parsed field count.",
+  "status": "completed",
+  "created_at": "2026-06-08T21:20:00+08:00",
+  "completed_at": "2026-06-08T21:27:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-228",
+      "title": "Preallocate COPY CSV record rows",
+      "status": "completed",
+      "evidence": [
+        "src/execution/copy.rs"
+      ],
+      "result": "COPY CSV record conversion now preallocates each row's Value vector from the parsed CSV record field count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_copy_from_csv_with_header_and_index_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_copy_from_csv_with_column_list_and_defaults -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_copy_from_csv_accepts_quoted_table_and_columns -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml",
+      "status": "passed: 43/43"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The conversion preserves CSV record order, null-marker handling, field-to-Value conversion, and row accumulation behavior."
+  ]
+}

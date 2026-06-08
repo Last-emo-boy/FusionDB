@@ -322,12 +322,11 @@ impl Executor {
         for record in reader.records() {
             let record = record
                 .map_err(|e| FusionError::Execution(format!("COPY CSV parse error: {}", e)))?;
-            rows.push(
-                record
-                    .iter()
-                    .map(|field| Self::copy_field_to_value(field, &options.null_marker))
-                    .collect(),
-            );
+            let mut row = Vec::with_capacity(record.len());
+            for field in record.iter() {
+                row.push(Self::copy_field_to_value(field, &options.null_marker));
+            }
+            rows.push(row);
         }
         Ok(rows)
     }

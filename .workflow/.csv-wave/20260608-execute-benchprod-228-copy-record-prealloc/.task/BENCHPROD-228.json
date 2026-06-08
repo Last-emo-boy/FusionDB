@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-228",
+  "title": "Preallocate COPY CSV record rows",
+  "status": "completed",
+  "created_at": "2026-06-08T21:20:00+08:00",
+  "completed_at": "2026-06-08T21:27:00+08:00",
+  "scope": "COPY CSV record conversion",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/copy.rs"
+      ],
+      "summary": [
+        "Replaced CSV record iterator collect with Vec::with_capacity(record.len()).",
+        "Preserved per-field copy_field_to_value conversion and null-marker handling.",
+        "Preserved row order and outer COPY row accumulation."
+      ]
+    },
+    "tests": {
+      "copy_header_index_lookup": "passed",
+      "copy_column_list_defaults": "passed",
+      "copy_quoted_table_columns": "passed",
+      "sql_dml": "43/43 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
