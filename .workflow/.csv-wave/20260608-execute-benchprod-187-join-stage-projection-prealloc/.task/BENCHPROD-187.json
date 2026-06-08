@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-187",
+  "title": "Preallocate join stage projection",
+  "status": "completed",
+  "created_at": "2026-06-08T18:17:00+08:00",
+  "completed_at": "2026-06-08T18:19:46+08:00",
+  "scope": "Join stage projection vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Replaced iterator collect for stage_projection with an explicit Vec::with_capacity(required_indices.len()) loop.",
+        "Kept output ordering by iterating schema columns in order.",
+        "Kept required index filtering and projection fallback decisions unchanged."
+      ]
+    },
+    "tests": {
+      "join_projection_pushdown_with_group_by": "passed",
+      "join_left_filter_projection_skips_unused_left_column_decode": "passed",
+      "comma_join_projection_keeps_right_columns_without_join_pushdown": "passed",
+      "join_index_probe_projection_skips_unused_right_column_decode": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused join, scan, expression, or predicate hot path."
+  ]
+}

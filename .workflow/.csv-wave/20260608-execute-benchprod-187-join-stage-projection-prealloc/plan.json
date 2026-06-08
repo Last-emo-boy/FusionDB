@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-187-join-stage-projection-prealloc",
+  "objective": "Preallocate join stage projection vector from required index count.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:17:00+08:00",
+  "completed_at": "2026-06-08T18:19:46+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-187",
+      "title": "Preallocate join stage projection",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "Join stage projection construction now uses a vector sized from the collected required index count while preserving schema-order output."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_join_projection_pushdown_with_group_by -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_join_left_filter_projection_skips_unused_left_column_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_comma_join_projection_keeps_right_columns_without_join_pushdown -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_join_index_probe_projection_skips_unused_right_column_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

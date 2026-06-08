@@ -560,13 +560,12 @@ impl Executor {
             return None;
         }
 
-        let stage_projection: Vec<String> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| required_indices.contains(index))
-            .map(|(_, column)| column.name.clone())
-            .collect();
+        let mut stage_projection = Vec::with_capacity(required_indices.len());
+        for (index, column) in schema.columns.iter().enumerate() {
+            if required_indices.contains(&index) {
+                stage_projection.push(column.name.clone());
+            }
+        }
 
         if stage_projection.is_empty() || stage_projection.len() >= schema.columns.len() {
             None
