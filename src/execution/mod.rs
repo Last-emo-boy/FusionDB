@@ -754,7 +754,11 @@ impl Executor {
             Statement::Query(query) => {
                 let mut tables = Vec::new();
                 Self::collect_query_tables(query, &mut tables);
-                tables.into_iter().map(|table| (table, "SELECT")).collect()
+                let mut permissions = Vec::with_capacity(tables.len());
+                for table in tables {
+                    permissions.push((table, "SELECT"));
+                }
+                permissions
             }
             Statement::Insert(insert) => vec![(insert.table.to_string(), "INSERT")],
             Statement::Delete(delete) => {
@@ -785,16 +789,21 @@ impl Executor {
                 vec![(create_index.table_name.to_string(), "ALL")]
             }
             Statement::AlterTable(alter_table) => vec![(alter_table.name.to_string(), "ALL")],
-            Statement::Truncate(truncate) => truncate
-                .table_names
-                .iter()
-                .map(|name| (name.to_string(), "DELETE"))
-                .collect(),
+            Statement::Truncate(truncate) => {
+                let mut permissions = Vec::with_capacity(truncate.table_names.len());
+                for name in &truncate.table_names {
+                    permissions.push((name.to_string(), "DELETE"));
+                }
+                permissions
+            }
             Statement::CreateView(create_view) => {
-                let mut permissions = vec![(create_view.name.to_string(), "ALL")];
                 let mut source_tables = Vec::new();
                 Self::collect_query_tables(&create_view.query, &mut source_tables);
-                permissions.extend(source_tables.into_iter().map(|table| (table, "SELECT")));
+                let mut permissions = Vec::with_capacity(source_tables.len() + 1);
+                permissions.push((create_view.name.to_string(), "ALL"));
+                for table in source_tables {
+                    permissions.push((table, "SELECT"));
+                }
                 permissions
             }
             Statement::Explain { statement, .. } => Self::statement_permissions(statement),
@@ -810,7 +819,11 @@ impl Executor {
                 sqlparser::ast::CopySource::Query(query) => {
                     let mut tables = Vec::new();
                     Self::collect_query_tables(query, &mut tables);
-                    tables.into_iter().map(|table| (table, "SELECT")).collect()
+                    let mut permissions = Vec::with_capacity(tables.len());
+                    for table in tables {
+                        permissions.push((table, "SELECT"));
+                    }
+                    permissions
                 }
             },
             Statement::ShowCreate { obj_name, .. } => vec![(obj_name.to_string(), "SELECT")],
@@ -818,7 +831,11 @@ impl Executor {
                 names, object_type, ..
             } => match object_type {
                 ObjectType::Table | ObjectType::View | ObjectType::Index => {
-                    names.iter().map(|name| (name.to_string(), "ALL")).collect()
+                    let mut permissions = Vec::with_capacity(names.len());
+                    for name in names {
+                        permissions.push((name.to_string(), "ALL"));
+                    }
+                    permissions
                 }
                 _ => Vec::new(),
             },
@@ -1192,5 +1209,61 @@ impl Executor {
             "Expected quoted string after {}",
             keyword
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn statement_permissions(sql: &str) -> Vec<(String, &'static str)> {
+        let statements = parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        Executor::statement_permissions(&statements[0])
+    }
+
+    #[test]
+    fn statement_permissions_preserve_preallocated_entries() {
+        assert_eq!(
+            statement_permissions("SELECT * FROM users JOIN orders ON users.id = orders.user_id"),
+            vec![
+                ("users".to_string(), "SELECT"),
+                ("orders".to_string(), "SELECT")
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("TRUNCATE TABLE old_orders, old_items"),
+            vec![
+                ("old_orders".to_string(), "DELETE"),
+                ("old_items".to_string(), "DELETE")
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("CREATE VIEW active_users AS SELECT id FROM users"),
+            vec![
+                ("active_users".to_string(), "ALL"),
+                ("users".to_string(), "SELECT")
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "COPY (SELECT * FROM users JOIN orders ON users.id = orders.user_id) TO 'out.csv'"
+            ),
+            vec![
+                ("users".to_string(), "SELECT"),
+                ("orders".to_string(), "SELECT")
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("DROP TABLE old_orders, old_items"),
+            vec![
+                ("old_orders".to_string(), "ALL"),
+                ("old_items".to_string(), "ALL")
+            ]
+        );
     }
 }

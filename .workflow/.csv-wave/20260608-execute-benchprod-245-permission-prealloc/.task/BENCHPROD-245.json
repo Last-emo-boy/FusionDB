@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-245",
+  "title": "Preallocate statement permission entries",
+  "status": "completed",
+  "created_at": "2026-06-08T22:43:32+08:00",
+  "completed_at": "2026-06-08T22:43:32+08:00",
+  "scope": "Authorization statement permission vector construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/mod.rs"
+      ],
+      "summary": [
+        "Replaced known-length permission collect paths with Vec::with_capacity and explicit pushes.",
+        "Preallocated SELECT, TRUNCATE, CREATE VIEW, COPY query, and DROP permission vectors.",
+        "Added a focused unit test for statement_permissions output order and contents across the changed branches."
+      ]
+    },
+    "tests": {
+      "statement_permissions_unit": "passed",
+      "sql_returning_upsert_vector_rbac": "14/14 passed",
+      "sql_ddl": "29/29 passed",
+      "sql_view_show_constraints": "16/16 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, storage, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

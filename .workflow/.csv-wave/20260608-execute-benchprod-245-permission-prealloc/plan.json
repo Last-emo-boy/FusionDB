@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-245-permission-prealloc",
+  "objective": "Preallocate authorization permission vectors from known statement table counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T22:43:32+08:00",
+  "completed_at": "2026-06-08T22:43:32+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-245",
+      "title": "Preallocate statement permission entries",
+      "status": "completed",
+      "evidence": [
+        "src/execution/mod.rs"
+      ],
+      "result": "Authorization permission vectors now preallocate for SELECT, TRUNCATE, CREATE VIEW, COPY query, and DROP branches where output length is known."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test execution::tests::statement_permissions_preserve_preallocated_entries -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+      "status": "passed: 14/14"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 29/29"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_view_show_constraints -- --nocapture",
+      "status": "passed: 16/16"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves authorization operation strings, statement table order, and private statement_permissions output semantics."
+  ]
+}
