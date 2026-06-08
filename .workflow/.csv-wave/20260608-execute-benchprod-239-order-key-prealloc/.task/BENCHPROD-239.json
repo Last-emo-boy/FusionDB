@@ -1,0 +1,34 @@
+{
+  "id": "BENCHPROD-239",
+  "title": "Preallocate ORDER BY sort keys",
+  "status": "completed",
+  "created_at": "2026-06-08T22:04:13+08:00",
+  "completed_at": "2026-06-08T22:04:13+08:00",
+  "scope": "ORDER BY sort-key construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced ORDER BY sort-key collect with Vec::with_capacity(exprs.len()).",
+        "Kept source resolution, sort direction, projected-row handling, and limit-window trimming unchanged.",
+        "Preserved behavior across aggregate, join, primary-key order, and set-query ORDER BY shapes."
+      ]
+    },
+    "tests": {
+      "group_by_order_limit_offset": "passed",
+      "join_order_by": "passed",
+      "primary_key_order_limit_offset": "passed",
+      "union_order_limit_offset": "2/2 passed",
+      "sql_group_aggregate": "50/50 passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, projection, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

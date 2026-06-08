@@ -1,0 +1,56 @@
+{
+  "id": "benchprod-239-order-key-prealloc",
+  "objective": "Preallocate ORDER BY sort-key buffers from known order expression counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T22:04:13+08:00",
+  "completed_at": "2026-06-08T22:04:13+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-239",
+      "title": "Preallocate ORDER BY sort keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "ORDER BY sort-key construction now preallocates from the known number of order expressions."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_aggregate_order_by_limit_offset_topn_window -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_order_by_prefers_projected_column_over_ambiguous_join_input -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_select_order_by_primary_key_limit_offset -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_union_all_order_by_limit_offset -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves ORDER BY key order, ascending/descending flags, projected/full-schema source resolution, limit-window handling, and row sorting semantics."
+  ]
+}

@@ -2712,9 +2712,9 @@ impl Executor {
                             if !group_exprs.is_empty()
                     );
                     let rows_are_full_schema = is_wildcard && !rows_are_projected;
-                    let sort_keys: Vec<SortOrderKey<'_>> = exprs
-                        .iter()
-                        .map(|order_expr| SortOrderKey {
+                    let mut sort_keys = Vec::with_capacity(exprs.len());
+                    for order_expr in exprs {
+                        sort_keys.push(SortOrderKey {
                             source: self.resolve_order_value_source(
                                 &order_expr.expr,
                                 projection,
@@ -2724,8 +2724,8 @@ impl Executor {
                                 rows_are_full_schema,
                             ),
                             asc: order_expr.options.asc.unwrap_or(true),
-                        })
-                        .collect();
+                        });
+                    }
 
                     let limit_window = limit.map(|value| {
                         if value == 0 {
