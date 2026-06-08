@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-184-exists-membership-cache-prealloc",
+  "objective": "Preallocate single-table EXISTS membership cache values from scanned row count.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:05:00+08:00",
+  "completed_at": "2026-06-08T18:09:24+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-184",
+      "title": "Preallocate EXISTS membership cache values",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "result": "Single-table EXISTS membership now builds cached probe values in a HashSet sized from the scanned local row count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_not_exists_membership_filter_with_alias -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_not_exists_against_cte -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_not_exists_filters_before_limit -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

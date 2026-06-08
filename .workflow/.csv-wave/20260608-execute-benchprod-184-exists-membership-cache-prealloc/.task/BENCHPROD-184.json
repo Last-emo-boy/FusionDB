@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-184",
+  "title": "Preallocate EXISTS membership cache values",
+  "status": "completed",
+  "created_at": "2026-06-08T18:05:00+08:00",
+  "completed_at": "2026-06-08T18:09:24+08:00",
+  "scope": "Single-table EXISTS membership cache allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "summary": [
+        "Replaced filter_map().collect() for single-table EXISTS membership cached values with explicit HashSet::with_capacity initialization.",
+        "Sized the cached values set from the scanned local row count.",
+        "Kept column lookup, null/missing-column skip behavior, duplicate handling, and cache insertion behavior unchanged."
+      ]
+    },
+    "tests": {
+      "correlated_not_exists_membership_filter_with_alias": "passed",
+      "correlated_not_exists_against_cte": "passed",
+      "correlated_not_exists_filters_before_limit": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused subquery, predicate, scan, or join hot path."
+  ]
+}

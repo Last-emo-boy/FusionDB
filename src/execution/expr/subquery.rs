@@ -469,10 +469,12 @@ impl Executor {
                 .scan_table_base(&plan.table_factor, txn, params)
                 .await?;
             let column_index = self.resolve_column_index(&plan.column_name, &local_schema)?;
-            let values = local_rows
-                .into_iter()
-                .filter_map(|row| row.get(column_index).cloned())
-                .collect();
+            let mut values = HashSet::with_capacity(local_rows.len());
+            for row in local_rows {
+                if let Some(value) = row.get(column_index).cloned() {
+                    values.insert(value);
+                }
+            }
             membership_caches.insert(
                 key.clone(),
                 ExistsCache::Single(ExistsMembershipCache {
