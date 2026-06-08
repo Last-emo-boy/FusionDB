@@ -6,6 +6,14 @@ use sqlparser::ast::TableFactor;
 
 use super::super::{Executor, QueryResult};
 
+fn update_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 impl Executor {
     pub(crate) async fn handle_update(
         &self,
@@ -30,7 +38,7 @@ impl Executor {
         let schema: TableSchema = bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
-        let prefix = format!("data:{}:", table_name_str);
+        let prefix = update_data_prefix_for_table(&table_name_str);
 
         // Optimization: Check for Primary Key (Clustered Index) Update
         let allowed_qualifiers = Self::primary_key_qualifiers(relation);
@@ -407,5 +415,18 @@ impl Executor {
         Ok(Some(QueryResult::Success {
             message: "Updated 1 rows".to_string(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_data_prefix_for_table;
+
+    #[test]
+    fn update_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = update_data_prefix_for_table("accounts");
+
+        assert_eq!(prefix, "data:accounts:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }

@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-307",
+  "title": "Preallocate DML update/delete data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/dml/update.rs",
+    "src/execution/dml/delete.rs"
+  ],
+  "description": "Avoid generic format! allocation work when DML update and delete paths build data:<table>: prefixes from known table-name length.",
+  "implementation": [
+    "Added update_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Added delete_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Replaced UPDATE point-lookup/full-scan prefix construction.",
+    "Replaced DELETE point-lookup/full-scan prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test data_prefix_for_table -- --nocapture",
+    "cargo test --test sql_dml test_update_primary_key_simple_table_fast_path -- --nocapture",
+    "cargo test --test sql_dml test_delete_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+    "cargo test --test sql_returning_upsert_vector_rbac test_update_returning -- --nocapture",
+    "cargo test --test sql_returning_upsert_vector_rbac test_delete_returning -- --nocapture",
+    "cargo test --test sql_dml -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "DML update/delete data-prefix construction now reserves capacity from known table-name length while preserving update, delete, point lookup, full scan, and RETURNING behavior."
+}

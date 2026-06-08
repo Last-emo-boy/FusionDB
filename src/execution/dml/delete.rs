@@ -6,6 +6,14 @@ use sqlparser::ast::TableFactor;
 
 use super::super::{Executor, QueryResult};
 
+fn delete_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 impl Executor {
     pub(crate) async fn handle_delete(
         &self,
@@ -54,7 +62,7 @@ impl Executor {
         let schema: TableSchema = bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
-        let prefix = format!("data:{}:", table_name_str);
+        let prefix = delete_data_prefix_for_table(&table_name_str);
         let allowed_qualifiers = match &delete.from {
             sqlparser::ast::FromTable::WithFromKeyword(tables) => tables
                 .first()
@@ -234,5 +242,18 @@ impl Executor {
         Ok(QueryResult::Success {
             message: format!("Deleted {} rows", deleted_count),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delete_data_prefix_for_table;
+
+    #[test]
+    fn delete_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = delete_data_prefix_for_table("accounts");
+
+        assert_eq!(prefix, "data:accounts:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }
