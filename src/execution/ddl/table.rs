@@ -24,6 +24,15 @@ impl TablePrimaryKeySpec {
     }
 }
 
+fn table_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
+    key.push_str("data:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 impl Executor {
     pub(crate) async fn handle_create_table(
         &self,
@@ -737,7 +746,7 @@ impl Executor {
         column.index_type = IndexType::BTree;
 
         for (old_key, old_row_id, new_row_id, value) in rewrites {
-            let new_key = format!("data:{}:{}", table_name, new_row_id);
+            let new_key = table_data_key_for_row_id(table_name, &new_row_id);
             let old_key_str = std::str::from_utf8(&old_key)
                 .map_err(|e| FusionError::Execution(format!("Data key decode error: {}", e)))?
                 .to_string();
@@ -919,5 +928,18 @@ impl Executor {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::table_data_key_for_row_id;
+
+    #[test]
+    fn table_data_key_for_row_id_preallocates_exact_key() {
+        let key = table_data_key_for_row_id("accounts", "00042");
+
+        assert_eq!(key, "data:accounts:00042");
+        assert!(key.capacity() >= key.len());
     }
 }

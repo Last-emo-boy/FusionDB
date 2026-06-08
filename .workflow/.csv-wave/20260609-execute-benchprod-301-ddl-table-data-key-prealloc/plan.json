@@ -1,0 +1,46 @@
+{
+  "id": "benchprod-301-ddl-table-data-key-prealloc",
+  "objective": "Preallocate DDL table rewrite data keys from table and row-id lengths.",
+  "status": "completed",
+  "created_at": "2026-06-09T04:06:00+08:00",
+  "completed_at": "2026-06-09T04:13:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-301",
+      "title": "Preallocate DDL table rewrite data keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/table.rs"
+      ],
+      "result": "ALTER TABLE primary-key row rewrites now use an explicit-capacity helper instead of format! for new data keys."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test table_data_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_alter_table_only_add_primary_key_pgbench_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for data:<table>:<row_id> before pushing known components.",
+    "The optimization replaces format! in ALTER TABLE ADD PRIMARY KEY row rewrite key construction.",
+    "Generated key bytes, duplicate storage-key checks, old-row deletion, new-row writes, row-cache invalidation, index rewrites, and SQL results are unchanged."
+  ]
+}

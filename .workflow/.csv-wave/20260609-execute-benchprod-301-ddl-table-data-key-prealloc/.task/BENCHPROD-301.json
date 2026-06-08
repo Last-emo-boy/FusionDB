@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-301",
+  "title": "Preallocate DDL table rewrite data keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/ddl/table.rs"
+  ],
+  "description": "Avoid generic format! allocation work when ALTER TABLE primary-key row rewrites build data:<table>:<row_id> keys from known component lengths.",
+  "implementation": [
+    "Added table_data_key_for_row_id() with explicit capacity for data:<table>:<row_id>.",
+    "Replaced ALTER TABLE ADD PRIMARY KEY row rewrite new-key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test table_data_key -- --nocapture",
+    "cargo test --test sql_ddl test_alter_table_only_add_primary_key_pgbench_shape -- --nocapture",
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "DDL table rewrite data-key construction now reserves capacity from known table and row-id lengths while preserving primary-key rewrite behavior."
+}
