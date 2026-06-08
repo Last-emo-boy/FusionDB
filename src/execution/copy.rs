@@ -189,10 +189,6 @@ impl Executor {
             })
     }
 
-    fn copy_sql_identifier(identifier: &str) -> String {
-        format!("\"{}\"", identifier.replace('"', "\"\""))
-    }
-
     fn copy_from_options(
         options: &[CopyOption],
         legacy_options: &[CopyLegacyOption],
@@ -394,84 +390,14 @@ impl Executor {
         rows: &[Vec<Value>],
         txn: &mut dyn Transaction,
     ) -> Result<()> {
-        let values = rows
-            .iter()
-            .map(|row| {
-                format!(
-                    "({})",
-                    row.iter()
-                        .map(Self::copy_value_to_sql)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let column_list = if columns.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " ({})",
-                columns
-                    .iter()
-                    .map(|column| Self::copy_sql_identifier(&column.value))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let sql = format!(
-            "INSERT INTO {}{} VALUES {}",
-            Self::copy_sql_identifier(table_name),
-            column_list,
-            values
-        );
         Self::copy_trace(format!(
-            "copy batch parse insert table={} rows={} sql={}",
+            "copy batch direct insert table={} rows={} columns={}",
             table_name,
             rows.len(),
-            sql
+            columns.len()
         ));
-        let statements = crate::parser::parse_sql(&sql)?;
-        let Some(Statement::Insert(insert)) = statements.first() else {
-            return Err(FusionError::Execution(
-                "COPY failed to build INSERT statement".to_string(),
-            ));
-        };
-
-        let result = self
-            .handle_insert(
-                table_name.to_string(),
-                &insert.columns,
-                &insert.source,
-                &insert.returning,
-                &insert.on,
-                txn,
-                &[],
-            )
-            .await?;
-        match result {
-            QueryResult::Success { .. } => Ok(()),
-            other => Err(FusionError::Execution(format!(
-                "COPY expected INSERT success, got {:?}",
-                other
-            ))),
-        }
-    }
-
-    fn copy_value_to_sql(value: &Value) -> String {
-        match value {
-            Value::Null => "NULL".to_string(),
-            Value::Boolean(value) => value.to_string(),
-            Value::Integer(value) => value.to_string(),
-            Value::Float(value) => value.to_string(),
-            Value::Decimal(value) => value.clone(),
-            Value::String(value) => format!("'{}'", value.replace('\'', "''")),
-            Value::Date(_) | Value::Timestamp(_) | Value::Interval(_) => {
-                format!("'{}'", value.to_plain_string().replace('\'', "''"))
-            }
-            Value::Blob(_) | Value::Vector(_) | Value::Array(_) | Value::Object(_) => {
-                format!("'{}'", value.to_string().replace('\'', "''"))
-            }
-        }
+        self.insert_direct_rows(table_name, columns, rows, txn)
+            .await
+            .map(|_| ())
     }
 }

@@ -1,0 +1,53 @@
+{
+  "id": "benchprod-009-direct-copy-writer",
+  "objective": "Replace COPY SQL-string INSERT batching with a direct row writer while preserving constraints and indexes.",
+  "status": "completed",
+  "created_at": "2026-06-08T10:00:00+08:00",
+  "completed_at": "2026-06-08T10:16:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-009",
+      "title": "Direct COPY bulk writer",
+      "status": "completed",
+      "evidence": [
+        "src/execution/copy.rs",
+        "src/execution/dml/insert.rs",
+        "tests/sql_dml.rs",
+        "E:\\Playground\\FusionDB-bench\\runs\\matrix_benchprod009_legacy_copy_ycsb_medium_20260608\\matrix_summary.json",
+        "E:\\Playground\\FusionDB-bench\\runs\\matrix_benchprod009_direct_copy_ycsb_medium_20260608\\matrix_summary.json",
+        "E:\\Playground\\FusionDB-bench\\runs\\matrix_benchprod009_direct_copy_production_medium_20260608\\matrix_summary.json"
+      ],
+      "result": "COPY no longer constructs SQL-string INSERT batches; ycsb medium copy setup improved from 583.375 ms to 497.966 ms (-14.64%) and production medium copy passed 5/5 suites with 0 case errors."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_dml copy_from",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test pg_integration copy_from_stdin",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_dml",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_view_show_constraints foreign_key",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite ycsb --load-mode copy --run-name matrix_benchprod009_direct_copy_ycsb_medium_20260608 --fusiondb-bin E:\\Playground\\FusionDB\\target\\release\\fusiondb.exe --suite-timeout 900",
+      "status": "passed"
+    },
+    {
+      "command": "python fusiondb_matrix.py --scale medium --suite production --load-mode copy --run-name matrix_benchprod009_direct_copy_production_medium_20260608 --fusiondb-bin E:\\Playground\\FusionDB\\target\\release\\fusiondb.exe --suite-timeout 1800",
+      "status": "passed"
+    }
+  ]
+}

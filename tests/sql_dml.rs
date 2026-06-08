@@ -1604,6 +1604,83 @@ async fn test_copy_from_csv_with_header_and_index_lookup() {
 }
 
 #[tokio::test]
+async fn test_copy_from_csv_enforces_constraints_on_direct_path() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE copy_unique (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    let unique_path = write_copy_fixture(
+        "copy_unique",
+        "id,email\n1,a@example.test\n2,a@example.test\n",
+    );
+    let statements = executor
+        .prepare(&format!(
+            "COPY copy_unique FROM '{}' WITH (FORMAT CSV, HEADER true)",
+            unique_path
+        ))
+        .unwrap();
+    let err = executor
+        .execute(&statements[0])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("UNIQUE"));
+    let (_, rows) = query(&executor, "SELECT id FROM copy_unique").await;
+    assert!(rows.is_empty());
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE copy_check (id INTEGER PRIMARY KEY, age INTEGER CHECK(age > 0))",
+    )
+    .await;
+    let check_path = write_copy_fixture("copy_check", "id,age\n1,-1\n");
+    let statements = executor
+        .prepare(&format!(
+            "COPY copy_check FROM '{}' WITH (FORMAT CSV, HEADER true)",
+            check_path
+        ))
+        .unwrap();
+    let err = executor
+        .execute(&statements[0])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("CHECK"));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE copy_parent (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO copy_parent VALUES (1)").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE copy_child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES copy_parent(id))",
+    )
+    .await;
+    let fk_path = write_copy_fixture("copy_fk", "id,parent_id\n1,99\n");
+    let statements = executor
+        .prepare(&format!(
+            "COPY copy_child FROM '{}' WITH (FORMAT CSV, HEADER true)",
+            fk_path
+        ))
+        .unwrap();
+    let err = executor
+        .execute(&statements[0])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("FOREIGN KEY"));
+
+    let _ = std::fs::remove_file(unique_path);
+    let _ = std::fs::remove_file(check_path);
+    let _ = std::fs::remove_file(fk_path);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_copy_from_csv_with_column_list_and_defaults() {
     let (executor, wal) = setup().await;
     exec_ok(
