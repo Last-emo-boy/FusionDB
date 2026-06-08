@@ -28,6 +28,10 @@ fn sstable_file_candidate_buffer() -> Vec<(u64, PathBuf)> {
     Vec::with_capacity(1)
 }
 
+fn sstable_handle_buffer() -> Vec<Arc<SsTable>> {
+    Vec::with_capacity(1)
+}
+
 // --- Data Structures ---
 
 use super::fbtree::FBTree;
@@ -184,7 +188,7 @@ impl FusionStorage {
         let block_cache = Arc::new(Cache::new(config.block_cache_capacity));
 
         // Load existing SSTables
-        let mut sstables_vec = Vec::new();
+        let mut sstables_vec = sstable_handle_buffer();
         let sst_dir = sstable_dir.as_path();
         if sst_dir.exists() {
             if let Ok(mut entries) = std::fs::read_dir(sst_dir) {
@@ -2332,5 +2336,11 @@ mod tests {
     fn sstable_file_candidate_buffer_preallocates_first_file() {
         let files = sstable_file_candidate_buffer();
         assert!(files.capacity() >= 1);
+    }
+
+    #[test]
+    fn sstable_handle_buffer_preallocates_first_sstable() {
+        let sstables = sstable_handle_buffer();
+        assert!(sstables.capacity() >= 1);
     }
 }

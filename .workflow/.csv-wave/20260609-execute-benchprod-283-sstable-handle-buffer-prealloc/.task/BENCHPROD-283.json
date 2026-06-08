@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-283",
+  "title": "Preallocate SSTable handle list",
+  "status": "completed",
+  "created_at": "2026-06-09T02:07:00+08:00",
+  "completed_at": "2026-06-09T02:09:00+08:00",
+  "scope": "Fusion storage startup loaded SSTable handle allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs"
+      ],
+      "summary": [
+        "Added sstable_handle_buffer to create loaded SSTable handle vectors with capacity 1.",
+        "Changed FusionStorage startup SSTable loading to use the preallocated handle buffer.",
+        "Added unit coverage proving the helper preallocates for the first loaded SSTable.",
+        "Preserved SSTable candidate scanning, sorted load order, active memtable id selection, and timestamp restore behavior."
+      ]
+    },
+    "tests": {
+      "sstable_handle_buffer_unit": "passed",
+      "fusion_reopen_uses_fresh_memtable_id_after_existing_sstables": "passed",
+      "storage_fusion_tests": "16/16 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}

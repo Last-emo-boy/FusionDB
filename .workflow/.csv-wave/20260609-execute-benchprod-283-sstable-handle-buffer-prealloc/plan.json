@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-283-sstable-handle-buffer-prealloc",
+  "objective": "Preallocate Fusion storage SSTable handle lists for the first loaded SSTable.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:07:00+08:00",
+  "completed_at": "2026-06-09T02:09:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-283",
+      "title": "Preallocate SSTable handle list",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "Fusion storage startup now creates its loaded SSTable handle list with capacity for the first opened SSTable."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test sstable_handle_buffer_preallocates_first_sstable -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests::fusion_reopen_uses_fresh_memtable_id_after_existing_sstables -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests -- --nocapture",
+      "status": "passed: 16/16"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The loaded SSTable handle list capacity is 1 because the first successfully opened SSTable is immediately pushed into the list.",
+    "The optimization only changes initial Vec allocation for loaded SSTable handles; candidate scanning, SSTable opening, active memtable id selection, and timestamp restore semantics are unchanged."
+  ]
+}
