@@ -81,6 +81,10 @@ impl MemTable {
     }
 }
 
+fn immutable_memtable_buffer() -> Vec<MemTable> {
+    Vec::with_capacity(1)
+}
+
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::sstable::{SsTable, SsTableBuilder};
 use crate::storage::vector_index::VectorIndex;
@@ -254,7 +258,7 @@ impl FusionStorage {
 
         let storage = Self {
             active_memtable: Arc::new(RwLock::new(active)),
-            immutable_memtables: Arc::new(RwLock::new(Vec::new())),
+            immutable_memtables: Arc::new(RwLock::new(immutable_memtable_buffer())),
             sstables: Arc::new(RwLock::new(sstables_vec)),
             obsolete_sstables: Arc::new(RwLock::new(Vec::new())),
             wal: Arc::new(wal),
@@ -2342,5 +2346,11 @@ mod tests {
     fn sstable_handle_buffer_preallocates_first_sstable() {
         let sstables = sstable_handle_buffer();
         assert!(sstables.capacity() >= 1);
+    }
+
+    #[test]
+    fn immutable_memtable_buffer_preallocates_first_flush() {
+        let memtables = immutable_memtable_buffer();
+        assert!(memtables.capacity() >= 1);
     }
 }

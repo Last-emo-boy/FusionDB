@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-284-immutable-memtable-buffer-prealloc",
+  "objective": "Preallocate Fusion storage immutable memtable buffers for the first flush.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:10:00+08:00",
+  "completed_at": "2026-06-09T02:12:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-284",
+      "title": "Preallocate immutable memtable buffer",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "Fusion storage now creates the immutable memtable queue with capacity for the first flushed memtable."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test immutable_memtable_buffer_preallocates_first_flush -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests::fusion_flush_candidate_remains_visible_until_sstable_registration -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests -- --nocapture",
+      "status": "passed: 17/17"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The immutable memtable buffer capacity is 1 because the first flush pushes the first old active memtable into this queue.",
+    "The optimization only changes initial Vec allocation for the immutable memtable queue; flush visibility, SSTable registration, and scan semantics are unchanged."
+  ]
+}

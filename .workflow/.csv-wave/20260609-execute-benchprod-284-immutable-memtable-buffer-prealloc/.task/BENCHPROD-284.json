@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-284",
+  "title": "Preallocate immutable memtable buffer",
+  "status": "completed",
+  "created_at": "2026-06-09T02:10:00+08:00",
+  "completed_at": "2026-06-09T02:12:00+08:00",
+  "scope": "Fusion storage immutable memtable queue allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs"
+      ],
+      "summary": [
+        "Added immutable_memtable_buffer to create immutable memtable queues with capacity 1.",
+        "Changed FusionStorage initialization to use the preallocated immutable memtable buffer.",
+        "Added unit coverage proving the helper preallocates for the first flush.",
+        "Preserved flush visibility, SSTable registration, and scan behavior."
+      ]
+    },
+    "tests": {
+      "immutable_memtable_buffer_unit": "passed",
+      "fusion_flush_candidate_remains_visible_until_sstable_registration": "passed",
+      "storage_fusion_tests": "17/17 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}
