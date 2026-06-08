@@ -161,7 +161,7 @@ impl Executor {
     }
 
     fn predicate_uses_only_relations(&self, expr: &Expr, relation_names: &HashSet<String>) -> bool {
-        let mut columns = HashSet::new();
+        let mut columns = HashSet::with_capacity(relation_names.len());
         self.extract_columns_from_expr(expr, &mut columns);
         if columns.is_empty() {
             return false;
@@ -198,7 +198,7 @@ impl Executor {
     }
 
     fn predicate_uses_only_schema(&self, expr: &Expr, schema: &TableSchema) -> bool {
-        let mut columns = HashSet::new();
+        let mut columns = HashSet::with_capacity(schema.columns.len());
         self.extract_columns_from_expr(expr, &mut columns);
         if columns.is_empty() {
             return false;

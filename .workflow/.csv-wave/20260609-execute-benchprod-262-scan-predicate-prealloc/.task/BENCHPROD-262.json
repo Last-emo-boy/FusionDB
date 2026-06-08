@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-262",
+  "title": "Preallocate scan predicate column sets",
+  "status": "completed",
+  "created_at": "2026-06-09T00:10:00+08:00",
+  "completed_at": "2026-06-09T00:12:00+08:00",
+  "scope": "Scan predicate pushdown relation/schema column extraction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/predicate.rs"
+      ],
+      "summary": [
+        "Changed predicate_uses_only_relations to preallocate the extracted-column set from relation_names.len().",
+        "Changed predicate_uses_only_schema to preallocate the extracted-column set from schema.columns.len().",
+        "Preserved the existing predicate extraction and relation/schema membership behavior."
+      ]
+    },
+    "tests": {
+      "inner_join_left_filter_indexed_probe": "passed",
+      "implicit_join_chbenchmark_q16_shape": "passed",
+      "join_projection_pushdown_group_by": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

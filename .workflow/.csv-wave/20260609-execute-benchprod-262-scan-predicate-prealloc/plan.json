@@ -1,0 +1,49 @@
+{
+  "id": "benchprod-262-scan-predicate-prealloc",
+  "objective": "Preallocate scan predicate column extraction sets from known relation and schema sizes.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:10:00+08:00",
+  "completed_at": "2026-06-09T00:12:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-262",
+      "title": "Preallocate scan predicate column sets",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/predicate.rs"
+      ],
+      "result": "Scan predicate relation/schema checks now preallocate temporary column sets from already-known predicate bounds."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_inner_join_with_left_filter_and_indexed_right_probe -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_implicit_join_where_equi_predicate_matches_chbenchmark_q16_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_join_projection_pushdown_with_group_by -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "Relation-only predicate checks use relation_names.len() as the temporary column set capacity.",
+    "Schema-only predicate checks use schema.columns.len() as the temporary column set capacity."
+  ]
+}
