@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-166",
+  "title": "Preallocate column-scan predicate scratch values",
+  "status": "completed",
+  "created_at": "2026-06-08T16:43:00+08:00",
+  "completed_at": "2026-06-08T16:46:49+08:00",
+  "scope": "COUNT(DISTINCT) and SELECT DISTINCT column-scan predicate scratch allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "summary": [
+        "Changed count_distinct_column_scan predicate_values from Vec::new() to Vec::with_capacity(predicate column count).",
+        "Changed distinct_column_scan predicate_values to use the same predicate column-count capacity.",
+        "Kept predicate decoding and matching behavior unchanged."
+      ]
+    },
+    "tests": {
+      "select_distinct_with_simple_where_uses_column_scan": "passed",
+      "count_distinct_with_simple_where_uses_column_scan": "passed",
+      "sql_select": "27/27 passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}

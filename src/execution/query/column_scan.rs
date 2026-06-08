@@ -1012,7 +1012,8 @@ impl Executor {
         let prefix = format!("data:{}:", table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
-        let mut predicate_values = Vec::new();
+        let mut predicate_values =
+            Vec::with_capacity(predicate.map_or(0, |predicate| predicate.column_indices.len()));
 
         for (_, data) in kv_pairs {
             Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
@@ -1099,7 +1100,8 @@ impl Executor {
         let distinct_capacity = kv_pairs.len().min(4096);
         let mut seen = HashSet::with_capacity(distinct_capacity);
         let mut rows = Vec::with_capacity(distinct_capacity);
-        let mut predicate_values = Vec::new();
+        let mut predicate_values =
+            Vec::with_capacity(predicate.map_or(0, |predicate| predicate.column_indices.len()));
 
         for (_, data) in kv_pairs {
             Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
