@@ -143,10 +143,14 @@ impl Executor {
         let indexes = self
             .load_composite_indexes_for_table(table_name, txn)
             .await?;
-        Ok(indexes
-            .into_iter()
-            .filter(|index| index.name.ends_with("_pkey"))
-            .collect())
+        let mut unique_indexes = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            if index.name.ends_with("_pkey") {
+                unique_indexes.push(index);
+            }
+        }
+
+        Ok(unique_indexes)
     }
 
     async fn load_composite_indexes_for_table_directory(
@@ -156,7 +160,7 @@ impl Executor {
     ) -> Result<Vec<CompositeIndexMeta>> {
         let prefix = Self::composite_index_table_prefix(table_name);
         let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
-        let mut indexes = Vec::new();
+        let mut indexes = Vec::with_capacity(entries.len());
 
         for (key, value) in entries {
             let Ok(key_str) = std::str::from_utf8(&key) else {

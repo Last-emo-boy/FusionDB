@@ -1,0 +1,64 @@
+{
+  "id": "benchprod-207-composite-index-metadata-prealloc",
+  "objective": "Preallocate composite index metadata vectors from known source lengths.",
+  "status": "completed",
+  "created_at": "2026-06-08T19:42:00+08:00",
+  "completed_at": "2026-06-08T19:46:08+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-207",
+      "title": "Preallocate composite index metadata vectors",
+      "status": "completed",
+      "evidence": [
+        "src/execution/composite_index.rs"
+      ],
+      "result": "Composite index table-directory loads and unique-index filtering now preallocate result vectors from known input counts."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_create_composite_btree_index_and_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_composite_index_prefix_scan_skips_nonmatching_row_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_composite_index_range_order_limit_skips_outside_range_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_dml_maintains_composite_index_entries -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_composite_index_dml_uses_table_metadata_directory -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_view_show_constraints test_composite_foreign_key_insert_update_and_parent_checks -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache",
+      "status": "passed: 37/37"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml",
+      "status": "passed: 43/43"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "Legacy global index metadata scanning was left unchanged to avoid overallocating from cross-table metadata entries."
+  ]
+}
