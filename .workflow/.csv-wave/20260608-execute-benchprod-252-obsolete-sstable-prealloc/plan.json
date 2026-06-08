@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-252-obsolete-sstable-prealloc",
+  "objective": "Preallocate obsolete-SSTable deletion buffers from the known obsolete list upper bound.",
+  "status": "completed",
+  "created_at": "2026-06-08T23:14:25+08:00",
+  "completed_at": "2026-06-08T23:16:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-252",
+      "title": "Preallocate obsolete SSTable deletion list",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "Obsolete SSTable collection now reserves deletion-path capacity from the obsolete list length while holding the existing write lock."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fusion::tests::fusion_compaction_defers_obsolete_sstable_delete_until_readers_drop -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fusion::tests::fusion_get_uses_latest_mvcc_timestamp_after_compaction -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The change uses the already-held obsolete_sstables write lock and does not add another lock acquisition.",
+    "The deletion loop still drops the lock before awaiting file removal."
+  ]
+}

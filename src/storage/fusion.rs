@@ -719,6 +719,7 @@ impl FusionStorage {
         let mut ready_to_delete = Vec::new();
         {
             let mut obsolete = self.obsolete_sstables.write().unwrap();
+            ready_to_delete.reserve(obsolete.len());
             let mut index = 0;
             while index < obsolete.len() {
                 if Arc::strong_count(&obsolete[index]) == 1 {

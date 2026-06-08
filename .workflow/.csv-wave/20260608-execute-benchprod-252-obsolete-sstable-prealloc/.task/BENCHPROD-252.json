@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-252",
+  "title": "Preallocate obsolete SSTable deletion list",
+  "status": "completed",
+  "created_at": "2026-06-08T23:14:25+08:00",
+  "completed_at": "2026-06-08T23:16:00+08:00",
+  "scope": "Fusion storage obsolete SSTable collection",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs"
+      ],
+      "summary": [
+        "Reserved ready_to_delete capacity from obsolete.len() inside collect_obsolete_sstables.",
+        "Kept the existing write-lock scope and deletion loop semantics.",
+        "Preserved deferred file deletion until all external SsTable Arc readers are released."
+      ]
+    },
+    "tests": {
+      "obsolete_sstable_reader_deferral": "passed",
+      "latest_mvcc_after_compaction": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
