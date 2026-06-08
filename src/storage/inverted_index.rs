@@ -15,6 +15,14 @@ pub struct InvertedIndex {
     total_docs: usize,
 }
 
+fn postings_map() -> HashMap<String, Vec<(String, u32)>> {
+    HashMap::with_capacity(1)
+}
+
+fn doc_lengths_map() -> HashMap<String, u32> {
+    HashMap::with_capacity(1)
+}
+
 impl Default for InvertedIndex {
     fn default() -> Self {
         Self::new()
@@ -24,8 +32,8 @@ impl Default for InvertedIndex {
 impl InvertedIndex {
     pub fn new() -> Self {
         Self {
-            postings: HashMap::new(),
-            doc_lengths: HashMap::new(),
+            postings: postings_map(),
+            doc_lengths: doc_lengths_map(),
             avg_doc_length: 0.0,
             total_docs: 0,
         }
@@ -160,7 +168,7 @@ fn bm25_score_order(a: &(String, f32), b: &(String, f32)) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::InvertedIndex;
+    use super::{doc_lengths_map, postings_map, InvertedIndex};
 
     #[test]
     fn add_document_updates_average_length_incrementally() {
@@ -173,6 +181,12 @@ mod tests {
         assert_eq!(index.doc_lengths.get("doc1"), Some(&3));
         assert_eq!(index.doc_lengths.get("doc2"), Some(&2));
         assert!((index.avg_doc_length - 2.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn new_preallocates_first_document_maps() {
+        assert!(postings_map().capacity() >= 1);
+        assert!(doc_lengths_map().capacity() >= 1);
     }
 
     #[test]

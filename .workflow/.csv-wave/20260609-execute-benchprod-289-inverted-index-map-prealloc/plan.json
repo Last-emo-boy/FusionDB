@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-289-inverted-index-map-prealloc",
+  "objective": "Preallocate inverted-index top-level maps for the first indexed document.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:29:00+08:00",
+  "completed_at": "2026-06-09T02:31:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-289",
+      "title": "Preallocate inverted-index top-level maps",
+      "status": "completed",
+      "evidence": [
+        "src/storage/inverted_index.rs"
+      ],
+      "result": "InvertedIndex initialization now reserves capacity for the first postings and document-length entries."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test new_preallocates_first_document_maps -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::inverted_index::tests -- --nocapture",
+      "status": "passed: 7/7"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests::hybrid_search -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The initial capacity is 1 because a newly constructed inverted index commonly receives its first document immediately after initialization.",
+    "The optimization only changes initial HashMap allocation for empty postings and document-length maps; tokenization, BM25 scoring, duplicate document semantics, and result ordering are unchanged."
+  ]
+}
