@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-210",
+  "title": "Preallocate join reorder vectors",
+  "status": "completed",
+  "created_at": "2026-06-08T19:55:00+08:00",
+  "completed_at": "2026-06-08T19:57:13+08:00",
+  "scope": "Comma-join reorder planning vector construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Replaced schema clone collect with an explicitly preallocated vector sized from relation_count.",
+        "Replaced reordered relation collect with an explicitly preallocated vector sized from order.len() plus passthrough.len().",
+        "Preserved join reorder scoring, passthrough sorting, final extension, and changed-order detection."
+      ]
+    },
+    "tests": {
+      "comma_join_reorder_preserves_ldbc_q4_shape_with_deferred_exists": "passed",
+      "explain_join_order_includes_analyze_estimates": "passed",
+      "sql_join": "31/31 passed",
+      "sql_ddl": "28/28 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

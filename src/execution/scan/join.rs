@@ -883,10 +883,10 @@ impl Executor {
         let relation_count = relations.len();
         let mut local_counts = vec![0usize; relation_count];
         let mut edge_counts = vec![vec![0usize; relation_count]; relation_count];
-        let schemas = relations
-            .iter()
-            .map(|relation| relation.schema.clone())
-            .collect::<Vec<_>>();
+        let mut schemas = Vec::with_capacity(relation_count);
+        for relation in &relations {
+            schemas.push(relation.schema.clone());
+        }
 
         for predicate in &predicates {
             let Some(members) = self.predicate_schema_members(predicate, &schemas) else {
@@ -967,10 +967,10 @@ impl Executor {
             order.push(next);
         }
 
-        let mut reordered: Vec<TableWithJoins> = order
-            .iter()
-            .map(|index| relations[*index].table.clone())
-            .collect();
+        let mut reordered = Vec::with_capacity(order.len() + passthrough.len());
+        for index in &order {
+            reordered.push(relations[*index].table.clone());
+        }
         passthrough.sort_by_key(|(original_index, _)| *original_index);
         reordered.extend(passthrough.into_iter().map(|(_, table)| table));
 
