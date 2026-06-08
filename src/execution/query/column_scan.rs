@@ -861,7 +861,7 @@ impl Executor {
     ) -> Option<ColumnPredicateScanPlan> {
         let predicates = Self::collect_conjunctive_predicates(selection);
         let mut terms = Vec::with_capacity(predicates.len());
-        let mut column_indices = Vec::new();
+        let mut column_indices = Vec::with_capacity(predicates.len());
 
         for predicate in predicates {
             let Expr::BinaryOp { left, op, right } = predicate else {

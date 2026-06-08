@@ -1,0 +1,40 @@
+{
+  "id": "benchprod-176-column-predicate-indices-prealloc",
+  "objective": "Preallocate column predicate index vectors during column-scan predicate planning.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:31:30+08:00",
+  "completed_at": "2026-06-08T17:33:52+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-176",
+      "title": "Preallocate column predicate indices",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "result": "Column-scan predicate planning now initializes column_indices with predicate-count capacity."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_group_aggregate test_group_by_aggregates_with_multi_predicate_partial_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate test_group_by_aggregates_reuses_multi_predicate_column_values -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

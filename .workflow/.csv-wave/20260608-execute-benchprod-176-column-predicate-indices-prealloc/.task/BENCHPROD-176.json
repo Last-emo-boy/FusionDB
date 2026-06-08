@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-176",
+  "title": "Preallocate column predicate indices",
+  "status": "completed",
+  "created_at": "2026-06-08T17:31:30+08:00",
+  "completed_at": "2026-06-08T17:33:52+08:00",
+  "scope": "Column-scan predicate plan construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "summary": [
+        "Changed simple_column_predicate_scan_plan column_indices from Vec::new to Vec::with_capacity(predicates.len()).",
+        "Kept predicate collection, operator handling, column resolution, and value coercion unchanged."
+      ]
+    },
+    "tests": {
+      "group_by_aggregates_with_multi_predicate_partial_decode": "passed",
+      "group_by_aggregates_reuses_multi_predicate_column_values": "passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}
