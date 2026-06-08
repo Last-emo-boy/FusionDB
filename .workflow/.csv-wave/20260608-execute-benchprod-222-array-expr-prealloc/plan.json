@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-222-array-expr-prealloc",
+  "objective": "Preallocate SQL array expression elements while converting Fusion array values.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:38:00+08:00",
+  "completed_at": "2026-06-08T20:44:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-222",
+      "title": "Preallocate array expression elements",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "result": "Fusion array value conversion now preallocates the SQL array expression element vector from the known array length before recursively converting each element."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_array_agg_over_array_expression_preserves_nested_values -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_array_agg_over_generated_subscripts -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_group_by_projection_can_materialize_correlated_scalar_array_subquery -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The conversion preserves element order, recursive fusion_value_to_sql_expr conversion, and named SQL array construction."
+  ]
+}

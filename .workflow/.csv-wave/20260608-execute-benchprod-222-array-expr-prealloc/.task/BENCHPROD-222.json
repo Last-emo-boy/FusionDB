@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-222",
+  "title": "Preallocate array expression elements",
+  "status": "completed",
+  "created_at": "2026-06-08T20:38:00+08:00",
+  "completed_at": "2026-06-08T20:44:00+08:00",
+  "scope": "Fusion array value to SQL array expression conversion",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "summary": [
+        "Replaced iterator collect for Value::Array conversion with an explicitly preallocated vector sized from values.len().",
+        "Preserved recursive conversion of each array element through fusion_value_to_sql_expr.",
+        "Preserved SQL array element order and named: true construction."
+      ]
+    },
+    "tests": {
+      "array_agg_nested_values": "passed",
+      "array_agg_generated_subscripts": "passed",
+      "correlated_scalar_array_subquery": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

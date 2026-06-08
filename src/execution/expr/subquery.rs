@@ -241,13 +241,16 @@ impl Executor {
                 },
                 uses_odbc_syntax: false,
             }),
-            Value::Array(values) => Expr::Array(sqlparser::ast::Array {
-                elem: values
-                    .iter()
-                    .map(|value| self.fusion_value_to_sql_expr(value))
-                    .collect(),
-                named: true,
-            }),
+            Value::Array(values) => {
+                let mut elems = Vec::with_capacity(values.len());
+                for value in values {
+                    elems.push(self.fusion_value_to_sql_expr(value));
+                }
+                Expr::Array(sqlparser::ast::Array {
+                    elem: elems,
+                    named: true,
+                })
+            }
             Value::Null => Expr::Value(sqlparser::ast::ValueWithSpan {
                 value: SqlValue::Null,
                 span,
