@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-216",
+  "title": "Preallocate join group aggregate output vectors",
+  "status": "completed",
+  "created_at": "2026-06-08T20:15:00+08:00",
+  "completed_at": "2026-06-08T20:17:24+08:00",
+  "scope": "Join group aggregate fast path result schema and ORDER BY sort keys",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced join group aggregate result schema column collect with an explicitly preallocated vector sized from columns.len().",
+        "Replaced ORDER BY sort key collect with an explicitly preallocated vector sized from exprs.len().",
+        "Preserved aggregate result rows, ORDER BY source resolution, sort direction, top-N windowing, and final trimming."
+      ]
+    },
+    "tests": {
+      "join_group_by_count_sum_fast_shape": "passed",
+      "join_group_by_aggregate_fast_path_order_limit_offset": "passed",
+      "join_group_by_aggregate_fast_path_matches_chbench_shape": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

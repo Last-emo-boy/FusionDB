@@ -1634,29 +1634,28 @@ impl Executor {
             rows.push(row);
         }
 
-        let result_schema = TableSchema::new(
-            "temp_join_group_by_result".to_string(),
-            columns
-                .iter()
-                .map(|name| Column {
-                    name: name.clone(),
-                    data_type: "UNKNOWN".to_string(),
-                    is_primary: false,
-                    is_indexed: false,
-                    index_type: IndexType::None,
-                    default_value: None,
-                    is_nullable: true,
-                    is_unique: false,
-                    check_expr: None,
-                })
-                .collect(),
-        );
+        let mut schema_columns = Vec::with_capacity(columns.len());
+        for name in &columns {
+            schema_columns.push(Column {
+                name: name.clone(),
+                data_type: "UNKNOWN".to_string(),
+                is_primary: false,
+                is_indexed: false,
+                index_type: IndexType::None,
+                default_value: None,
+                is_nullable: true,
+                is_unique: false,
+                check_expr: None,
+            });
+        }
+        let result_schema =
+            TableSchema::new("temp_join_group_by_result".to_string(), schema_columns);
 
         if let Some(order_by) = order_by {
             if let OrderByKind::Expressions(exprs) = &order_by.kind {
-                let sort_keys: Vec<SortOrderKey<'_>> = exprs
-                    .iter()
-                    .map(|order_expr| SortOrderKey {
+                let mut sort_keys = Vec::with_capacity(exprs.len());
+                for order_expr in exprs {
+                    sort_keys.push(SortOrderKey {
                         source: self.resolve_order_value_source(
                             &order_expr.expr,
                             &select.projection,
@@ -1666,8 +1665,8 @@ impl Executor {
                             false,
                         ),
                         asc: order_expr.options.asc.unwrap_or(true),
-                    })
-                    .collect();
+                    });
+                }
                 let limit_window = limit.map(|value| {
                     if value == 0 {
                         0
