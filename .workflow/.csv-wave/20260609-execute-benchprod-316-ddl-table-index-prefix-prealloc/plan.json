@@ -1,0 +1,49 @@
+{
+  "id": "benchprod-316-ddl-table-index-prefix-prealloc",
+  "objective": "Preallocate DDL table-operation index prefixes from table and column name lengths.",
+  "status": "completed",
+  "created_at": "2026-06-09T04:40:00+08:00",
+  "completed_at": "2026-06-09T04:44:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-316",
+      "title": "Preallocate DDL table index prefixes",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/table.rs",
+        "tests/sql_ddl.rs"
+      ],
+      "result": "DDL table index cleanup and secondary-index row-id rewrite paths now use explicit-capacity helpers instead of format! for index prefixes."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test table_index_prefix -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_alter_table_add_primary_key_rewrites_secondary_btree_index_row_ids -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 33/33"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The table index helper reserves capacity for index:<table>: before pushing known components.",
+    "The column index helper reserves capacity for index:<table>:<column>: before pushing known components.",
+    "The optimization replaces format! in DROP TABLE index cleanup, TRUNCATE TABLE index cleanup, and ALTER TABLE ADD PRIMARY KEY secondary BTree index row-id rewrite scan-prefix construction.",
+    "Added a SQL DDL regression that exercises ADD PRIMARY KEY after a secondary BTree index already exists.",
+    "Generated prefix bytes, scan_prefix inputs, deleted index keys, rewritten secondary index row IDs, and SQL DDL results are unchanged."
+  ]
+}

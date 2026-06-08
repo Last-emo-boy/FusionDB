@@ -1,0 +1,28 @@
+{
+  "id": "BENCHPROD-316",
+  "title": "Preallocate DDL table index prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/ddl/table.rs",
+    "tests/sql_ddl.rs"
+  ],
+  "description": "Avoid generic format! allocation work when DDL table operations build index:<table>: and index:<table>:<column>: prefixes from known name lengths.",
+  "implementation": [
+    "Added table_index_prefix_for_table() with explicit capacity for index:<table>:.",
+    "Added table_index_prefix_for_column() with explicit capacity for index:<table>:<column>:.",
+    "Replaced DROP TABLE index cleanup prefix construction.",
+    "Replaced TRUNCATE TABLE index cleanup prefix construction.",
+    "Replaced ALTER TABLE ADD PRIMARY KEY secondary BTree index row-id rewrite prefix construction.",
+    "Added unit coverage for helper outputs and capacities.",
+    "Added SQL coverage for ADD PRIMARY KEY after a secondary BTree index already exists."
+  ],
+  "verification": [
+    "cargo test table_index_prefix -- --nocapture",
+    "cargo test --test sql_ddl test_alter_table_add_primary_key_rewrites_secondary_btree_index_row_ids -- --nocapture",
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "DDL table index-prefix construction now reserves capacity from known table and column name lengths while preserving index cleanup and secondary-index row-id rewrite behavior."
+}

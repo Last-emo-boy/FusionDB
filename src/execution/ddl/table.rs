@@ -41,6 +41,25 @@ fn table_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn table_index_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("index:".len() + table_name.len() + 1);
+    prefix.push_str("index:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
+fn table_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
+    let mut prefix =
+        String::with_capacity("index:".len() + table_name.len() + 1 + column_name.len() + 1);
+    prefix.push_str("index:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix.push_str(column_name);
+    prefix.push(':');
+    prefix
+}
+
 impl Executor {
     pub(crate) async fn handle_create_table(
         &self,
@@ -345,7 +364,7 @@ impl Executor {
                 }
             }
 
-            let index_prefix = format!("index:{}:", table_name);
+            let index_prefix = table_index_prefix_for_table(&table_name);
             let index_entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
@@ -387,7 +406,7 @@ impl Executor {
             }
             count += kv_pairs.len();
 
-            let index_prefix = format!("index:{}:", table_name);
+            let index_prefix = table_index_prefix_for_table(&table_name);
             let index_entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
@@ -821,7 +840,7 @@ impl Executor {
             match column.index_type {
                 IndexType::BTree => {
                     let old_suffix = format!(":{}", old_row_id);
-                    let prefix = format!("index:{}:{}:", table_name, column.name);
+                    let prefix = table_index_prefix_for_column(table_name, &column.name);
                     let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
                     for (index_key, index_value) in entries {
                         let Ok(index_key_str) = std::str::from_utf8(&index_key) else {
@@ -941,7 +960,10 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{table_data_key_for_row_id, table_data_prefix_for_table};
+    use super::{
+        table_data_key_for_row_id, table_data_prefix_for_table, table_index_prefix_for_column,
+        table_index_prefix_for_table,
+    };
 
     #[test]
     fn table_data_prefix_for_table_preallocates_exact_prefix() {
@@ -957,5 +979,21 @@ mod tests {
 
         assert_eq!(key, "data:accounts:00042");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn table_index_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = table_index_prefix_for_table("accounts");
+
+        assert_eq!(prefix, "index:accounts:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn table_index_prefix_for_column_preallocates_exact_prefix() {
+        let prefix = table_index_prefix_for_column("accounts", "name");
+
+        assert_eq!(prefix, "index:accounts:name:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }

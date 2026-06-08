@@ -711,6 +711,41 @@ async fn test_alter_table_only_add_primary_key_pgbench_shape() {
 }
 
 #[tokio::test]
+async fn test_alter_table_add_primary_key_rewrites_secondary_btree_index_row_ids() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE add_pk_secondary_index (id INTEGER NOT NULL, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO add_pk_secondary_index VALUES (10, 'alice'), (20, 'bob')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_add_pk_secondary_name ON add_pk_secondary_index (name)",
+    )
+    .await;
+
+    exec_ok(
+        &executor,
+        "ALTER TABLE ONLY add_pk_secondary_index ADD CONSTRAINT add_pk_secondary_index_pkey PRIMARY KEY (id)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM add_pk_secondary_index WHERE name = 'bob'",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(20)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_alter_table_add_primary_key_rejects_existing_primary_key() {
     let (executor, wal) = setup().await;
     exec_ok(
