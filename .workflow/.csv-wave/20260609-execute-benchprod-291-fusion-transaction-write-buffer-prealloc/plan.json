@@ -1,0 +1,46 @@
+{
+  "id": "benchprod-291-fusion-transaction-write-buffer-prealloc",
+  "objective": "Preallocate Fusion transaction write buffers for the first write operation.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:36:00+08:00",
+  "completed_at": "2026-06-09T02:40:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-291",
+      "title": "Preallocate Fusion transaction write buffer",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "FusionTransaction initialization now reserves capacity for the first buffered write."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test fusion_transaction_write_buffer_preallocates_first_write -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests -- --nocapture",
+      "status": "passed: 19/19"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_fusion_storage_prefix_scan_seeks_inside_sstable_block -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The initial write-buffer capacity is 1 because most write transactions push at least one put or delete entry before commit.",
+    "The optimization only changes initial Vec allocation for the transaction write buffer; read timestamps, write ordering, conflict checks, WAL entries, memtable updates, and scan/count visibility are unchanged.",
+    "The sql_dml regression emitted an existing SSTable retry warning after the passing result; the command exited successfully."
+  ]
+}

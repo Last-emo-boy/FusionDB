@@ -89,6 +89,10 @@ fn immutable_memtable_buffer() -> Vec<MemTable> {
     Vec::with_capacity(1)
 }
 
+fn transaction_write_buffer() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    Vec::with_capacity(1)
+}
+
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::sstable::{SsTable, SsTableBuilder};
 use crate::storage::vector_index::VectorIndex;
@@ -1748,7 +1752,7 @@ impl Storage for FusionStorage {
         let read_ts = self.current_ts.load(Ordering::SeqCst);
         Ok(Box::new(FusionTransaction {
             storage: self.clone(),
-            write_buffer: Vec::new(),
+            write_buffer: transaction_write_buffer(),
             read_ts,
         }))
     }
@@ -1776,6 +1780,11 @@ mod tests {
 
     fn cleanup_storage_dir(path: &Path) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn fusion_transaction_write_buffer_preallocates_first_write() {
+        assert!(transaction_write_buffer().capacity() >= 1);
     }
 
     #[tokio::test]

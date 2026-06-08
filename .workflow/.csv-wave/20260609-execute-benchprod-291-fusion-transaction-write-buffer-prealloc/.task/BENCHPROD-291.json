@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-291",
+  "title": "Preallocate Fusion transaction write buffer",
+  "status": "completed",
+  "created_at": "2026-06-09T02:36:00+08:00",
+  "completed_at": "2026-06-09T02:40:00+08:00",
+  "scope": "Fusion transaction write-buffer allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs"
+      ],
+      "summary": [
+        "Added a transaction_write_buffer helper that reserves one write-buffer slot.",
+        "Changed FusionStorage::begin_transaction() to initialize FusionTransaction with the preallocated write buffer.",
+        "Added unit coverage proving the helper reserves capacity for the first write.",
+        "Left MVCC read timestamps, buffered write ordering, WAL generation, commit, rollback, and read-your-own-writes behavior unchanged."
+      ]
+    },
+    "tests": {
+      "write_buffer_capacity_unit": "passed",
+      "fusion_units": "19/19 passed",
+      "fusion_dml_prefix_scan_regression": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}
