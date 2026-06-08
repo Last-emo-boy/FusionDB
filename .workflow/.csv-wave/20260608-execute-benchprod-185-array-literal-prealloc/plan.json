@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-185-array-literal-prealloc",
+  "objective": "Preallocate array literal values from the known element count.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:10:00+08:00",
+  "completed_at": "2026-06-08T18:12:43+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-185",
+      "title": "Preallocate array literal values",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/value.rs"
+      ],
+      "result": "Array literal evaluation now initializes its output values vector with the parser-provided element count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_generate_subscripts_from_array_literal -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_quantified_array_comparison_predicates -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_array_agg_over_array_expression_preserves_nested_values -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

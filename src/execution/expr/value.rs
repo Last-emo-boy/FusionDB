@@ -107,7 +107,7 @@ impl Executor {
                 }
             }
             Expr::Array(arr) => {
-                let mut values = Vec::new();
+                let mut values = Vec::with_capacity(arr.elem.len());
                 for elem in &arr.elem {
                     values.push(self.evaluate_value(elem, row, schema, params)?);
                 }

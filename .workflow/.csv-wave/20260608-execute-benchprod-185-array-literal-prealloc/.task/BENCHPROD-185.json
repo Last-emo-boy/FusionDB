@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-185",
+  "title": "Preallocate array literal values",
+  "status": "completed",
+  "created_at": "2026-06-08T18:10:00+08:00",
+  "completed_at": "2026-06-08T18:12:43+08:00",
+  "scope": "Array literal expression evaluation allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/value.rs"
+      ],
+      "summary": [
+        "Changed Expr::Array evaluation from Vec::new() to Vec::with_capacity(arr.elem.len()).",
+        "Kept element evaluation order, error propagation, and resulting Value::Array contents unchanged."
+      ]
+    },
+    "tests": {
+      "generate_subscripts_from_array_literal": "passed",
+      "quantified_array_comparison_predicates": "passed",
+      "array_agg_over_array_expression_preserves_nested_values": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused expression, subquery, scan, or join hot path."
+  ]
+}
