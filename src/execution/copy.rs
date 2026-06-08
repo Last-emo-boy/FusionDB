@@ -166,7 +166,7 @@ impl Executor {
             copy_options.format_csv,
             copy_options.delimiter as char
         ));
-        let rows = self.read_copy_bytes(payload, &copy_options)?;
+        let rows = Self::read_copy_bytes(payload, &copy_options)?;
         let table_name = Self::copy_table_name(table_name)?;
         Self::copy_trace(format!(
             "stdin copy insert start table={} columns={} rows={} first_row={:?}",
@@ -298,15 +298,20 @@ impl Executor {
         Self::read_copy_reader(file, options)
     }
 
-    fn read_copy_bytes(
-        &self,
-        payload: &[u8],
-        options: &CopyFromOptions,
-    ) -> Result<Vec<Vec<Value>>> {
-        Self::read_copy_reader(Cursor::new(payload), options)
+    fn read_copy_bytes(payload: &[u8], options: &CopyFromOptions) -> Result<Vec<Vec<Value>>> {
+        let row_capacity = Self::copy_payload_row_capacity(payload, options);
+        Self::read_copy_reader_with_capacity(Cursor::new(payload), options, row_capacity)
     }
 
     fn read_copy_reader<R: Read>(reader: R, options: &CopyFromOptions) -> Result<Vec<Vec<Value>>> {
+        Self::read_copy_reader_with_capacity(reader, options, 0)
+    }
+
+    fn read_copy_reader_with_capacity<R: Read>(
+        reader: R,
+        options: &CopyFromOptions,
+        row_capacity: usize,
+    ) -> Result<Vec<Vec<Value>>> {
         let mut builder = csv::ReaderBuilder::new();
         builder
             .has_headers(options.header)
@@ -318,7 +323,7 @@ impl Executor {
         }
 
         let mut reader = builder.from_reader(reader);
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(row_capacity);
         for record in reader.records() {
             let record = record
                 .map_err(|e| FusionError::Execution(format!("COPY CSV parse error: {}", e)))?;
@@ -329,6 +334,22 @@ impl Executor {
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    fn copy_payload_row_capacity(payload: &[u8], options: &CopyFromOptions) -> usize {
+        if payload.is_empty() {
+            return 0;
+        }
+
+        let mut line_count = payload.iter().filter(|byte| **byte == b'\n').count();
+        if payload
+            .last()
+            .is_some_and(|byte| *byte != b'\n' && *byte != b'\r')
+        {
+            line_count += 1;
+        }
+
+        line_count.saturating_sub(usize::from(options.header))
     }
 
     fn copy_field_to_value(field: &str, null_marker: &str) -> Value {
@@ -398,5 +419,64 @@ impl Executor {
         self.insert_direct_rows(table_name, columns, rows, txn)
             .await
             .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_payload_row_capacity_accounts_for_headers_and_trailing_rows() {
+        let csv_options = CopyFromOptions {
+            format_csv: true,
+            header: true,
+            delimiter: b',',
+            ..CopyFromOptions::default()
+        };
+        assert_eq!(
+            Executor::copy_payload_row_capacity(b"id,name\n1,Alice\n2,Bob\n", &csv_options),
+            2
+        );
+        assert_eq!(
+            Executor::copy_payload_row_capacity(b"id,name\n1,Alice", &csv_options),
+            1
+        );
+
+        let text_options = CopyFromOptions::default();
+        assert_eq!(
+            Executor::copy_payload_row_capacity(b"1\tAlice\n2\tBob\n", &text_options),
+            2
+        );
+    }
+
+    #[test]
+    fn read_copy_bytes_preserves_csv_rows_with_capacity_hint() {
+        let options = CopyFromOptions {
+            format_csv: true,
+            header: true,
+            delimiter: b',',
+            null_marker: "NULL".to_string(),
+            ..CopyFromOptions::default()
+        };
+
+        let rows =
+            Executor::read_copy_bytes(b"id,name,age\n1,Alice,30\n2,Bob,NULL\n", &options).unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::String("Alice".to_string()),
+                    Value::Integer(30)
+                ],
+                vec![
+                    Value::Integer(2),
+                    Value::String("Bob".to_string()),
+                    Value::Null
+                ],
+            ]
+        );
     }
 }

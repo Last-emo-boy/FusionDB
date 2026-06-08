@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-256-copy-stdin-row-prealloc",
+  "objective": "Preallocate COPY STDIN row buffers from in-memory payload line counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T23:36:00+08:00",
+  "completed_at": "2026-06-08T23:42:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-256",
+      "title": "Preallocate COPY STDIN rows",
+      "status": "completed",
+      "evidence": [
+        "src/execution/copy.rs"
+      ],
+      "result": "COPY STDIN now estimates row capacity from the already-buffered payload before CSV/text parsing."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test execution::copy::tests -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test pg_integration test_pg_protocol_copy_from_stdin_text_and_csv -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "cargo fmt was applied once, then the COPY unit tests and PostgreSQL COPY STDIN integration test were rerun against the final formatted state.",
+    "File-based COPY still uses the generic reader path with zero initial row capacity, avoiding any extra file scan."
+  ]
+}

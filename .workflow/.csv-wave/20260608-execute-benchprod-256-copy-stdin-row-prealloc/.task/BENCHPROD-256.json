@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-256",
+  "title": "Preallocate COPY STDIN rows",
+  "status": "completed",
+  "created_at": "2026-06-08T23:36:00+08:00",
+  "completed_at": "2026-06-08T23:42:00+08:00",
+  "scope": "COPY STDIN payload parsing",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/copy.rs"
+      ],
+      "summary": [
+        "Changed COPY STDIN byte parsing to estimate row capacity from the in-memory payload.",
+        "Added a reader helper that accepts an explicit row capacity while preserving the existing generic reader behavior for file COPY.",
+        "Added unit coverage for payload row-capacity estimation and CSV row parsing with the capacity hint."
+      ]
+    },
+    "tests": {
+      "copy_unit_tests": "2/2 passed",
+      "pg_copy_stdin_text_and_csv": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
