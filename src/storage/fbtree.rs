@@ -41,17 +41,30 @@ pub struct FBTree {
 
 impl FBTree {
     pub fn new() -> Self {
-        let root = Node::Leaf(LeafNode {
-            keys: Vec::new(),
-            values: Vec::new(),
-            tags: Vec::new(),
-            occupied: Vec::new(),
-            next: None,
-        });
+        let root = Node::Leaf(Self::empty_leaf_node());
 
         Self {
             nodes: vec![Arc::new(RwLock::new(root))],
             root: 0,
+        }
+    }
+
+    fn empty_leaf_node() -> LeafNode {
+        LeafNode {
+            keys: Vec::with_capacity(FANOUT),
+            values: Vec::with_capacity(FANOUT),
+            tags: Vec::with_capacity(FANOUT),
+            occupied: Vec::with_capacity(FANOUT),
+            next: None,
+        }
+    }
+
+    fn empty_inner_node() -> InnerNode {
+        InnerNode {
+            prefix: Vec::new(),
+            features: vec![0u8; FEATURE_SIZE * FANOUT],
+            children: Vec::with_capacity(FANOUT),
+            anchors: Vec::with_capacity(FANOUT.saturating_sub(1)),
         }
     }
 
@@ -75,13 +88,7 @@ impl FBTree {
         I: Iterator<Item = (Vec<u8>, Vec<u8>)>,
     {
         let mut leaves = Vec::new();
-        let mut current_leaf = LeafNode {
-            keys: Vec::new(),
-            values: Vec::new(),
-            tags: Vec::new(),
-            occupied: Vec::new(),
-            next: None,
-        };
+        let mut current_leaf = Self::empty_leaf_node();
 
         let mut nodes_arena = Vec::new();
 
@@ -92,13 +99,7 @@ impl FBTree {
                 nodes_arena.push(Arc::new(RwLock::new(Node::Leaf(current_leaf))));
                 leaves.push(id);
 
-                current_leaf = LeafNode {
-                    keys: Vec::new(),
-                    values: Vec::new(),
-                    tags: Vec::new(),
-                    occupied: Vec::new(),
-                    next: None, // Will link later
-                };
+                current_leaf = Self::empty_leaf_node();
             }
 
             // Add to leaf
@@ -127,12 +128,7 @@ impl FBTree {
 
         while current_level_ids.len() > 1 {
             let mut next_level_ids = Vec::new();
-            let mut current_inner = InnerNode {
-                prefix: Vec::new(),
-                features: vec![0u8; FEATURE_SIZE * FANOUT],
-                children: Vec::new(),
-                anchors: Vec::new(),
-            };
+            let mut current_inner = Self::empty_inner_node();
 
             for (_i, &child_id) in current_level_ids.iter().enumerate() {
                 if current_inner.children.len() >= FANOUT {
@@ -146,12 +142,7 @@ impl FBTree {
                     nodes_arena.push(Arc::new(RwLock::new(node)));
                     next_level_ids.push(id);
 
-                    current_inner = InnerNode {
-                        prefix: Vec::new(),
-                        features: vec![0u8; FEATURE_SIZE * FANOUT],
-                        children: Vec::new(),
-                        anchors: Vec::new(),
-                    };
+                    current_inner = Self::empty_inner_node();
                 }
 
                 // Add child
@@ -412,5 +403,65 @@ impl<'a> Iterator for FBTreeIterator<'a> {
                 return None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sorted_pairs(count: usize) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
+        (0..count).map(|id| {
+            (
+                format!("key:{id:04}").into_bytes(),
+                format!("value:{id:04}").into_bytes(),
+            )
+        })
+    }
+
+    #[test]
+    fn new_tree_preallocates_root_leaf_slots() {
+        let tree = FBTree::new();
+        let root = tree.nodes[tree.root].read().unwrap();
+        let Node::Leaf(leaf) = &*root else {
+            panic!("new tree root should be a leaf");
+        };
+
+        assert!(leaf.keys.capacity() >= FANOUT);
+        assert!(leaf.values.capacity() >= FANOUT);
+        assert!(leaf.tags.capacity() >= FANOUT);
+        assert!(leaf.occupied.capacity() >= FANOUT);
+    }
+
+    #[test]
+    fn bulk_load_preallocates_leaf_and_inner_slots() {
+        let tree = FBTree::bulk_load(sorted_pairs(FANOUT * 2 + 1));
+
+        let root = tree.nodes[tree.root].read().unwrap();
+        let Node::Inner(inner) = &*root else {
+            panic!("bulk-loaded multi-leaf tree root should be inner");
+        };
+        assert!(inner.children.capacity() >= FANOUT);
+        assert!(inner.anchors.capacity() >= FANOUT.saturating_sub(1));
+        let first_child = inner.children[0];
+        drop(root);
+
+        let child = tree.nodes[first_child].read().unwrap();
+        let Node::Leaf(leaf) = &*child else {
+            panic!("first child should be a leaf");
+        };
+        assert!(leaf.keys.capacity() >= FANOUT);
+        assert!(leaf.values.capacity() >= FANOUT);
+        assert!(leaf.tags.capacity() >= FANOUT);
+        assert!(leaf.occupied.capacity() >= FANOUT);
+
+        assert_eq!(
+            tree.get(b"key:0017"),
+            Some(b"value:0017".to_vec()),
+            "bulk-loaded tree should still find keys"
+        );
+        let scanned: Vec<_> = tree.scan(b"key:0031").collect();
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned[0].0, b"key:0031".to_vec());
     }
 }

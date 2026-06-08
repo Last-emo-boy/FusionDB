@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-257-fbtree-node-prealloc",
+  "objective": "Preallocate FBTree leaf and inner node buffers from the fixed FANOUT bound.",
+  "status": "completed",
+  "created_at": "2026-06-08T23:45:00+08:00",
+  "completed_at": "2026-06-08T23:49:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-257",
+      "title": "Preallocate FBTree node slots",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fbtree.rs"
+      ],
+      "result": "FBTree leaf and inner node construction now preallocates slot buffers from the fixed FANOUT bound."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fbtree::tests -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::fusion::tests::fusion_immutable_memtable_prefix_scan_covers_all_large_fbtree_keys -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The capacity bound comes from the FBTree FANOUT constant, not from a speculative iterator size hint.",
+    "The change preserves bulk-load order, leaf linking, inner feature rebuilds, get, and scan behavior."
+  ]
+}
