@@ -1,21 +1,81 @@
 use crate::common::{Result, Value};
+use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
 
 use super::super::Executor;
 
 impl Executor {
+    fn evaluate_check_truth(
+        &self,
+        expr: &Expr,
+        row: &[Value],
+        schema: &crate::catalog::TableSchema,
+    ) -> Result<Option<bool>> {
+        match expr {
+            Expr::Nested(inner) => self.evaluate_check_truth(inner, row, schema),
+            Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+            } => Ok(self
+                .evaluate_check_truth(expr, row, schema)?
+                .map(|value| !value)),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                let left = self.evaluate_check_truth(left, row, schema)?;
+                let right = self.evaluate_check_truth(right, row, schema)?;
+                Ok(match (left, right) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                })
+            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => {
+                let left = self.evaluate_check_truth(left, row, schema)?;
+                let right = self.evaluate_check_truth(right, row, schema)?;
+                Ok(match (left, right) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                })
+            }
+            Expr::BinaryOp { left, op, right }
+                if matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Lt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::LtEq
+                ) =>
+            {
+                let left_val = self.evaluate_value(left, row, schema, &[])?;
+                let right_val = self.evaluate_value(right, row, schema, &[])?;
+                if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
+                    Ok(None)
+                } else {
+                    self.evaluate_expr(expr, row, schema, &[]).map(Some)
+                }
+            }
+            _ => self.evaluate_expr(expr, row, schema, &[]).map(Some),
+        }
+    }
+
     pub(super) fn evaluate_check_constraint(
         &self,
         check_sql: &str,
-        col_name: &str,
-        value: &Value,
+        schema: &crate::catalog::TableSchema,
+        row: &[Value],
     ) -> bool {
         // Parse the CHECK expression and evaluate it against the column value
         // CHECK expressions reference the column by name, e.g. CHECK(age > 0)
         // We build a minimal SELECT with a WHERE clause to reuse existing expression evaluation
-        if *value == Value::Null {
-            return true; // NULL passes CHECK constraints (SQL standard)
-        }
-
         // Strip "CHECK" prefix if present (sqlparser Display may include it)
         let expr_str = check_sql.trim();
         let expr_str = if expr_str.to_uppercase().starts_with("CHECK") {
@@ -28,6 +88,12 @@ impl Executor {
         } else {
             expr_str
         };
+        let expr_str = expr_str.trim();
+        let expr_str = expr_str
+            .strip_prefix('(')
+            .and_then(|inner| inner.strip_suffix(')'))
+            .unwrap_or(expr_str)
+            .trim();
 
         // Try to parse the check expression
         let parse_result = crate::parser::parse_sql(&format!("SELECT 1 WHERE {}", expr_str));
@@ -35,26 +101,11 @@ impl Executor {
             if let Some(sqlparser::ast::Statement::Query(query)) = stmts.first() {
                 if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
                     if let Some(ref where_expr) = select.selection {
-                        // Build a single-column schema and row for evaluation
-                        use crate::catalog::{Column, IndexType, TableSchema};
-                        let schema = TableSchema::new(
-                            "_check".to_string(),
-                            vec![Column {
-                                name: col_name.to_string(),
-                                data_type: "TEXT".to_string(),
-                                is_primary: false,
-                                is_indexed: false,
-                                index_type: IndexType::None,
-                                default_value: None,
-                                is_nullable: true,
-                                is_unique: false,
-                                check_expr: None,
-                            }],
+                        // SQL CHECK passes when the predicate is true or unknown.
+                        return !matches!(
+                            self.evaluate_check_truth(where_expr, row, schema),
+                            Ok(Some(false))
                         );
-                        let row = vec![value.clone()];
-                        return self
-                            .evaluate_expr(where_expr, &row, &schema, &[])
-                            .unwrap_or(false);
                     }
                 }
             }

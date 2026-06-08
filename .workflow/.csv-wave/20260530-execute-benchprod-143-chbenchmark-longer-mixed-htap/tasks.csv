@@ -1,0 +1,2 @@
+id,task,status,next
+BENCHPROD-143,CH-benCHmark longer mixed HTAP,done,"300s t1 passed; 300s t2 exposed write-conflict SQLSTATE gap; PgWire now maps write conflicts to 40001; 300s t2 passed and tightened medium gate consumed the report"

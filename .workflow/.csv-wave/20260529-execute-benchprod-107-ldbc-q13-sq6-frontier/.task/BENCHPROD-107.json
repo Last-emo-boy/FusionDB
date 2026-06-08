@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-107",
+  "title": "Broaden LDBC full test-data coverage through Q13 and Short Query 6 frontiers",
+  "date": "2026-05-29",
+  "status": "completed",
+  "files_touched": [
+    "src/execution/expr/mod.rs",
+    "tests/sql_set_subquery.rs"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo test --release --test pg_integration -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "JDBC PreparedStatement#setLong SQ6 probe against old run WAL copy",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --disable-read-query 14 --operation-count 10 --tool-timeout 360 --preload-timeout 360 --run-name ldbc_snb_native_benchprod107_sq6fix_disable_q14_full_testdata_10ops_20260529"
+  ],
+  "result": "Disable-Q14 full test-data isolation run completed ldbc_command successfully and exercised Q1, Q13, and Short Queries 1-7; overall summary remains gap because Q14 was intentionally disabled.",
+  "evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod107_sq6fix_disable_q14_full_testdata_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+  "next_task": "BENCHPROD-108"
+}

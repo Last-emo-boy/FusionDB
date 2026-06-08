@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-091",
+  "title": "native pgbench smoke runner",
+  "status": "completed",
+  "started_at": "2026-05-28T02:04:13",
+  "completed_at": "2026-05-28T02:08:36",
+  "objective": "Prepare the bench repository to run the real pgbench binary as soon as PostgreSQL client tools are available, while recording current tool_missing evidence.",
+  "scope": [
+    "Add a native pgbench smoke runner that can execute pgbench --version, pgbench -i, and a short transaction run against FusionDB.",
+    "Emit structured reports for passed, gap, and tool_missing states.",
+    "Connect native pgbench evidence into external_smoke.py.",
+    "Document the native pgbench smoke commands in FusionDB-bench README."
+  ],
+  "verification": [
+    "python -m py_compile pgbench_native_smoke.py external_smoke.py pgbench_compat_smoke.py jdbc_smoke.py pgwire_smoke.py fusiondb_matrix.py",
+    "python pgbench_native_smoke.py --run-name pgbench_native_benchprod091_tool_missing_20260528",
+    "python external_smoke.py --run-name external_smoke_benchprod091_pgbench_native_evidence_20260528 --target pgbench --pgwire-evidence runs\\pgwire_smoke_benchprod087_jdbc_catalog_final_20260527\\pgwire_smoke_summary.json --jdbc-evidence runs\\jdbc_smoke_benchprod089_txn_extended_final_20260528\\jdbc_smoke_summary.json --pgbench-compat-evidence runs\\pgbench_compat_benchprod090_add_primary_key_20260528\\pgbench_compat_smoke_summary.json --pgbench-native-evidence runs\\pgbench_native_benchprod091_tool_missing_20260528\\pgbench_native_smoke_summary.json"
+  ],
+  "current_environment_result": "pgbench is not installed on PATH; native smoke report status is tool_missing.",
+  "next_candidates": [
+    "Install PostgreSQL client tools under E:\\Playground\\tools\\postgresql-client and rerun pgbench_native_smoke.py with --pgbench-bin.",
+    "If pgbench -i reaches a new FusionDB gap, fix the captured DDL/COPY/protocol failure.",
+    "Start BenchBase artifact bootstrap after pgbench native smoke has at least an init gap or pass."
+  ]
+}

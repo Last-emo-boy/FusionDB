@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-096",
+  "title": "LDBC artifact bootstrap",
+  "status": "completed",
+  "description": "Add a reproducible LDBC SNB Interactive v1 artifact bootstrap path using portable Maven, official driver/impl repositories, and bounded artifact discovery.",
+  "files": [
+    "E:/Playground/FusionDB-bench/install_external_tools.ps1",
+    "E:/Playground/FusionDB-bench/external_bootstrap.py",
+    "E:/Playground/FusionDB-bench/ldbc_snb_native_smoke.py",
+    "E:/Playground/FusionDB-bench/external_smoke.py",
+    "E:/Playground/FusionDB-bench/bench_gate.py",
+    "E:/Playground/FusionDB-bench/README.md"
+  ],
+  "evidence": [
+    "E:/Playground/FusionDB-bench/runs/external_bootstrap_benchprod096_ldbc_artifact_bootstrap_20260529_fast/external_bootstrap_summary.json",
+    "E:/Playground/FusionDB-bench/runs/ldbc_snb_native_benchprod096_driver_help_20260529/ldbc_snb_native_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod096_all_targets_ldbc_artifact_bootstrap_with_tsbs_path_20260529/external_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod096_ldbc_artifact_bootstrap_strict_20260529/bench_gate_summary.json",
+    "E:/Playground/ldbc-snb/build_logs/driver_maven_package.log",
+    "E:/Playground/ldbc-snb/build_logs/impls_postgres_maven_package.log"
+  ],
+  "result": "LDBC artifact blocker moved from missing to configurable/tool_available. Strict native gate remains failed because help mode is not a workload command and memtier_benchmark is still missing."
+}

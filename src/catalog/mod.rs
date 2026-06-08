@@ -48,7 +48,14 @@ impl TableSchema {
     }
 
     pub fn get_column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name == name)
+        self.columns
+            .iter()
+            .position(|c| c.name == name)
+            .or_else(|| {
+                self.columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(name))
+            })
     }
 }
 
@@ -127,6 +134,13 @@ mod tests {
         let schema = sample_schema();
         assert_eq!(schema.get_column_index("name"), Some(1));
         assert_eq!(schema.get_column_index("email"), Some(2));
+    }
+
+    #[test]
+    fn test_get_column_index_matches_unquoted_postgres_identifiers_case_insensitively() {
+        let schema = sample_schema();
+        assert_eq!(schema.get_column_index("NAME"), Some(1));
+        assert_eq!(schema.get_column_index("Email"), Some(2));
     }
 
     #[test]

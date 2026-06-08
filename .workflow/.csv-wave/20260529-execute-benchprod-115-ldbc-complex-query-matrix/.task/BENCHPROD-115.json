@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-115",
+  "title": "Add LDBC complex-query isolation matrix",
+  "date": "2026-05-29",
+  "status": "completed",
+  "files_touched": [
+    "E:\\Playground\\FusionDB-bench\\ldbc_snb_complex_matrix.py"
+  ],
+  "verification": [
+    "python -m py_compile ldbc_snb_complex_matrix.py ldbc_snb_native_smoke.py external_bootstrap.py",
+    "python ldbc_snb_complex_matrix.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --queries Q4,Q6,Q10,Q14 --operation-count 1 --duration 10 --warmup 0 --tool-timeout 240 --preload-timeout 360 --case-timeout 900 --run-name ldbc_snb_complex_matrix_benchprod115_q4_q6_q10_q14_20260529",
+    "python ldbc_snb_complex_matrix.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --queries all --operation-count 1 --duration 10 --warmup 0 --tool-timeout 240 --preload-timeout 360 --case-timeout 900 --run-name ldbc_snb_complex_matrix_benchprod115_all_q1_q14_20260529"
+  ],
+  "result": "Added a repeatable LDBC complex-query isolation matrix and captured 14/14 command-mode pass evidence for LdbcQuery1 through LdbcQuery14.",
+  "evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_complex_matrix_benchprod115_all_q1_q14_20260529\\ldbc_snb_complex_matrix_summary.json",
+  "labels": [
+    "native-command-mode-isolation-matrix",
+    "ldbc-complex-q1-q14",
+    "q6-covered",
+    "updates-disabled",
+    "not-full-official-ldbc-pass"
+  ],
+  "known_limits": [
+    "This is not a full official LDBC benchmark pass.",
+    "Each matrix case disables all other read queries and all short reads.",
+    "Updates remain disabled in the underlying generated LDBC properties.",
+    "The matrix proves per-query command-mode coverage, not official mixed scheduling semantics."
+  ],
+  "next_task": "BENCHPROD-116"
+}

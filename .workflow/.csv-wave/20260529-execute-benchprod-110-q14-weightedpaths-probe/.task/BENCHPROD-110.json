@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-110",
+  "title": "Optimize Q14 weightedpaths expression-key indexed probe",
+  "date": "2026-05-29",
+  "status": "completed",
+  "files_touched": [
+    "E:\\Playground\\FusionDB\\src\\execution\\expr\\mod.rs",
+    "E:\\Playground\\FusionDB\\src\\execution\\scan\\join.rs",
+    "E:\\Playground\\FusionDB\\src\\execution\\query\\mod.rs",
+    "E:\\Playground\\FusionDB\\tests\\sql_join.rs",
+    "E:\\Playground\\FusionDB-bench\\ldbc_q14_profile.py"
+  ],
+  "verification": [
+    "python -m py_compile ldbc_q14_profile.py",
+    "cargo fmt --check",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo test --release --test pg_integration -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python ldbc_q14_profile.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --preload-postgres-test-data --preload-max-rows-per-file 40 --create-q14-indexes --query-timeout 15 --tool-timeout 80 --preload-timeout 180 --run-name ldbc_q14_profile_benchprod110_prefix40_indexes_20260529",
+    "python ldbc_q14_profile.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --preload-postgres-test-data --preload-max-rows-per-file 0 --create-q14-indexes --query-timeout 60 --tool-timeout 90 --preload-timeout 360 --run-name ldbc_q14_profile_benchprod110_full_testdata_expr_probe_20260529"
+  ],
+  "result": "Q14 weightedpaths full test-data profiler stage improved from 90-second timeout with indexes alone to a passing 1116 ms run after expression-key indexed probe support.",
+  "evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_q14_profile_benchprod110_full_testdata_expr_probe_20260529\\ldbc_q14_profile_summary.json",
+  "labels": [
+    "profiler",
+    "full-testdata-target-pair",
+    "not-full-native-ldbc-pass"
+  ],
+  "next_task": "BENCHPROD-111"
+}

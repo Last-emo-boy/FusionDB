@@ -1,0 +1,11 @@
+{
+  "id": "BENCHPROD-085",
+  "status": "completed",
+  "title": "PgWire protocol smoke readiness for production benchmark adapters",
+  "completed_at": "2026-05-27T22:29:11+08:00",
+  "artifacts": {
+    "external_precheck": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod085_precheck_20260527/external_smoke_summary.md",
+    "pgwire_smoke": "E:/Playground/FusionDB-bench/runs/pgwire_smoke_benchprod085_final_20260527/pgwire_smoke_summary.md"
+  },
+  "followup": "BENCHPROD-086"
+}

@@ -1,0 +1,54 @@
+{
+  "id": "BENCHPROD-101",
+  "title": "LDBC recursive query isolation harness",
+  "date": "2026-05-29",
+  "status": "completed_with_next_gap",
+  "steps": [
+    {
+      "step": "Add repeatable disable-read-query support to LDBC native smoke",
+      "status": "completed"
+    },
+    {
+      "step": "Mark disabled-query LDBC runs as isolation-only gap evidence",
+      "status": "completed"
+    },
+    {
+      "step": "Expose isolation mode in external smoke and production gate checks",
+      "status": "completed"
+    },
+    {
+      "step": "Run Query 14 and Query 13/14 isolation commands to find next blockers",
+      "status": "completed"
+    },
+    {
+      "step": "Run Query 12/13/14 isolation command to verify pass-prevention marker",
+      "status": "completed"
+    },
+    {
+      "step": "Document recursive CTE coverage and diagnosis-only semantics",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "py_compile": "python -m py_compile ldbc_snb_native_smoke.py external_smoke.py bench_gate.py external_bootstrap.py: passed",
+    "help": "python ldbc_snb_native_smoke.py --help: passed",
+    "disable_q14": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod101_disable_q14_isolate_20rows_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "disable_q13_q14": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod101_disable_q13_q14_isolate_20rows_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "disable_q12_q13_q14": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod101_disable_q12_q13_q14_isolate_20rows_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "external_smoke_isolation": "E:\\Playground\\FusionDB-bench\\runs\\external_smoke_benchprod101_ldbc_isolation_marker_20260529\\external_smoke_summary.json",
+    "external_smoke_default_skip": "E:\\Playground\\FusionDB-bench\\runs\\external_smoke_benchprod101_default_ldbc_evidence_skip_isolation_20260529\\external_smoke_summary.json",
+    "strict_gate_isolation": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod101_ldbc_isolation_marker_strict_20260529\\bench_gate_summary.json"
+  },
+  "discoveries": [
+    "Disabling LdbcQuery14 exposes LdbcQuery13 as the next dynamic blocker.",
+    "Disabling LdbcQuery13 and LdbcQuery14 exposes LdbcQuery12 as the next dynamic blocker.",
+    "Disabling LdbcQuery12, LdbcQuery13, and LdbcQuery14 lets the 10-operation sample complete LdbcQuery1 and LdbcQuery11, but the harness correctly reports gap because isolation_mode=true.",
+    "Official PostgreSQL implementation recursive CTE use appears in complex queries 12, 13, 14 and short queries 2, 6."
+  ],
+  "remaining_blockers": [
+    "memtier native tool/probe missing",
+    "LDBC WITH RECURSIVE support across Query 12, Query 13, Query 14, Short Query 2, and Short Query 6",
+    "Post-recursive Query 14 PostgreSQL SQL coverage: arrays, generate_subscripts, row_number window function, and nested aggregation"
+  ],
+  "next_task": "BENCHPROD-102: implement bounded recursive CTE support or a semantically equivalent LDBC adapter path"
+}

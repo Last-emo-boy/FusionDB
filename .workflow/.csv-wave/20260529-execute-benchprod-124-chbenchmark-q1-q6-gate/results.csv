@@ -1,0 +1,4 @@
+task,status,evidence
+chbenchmark_q6_probe,passed,"E:\Playground\FusionDB-bench\runs\chbenchmark_query_class_matrix_benchprod124_q6_probe_20260529\chbenchmark_query_class_matrix_summary.json"
+chbenchmark_q1_q6_matrix,passed,"E:\Playground\FusionDB-bench\runs\chbenchmark_query_class_matrix_benchprod124_q1_q2_q3_q4_q5_q6_20260529\chbenchmark_query_class_matrix_summary.json"
+strict_gate_explicit_q1_q6,passed,"E:\Playground\FusionDB-bench\runs\gate_benchprod124_strict_explicit_q1_q2_q3_q4_q5_q6_20260529\bench_gate_summary.json"

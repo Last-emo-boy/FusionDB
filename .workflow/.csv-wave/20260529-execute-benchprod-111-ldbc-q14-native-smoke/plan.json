@@ -1,0 +1,92 @@
+{
+  "id": "BENCHPROD-111",
+  "title": "Retry native LDBC command-mode smoke with Q14 enabled",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-110 after Q14 weightedpaths profiler no longer timed out on full test-data",
+      "status": "completed"
+    },
+    {
+      "step": "Add optional Q14 message-index creation to ldbc_snb_native_smoke.py for command-mode native runs",
+      "status": "completed"
+    },
+    {
+      "step": "Run Q14-enabled full test-data native LDBC command-mode smoke with 10 requested operations",
+      "status": "completed"
+    },
+    {
+      "step": "Classify the initial LdbcQuery1 nested array failure separately from the Q14 weightedpaths fix",
+      "status": "completed"
+    },
+    {
+      "step": "Fix projection dependency extraction for array_agg(ARRAY[...]) expressions and add regression coverage",
+      "status": "completed"
+    },
+    {
+      "step": "Rebuild release binary and rerun Q14-enabled native smoke",
+      "status": "completed"
+    },
+    {
+      "step": "Run focused Rust and bench-harness verification after the final array projection fix",
+      "status": "completed"
+    },
+    {
+      "step": "Record smoke evidence conservatively without claiming full official LDBC coverage",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "bench_script": "E:\\Playground\\FusionDB-bench\\ldbc_snb_native_smoke.py",
+    "bench_hint_update": "E:\\Playground\\FusionDB-bench\\external_bootstrap.py",
+    "initial_gap_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod111_q14_enabled_full_testdata_10ops_indexes_20260529\\ldbc_snb_native_smoke_summary.json",
+    "successful_smoke_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod111_q14_enabled_full_testdata_10ops_indexes_arrayfix_20260529\\ldbc_snb_native_smoke_summary.json",
+    "verification": [
+      "python -m py_compile external_bootstrap.py ldbc_snb_native_smoke.py ldbc_q14_profile.py: passed",
+      "cargo fmt --check: passed",
+      "cargo test --test sql_set_subquery -- --nocapture: 34/34 passed",
+      "cargo test --test sql_join -- --nocapture: 22/22 passed",
+      "cargo build --release --bin fusiondb: passed",
+      "cargo test --release --test pg_integration -- --nocapture: final rerun passed 28/28"
+    ]
+  },
+  "result": {
+    "full_official_ldbc_pass": false,
+    "native_ldbc_q14_enabled_10op_smoke_pass": true,
+    "smoke_scope": "command-mode LDBC SNB Interactive PostgreSQL implementation, preloaded PostgreSQL test-data, Q14 indexes enabled, 10 requested operations, warmup 0, duration 10 seconds",
+    "successful_smoke_metrics": {
+      "reported_status": "passed",
+      "reported_operation_count": 19,
+      "reported_duration_seconds": 1.566,
+      "reported_throughput_ops_per_second": 12.13,
+      "ldbc_query_1_count": 1,
+      "ldbc_query_1_ms": 116,
+      "ldbc_query_14_count": 1,
+      "ldbc_query_14_ms": 1083,
+      "short_query_counts": {
+        "LdbcShortQuery1PersonProfile": 3,
+        "LdbcShortQuery2PersonPosts": 3,
+        "LdbcShortQuery3PersonFriends": 3,
+        "LdbcShortQuery4MessageContent": 2,
+        "LdbcShortQuery5MessageCreator": 2,
+        "LdbcShortQuery6MessageForum": 2,
+        "LdbcShortQuery7MessageReplies": 2
+      }
+    },
+    "initial_gap": {
+      "status": "gap",
+      "operation": "LdbcQuery1",
+      "error": "ClassCastException: class [Ljava.lang.String; cannot be cast to class [[Ljava.lang.Object;",
+      "root_cause": "Projection pushdown dependency extraction missed Expr::Array elements inside array_agg(ARRAY[...]), so nested array result materialization lost required inputs."
+    },
+    "current_frontier": "Q14-enabled native command-mode smoke passes for the small full-testdata run, but full official LDBC coverage remains unproven because the PostgreSQL implementation still reports missing complex-query/update SQL files and the operation mix is narrow."
+  },
+  "remaining_blockers": [
+    "Missing LDBC PostgreSQL query files still appear in stderr: interactive-complex-3-duration-as-function.sql, interactive-complex-4-duration-as-function.sql, interactive-complex-7-with-second.sql, and several interactive-update SQL files.",
+    "The successful smoke exercised LdbcQuery1, LdbcQuery14, and short queries 1-7 only; it did not prove all complex queries or updates.",
+    "This evidence is not a full official/native LDBC benchmark pass.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-112 candidate: supply or fix the missing LDBC PostgreSQL query/update SQL files, then broaden command-mode native smoke operation coverage and keep pass labels separated by operation mix."
+}

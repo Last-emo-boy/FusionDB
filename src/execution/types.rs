@@ -156,18 +156,21 @@ impl Executor {
 
     fn comparison_column_type<'a>(&self, expr: &Expr, schema: &'a TableSchema) -> Option<&'a str> {
         match expr {
-            Expr::Identifier(ident) => schema
-                .columns
-                .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(&ident.value))
-                .map(|column| column.data_type.as_str()),
+            Expr::Identifier(ident) => self
+                .resolve_column_index(&ident.value, schema)
+                .ok()
+                .map(|index| schema.columns[index].data_type.as_str()),
             Expr::CompoundIdentifier(idents) => {
-                let col_name = idents.last()?.value.as_str();
-                schema
-                    .columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(col_name))
-                    .map(|column| column.data_type.as_str())
+                let mut col_name = String::new();
+                for (index, ident) in idents.iter().enumerate() {
+                    if index > 0 {
+                        col_name.push('.');
+                    }
+                    col_name.push_str(&ident.value);
+                }
+                self.resolve_column_index(&col_name, schema)
+                    .ok()
+                    .map(|index| schema.columns[index].data_type.as_str())
             }
             Expr::Nested(expr) | Expr::Cast { expr, .. } => {
                 self.comparison_column_type(expr, schema)
@@ -188,6 +191,12 @@ impl Executor {
                 | "BIGINT"
                 | "TINYINT"
                 | "MEDIUMINT"
+                | "SERIAL"
+                | "SERIAL2"
+                | "SERIAL4"
+                | "SERIAL8"
+                | "SMALLSERIAL"
+                | "BIGSERIAL"
         )
     }
 
@@ -352,6 +361,16 @@ impl Executor {
                 };
                 let dt = date.and_hms_opt(0, 0, 0).unwrap();
                 Ok(Value::Timestamp(dt.and_utc().timestamp_micros()))
+            }
+            Value::Integer(value) => {
+                let micros = if value.abs() >= 1_000_000_000_000_000 {
+                    value / 1_000
+                } else if value.abs() >= 1_000_000_000_000 {
+                    value
+                } else {
+                    value.saturating_mul(1_000_000)
+                };
+                Ok(Value::Timestamp(micros))
             }
             Value::String(s) => Value::timestamp_from_str(&s)
                 .ok_or_else(|| FusionError::Execution(format!("Cannot cast '{}' to TIMESTAMP", s))),

@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 
 pub mod http_server;
 pub mod pg_server;
+pub mod redis_server;
 pub mod tcp_server;
 pub mod tls;
 
@@ -75,6 +76,22 @@ pub async fn start_server(
             },
         }
     });
+
+    if config.server.redis_enabled {
+        let mut redis_rx = shutdown_tx.subscribe();
+        let redis_storage = storage.clone();
+        let redis_port = config.server.redis_port;
+        let redis_bind = config.server.bind.clone();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = redis_server::start_redis_server(redis_storage, &redis_bind, redis_port) => {},
+                _ = redis_rx.recv() => {
+                    println!("[shutdown] Redis-compatible server stopping...");
+                },
+            }
+        });
+    }
 
     println!(
         "  Distributed: isolated (OpenRaft module is available but not wired into start_server)"

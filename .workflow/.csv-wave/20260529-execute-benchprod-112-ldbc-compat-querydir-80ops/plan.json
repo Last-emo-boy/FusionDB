@@ -1,0 +1,147 @@
+{
+  "id": "BENCHPROD-112",
+  "title": "Generate run-local LDBC queryDir compatibility files and broaden native smoke coverage",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-111 missing PostgreSQL query/update SQL file gaps",
+      "status": "completed"
+    },
+    {
+      "step": "Generate a run-local ldbc_queries directory instead of modifying the external ldbc-snb checkout",
+      "status": "completed"
+    },
+    {
+      "step": "Add compatibility aliases and inline update SQL files required by the PostgreSQL implementation loader",
+      "status": "completed"
+    },
+    {
+      "step": "Run Q14-enabled 10-op native command-mode smoke to confirm query-load stderr is gone",
+      "status": "completed"
+    },
+    {
+      "step": "Broaden to an 80-op command-mode smoke and classify newly exposed LDBC blockers",
+      "status": "completed"
+    },
+    {
+      "step": "Fix timestamp/date/interval arithmetic needed by the LdbcQuery4 SQL shape",
+      "status": "completed"
+    },
+    {
+      "step": "Fix ORDER BY projection preference for the LdbcQuery7 ambiguous l_creationdate shape",
+      "status": "completed"
+    },
+    {
+      "step": "Run focused isolation checks for Q6, Q7, Q12, and Q13",
+      "status": "completed"
+    },
+    {
+      "step": "Rerun the broadened 80-op command-mode smoke after the interval and ORDER BY fixes",
+      "status": "completed"
+    },
+    {
+      "step": "Record evidence conservatively as native command-mode smoke, not a full official LDBC pass",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "bench_script": "E:\\Playground\\FusionDB-bench\\ldbc_snb_native_smoke.py",
+    "successful_10op_compat_query_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_q14_enabled_10ops_compat_queries_20260529\\ldbc_snb_native_smoke_summary.json",
+    "initial_80op_interval_gap_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_q14_enabled_80ops_compat_queries_20260529\\ldbc_snb_native_smoke_summary.json",
+    "successful_80op_interval_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_q14_enabled_80ops_intervalfix_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q6_isolation_gap_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_isolate_q6_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q7_initial_gap_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_isolate_q7_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q7_orderfix_isolation_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_isolate_q7_orderfix_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q12_isolation_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_isolate_q12_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q13_isolation_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_isolate_q13_20260529\\ldbc_snb_native_smoke_summary.json",
+    "final_80op_smoke_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_q14_enabled_80ops_orderfix_20260529\\ldbc_snb_native_smoke_summary.json",
+    "final_80op_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_q14_enabled_80ops_orderfix_20260529\\ldbc_results\\fusiondb-results.json",
+    "verification": [
+      "python -m py_compile ldbc_snb_native_smoke.py external_bootstrap.py: passed",
+      "cargo fmt --check: passed",
+      "cargo test --test sql_expr_functions -- --nocapture: 21/21 passed",
+      "cargo test --test sql_join -- --nocapture: 23/23 passed",
+      "cargo build --release --bin fusiondb: passed"
+    ]
+  },
+  "result": {
+    "full_official_ldbc_pass": false,
+    "native_ldbc_q14_enabled_80op_smoke_pass": true,
+    "smoke_scope": "command-mode LDBC SNB Interactive PostgreSQL implementation, preloaded PostgreSQL test-data, run-local compatibility queryDir, updates disabled, Q14 indexes enabled, 80 requested operations, warmup 0, duration 20 seconds",
+    "query_load_gap_removed": true,
+    "final_smoke_metrics": {
+      "reported_status": "passed",
+      "reported_operation_count": 80,
+      "reported_total_duration_ms": 47971,
+      "reported_throughput_ops_per_second": 1.667674219841154,
+      "complex_queries_exercised": {
+        "LdbcQuery1": {
+          "count": 1,
+          "ms": 123
+        },
+        "LdbcQuery2": {
+          "count": 1,
+          "ms": 37
+        },
+        "LdbcQuery3": {
+          "count": 1,
+          "ms": 189
+        },
+        "LdbcQuery4": {
+          "count": 1,
+          "ms": 41330
+        },
+        "LdbcQuery5": {
+          "count": 1,
+          "ms": 247
+        },
+        "LdbcQuery8": {
+          "count": 1,
+          "ms": 41
+        },
+        "LdbcQuery9": {
+          "count": 1,
+          "ms": 109
+        },
+        "LdbcQuery10": {
+          "count": 1,
+          "ms": 2010
+        },
+        "LdbcQuery11": {
+          "count": 1,
+          "ms": 40
+        },
+        "LdbcQuery14": {
+          "count": 1,
+          "ms": 1138
+        }
+      },
+      "short_queries_exercised": {
+        "LdbcShortQuery1PersonProfile": 10,
+        "LdbcShortQuery2PersonPosts": 10,
+        "LdbcShortQuery3PersonFriends": 10,
+        "LdbcShortQuery4MessageContent": 10,
+        "LdbcShortQuery5MessageCreator": 10,
+        "LdbcShortQuery6MessageForum": 10,
+        "LdbcShortQuery7MessageReplies": 10
+      }
+    },
+    "isolation_findings": {
+      "LdbcQuery6": "ldbc_command timed out after 180 seconds with 2 of 3 operations completed; treat as performance blocker, not a confirmed functional error.",
+      "LdbcQuery7": "ldbc_command passed after ORDER BY projection preference fix; isolation summary remains gap by design because isolation mode disables other read queries.",
+      "LdbcQuery12": "ldbc_command passed, 1 operation at 181 ms; isolation summary remains gap by design.",
+      "LdbcQuery13": "ldbc_command passed, 1 operation at 93 ms; isolation summary remains gap by design."
+    },
+    "stderr_boundary": "Final broad smoke no longer reports Unable to load query; stderr contains only SLF4J no-provider warnings."
+  },
+  "remaining_blockers": [
+    "This is not a full official/native LDBC benchmark pass.",
+    "Updates remain disabled in the generated LDBC properties even though compatibility update SQL files are now present.",
+    "The final broad 80-op stream did not exercise every complex query in one run; Q7, Q12, and Q13 are covered only by isolation commands.",
+    "LdbcQuery6 remains a performance blocker and timed out in isolation after 180 seconds.",
+    "LdbcQuery4 is functionally passing but very slow at about 41.3 seconds for one operation.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-113 candidate: optimize LdbcQuery6 performance, starting from the isolate_q6 timeout evidence and Q6 SQL shape."
+}

@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-095",
+  "title": "LDBC SNB install target and blocker refresh",
+  "status": "completed",
+  "started_at": "2026-05-29T01:20:00+08:00",
+  "completed_at": "2026-05-29T01:45:00+08:00",
+  "objective": "Move the strict native LDBC blocker from an ad hoc missing-artifact state into the common external benchmark install/bootstrap workflow, without claiming native LDBC success before a real artifact and workload command exist.",
+  "scope": [
+    "Add LDBC SNB as a first-class install_external_tools.ps1 target.",
+    "Keep LDBC discovery bounded to expected local tool/artifact locations so diagnostics finish quickly.",
+    "Emit explicit environment configuration and native smoke commands when an artifact is configured or locally discoverable.",
+    "Refresh LDBC bootstrap/native smoke/external smoke evidence with artifact_missing as the current blocker."
+  ],
+  "verification": [
+    "powershell -NoProfile -ExecutionPolicy Bypass -File .\\install_external_tools.ps1 -Target ldbc",
+    "PowerShell Parser.ParseFile install_external_tools.ps1",
+    "python -m py_compile external_bootstrap.py external_smoke.py ldbc_snb_native_smoke.py bench_gate.py",
+    "python external_bootstrap.py --target ldbc --search-root E:\\Playground\\FusionDB-bench --run-name external_bootstrap_benchprod095_ldbc_install_target_20260529",
+    "python ldbc_snb_native_smoke.py --run-name ldbc_snb_native_benchprod095_install_target_20260529 --search-root E:\\Playground\\FusionDB-bench --artifact-scan-depth 3",
+    "python external_smoke.py --target ldbc --ldbc-native-evidence runs\\ldbc_snb_native_benchprod095_install_target_20260529\\ldbc_snb_native_smoke_summary.json --run-name external_smoke_benchprod095_ldbc_install_target_20260529"
+  ],
+  "verification_status": "passed_with_expected_artifact_blocker",
+  "current_environment_result": "Java/JDBC prerequisites exist and LDBC native smoke generated config evidence, but no LDBC_SNB_HOME/LDBC_DRIVER_HOME or local LDBC artifact is configured. Native LDBC remains artifact_missing by design.",
+  "next_candidates": [
+    "Place or build the LDBC SNB driver/datagen distribution under E:\\Playground\\ldbc-snb.",
+    "Run install_external_tools.ps1 -Target ldbc again and configure LDBC_SNB_HOME.",
+    "Run ldbc_snb_native_smoke.py with run-mode=help against the configured artifact.",
+    "Provide an explicit --ldbc-command template for the chosen distribution and capture the first real schema/import/workload gap."
+  ]
+}

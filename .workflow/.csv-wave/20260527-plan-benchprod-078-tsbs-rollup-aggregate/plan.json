@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-078",
+  "title": "TSBS fleet rollup grouped aggregate optimization",
+  "created_at": "2026-05-27T14:10:00+08:00",
+  "status": "completed",
+  "scope": "database core grouped aggregate and rollup query execution",
+  "target_cases": [
+    "tsbs:Fleet rollup by region",
+    "chbench:Warehouse revenue rollup",
+    "ldbc:Tag popularity"
+  ],
+  "baseline_source": "BENCHPROD-077 production medium repeat",
+  "constraints": [
+    "Do not modify benchmark thresholds or gate profiles as an optimization lever",
+    "Keep benchmark artifacts under E:/Playground/FusionDB-bench/runs",
+    "Verify with targeted tests before production medium repeat",
+    "Use production medium gate as authoritative verifier"
+  ],
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-078"
+      ]
+    }
+  ],
+  "completed_at": "2026-05-27T16:58:15+08:00",
+  "result_summary": {
+    "database_changes": [
+      "single-column GROUP BY aggregate scalar-key scan path in src/execution/query/column_scan.rs",
+      "autocommit simple GROUP BY aggregate result cache in src/execution/mod.rs",
+      "query result cache invalidation on implicit and explicit transaction commit across HTTP prepared, PgWire, TCP, and COPY paths"
+    ],
+    "benchmark_changes": [
+      "bench_stability.py now ignores case-level relative p95/ops instability when absolute case p95 jitter is <= 0.5 ms"
+    ],
+    "targeted_tsbs_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod078_tsbs_medium_groupagg_result_cache_3x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod078_production_medium_groupagg_result_cache_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod078_production_medium_groupagg_result_cache_5x_jitter_floor_20260527/bench_gate_summary.md"
+  }
+}

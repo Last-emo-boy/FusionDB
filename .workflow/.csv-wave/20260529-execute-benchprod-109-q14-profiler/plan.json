@@ -1,0 +1,86 @@
+{
+  "id": "BENCHPROD-109",
+  "title": "Add targeted LDBC Query 14 stage profiler",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-108 where non-isolation full test-data LDBC still timed out with Q14 enabled",
+      "status": "completed"
+    },
+    {
+      "step": "Add a dedicated FusionDB-bench Q14 profiling harness using existing LDBC PostgreSQL test-data preload",
+      "status": "completed"
+    },
+    {
+      "step": "Split Q14 into measurable stages: search_graph, paths, edges, unique_edges, weightedpaths",
+      "status": "completed"
+    },
+    {
+      "step": "Run prefix40 profiler smoke to verify harness correctness",
+      "status": "completed"
+    },
+    {
+      "step": "Run full test-data profiler to identify the active Q14 bottleneck",
+      "status": "completed"
+    },
+    {
+      "step": "Record profiler evidence without claiming a full native LDBC pass",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "script": "E:\\Playground\\FusionDB-bench\\ldbc_q14_profile.py",
+    "prefix40_profile": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_q14_profile_benchprod109_prefix40_smoke3_20260529\\ldbc_q14_profile_summary.json",
+    "full_testdata_profile": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_q14_profile_benchprod109_full_testdata_20260529\\ldbc_q14_profile_summary.json",
+    "python_compile": "python -m py_compile ldbc_q14_profile.py: passed",
+    "fmt": "cargo fmt --check: passed"
+  },
+  "result": {
+    "ldbc_full_native_pass": false,
+    "profiler_added": true,
+    "prefix40_profile_status": "passed",
+    "full_testdata_profile_status": "gap",
+    "full_testdata_stages": [
+      {
+        "name": "search_graph",
+        "status": "passed",
+        "elapsed_ms": 56,
+        "row_count": 506,
+        "max_depth": 2
+      },
+      {
+        "name": "paths",
+        "status": "passed",
+        "elapsed_ms": 60,
+        "path_count": 7
+      },
+      {
+        "name": "edges",
+        "status": "passed",
+        "elapsed_ms": 60,
+        "edge_count": 14
+      },
+      {
+        "name": "unique_edges",
+        "status": "passed",
+        "elapsed_ms": 63,
+        "unique_edge_count": 14
+      },
+      {
+        "name": "weightedpaths",
+        "status": "gap",
+        "error": "command timed out after 90 seconds"
+      }
+    ],
+    "current_frontier": "Q14 full test-data is no longer a black-box recursive CTE timeout. The recursive/path/edge stages are small and fast; the active bottleneck is weightedpaths message-pair scoring and aggregation."
+  },
+  "remaining_blockers": [
+    "BENCHPROD-109 is targeted diagnostic evidence, not a full official/native LDBC benchmark pass.",
+    "Full native LDBC remains blocked because weightedpaths times out in Q14 full test-data profiling.",
+    "Next optimization should focus on the unique_edges x message x message scoring joins and grouped aggregation.",
+    "The configured LDBC PostgreSQL implementation still logs missing update-query files in command-mode runs, so update coverage is not proven.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-110 candidate: optimize Q14 weightedpaths/message-pair scoring through join ordering, indexed creator/reply lookups, or a targeted semi-join/materialization path."
+}

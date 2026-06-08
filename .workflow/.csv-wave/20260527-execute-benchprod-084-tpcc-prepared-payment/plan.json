@@ -1,0 +1,59 @@
+{
+  "id": "BENCHPROD-084",
+  "title": "TPC-C prepared Payment transaction and production gate sampling",
+  "created_at": "2026-05-27T21:47:00+08:00",
+  "completed_at": "2026-05-27T22:11:09+08:00",
+  "status": "completed",
+  "scope": "TPC-C Payment latency/stability and production medium gate evidence quality",
+  "target_cases": [
+    "tpcc:Payment transaction"
+  ],
+  "baseline_source": "E:/Playground/FusionDB-bench/runs/gate_benchprod083_production_medium_prepared_neworder_no_results_recalc_5x_20260527/bench_gate_summary.md",
+  "constraints": [
+    "Do not relax suite latency/throughput thresholds",
+    "Do not add Payment or newly observed cases to the allowlist to force a pass",
+    "Keep production verification on scale=medium suite=production load_mode=insert",
+    "Use production medium gate as authoritative verifier"
+  ],
+  "steps": [
+    {
+      "step": "Convert Payment to prepared multi-statement",
+      "status": "completed"
+    },
+    {
+      "step": "Run targeted TPC-C repeat",
+      "status": "completed"
+    },
+    {
+      "step": "Diagnose production gate noise from low per-case sample count",
+      "status": "completed"
+    },
+    {
+      "step": "Add production gate minimum case sample check",
+      "status": "completed"
+    },
+    {
+      "step": "Run high-sample production repeat and gate",
+      "status": "completed"
+    }
+  ],
+  "result_summary": {
+    "benchmark_changes": [
+      "converted tpcc:Payment transaction from three independent HTTP /query calls to one parameterized prepared multi-statement /execute call",
+      "suppressed unused Payment result payloads with return_results=false",
+      "added production gate min_case_samples support",
+      "set production_medium min_case_samples=60",
+      "documented --iters 60 --warmup 5 for production gate repeat runs"
+    ],
+    "tests": [
+      "python -m py_compile fusiondb_bench.py bench_repeat.py bench_stability.py bench_gate.py fusiondb_matrix.py",
+      "cargo build --release --bin fusiondb"
+    ],
+    "negative_gate_check": "E:/Playground/FusionDB-bench/runs/gate_benchprod084_sample_check_expected_fail_20260527/bench_gate_summary.md",
+    "targeted_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod084_tpcc_medium_prepared_payment_5x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod084_production_medium_prepared_payment_60iters_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod084_production_medium_prepared_payment_60iters_5x_20260527/bench_gate_summary.md",
+    "production_gate_status": "passed 23/23"
+  },
+  "followup": "BENCHPROD-085"
+}

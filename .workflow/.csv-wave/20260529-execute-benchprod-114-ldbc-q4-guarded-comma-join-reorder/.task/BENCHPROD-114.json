@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-114",
+  "title": "Optimize LDBC Query4 with guarded comma-join reorder",
+  "date": "2026-05-29",
+  "status": "completed",
+  "files_touched": [
+    "E:\\Playground\\FusionDB\\src\\execution\\scan\\join.rs",
+    "E:\\Playground\\FusionDB\\src\\execution\\query\\mod.rs",
+    "E:\\Playground\\FusionDB\\tests\\sql_join.rs"
+  ],
+  "verification": [
+    "python -m py_compile ldbc_snb_native_smoke.py external_bootstrap.py",
+    "cargo fmt --check",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --disable-read-query LdbcQuery1 --disable-read-query LdbcQuery2 --disable-read-query LdbcQuery3 --disable-read-query LdbcQuery5 --disable-read-query LdbcQuery6 --disable-read-query LdbcQuery7 --disable-read-query LdbcQuery8 --disable-read-query LdbcQuery9 --disable-read-query LdbcQuery10 --disable-read-query LdbcQuery11 --disable-read-query LdbcQuery12 --disable-read-query LdbcQuery13 --disable-read-query LdbcQuery14 --disable-read-query LdbcShortQuery1PersonProfile --disable-read-query LdbcShortQuery2PersonPosts --disable-read-query LdbcShortQuery3PersonFriends --disable-read-query LdbcShortQuery4MessageContent --disable-read-query LdbcShortQuery5MessageCreator --disable-read-query LdbcShortQuery6MessageForum --disable-read-query LdbcShortQuery7MessageReplies --create-q6-indexes --operation-count 1 --duration 10 --warmup 0 --tool-timeout 180 --preload-timeout 360 --run-name ldbc_snb_native_benchprod114_isolate_q4_reorder_retry_20260529",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --disable-read-query LdbcQuery1 --disable-read-query LdbcQuery2 --disable-read-query LdbcQuery3 --disable-read-query LdbcQuery4 --disable-read-query LdbcQuery5 --disable-read-query LdbcQuery6 --disable-read-query LdbcQuery7 --disable-read-query LdbcQuery8 --disable-read-query LdbcQuery9 --disable-read-query LdbcQuery11 --disable-read-query LdbcQuery12 --disable-read-query LdbcQuery13 --disable-read-query LdbcQuery14 --disable-read-query LdbcShortQuery1PersonProfile --disable-read-query LdbcShortQuery2PersonPosts --disable-read-query LdbcShortQuery3PersonFriends --disable-read-query LdbcShortQuery4MessageContent --disable-read-query LdbcShortQuery5MessageCreator --disable-read-query LdbcShortQuery6MessageForum --disable-read-query LdbcShortQuery7MessageReplies --create-q6-indexes --operation-count 1 --duration 10 --warmup 0 --tool-timeout 180 --preload-timeout 360 --run-name ldbc_snb_native_benchprod114_isolate_q10_after_q4_guard_20260529",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --create-q14-indexes --create-q6-indexes --operation-count 80 --duration 20 --warmup 0 --tool-timeout 240 --preload-timeout 360 --run-name ldbc_snb_native_benchprod114_q4_guard_80ops_20260529"
+  ],
+  "result": "Guarded Q4 comma-join reorder reduced the sampled LdbcQuery4 runtime from 39,368 ms in BENCHPROD-113 to 118 ms in the final BENCHPROD-114 80-op native command-mode smoke.",
+  "evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_q4_guard_80ops_20260529\\ldbc_snb_native_smoke_summary.json",
+  "metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_q4_guard_80ops_20260529\\ldbc_results\\fusiondb-results.json",
+  "labels": [
+    "native-command-mode-smoke",
+    "q4-optimized",
+    "guarded-comma-join-reorder",
+    "q14-enabled",
+    "q6-indexes-enabled",
+    "80-requested-operations",
+    "updates-disabled",
+    "not-full-official-ldbc-pass"
+  ],
+  "known_limits": [
+    "This is not a full official LDBC benchmark pass.",
+    "Updates are still disabled in generated LDBC properties.",
+    "The final 80-op broad smoke did not sample LdbcQuery6 in metrics.",
+    "Q4 optimization is intentionally guarded to the LDBC Q4 table shape after a broader attempt exposed Q10 self-join ambiguity.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-115"
+}

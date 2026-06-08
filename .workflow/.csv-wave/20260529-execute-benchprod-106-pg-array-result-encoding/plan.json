@@ -1,0 +1,60 @@
+{
+  "id": "BENCHPROD-106",
+  "title": "Make PgWire nested array results decodable by PostgreSQL JDBC",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Audit BENCHPROD-105 Q14 PgArray decode failure and PgWire Value::Array encoding",
+      "status": "completed"
+    },
+    {
+      "step": "Encode Value::Array results as PostgreSQL brace array literals instead of Rust debug strings",
+      "status": "completed"
+    },
+    {
+      "step": "Infer array result metadata as PostgreSQL array OIDs, including CTE-derived Q14 path projections",
+      "status": "completed"
+    },
+    {
+      "step": "Force array result fields to text format so payload format matches field metadata",
+      "status": "completed"
+    },
+    {
+      "step": "Add PgJDBC pg_type array element metadata coverage required by PgArray.getArray()",
+      "status": "completed"
+    },
+    {
+      "step": "Run Rust regressions, release build, and bounded native LDBC 40-row smoke",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "initial_ldbc_frontier": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod105_pg_describe_prefix40_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "intermediate_pg_type_frontier": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod106_pg_array_prefix40_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "final_ldbc_prefix40_pass": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod106_pg_array_pgtype_prefix40_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "fmt": "cargo fmt --check: passed",
+    "sql_set_subquery": "cargo test --test sql_set_subquery -- --nocapture: 25 passed",
+    "sql_expr_functions_targeted": "cargo test --test sql_expr_functions test_string_concat_operator -- --nocapture: passed",
+    "pg_integration_release": "cargo test --release --test pg_integration -- --nocapture: 26 passed",
+    "release_binary": "cargo build --release --bin fusiondb: passed"
+  },
+  "result": {
+    "ldbc_full_native_pass": false,
+    "bounded_ldbc_prefix40_command_pass": true,
+    "bounded_ldbc_prefix40_run": "ldbc_snb_native_benchprod106_pg_array_pgtype_prefix40_10ops_20260529",
+    "operations_completed": 2,
+    "queries_observed": [
+      "LdbcQuery1",
+      "LdbcQuery14"
+    ],
+    "current_frontier": "No Q14 PgArray blocker remains in the bounded 40-row command smoke. Broader LDBC native readiness still needs larger/unbounded runs and other query paths."
+  },
+  "remaining_blockers": [
+    "This is bounded 40-row LDBC command evidence, not a full native LDBC benchmark pass.",
+    "Full LDBC workload remains unproven outside the prefix40 Q1/Q14 command path.",
+    "20-row Q14 diagnostics remain vulnerable to unreachable parameter-pair artifacts.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-107 candidate: broaden native LDBC from prefix40 Q1/Q14 pass to additional query paths or larger preload, preserving non-isolation evidence labels."
+}

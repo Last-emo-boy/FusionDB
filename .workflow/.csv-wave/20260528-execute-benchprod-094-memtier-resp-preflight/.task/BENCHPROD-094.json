@@ -1,0 +1,18 @@
+{
+  "id": "BENCHPROD-094",
+  "status": "completed",
+  "deliverables": [
+    "memtier_native_smoke.py --resp-preflight",
+    "external_smoke.py native memtier RESP preflight evidence",
+    "install_external_tools.ps1 repeatable WSL memtier diagnostics",
+    "README memtier preflight documentation",
+    "memtier native report with FusionDB RESP preflight passed",
+    "relaxed production gate pass and strict native expected-fail report"
+  ],
+  "verification_status": "passed_with_expected_strict_blockers",
+  "remaining_global_goal_work": [
+    "Install or build real memtier_benchmark.",
+    "Run native memtier_benchmark probe and fix any concrete RESP/protocol gap.",
+    "Provide LDBC SNB artifact and run native LDBC smoke."
+  ]
+}

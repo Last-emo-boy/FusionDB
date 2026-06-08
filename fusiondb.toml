@@ -1,6 +1,8 @@
 [server]
 http_port = 8091
 pg_port = 8092
+redis_enabled = false
+redis_port = 6379
 bind = "127.0.0.1"
 
 [storage]

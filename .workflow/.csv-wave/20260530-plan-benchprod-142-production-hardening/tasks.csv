@@ -1,0 +1,6 @@
+id,task,status,next
+BENCHPROD-142,Recovery gate smoke,done,Recovery smoke passed and medium gate consumed the current report; proceed to BENCHPROD-143
+BENCHPROD-143,CH-benCHmark longer mixed HTAP,done,300s t1 passed; t2 exposed write-conflict SQLSTATE gap; 40001 fix verified by full 300s t2 and tightened medium gate
+BENCHPROD-144,Native memtier completion,pending,RESP preflight passed and medium gate still passes with explicit memtier tool_missing blocker; next install/build real memtier_benchmark and run protocol probe
+BENCHPROD-145,LDBC official-shape gap reduction,pending,Reduce Query 12-14 recursive/window/array blockers without claiming full official pass
+BENCHPROD-146,Larger-scale production repeat,pending,Run 3x larger-scale repeat and create thresholded gate evidence

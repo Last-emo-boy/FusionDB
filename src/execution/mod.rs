@@ -11,6 +11,7 @@ mod scan;
 mod types;
 
 pub(crate) use aggregation::AggregateAccumulator;
+pub(crate) use foreign_key::ForeignKeyMeta;
 
 use crate::ai::embedding::EmbeddingRegistry;
 use crate::common::{FusionError, Result, Value};
@@ -20,12 +21,18 @@ use crate::parser::parse_sql;
 use crate::storage::{vector_index::VectorIndex, FusionStorage, Storage, Transaction};
 use moka::sync::Cache;
 use parking_lot::RwLock;
-use sqlparser::ast::{ObjectType, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectType, OrderByKind,
+    SelectItem, SetExpr, Statement, TableFactor,
+};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum QueryResult {
     Select {
         columns: Vec<String>,
@@ -40,7 +47,7 @@ pub enum QueryResult {
 pub struct PreparedStatementRecord {
     pub id: String,
     pub sql: String,
-    pub statements: Vec<Statement>,
+    pub statements: Arc<Vec<Statement>>,
     pub owner: Option<String>,
     pub created_at_epoch_ms: u128,
 }
@@ -51,9 +58,19 @@ struct PreparedStatementStore {
     order: VecDeque<String>,
 }
 
+#[derive(Clone)]
+struct CachedSelectResult {
+    epoch: u64,
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+}
+
 pub struct Executor {
     pub(crate) storage: Arc<dyn Storage>,
     statement_cache: Cache<String, Vec<Statement>>,
+    query_result_cache: Cache<String, CachedSelectResult>,
+    simple_pk_update_fast_path_cache: Cache<String, bool>,
+    query_result_epoch: AtomicU64,
     prepared_statements: RwLock<PreparedStatementStore>,
     pub(crate) row_cache: Cache<String, Vec<Value>>,
     pub(crate) vector_index: Arc<VectorIndex>,
@@ -95,10 +112,315 @@ impl Executor {
         Self {
             storage,
             statement_cache: Cache::new(config.statement_cache_capacity),
+            query_result_cache: Cache::new(config.statement_cache_capacity.max(1)),
+            simple_pk_update_fast_path_cache: Cache::new(config.statement_cache_capacity.max(1)),
+            query_result_epoch: AtomicU64::new(0),
             prepared_statements: RwLock::new(PreparedStatementStore::default()),
             row_cache: Cache::new(config.row_cache_capacity),
             vector_index: shared_vector_index,
             embedding_registry: Arc::new(EmbeddingRegistry::new()),
+        }
+    }
+
+    pub(crate) fn invalidate_query_result_cache(&self) {
+        self.query_result_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        self.query_result_cache.invalidate_all();
+    }
+
+    fn invalidate_update_fast_path_cache(&self) {
+        self.simple_pk_update_fast_path_cache.invalidate_all();
+    }
+
+    fn current_query_result_epoch(&self) -> u64 {
+        self.query_result_epoch.load(AtomicOrdering::Acquire)
+    }
+
+    fn query_result_cache_key(sql: &str) -> String {
+        sql.trim().trim_end_matches(';').trim().to_string()
+    }
+
+    pub(crate) fn statement_may_change_query_results(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Insert(_) | Statement::Delete(_) | Statement::Update(_) => true,
+            Statement::CreateTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::AlterTable(_)
+            | Statement::Truncate(_)
+            | Statement::CreateView(_)
+            | Statement::Analyze(_)
+            | Statement::Drop { .. } => true,
+            Statement::Copy { to, .. } => !*to,
+            Statement::Explain { statement, .. } => {
+                Self::statement_may_change_query_results(statement)
+            }
+            _ => false,
+        }
+    }
+
+    fn statement_may_change_update_fast_path_metadata(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::CreateTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::AlterTable(_)
+            | Statement::Truncate(_)
+            | Statement::Drop { .. } => true,
+            Statement::Explain { statement, .. } => {
+                Self::statement_may_change_update_fast_path_metadata(statement)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_cacheable_group_aggregate_statement(stmt: &Statement) -> bool {
+        let Statement::Query(query) = stmt else {
+            return false;
+        };
+
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return false;
+        };
+
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+        {
+            return false;
+        }
+
+        if !matches!(select.from[0].relation, TableFactor::Table { .. }) {
+            return false;
+        }
+
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return false;
+        };
+        if group_exprs.is_empty() {
+            return false;
+        }
+        if !group_exprs.iter().all(Self::is_cacheable_column_expr) {
+            return false;
+        }
+
+        if let Some(selection) = &select.selection {
+            if !Self::is_cacheable_predicate_expr(selection) {
+                return false;
+            }
+        }
+
+        if let Some(order_by) = &query.order_by {
+            let OrderByKind::Expressions(exprs) = &order_by.kind else {
+                return false;
+            };
+            if !exprs
+                .iter()
+                .all(|expr| Self::is_cacheable_order_expr(&expr.expr))
+            {
+                return false;
+            }
+        }
+
+        if select.projection.len() <= group_exprs.len() {
+            return false;
+        }
+
+        for (item, group_expr) in select
+            .projection
+            .iter()
+            .take(group_exprs.len())
+            .zip(group_exprs)
+        {
+            if !Self::projection_matches_group_expr(item, group_expr) {
+                return false;
+            }
+        }
+
+        select
+            .projection
+            .iter()
+            .skip(group_exprs.len())
+            .all(Self::is_cacheable_aggregate_projection)
+    }
+
+    fn is_cacheable_join_group_aggregate_statement(stmt: &Statement) -> bool {
+        let Statement::Query(query) = stmt else {
+            return false;
+        };
+
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return false;
+        };
+
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.selection.is_some()
+            || select.from.len() != 1
+            || select.from[0].joins.len() != 1
+        {
+            return false;
+        }
+
+        if !matches!(select.from[0].relation, TableFactor::Table { .. }) {
+            return false;
+        }
+
+        let join = &select.from[0].joins[0];
+        if !matches!(join.relation, TableFactor::Table { .. }) {
+            return false;
+        }
+        if !matches!(
+            join.join_operator,
+            sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(_))
+                | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(_))
+        ) {
+            return false;
+        }
+
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return false;
+        };
+        if group_exprs.is_empty() || !group_exprs.iter().all(Self::is_cacheable_column_expr) {
+            return false;
+        }
+
+        if let Some(order_by) = &query.order_by {
+            let OrderByKind::Expressions(exprs) = &order_by.kind else {
+                return false;
+            };
+            if !exprs
+                .iter()
+                .all(|expr| Self::is_cacheable_order_expr(&expr.expr))
+            {
+                return false;
+            }
+        }
+
+        if select.projection.len() <= group_exprs.len() {
+            return false;
+        }
+
+        for (item, group_expr) in select
+            .projection
+            .iter()
+            .take(group_exprs.len())
+            .zip(group_exprs)
+        {
+            if !Self::projection_matches_group_expr(item, group_expr) {
+                return false;
+            }
+        }
+
+        select
+            .projection
+            .iter()
+            .skip(group_exprs.len())
+            .all(Self::is_cacheable_aggregate_projection)
+    }
+
+    fn projection_matches_group_expr(item: &SelectItem, group_expr: &Expr) -> bool {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                expr == group_expr && Self::is_cacheable_column_expr(expr)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_cacheable_aggregate_projection(item: &SelectItem) -> bool {
+        match item {
+            SelectItem::UnnamedExpr(Expr::Function(func))
+            | SelectItem::ExprWithAlias {
+                expr: Expr::Function(func),
+                ..
+            } => Self::is_cacheable_aggregate_function(func),
+            _ => false,
+        }
+    }
+
+    fn is_cacheable_order_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Nested(inner) => Self::is_cacheable_order_expr(inner),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+            Expr::Function(func) => Self::is_cacheable_aggregate_function(func),
+            _ => false,
+        }
+    }
+
+    fn is_cacheable_column_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Nested(inner) => Self::is_cacheable_column_expr(inner),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_cacheable_literal_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Nested(inner) => Self::is_cacheable_literal_expr(inner),
+            Expr::Value(value) => !matches!(
+                value.value,
+                sqlparser::ast::Value::Placeholder(_)
+                    | sqlparser::ast::Value::SingleQuotedByteStringLiteral(_)
+                    | sqlparser::ast::Value::DoubleQuotedByteStringLiteral(_)
+            ),
+            _ => false,
+        }
+    }
+
+    fn is_cacheable_predicate_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Nested(inner) => Self::is_cacheable_predicate_expr(inner),
+            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+                Self::is_cacheable_predicate_expr(left) && Self::is_cacheable_predicate_expr(right)
+            }
+            Expr::BinaryOp { left, op, right }
+                if matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Lt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::LtEq
+                ) =>
+            {
+                (Self::is_cacheable_column_expr(left) && Self::is_cacheable_literal_expr(right))
+                    || (Self::is_cacheable_literal_expr(left)
+                        && Self::is_cacheable_column_expr(right))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_cacheable_aggregate_function(func: &sqlparser::ast::Function) -> bool {
+        let func_name = func.name.to_string().to_uppercase();
+        let FunctionArguments::List(args) = &func.args else {
+            return false;
+        };
+        if args.args.len() != 1 {
+            return false;
+        }
+
+        match func_name.as_str() {
+            "COUNT" => {
+                matches!(
+                    args.args[0],
+                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                ) || matches!(
+                    &args.args[0],
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                        if Self::is_cacheable_column_expr(expr)
+                )
+            }
+            "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "GROUP_CONCAT" => {
+                args.duplicate_treatment.is_none()
+                    && matches!(
+                        &args.args[0],
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                            if Self::is_cacheable_column_expr(expr)
+                    )
+            }
+            _ => false,
         }
     }
 
@@ -110,6 +432,7 @@ impl Executor {
         if upper == "SHOW VIEWS"
             || upper == "SHOW INDEXES"
             || upper.starts_with("SHOW INDEXES FROM ")
+            || upper == "SHOW ALL"
             || upper == "SHOW USERS"
             || upper.starts_with("CREATE USER ")
             || upper.starts_with("DROP USER ")
@@ -135,7 +458,7 @@ impl Executor {
         sql: &str,
         owner: Option<&str>,
     ) -> Result<PreparedStatementRecord> {
-        let statements = self.prepare(sql)?;
+        let statements = Arc::new(self.prepare(sql)?);
         let id = uuid::Uuid::new_v4().to_string();
         let record = PreparedStatementRecord {
             id: id.clone(),
@@ -251,6 +574,10 @@ impl Executor {
         txn: &mut dyn Transaction,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if Self::statement_may_change_update_fast_path_metadata(stmt) {
+            self.invalidate_update_fast_path_cache();
+        }
+
         match stmt {
             Statement::CreateTable(create_table) => {
                 self.handle_create_table(
@@ -524,6 +851,9 @@ impl Executor {
         let res = self.execute_in_transaction(stmt, &mut *txn).await;
         if res.is_ok() {
             txn.commit().await?;
+            if Self::statement_may_change_query_results(stmt) {
+                self.invalidate_query_result_cache();
+            }
         } else {
             txn.rollback().await?;
         }
@@ -577,6 +907,11 @@ impl Executor {
             return res.map(|r| vec![r]);
         }
 
+        if upper == "SHOW ALL" {
+            crate::monitor::record_query(trimmed, std::time::Duration::ZERO);
+            return Ok(vec![Self::show_all_settings_result()]);
+        }
+
         if upper.starts_with("CREATE USER ") {
             return self.handle_rbac_sql(trimmed).await.map(|r| vec![r]);
         }
@@ -591,10 +926,62 @@ impl Executor {
         }
 
         let stmts = self.prepare(sql)?;
-        let mut results = Vec::new();
-        for stmt in &stmts {
-            results.push(self.execute(stmt).await?);
+        if stmts.len() == 1
+            && (Self::is_cacheable_group_aggregate_statement(&stmts[0])
+                || Self::is_cacheable_join_group_aggregate_statement(&stmts[0]))
+        {
+            let start = std::time::Instant::now();
+            let cache_key = Self::query_result_cache_key(trimmed);
+            let current_epoch = self.current_query_result_epoch();
+            if let Some(cached) = self.query_result_cache.get(&cache_key) {
+                if cached.epoch == current_epoch {
+                    crate::monitor::record_query(trimmed, start.elapsed());
+                    return Ok(vec![QueryResult::Select {
+                        columns: cached.columns,
+                        rows: cached.rows,
+                    }]);
+                }
+            }
+
+            let result = self.execute(&stmts[0]).await?;
+            if let QueryResult::Select { columns, rows } = &result {
+                self.query_result_cache.insert(
+                    cache_key,
+                    CachedSelectResult {
+                        epoch: current_epoch,
+                        columns: columns.clone(),
+                        rows: rows.clone(),
+                    },
+                );
+            }
+            return Ok(vec![result]);
         }
+
+        if stmts.len() == 1 {
+            return self.execute(&stmts[0]).await.map(|result| vec![result]);
+        }
+
+        let start = std::time::Instant::now();
+        let mut txn = self.storage.begin_transaction().await?;
+        let mut results = Vec::with_capacity(stmts.len());
+        let mut may_change_query_results = false;
+        for stmt in &stmts {
+            may_change_query_results |= Self::statement_may_change_query_results(stmt);
+            match self.execute_in_transaction(stmt, &mut *txn).await {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    txn.rollback().await?;
+                    crate::monitor::record_query(trimmed, start.elapsed());
+                    return Err(error);
+                }
+            }
+        }
+
+        txn.commit().await?;
+        if may_change_query_results {
+            self.invalidate_query_result_cache();
+        }
+        crate::monitor::record_query(trimmed, start.elapsed());
         Ok(results)
     }
 

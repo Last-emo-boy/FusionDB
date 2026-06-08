@@ -1,0 +1,18 @@
+{
+  "id": "BENCHPROD-090",
+  "status": "completed",
+  "deliverables": [
+    "FusionDB supports official pgbench-shape single first-column ALTER TABLE ADD PRIMARY KEY DDL.",
+    "Rust DDL tests cover pgbench shape and rejection cases.",
+    "pgbench compatibility bridge smoke passes.",
+    "external_smoke.py includes pgbench compatibility evidence.",
+    "FusionDB-bench README documents pgbench_compat_smoke.py."
+  ],
+  "verification_status": "passed",
+  "remaining_global_goal_work": [
+    "Official pgbench binary installation and end-to-end run.",
+    "BenchBase/TPC-C artifact bootstrap and real load/run gap capture.",
+    "TSBS/LDBC/CH-benCHmark official adapter setup and gap capture.",
+    "Production hardening beyond benchmark bridge evidence."
+  ]
+}

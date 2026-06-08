@@ -1,0 +1,17 @@
+{
+  "id": "BENCHPROD-093",
+  "status": "completed",
+  "deliverables": [
+    "external_smoke.py BenchBase artifact recognition for CH-benCHmark",
+    "fusiondb_bench.py capability readiness refresh",
+    "README evidence and gate blocker refresh",
+    "external smoke report with CH-benCHmark tool_available and native full passed evidence",
+    "relaxed production gate pass and strict native gate expected-fail report"
+  ],
+  "verification_status": "passed_with_expected_strict_blockers",
+  "remaining_global_goal_work": [
+    "Provide real memtier_benchmark and run native memtier protocol probe.",
+    "Provide LDBC SNB artifact and run native LDBC smoke.",
+    "Scale CH-benCHmark and TPC-C native evidence beyond short smoke."
+  ]
+}

@@ -1,0 +1,99 @@
+{
+  "id": "BENCHPROD-119",
+  "title": "Expose CH-benCHmark query-class coverage in native smoke and production gate evidence",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Inspect latest CH-benCHmark native full-run stdout histogram and confirm current query-class coverage",
+      "status": "completed"
+    },
+    {
+      "step": "Add Completed Transactions parsing to chbenchmark_native_smoke.py",
+      "status": "completed"
+    },
+    {
+      "step": "Add CH-benCHmark coverage derivation and gate checks to bench_gate.py",
+      "status": "completed"
+    },
+    {
+      "step": "Update production_medium and production_medium_strict_native profile thresholds conservatively",
+      "status": "completed"
+    },
+    {
+      "step": "Verify explicit report and latest-discovery gate paths for normal and strict profiles",
+      "status": "completed"
+    },
+    {
+      "step": "Record evidence conservatively as query-class visibility, not broad CH Q1-Q22 coverage",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "modified_files": [
+      "E:\\Playground\\FusionDB-bench\\chbenchmark_native_smoke.py",
+      "E:\\Playground\\FusionDB-bench\\bench_gate.py",
+      "E:\\Playground\\FusionDB-bench\\gate_profiles\\production_medium.json",
+      "E:\\Playground\\FusionDB-bench\\gate_profiles\\production_medium_strict_native.json"
+    ],
+    "source_stdout": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_native_benchbase_full_after_q6_q8_fix_20260528\\chbenchmark_execute.stdout.log",
+    "source_summary": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_native_benchbase_full_after_q6_q8_fix_20260528\\chbenchmark_native_smoke_summary.json",
+    "coverage_observed": {
+      "completed_total": 4,
+      "covered_chbenchmark_queries": [
+        "Q3"
+      ],
+      "covered_tpcc_transactions": [
+        "NewOrder"
+      ],
+      "chbenchmark_query_classes_completed": 1,
+      "tpcc_transaction_classes_completed": 1,
+      "chbenchmark_query_classes_observed": 22,
+      "tpcc_transaction_classes_observed": 5
+    },
+    "gate_outputs": [
+      "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod119_chbenchmark_query_coverage_only_20260529\\bench_gate_summary.json",
+      "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod119_strict_chbenchmark_query_coverage_only_20260529\\bench_gate_summary.json",
+      "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod119_independent_ldbc_tsbs_ch_query_coverage_20260529\\bench_gate_summary.json",
+      "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod119_strict_independent_ldbc_tsbs_ch_query_coverage_20260529\\bench_gate_summary.json",
+      "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod119_independent_discovery_query_coverage_20260529\\bench_gate_summary.json",
+      "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod119_strict_independent_discovery_query_coverage_20260529\\bench_gate_summary.json"
+    ],
+    "verification": [
+      "python -m py_compile chbenchmark_native_smoke.py bench_gate.py: passed",
+      "python -m json.tool gate_profiles\\production_medium.json: passed",
+      "python -m json.tool gate_profiles\\production_medium_strict_native.json: passed",
+      "chbenchmark_native_smoke.build_chbenchmark_coverage over existing stdout: completed_total=4, CH=Q3, TPCC=NewOrder",
+      "python bench_gate.py ... --chbenchmark-native-report ... production_medium: passed 31/31",
+      "python bench_gate.py ... --chbenchmark-native-report ... production_medium_strict_native: passed 31/31",
+      "python bench_gate.py ... explicit independent LDBC + TSBS + CH reports production_medium: passed 46/46",
+      "python bench_gate.py ... explicit independent LDBC + TSBS + CH reports production_medium_strict_native: passed 46/46",
+      "python bench_gate.py ... latest discovery production_medium: passed 46/46",
+      "python bench_gate.py ... latest discovery production_medium_strict_native: passed 46/46"
+    ]
+  },
+  "result": {
+    "coverage_extraction": true,
+    "gate_integration": true,
+    "profile_defaults_enabled": true,
+    "checks_added": [
+      "external_smoke.chbenchmark.completed_transactions",
+      "external_smoke.chbenchmark.query_classes",
+      "external_smoke.chbenchmark.tpcc_transaction_classes"
+    ],
+    "conservative_thresholds": {
+      "min_completed_transactions": 1,
+      "min_query_classes_completed": 1,
+      "min_tpcc_transaction_classes_completed": 1
+    },
+    "all_ch_queries_covered": false,
+    "long_duration_htap_certification": false
+  },
+  "remaining_blockers": [
+    "Current latest CH-benCHmark full-run evidence completed only Q3 among CH queries and NewOrder among TPC-C transactions.",
+    "This task adds structured visibility and a conservative gate floor, not broad CH Q1-Q22 coverage.",
+    "A future query-class matrix or forced-query workload is still needed before claiming broad CH-benCHmark query-class coverage.",
+    "Native memtier remains blocked until a real memtier_benchmark binary is installed and runnable."
+  ],
+  "next_task": "BENCHPROD-120 candidate: build a CH-benCHmark query-class matrix or forced-query runner so Q1-Q22 can be exercised intentionally."
+}

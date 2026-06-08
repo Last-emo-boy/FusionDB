@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-098",
+  "title": "PgWire SHOW transaction isolation compatibility",
+  "status": "completed",
+  "description": "Return PostgreSQL-compatible SHOW TRANSACTION ISOLATION LEVEL metadata for JDBC/Hikari, then rerun LDBC command-mode evidence to capture the next real native blocker.",
+  "files": [
+    "E:/Playground/FusionDB/src/server/pg_server.rs",
+    "E:/Playground/FusionDB/tests/pg_integration.rs",
+    "E:/Playground/FusionDB-bench/ldbc_snb_native_smoke.py",
+    "E:/Playground/FusionDB-bench/README.md"
+  ],
+  "evidence": [
+    "cargo test test_pg_protocol_show_transaction_isolation_level_for_jdbc_pool_startup --test pg_integration",
+    "cargo test --test pg_integration",
+    "cargo build --release --bin fusiondb",
+    "E:/Playground/FusionDB-bench/runs/ldbc_snb_native_benchprod098_show_tx_isolation_java17_20260529/ldbc_snb_native_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod098_show_tx_isolation_20260529/external_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod098_show_tx_isolation_strict_20260529/bench_gate_summary.json"
+  ],
+  "result": "FusionDB now returns transaction_isolation=read committed for SHOW TRANSACTION ISOLATION LEVEL through PgWire, unblocking PostgreSQL JDBC/Hikari startup. LDBC native command-mode progresses to official Query 1 and is now blocked by missing SNB schema/data: Table knows not found."
+}

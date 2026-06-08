@@ -1,0 +1,49 @@
+{
+  "id": "BENCHPROD-104",
+  "title": "Make LDBC Query 14 recursive timeout diagnosable and preserve array concat semantics",
+  "date": "2026-05-29",
+  "status": "completed_with_next_gap",
+  "steps": [
+    {
+      "step": "Confirm BENCHPROD-103 frontier and Query 14 recursive shape",
+      "status": "completed"
+    },
+    {
+      "step": "Add explicit recursive CTE row and iteration guards",
+      "status": "completed"
+    },
+    {
+      "step": "Preserve PostgreSQL-style array concat behavior for `||`",
+      "status": "completed"
+    },
+    {
+      "step": "Add regression coverage for runaway recursion and Q14 path array concat",
+      "status": "completed"
+    },
+    {
+      "step": "Run targeted SQL tests, release build, pg integration, and LDBC non-isolation smoke",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "fmt": "cargo fmt --check: passed",
+    "sql_set_subquery": "cargo test --test sql_set_subquery -- --nocapture: 20 passed",
+    "sql_expr_functions_targeted": "cargo test --test sql_expr_functions test_string_concat_operator -- --nocapture: passed",
+    "release_binary": "cargo build --release --bin fusiondb: passed",
+    "pg_integration_release": "cargo test --release --test pg_integration -- --nocapture: 25 passed",
+    "ldbc_recursive_budget_frontier": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod104_recursive_budget_array_concat_20rows_10ops_20260529\\ldbc_snb_native_smoke_summary.json"
+  },
+  "result": {
+    "recursive_timeout_converted_to_explicit_gap": true,
+    "array_concat_subset_supported": true,
+    "ldbc_full_native_pass": false,
+    "ldbc_frontier": "LDBC Query 14 now fails in about 28 seconds with `WITH RECURSIVE CTE search_graph row limit exceeded: max 4096 rows` instead of timing out after 180 seconds."
+  },
+  "remaining_blockers": [
+    "Q14 recursive search_graph expansion still exceeds FusionDB's current row budget and needs pruning or more faithful visited-path semantics",
+    "Q14 downstream SQL features remain unproven after the recursive frontier, including multidimensional array indexing, generate_subscripts, row_number() OVER (), and weighted path aggregation",
+    "LDBC report remains non-isolation status=gap, not a native benchmark pass",
+    "native memtier real tool/probe missing"
+  ],
+  "next_task": "BENCHPROD-105: reduce Q14 search_graph row explosion or add a targeted Q14 harness before attempting broader LDBC pass claims"
+}

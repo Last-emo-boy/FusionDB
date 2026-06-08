@@ -28,6 +28,14 @@ async fn main() -> Result<()> {
         "  PgWire:  {}:{}",
         config.server.bind, config.server.pg_port
     );
+    if config.server.redis_enabled {
+        println!(
+            "  Redis:   {}:{}",
+            config.server.bind, config.server.redis_port
+        );
+    } else {
+        println!("  Redis:   disabled");
+    }
     println!("  Data:    {}", config.storage.data_dir);
 
     // 2. Apply config to monitor

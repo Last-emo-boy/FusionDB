@@ -1,0 +1,35 @@
+{
+  "id": "BENCHPROD-079",
+  "title": "Indexed filtered bare aggregate optimization",
+  "created_at": "2026-05-27T17:06:00+08:00",
+  "completed_at": "2026-05-27T17:38:32+08:00",
+  "status": "completed",
+  "scope": "database core filtered aggregate execution for production benchmark stability",
+  "target_cases": [
+    "tpcc:Stock level query",
+    "tpcc:Payment transaction",
+    "tsbs:Ingest one point"
+  ],
+  "baseline_source": "E:/Playground/FusionDB-bench/runs/repeat_benchprod078_production_medium_groupagg_result_cache_5x_20260527/stability/bench_stability_summary.md",
+  "constraints": [
+    "Do not modify benchmark thresholds or gate profiles as an optimization lever",
+    "Keep benchmark artifacts under E:/Playground/FusionDB-bench/runs",
+    "Verify targeted tpcc/tsbs repeat before production medium repeat",
+    "Use production medium gate as authoritative verifier"
+  ],
+  "result_summary": {
+    "database_changes": [
+      "stream bare aggregate column scans through scan_prefix_for_each instead of materializing all key-value pairs",
+      "use primary-key or single-column BTree equality predicates as candidate sources for filtered bare aggregate scans",
+      "preserve predicate/aggregate partial column decoding so unrelated columns are not decoded"
+    ],
+    "tests": [
+      "cargo fmt --check",
+      "cargo check --lib",
+      "cargo test --test sql_group_aggregate -- --nocapture"
+    ],
+    "targeted_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod079_tpcc_tsbs_medium_indexed_bareagg_3x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod079_production_medium_indexed_bareagg_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod079_production_medium_indexed_bareagg_5x_20260527/bench_gate_summary.md"
+  }
+}

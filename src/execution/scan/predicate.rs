@@ -6,7 +6,9 @@ use super::Executor;
 
 impl Executor {
     fn split_conjunctive_predicates(expr: &Expr, out: &mut Vec<Expr>) {
-        if let Expr::BinaryOp {
+        if let Expr::Nested(inner) = expr {
+            Self::split_conjunctive_predicates(inner, out);
+        } else if let Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
@@ -19,8 +21,26 @@ impl Executor {
         }
     }
 
+    fn split_disjunctive_predicates(expr: &Expr, out: &mut Vec<Expr>) {
+        if let Expr::Nested(inner) = expr {
+            Self::split_disjunctive_predicates(inner, out);
+        } else if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } = expr
+        {
+            Self::split_disjunctive_predicates(left, out);
+            Self::split_disjunctive_predicates(right, out);
+        } else {
+            out.push(expr.clone());
+        }
+    }
+
     fn conjunctive_predicate_count(expr: &Expr) -> usize {
-        if let Expr::BinaryOp {
+        if let Expr::Nested(inner) = expr {
+            Self::conjunctive_predicate_count(inner)
+        } else if let Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
@@ -33,7 +53,84 @@ impl Executor {
         }
     }
 
+    fn combine_disjunctive_predicates(predicates: Vec<Expr>) -> Option<Expr> {
+        let mut iter = predicates.into_iter();
+        let first = iter.next()?;
+        Some(iter.fold(first, |acc, expr| Expr::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOperator::Or,
+            right: Box::new(expr),
+        }))
+    }
+
+    fn remove_common_predicates(mut predicates: Vec<Expr>, common: &[Expr]) -> Vec<Expr> {
+        for common_predicate in common {
+            if let Some(index) = predicates
+                .iter()
+                .position(|predicate| predicate == common_predicate)
+            {
+                predicates.remove(index);
+            }
+        }
+        predicates
+    }
+
+    fn extract_common_or_conjunctive_predicates(expr: &Expr) -> Option<Vec<Expr>> {
+        let mut branches = Vec::new();
+        Self::split_disjunctive_predicates(expr, &mut branches);
+        if branches.len() < 2 {
+            return None;
+        }
+
+        let branch_predicates = branches
+            .iter()
+            .map(|branch| {
+                let mut predicates = Vec::with_capacity(Self::conjunctive_predicate_count(branch));
+                Self::split_conjunctive_predicates(branch, &mut predicates);
+                predicates
+            })
+            .collect::<Vec<_>>();
+
+        let first_branch = branch_predicates.first()?;
+        let mut common = Vec::with_capacity(first_branch.len());
+        for predicate in first_branch {
+            if common.contains(predicate) {
+                continue;
+            }
+            if branch_predicates
+                .iter()
+                .all(|branch| branch.iter().any(|candidate| candidate == predicate))
+            {
+                common.push(predicate.clone());
+            }
+        }
+
+        if common.is_empty() {
+            return None;
+        }
+
+        let mut lifted = common.clone();
+        let mut residual_branches = Vec::with_capacity(branch_predicates.len());
+        for branch in branch_predicates {
+            let residual = Self::remove_common_predicates(branch, &common);
+            if residual.is_empty() {
+                return Some(lifted);
+            }
+            if let Some(residual_expr) = Self::combine_predicates(residual) {
+                residual_branches.push(residual_expr);
+            }
+        }
+
+        if let Some(residual_expr) = Self::combine_disjunctive_predicates(residual_branches) {
+            lifted.push(residual_expr);
+        }
+        Some(lifted)
+    }
+
     pub(crate) fn collect_conjunctive_predicates(expr: &Expr) -> Vec<Expr> {
+        if let Some(predicates) = Self::extract_common_or_conjunctive_predicates(expr) {
+            return predicates;
+        }
         let mut predicates = Vec::with_capacity(Self::conjunctive_predicate_count(expr));
         Self::split_conjunctive_predicates(expr, &mut predicates);
         predicates
@@ -185,5 +282,70 @@ impl Executor {
     ) -> Option<(usize, String)> {
         let idx = self.resolve_schema_column_index(expr, schema)?;
         Some((idx, schema.columns[idx].name.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+    use sqlparser::ast::{
+        Expr, JoinConstraint, JoinOperator, SelectItem, SetExpr, Statement, TableFactor,
+    };
+
+    #[test]
+    fn collect_conjunctive_predicates_flattens_nested_on_clause() {
+        let statements = crate::parser::parse_sql(
+            "SELECT * FROM customer LEFT OUTER JOIN oorder ON \
+             (c_w_id = o_w_id AND c_d_id = o_d_id AND c_id = o_c_id AND o_carrier_id > 8)",
+        )
+        .unwrap();
+
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let TableFactor::Table { .. } = &select.from[0].relation else {
+            panic!("expected table");
+        };
+        assert!(matches!(select.projection[0], SelectItem::Wildcard(_)));
+
+        let JoinOperator::LeftOuter(JoinConstraint::On(join_expr)) =
+            &select.from[0].joins[0].join_operator
+        else {
+            panic!("expected left outer join ON expression");
+        };
+        assert!(matches!(join_expr, Expr::Nested(_)));
+
+        let predicates = Executor::collect_conjunctive_predicates(join_expr);
+        assert_eq!(predicates.len(), 4);
+        assert_eq!(predicates[0].to_string(), "c_w_id = o_w_id");
+        assert_eq!(predicates[3].to_string(), "o_carrier_id > 8");
+    }
+
+    #[test]
+    fn collect_conjunctive_predicates_lifts_common_or_join_key() {
+        let statements = crate::parser::parse_sql(
+            "SELECT sum(ol_amount) FROM order_line, item \
+             WHERE (ol_i_id = i_id AND i_data LIKE '%a' AND ol_w_id IN (1, 2, 3)) \
+                OR (ol_i_id = i_id AND i_data LIKE '%b' AND ol_w_id IN (1, 2, 4)) \
+                OR (ol_i_id = i_id AND i_data LIKE '%c' AND ol_w_id IN (1, 5, 3))",
+        )
+        .unwrap();
+
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let selection = select.selection.as_ref().expect("expected selection");
+
+        let predicates = Executor::collect_conjunctive_predicates(selection);
+        assert_eq!(predicates.len(), 2);
+        assert_eq!(predicates[0].to_string(), "ol_i_id = i_id");
+        assert!(predicates[1].to_string().contains(" OR "));
+        assert!(!predicates[1].to_string().contains("ol_i_id = i_id"));
     }
 }

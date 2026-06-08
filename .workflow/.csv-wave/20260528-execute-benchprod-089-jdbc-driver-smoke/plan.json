@@ -1,0 +1,31 @@
+{
+  "id": "20260528-execute-benchprod-089-jdbc-driver-smoke",
+  "task": "BENCHPROD-089",
+  "title": "PostgreSQL JDBC driver smoke readiness",
+  "status": "completed",
+  "created_at": "2026-05-28",
+  "scope": [
+    "E:/Playground/FusionDB/src/server/pg_server.rs",
+    "E:/Playground/FusionDB/tests/pg_integration.rs",
+    "E:/Playground/FusionDB-bench/jdbc_smoke.py",
+    "E:/Playground/FusionDB-bench/external_smoke.py",
+    "E:/Playground/FusionDB-bench/README.md"
+  ],
+  "validation": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test pg_integration -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python jdbc_smoke.py --run-name jdbc_smoke_benchprod089_txn_extended_final_20260528 --jdbc-driver E:/Playground/tools/postgresql-jdbc/postgresql-42.7.11.jar",
+    "python -m py_compile jdbc_smoke.py pgwire_smoke.py fusiondb_matrix.py external_smoke.py external_bootstrap.py bench_gate.py bench_repeat.py bench_stability.py fusiondb_bench.py",
+    "python external_smoke.py --run-name external_smoke_benchprod089_jdbc_evidence_20260528 --target pgbench,benchbase-tpcc,ldbc,chbenchmark --pgwire-evidence runs/pgwire_smoke_benchprod087_jdbc_catalog_final_20260527/pgwire_smoke_summary.json --jdbc-evidence runs/jdbc_smoke_benchprod089_txn_extended_final_20260528/jdbc_smoke_summary.json"
+  ],
+  "next_task": {
+    "id": "BENCHPROD-090",
+    "title": "Install/configure first official external benchmark harness or pgbench smoke",
+    "candidate_paths": [
+      "pgbench availability plus initialization gap capture",
+      "BenchBase/TPC-C artifact configuration and FusionDB adapter smoke"
+    ]
+  }
+}

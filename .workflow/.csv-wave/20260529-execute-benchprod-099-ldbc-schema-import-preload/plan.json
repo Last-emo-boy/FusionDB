@@ -1,0 +1,45 @@
+{
+  "id": "BENCHPROD-099",
+  "title": "LDBC schema/import preload and Query 14 gap",
+  "date": "2026-05-29",
+  "status": "completed_with_next_gap",
+  "steps": [
+    {
+      "step": "Add bounded official LDBC PostgreSQL test-data preload to native smoke",
+      "status": "completed"
+    },
+    {
+      "step": "Fix extended query parameters through derived tables and UNION ALL",
+      "status": "completed"
+    },
+    {
+      "step": "Verify PgWire regression and release binary",
+      "status": "completed"
+    },
+    {
+      "step": "Run minimal LDBC native command path",
+      "status": "completed"
+    },
+    {
+      "step": "Run expanded LDBC native command path and capture next blocker",
+      "status": "completed"
+    },
+    {
+      "step": "Refresh external smoke and strict native gate evidence",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "pg_integration_release": "cargo test --release --test pg_integration: 25 passed",
+    "release_binary": "cargo build --release --bin fusiondb: passed",
+    "ldbc_query1_pass": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod099_preload_params_fix_20260529\\ldbc_snb_native_smoke_summary.json",
+    "ldbc_query14_gap": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod099_query14_gap_final_20260529\\ldbc_snb_native_smoke_summary.json",
+    "external_smoke": "E:\\Playground\\FusionDB-bench\\runs\\external_smoke_benchprod099_query14_gap_final_20260529\\external_smoke_summary.json",
+    "strict_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod099_query14_gap_final_strict_20260529\\bench_gate_summary.json"
+  },
+  "remaining_blockers": [
+    "memtier native tool missing",
+    "LDBC native expanded workload blocked by LdbcQuery14 Unsupported SELECT format"
+  ],
+  "next_task": "BENCHPROD-100: isolate and address LdbcQuery14 recursive CTE/array/window SQL coverage"
+}

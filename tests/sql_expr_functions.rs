@@ -23,6 +23,64 @@ async fn test_arithmetic_expression() {
 }
 
 #[tokio::test]
+async fn test_timestamp_interval_arithmetic_matches_ldbc_q4_shape() {
+    let (executor, wal) = setup().await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT
+            TIMESTAMP '2010-06-01 00:00:00' + INTERVAL '1 days' * 29,
+            TIMESTAMP '2010-06-01 00:00:00' - INTERVAL '1 days',
+            INTERVAL '2 days' / 2",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::timestamp_from_str("2010-06-30 00:00:00").unwrap(),
+            Value::timestamp_from_str("2010-05-31 00:00:00").unwrap(),
+            Value::Interval(86_400_000_000),
+        ]]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_parameterized_timestamp_interval_arithmetic() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+    let stmts = executor
+        .prepare("SELECT $1 + INTERVAL '1 days' * $2")
+        .unwrap();
+    let mut txn = storage.begin_transaction().await.unwrap();
+    let result = executor
+        .execute_in_transaction_with_params(
+            &stmts[0],
+            txn.as_mut(),
+            &[
+                Value::timestamp_from_str("2010-06-01 00:00:00").unwrap(),
+                Value::Integer(29),
+            ],
+        )
+        .await
+        .unwrap();
+
+    if let QueryResult::Select { rows, .. } = result {
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::timestamp_from_str("2010-06-30 00:00:00").unwrap()
+            ]]
+        );
+    } else {
+        panic!("Expected Select result from parameterized timestamp interval query");
+    }
+
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_like_pattern() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -186,6 +244,37 @@ async fn test_string_functions() {
 }
 
 #[tokio::test]
+async fn test_ascii_function_matches_chbenchmark_q8_shape() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE ascii_inputs (id INTEGER PRIMARY KEY, c_state TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO ascii_inputs VALUES (1, 'Germany'), (2, ''), (3, NULL)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT ASCII(substring(c_state from 1 for 1)) FROM ascii_inputs ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(71)],
+            vec![Value::Null],
+            vec![Value::Null]
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_coalesce_nullif() {
     let (executor, wal) = setup().await;
     let (_, rows) = query(&executor, "SELECT COALESCE(NULL, NULL, 42)").await;
@@ -236,10 +325,44 @@ async fn test_cast_expressions() {
         rows[0][0],
         fusiondb::common::Value::timestamp_from_str("2024-01-31 12:30:45").unwrap()
     );
+    let (_, rows) = query(
+        &executor,
+        "SELECT CAST('2016-01-01 03:33:11.947779 +0000' AS TIMESTAMP)",
+    )
+    .await;
+    assert_eq!(
+        rows[0][0],
+        fusiondb::common::Value::timestamp_from_str("2016-01-01 03:33:11.947779").unwrap()
+    );
     let (_, rows) = query(&executor, "SELECT CAST('123.4500' AS DECIMAL(10, 4))").await;
     assert_eq!(
         rows[0][0],
         fusiondb::common::Value::Decimal("123.45".to_string())
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_postgres_timestamp_functions_for_tsbs_queries() {
+    let (executor, wal) = setup().await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT EXTRACT(EPOCH FROM TIMESTAMP '2016-01-01 03:33:11.947779 +0000')",
+    )
+    .await;
+    assert_eq!(
+        rows[0][0],
+        fusiondb::common::Value::Float(1451619191.947779)
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT to_timestamp(((EXTRACT(EPOCH FROM TIMESTAMP '2016-01-01 03:33:11.947779 +0000')::int)/60)*60)",
+    )
+    .await;
+    assert_eq!(
+        rows[0][0],
+        fusiondb::common::Value::timestamp_from_str("2016-01-01 03:33:00").unwrap()
     );
     cleanup(&wal);
 }

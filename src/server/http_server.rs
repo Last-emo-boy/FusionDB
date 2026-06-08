@@ -439,7 +439,7 @@ async fn handle_execute(
         .get_prepared_statement_for_owner(&payload.statement_id, Some(&username))
     {
         Ok(record) => {
-            for statement in &record.statements {
+            for statement in record.statements.iter() {
                 if let Err(e) = state
                     .executor
                     .authorize_statement(&username, statement)
@@ -454,16 +454,24 @@ async fn handle_execute(
 
             let mut results = Vec::new();
             let params: Vec<Value> = payload.params.iter().map(Value::from_json).collect();
+            let return_results = payload.return_results.unwrap_or(true);
 
+            let mut may_change_query_results = false;
             match state.storage.begin_transaction().await {
                 Ok(mut txn) => {
-                    for stmt in record.statements {
+                    for stmt in record.statements.iter() {
+                        may_change_query_results |=
+                            Executor::statement_may_change_query_results(stmt);
                         match state
                             .executor
-                            .execute_in_transaction_with_params(&stmt, &mut *txn, &params)
+                            .execute_in_transaction_with_params(stmt, &mut *txn, &params)
                             .await
                         {
-                            Ok(res) => results.push(res.into()),
+                            Ok(res) => {
+                                if return_results {
+                                    results.push(res.into());
+                                }
+                            }
                             Err(e) => {
                                 let _ = txn.rollback().await;
                                 return json_error(
@@ -478,6 +486,9 @@ async fn handle_execute(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("Commit Error: {:?}", e),
                         );
+                    }
+                    if may_change_query_results {
+                        state.executor.invalidate_query_result_cache();
                     }
                 }
                 Err(e) => {
@@ -579,6 +590,7 @@ pub struct AuthContextInfo {
 pub struct ExecuteRequest {
     statement_id: String,
     params: Vec<serde_json::Value>,
+    return_results: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -866,6 +878,132 @@ mod tests {
             delete_envelope.data.expect("deleted data").statement_id,
             prepared.statement_id
         );
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_prepared_multi_statement_executes_with_params_in_one_transaction() {
+        let wal_path = format!("test_http_prepare_multi_{}.wal", std::process::id());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = test_app(storage.clone());
+
+        let sql = "CREATE TABLE http_prepared_multi (id INTEGER PRIMARY KEY, value INTEGER); \
+                   INSERT INTO http_prepared_multi VALUES ($1, $2); \
+                   UPDATE http_prepared_multi SET value = value + $3 WHERE id = $1; \
+                   SELECT value FROM http_prepared_multi WHERE id = $1";
+        let prepare_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "sql": sql }).to_string()))
+            .expect("prepare request");
+        let prepare_response = app
+            .clone()
+            .oneshot(prepare_request)
+            .await
+            .expect("prepare response");
+        let prepare_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_response).await;
+        let prepared = prepare_envelope.data.expect("prepared data");
+        assert_eq!(prepared.statement_count, 4);
+
+        let execute_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared.statement_id,
+                    "params": [1, 10, 5]
+                })
+                .to_string(),
+            ))
+            .expect("execute request");
+        let execute_response = app
+            .clone()
+            .oneshot(execute_request)
+            .await
+            .expect("execute response");
+        let execute_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_response).await;
+        let results = execute_envelope.data.expect("execute data");
+        assert_eq!(results.len(), 4);
+        match &results[3] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(15)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected final select"),
+        }
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_prepared_execute_can_suppress_result_payload() {
+        let wal_path = format!("test_http_prepare_no_results_{}.wal", std::process::id());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = test_app(storage.clone());
+
+        let sql = "CREATE TABLE http_prepared_no_results (id INTEGER PRIMARY KEY, value INTEGER); \
+                   INSERT INTO http_prepared_no_results VALUES ($1, $2)";
+        let prepare_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "sql": sql }).to_string()))
+            .expect("prepare request");
+        let prepare_response = app
+            .clone()
+            .oneshot(prepare_request)
+            .await
+            .expect("prepare response");
+        let prepare_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_response).await;
+        let prepared = prepare_envelope.data.expect("prepared data");
+
+        let execute_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared.statement_id,
+                    "params": [1, 10],
+                    "return_results": false
+                })
+                .to_string(),
+            ))
+            .expect("execute request");
+        let execute_response = app
+            .clone()
+            .oneshot(execute_request)
+            .await
+            .expect("execute response");
+        let execute_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_response).await;
+        assert!(execute_envelope.data.expect("execute data").is_empty());
+
+        let query_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"SELECT value FROM http_prepared_no_results WHERE id = 1"}"#,
+            ))
+            .expect("query request");
+        let query_response = app
+            .clone()
+            .oneshot(query_request)
+            .await
+            .expect("query response");
+        let query_envelope: Envelope<Vec<QueryResultJson>> = response_json(query_response).await;
+        match &query_envelope.data.expect("query data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(10)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected select"),
+        }
 
         let _ = std::fs::remove_file(&wal_path);
     }

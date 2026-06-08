@@ -1,0 +1,10 @@
+task,status,evidence
+q13_root_cause,confirmed,"src/execution/scan/predicate.rs did not flatten Expr::Nested before splitting AND predicates, so BenchBase Q13 ON (...) could not expose join keys and fell back to slow join execution"
+predicate_splitter_fix,passed,"cargo test collect_conjunctive_predicates_flattens_nested_on_clause --lib"
+q13_shape_regression,passed,"cargo test test_left_join_nested_on_group_by_matches_chbenchmark_q13_shape --test sql_join"
+join_regression_suite,passed,"cargo test --test sql_join"
+group_aggregate_regression_suite,passed,"cargo test --test sql_group_aggregate"
+release_build,passed,"cargo build --release"
+chbenchmark_q13_probe,passed,"E:\Playground\FusionDB-bench\runs\chbenchmark_query_class_matrix_benchprod131_q13_probe_after_nested_on_fix_20260529\chbenchmark_query_class_matrix_summary.json"
+chbenchmark_q1_q13_matrix,passed,"E:\Playground\FusionDB-bench\runs\chbenchmark_query_class_matrix_benchprod131_q1_q2_q3_q4_q5_q6_q7_q8_q9_q10_q11_q12_q13_20260529\chbenchmark_query_class_matrix_summary.json"
+strict_gate_explicit,passed,"E:\Playground\FusionDB-bench\runs\gate_benchprod131_strict_explicit_q1_q2_q3_q4_q5_q6_q7_q8_q9_q10_q11_q12_q13_20260529\bench_gate_summary.json"

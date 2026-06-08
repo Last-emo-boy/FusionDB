@@ -1,0 +1,18 @@
+{
+  "id": "BENCHPROD-087",
+  "status": "completed",
+  "title": "JDBC-style PgWire catalog probe expansion",
+  "completed_at": "2026-05-27T23:24:12+08:00",
+  "artifacts": {
+    "pgwire_jdbc_catalog_smoke": "E:/Playground/FusionDB-bench/runs/pgwire_smoke_benchprod087_jdbc_catalog_final_20260527/pgwire_smoke_summary.md"
+  },
+  "verification": [
+    "cargo build --release --bin fusiondb",
+    "python pgwire_smoke.py --run-name pgwire_smoke_benchprod087_jdbc_catalog_final_20260527",
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test pg_integration -- --nocapture",
+    "python -m py_compile pgwire_smoke.py fusiondb_bench.py bench_repeat.py bench_stability.py bench_gate.py fusiondb_matrix.py external_smoke.py external_bootstrap.py"
+  ],
+  "followup": "BENCHPROD-088"
+}

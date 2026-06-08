@@ -31,6 +31,35 @@ impl Value {
 
     pub fn timestamp_from_str(value: &str) -> Option<Self> {
         let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+            return Some(Value::Timestamp(timestamp.timestamp_micros()));
+        }
+
+        let fixed_offset_formats = [
+            "%Y-%m-%d %H:%M:%S%.f%:z",
+            "%Y-%m-%d %H:%M:%S%.f%z",
+            "%Y-%m-%d %H:%M:%S%.f %:z",
+            "%Y-%m-%d %H:%M:%S%.f %z",
+            "%Y-%m-%dT%H:%M:%S%.f%:z",
+            "%Y-%m-%dT%H:%M:%S%.f%z",
+        ];
+        for format in fixed_offset_formats {
+            if let Ok(timestamp) = chrono::DateTime::parse_from_str(trimmed, format) {
+                return Some(Value::Timestamp(timestamp.timestamp_micros()));
+            }
+        }
+        if let Some(normalized) = Self::normalize_hour_only_timezone_offset(trimmed) {
+            for format in fixed_offset_formats {
+                if let Ok(timestamp) = chrono::DateTime::parse_from_str(&normalized, format) {
+                    return Some(Value::Timestamp(timestamp.timestamp_micros()));
+                }
+            }
+        }
+
         let normalized = trimmed.trim_end_matches('Z').replace('T', " ");
         let timestamp = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f")
             .or_else(|_| {
@@ -39,6 +68,20 @@ impl Value {
             })
             .ok()?;
         Some(Value::Timestamp(timestamp.and_utc().timestamp_micros()))
+    }
+
+    fn normalize_hour_only_timezone_offset(value: &str) -> Option<String> {
+        let split = value.rfind(['+', '-'])?;
+        let suffix = &value[split..];
+        if suffix.len() != 3 {
+            return None;
+        }
+        let mut chars = suffix.chars();
+        let sign = chars.next()?;
+        if !matches!(sign, '+' | '-') || !chars.all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        Some(format!("{}{}:00", &value[..split], suffix))
     }
 
     pub fn interval_from_str(value: &str) -> Option<Self> {

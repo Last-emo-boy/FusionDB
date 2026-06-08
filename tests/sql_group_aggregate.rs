@@ -193,6 +193,123 @@ async fn test_select_count_star_with_simple_where_column_scan() {
 }
 
 #[tokio::test]
+async fn test_filtered_bare_aggregates_stream_required_columns_only() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE stock_aggregate_fast (id INTEGER PRIMARY KEY, w_id INTEGER, quantity INTEGER, ytd INTEGER, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (s_id, w_id, quantity, ytd) in [
+            (1_i64, 1_i64, 10_i64, 100_i64),
+            (2, 1, 25, 200),
+            (3, 2, 5, 300),
+            (4, 1, 19, 400),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(s_id),
+                Value::Integer(w_id),
+                Value::Integer(quantity),
+                Value::Integer(ytd),
+                Value::String(format!("payload-{}", s_id)),
+            ]);
+            let corrupt_col_idx = 4usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:stock_aggregate_fast:{}",
+                fusiondb::common::encoding::encode_i64_comparable(s_id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT COUNT(*), SUM(ytd), MIN(quantity), MAX(quantity) FROM stock_aggregate_fast WHERE w_id = 1 AND quantity < 20",
+    )
+    .await;
+
+    assert_eq!(
+        cols,
+        vec!["COUNT(*)", "SUM(ytd)", "MIN(quantity)", "MAX(quantity)"]
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::Integer(500),
+            Value::Integer(10),
+            Value::Integer(19),
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_filtered_count_uses_index_candidates_and_required_columns_only() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE stock_level_indexed (s_id INTEGER PRIMARY KEY, w_id INTEGER, quantity INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_stock_level_indexed_w_id ON stock_level_indexed (w_id)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (s_id, w_id, quantity) in [(1_i64, 1_i64, 10_i64), (2, 1, 25), (3, 2, 5), (4, 1, 19)] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(s_id),
+                Value::Integer(w_id),
+                Value::Integer(quantity),
+                Value::String(format!("payload-{}", s_id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let row_id = fusiondb::common::encoding::encode_i64_comparable(s_id);
+            let data_key = format!("data:stock_level_indexed:{}", row_id);
+            let index_value = fusiondb::common::encoding::encode_key(&Value::Integer(w_id));
+            let index_key = format!("index:stock_level_indexed:w_id:{}:{}", index_value, row_id);
+            txn.put(data_key.as_bytes(), &row).await.unwrap();
+            txn.put(index_key.as_bytes(), &[]).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT COUNT(*) FROM stock_level_indexed WHERE w_id = 1 AND quantity < 20",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["COUNT(*)"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_select_count_reuses_predicate_column_value() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -378,6 +495,77 @@ async fn test_group_by_column_aggregates_fast_path_preserves_alias_and_nulls() {
         ]
     }));
     cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_single_column_group_by_aggregates_preserve_null_key_and_partial_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE rollup_scalar (id INTEGER PRIMARY KEY, region TEXT, ts INTEGER, usage_user FLOAT, usage_system FLOAT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, region, ts, usage_user, usage_system) in [
+            (1_i64, Some("east"), 1000_i64, 10.0_f64, 5.0_f64),
+            (2, Some("east"), 2000, 30.0, 8.0),
+            (3, None, 3000, 7.0, 9.0),
+            (4, Some("west"), 50000, 100.0, 100.0),
+        ] {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                region
+                    .map(|value| Value::String(value.to_string()))
+                    .unwrap_or(Value::Null),
+                Value::Integer(ts),
+                Value::Float(usage_user),
+                Value::Float(usage_system),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 5usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:rollup_scalar:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT region, AVG(usage_user), MAX(usage_system), COUNT(*) FROM rollup_scalar WHERE ts >= 1000 AND ts < 50000 GROUP BY region",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| {
+        row == &vec![
+            Value::String("east".to_string()),
+            Value::Float(20.0),
+            Value::Float(8.0),
+            Value::Integer(2),
+        ]
+    }));
+    assert!(rows.iter().any(|row| {
+        row == &vec![
+            Value::Null,
+            Value::Float(7.0),
+            Value::Float(9.0),
+            Value::Integer(1),
+        ]
+    }));
+    cleanup(&wal_path);
 }
 
 #[tokio::test]
@@ -1050,6 +1238,74 @@ async fn test_group_by_column_aggregates_fast_path_order_by_limit() {
 }
 
 #[tokio::test]
+async fn test_execute_sql_group_by_aggregate_cache_invalidates_after_insert() {
+    let (executor, wal) = setup().await;
+    executor
+        .execute_sql(
+            "CREATE TABLE rollup_cache (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)",
+        )
+        .await
+        .unwrap();
+    executor
+        .execute_sql("INSERT INTO rollup_cache VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 5)")
+        .await
+        .unwrap();
+
+    let sql = "SELECT region, SUM(amount) FROM rollup_cache GROUP BY region ORDER BY region";
+    let first = executor.execute_sql(sql).await.unwrap();
+    let second = executor.execute_sql(sql).await.unwrap();
+    assert_eq!(format!("{:?}", first), format!("{:?}", second));
+
+    executor
+        .execute_sql("INSERT INTO rollup_cache VALUES (4, 'C', 7)")
+        .await
+        .unwrap();
+    let after_insert = executor.execute_sql(sql).await.unwrap();
+
+    let fusiondb::execution::QueryResult::Select { rows, .. } = &after_insert[0] else {
+        panic!("expected SELECT result");
+    };
+    assert_eq!(
+        rows,
+        &vec![
+            vec![Value::String("A".to_string()), Value::Integer(30)],
+            vec![Value::String("B".to_string()), Value::Integer(5)],
+            vec![Value::String("C".to_string()), Value::Integer(7)],
+        ]
+    );
+
+    executor
+        .execute_sql("UPDATE rollup_cache SET amount = 17 WHERE id = 4")
+        .await
+        .unwrap();
+    let after_update = executor.execute_sql(sql).await.unwrap();
+    let fusiondb::execution::QueryResult::Select { rows, .. } = &after_update[0] else {
+        panic!("expected SELECT result");
+    };
+    assert_eq!(
+        rows[2],
+        vec![Value::String("C".to_string()), Value::Integer(17)]
+    );
+
+    executor
+        .execute_sql("DELETE FROM rollup_cache WHERE id = 4")
+        .await
+        .unwrap();
+    let after_delete = executor.execute_sql(sql).await.unwrap();
+    let fusiondb::execution::QueryResult::Select { rows, .. } = &after_delete[0] else {
+        panic!("expected SELECT result");
+    };
+    assert_eq!(
+        rows,
+        &vec![
+            vec![Value::String("A".to_string()), Value::Integer(30)],
+            vec![Value::String("B".to_string()), Value::Integer(5)],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_multi_column_group_by_aggregates_fast_path_order_by_limit() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
@@ -1189,6 +1445,119 @@ async fn test_group_by_sum_multiply_expr() {
     cleanup(&wal);
 }
 
+#[tokio::test]
+async fn test_group_by_projection_alias_and_ordinal_expressions() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE tsbs_alias_group (
+            id INTEGER PRIMARY KEY,
+            tags_id INTEGER,
+            time TIMESTAMP,
+            usage_user FLOAT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO tsbs_alias_group VALUES
+            (1, 1, TIMESTAMP '2016-01-01 03:33:11.947779 +0000', 10.0),
+            (2, 1, TIMESTAMP '2016-01-01 03:33:30.000000 +0000', 20.0),
+            (3, 2, TIMESTAMP '2016-01-01 04:10:00.000000 +0000', 5.0)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT to_timestamp(((EXTRACT(EPOCH FROM time)::int)/60)*60) AS minute,
+                MAX(usage_user)
+         FROM tsbs_alias_group
+         GROUP BY minute
+         ORDER BY minute",
+    )
+    .await;
+    assert_eq!(cols, vec!["minute", "MAX(usage_user)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::timestamp_from_str("2016-01-01 03:33:00").unwrap(),
+                Value::Float(20.0),
+            ],
+            vec![
+                Value::timestamp_from_str("2016-01-01 04:10:00").unwrap(),
+                Value::Float(5.0),
+            ],
+        ]
+    );
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT to_timestamp(((EXTRACT(EPOCH FROM time)::int)/3600)*3600) AS hour,
+                tags_id,
+                AVG(usage_user)
+         FROM tsbs_alias_group
+         GROUP BY 1, 2
+         ORDER BY hour, tags_id",
+    )
+    .await;
+    assert_eq!(cols, vec!["hour", "tags_id", "AVG(usage_user)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::timestamp_from_str("2016-01-01 03:00:00").unwrap(),
+                Value::Integer(1),
+                Value::Float(15.0),
+            ],
+            vec![
+                Value::timestamp_from_str("2016-01-01 04:00:00").unwrap(),
+                Value::Integer(2),
+                Value::Float(5.0),
+            ],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_group_by_projection_scalar_function_from_group_columns() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE ch_q20_stock (
+            id INTEGER PRIMARY KEY,
+            s_i_id INTEGER,
+            s_w_id INTEGER,
+            s_quantity INTEGER,
+            ol_quantity INTEGER
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO ch_q20_stock VALUES
+            (1, 101, 3, 30, 10),
+            (2, 101, 3, 30, 20),
+            (3, 202, 4, 5, 20)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT MOD(s_i_id * s_w_id, 10000)
+           FROM ch_q20_stock
+          GROUP BY s_i_id, s_w_id, s_quantity
+         HAVING 2 * s_quantity > SUM(ol_quantity)
+          ORDER BY MOD(s_i_id * s_w_id, 10000)",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["MOD(s_i_id * s_w_id, 10000)"]);
+    assert_eq!(rows, vec![vec![Value::Integer(303)]]);
+    cleanup(&wal);
+}
+
 // ==================== JOIN Tests ====================
 
 #[tokio::test]
@@ -1305,6 +1674,58 @@ async fn test_bare_aggregate_sum_avg() {
     let (_, rows) = query(&executor, "SELECT SUM(val), AVG(val) FROM nums").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], fusiondb::common::Value::Integer(60));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_bare_aggregate_sum_avg_decimal() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE sales_decimal (id INTEGER PRIMARY KEY, amount DECIMAL(12, 2))",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sales_decimal VALUES (1, CAST('12.50' AS DECIMAL)), (2, CAST('7.75' AS DECIMAL))",
+    )
+    .await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT SUM(amount), AVG(amount) FROM sales_decimal",
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Float(20.25));
+    assert_eq!(rows[0][1], Value::Float(10.125));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_group_by_sum_decimal_column_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE grouped_decimal (id INTEGER PRIMARY KEY, category TEXT, amount DECIMAL(12, 2))",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO grouped_decimal VALUES (1, 'A', CAST('12.50' AS DECIMAL)), (2, 'A', CAST('7.75' AS DECIMAL)), (3, 'B', CAST('1.25' AS DECIMAL))",
+    )
+    .await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT category, SUM(amount) FROM grouped_decimal GROUP BY category ORDER BY category",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("A".to_string()), Value::Float(20.25)],
+            vec![Value::String("B".to_string()), Value::Float(1.25)],
+        ]
+    );
     cleanup(&wal);
 }
 
@@ -1559,6 +1980,59 @@ async fn test_bare_string_agg_column_scan_uses_only_aggregate_columns() {
         panic!("STRING_AGG should return a string for non-empty input");
     }
     cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_chbenchmark_q6_timestamp_decimal_filter_shape() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE ch_q6_order_line (
+            ol_id INTEGER PRIMARY KEY,
+            ol_delivery_d TIMESTAMP,
+            ol_amount DECIMAL(6, 2),
+            ol_quantity DECIMAL(6, 2)
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO ch_q6_order_line VALUES
+            (1, TIMESTAMP '1998-12-31 00:00:00.000000', 10.00, 5.00),
+            (2, TIMESTAMP '1999-01-01 00:00:00.000000', 20.00, 1.00),
+            (3, TIMESTAMP '2010-01-01 00:00:00.000000', 30.00, 100000.00),
+            (4, TIMESTAMP '2020-01-01 00:00:00.000000', 40.00, 2.00),
+            (5, NULL, 50.00, 5.00)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT sum(ol_amount) AS revenue
+           FROM ch_q6_order_line
+          WHERE ol_delivery_d >= '1999-01-01 00:00:00.000000'
+            AND ol_delivery_d < '2020-01-01 00:00:00.000000'
+            AND ol_quantity BETWEEN 1 AND 100000",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["revenue"]);
+    assert_eq!(rows, vec![vec![Value::Float(50.0)]]);
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT sum(ol_amount) AS revenue
+           FROM ch_q6_order_line
+          WHERE ol_delivery_d >= '1999-01-01 00:00:00.000000'
+            AND ol_delivery_d < '2020-01-01 00:00:00.000000'
+            AND ol_quantity >= 1
+            AND ol_quantity <= 100000",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["revenue"]);
+    assert_eq!(rows, vec![vec![Value::Float(50.0)]]);
+    cleanup(&wal);
 }
 
 #[tokio::test]

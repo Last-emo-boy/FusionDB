@@ -18,6 +18,10 @@ pub struct ServerConfig {
     pub http_port: u16,
     /// PostgreSQL wire protocol port (http_port + 1 if not set)
     pub pg_port: u16,
+    /// Enable the Redis-compatible RESP endpoint for native memtier probes
+    pub redis_enabled: bool,
+    /// Redis-compatible RESP endpoint port
+    pub redis_port: u16,
     /// Bind address
     pub bind: String,
 }
@@ -91,6 +95,8 @@ impl Default for ServerConfig {
         Self {
             http_port: 8091,
             pg_port: 8092,
+            redis_enabled: false,
+            redis_port: 6379,
             bind: "127.0.0.1".to_string(),
         }
     }
@@ -192,6 +198,8 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.server.http_port, 8091);
         assert_eq!(config.server.pg_port, 8092);
+        assert!(!config.server.redis_enabled);
+        assert_eq!(config.server.redis_port, 6379);
         assert_eq!(config.storage.data_dir, "data");
         assert_eq!(config.auth.password, "fusiondb");
     }
@@ -202,6 +210,8 @@ mod tests {
 [server]
 http_port = 9091
 pg_port = 9092
+redis_enabled = true
+redis_port = 6380
 bind = "0.0.0.0"
 
 [storage]
@@ -213,6 +223,8 @@ password = "secret123"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.server.http_port, 9091);
+        assert!(config.server.redis_enabled);
+        assert_eq!(config.server.redis_port, 6380);
         assert_eq!(config.storage.data_dir, "/var/fusiondb");
         assert_eq!(config.storage.memtable_flush_mb, 64);
         assert_eq!(config.auth.password, "secret123");

@@ -1,0 +1,52 @@
+{
+  "id": "BENCHPROD-101",
+  "title": "LDBC recursive query isolation harness",
+  "status": "completed_with_next_gap",
+  "created_at": "2026-05-29",
+  "completed_at": "2026-05-29",
+  "scope": [
+    "E:\\Playground\\FusionDB-bench\\ldbc_snb_native_smoke.py",
+    "E:\\Playground\\FusionDB-bench\\external_smoke.py",
+    "E:\\Playground\\FusionDB-bench\\bench_gate.py",
+    "E:\\Playground\\FusionDB-bench\\external_bootstrap.py",
+    "E:\\Playground\\FusionDB-bench\\README.md"
+  ],
+  "summary": "Added diagnosis-only LDBC read-query isolation support, mapped recursive CTE blockers beyond Query 14, and prevented disabled-query reports from being treated as full native LDBC pass evidence.",
+  "verification": [
+    {
+      "command": "python -m py_compile ldbc_snb_native_smoke.py external_smoke.py bench_gate.py external_bootstrap.py",
+      "status": "passed"
+    },
+    {
+      "command": "python ldbc_snb_native_smoke.py --help",
+      "status": "passed"
+    },
+    {
+      "command": "python ldbc_snb_native_smoke.py --disable-read-query 12 --disable-read-query 13 --disable-read-query 14 ... --fail-on-gap",
+      "status": "expected_gap"
+    },
+    {
+      "command": "python external_smoke.py --target ldbc --ldbc-native-evidence runs\\ldbc_snb_native_benchprod101_disable_q12_q13_q14_isolate_20rows_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles\\production_medium_strict_native.json --external-smoke-report runs\\external_smoke_benchprod101_ldbc_isolation_marker_20260529\\external_smoke_summary.json --no-recovery-smoke",
+      "status": "expected_failed",
+      "expected_failure": "external_smoke.ldbc.native_isolation_mode rejects isolation evidence"
+    }
+  ],
+  "result": {
+    "ldbc_full_native_pass": false,
+    "isolation_mode_guard": true,
+    "recursive_cte_dynamic_blockers": [
+      "LdbcQuery12",
+      "LdbcQuery13",
+      "LdbcQuery14"
+    ],
+    "recursive_cte_static_risks": [
+      "LdbcShortQuery2PersonPosts",
+      "LdbcShortQuery6MessageForum"
+    ]
+  },
+  "next": "BENCHPROD-102 should address bounded WITH RECURSIVE support or a semantically equivalent LDBC adapter path."
+}

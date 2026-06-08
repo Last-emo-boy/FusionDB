@@ -186,6 +186,10 @@ impl Executor {
             Self::composite_index_meta_value(&table_name_str, &target_col_names)
         };
         txn.put(meta_key.as_bytes(), meta_val.as_bytes()).await?;
+        if target_col_names.len() > 1 {
+            self.rebuild_composite_index_directory_for_table(&table_name_str, txn)
+                .await?;
+        }
 
         Ok(QueryResult::Success {
             message: format!(
@@ -245,6 +249,10 @@ impl Executor {
                                 txn.put(schema_key.as_bytes(), &new_bytes).await?;
                             }
                         }
+                    } else {
+                        let table_meta_key =
+                            Self::composite_index_table_meta_key(&table_name, &index_name);
+                        txn.delete(table_meta_key.as_bytes()).await?;
                     }
                 }
                 txn.delete(meta_key.as_bytes()).await?;

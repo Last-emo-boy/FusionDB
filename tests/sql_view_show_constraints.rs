@@ -486,6 +486,73 @@ async fn test_table_level_foreign_key_constraint() {
 }
 
 #[tokio::test]
+async fn test_composite_foreign_key_insert_update_and_parent_checks() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fk_comp_parent (w_id INTEGER, d_id INTEGER, name TEXT, PRIMARY KEY (w_id, d_id))",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fk_comp_child (id INTEGER PRIMARY KEY, c_w_id INTEGER, c_d_id INTEGER, note TEXT, CONSTRAINT fk_comp_child_parent FOREIGN KEY (c_w_id, c_d_id) REFERENCES fk_comp_parent(w_id, d_id))",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fk_comp_parent VALUES (1, 1, 'district 1'), (1, 2, 'district 2')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fk_comp_child VALUES (10, 1, 1, 'ok'), (11, NULL, 9, 'partial-null-ok')",
+    )
+    .await;
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("INSERT INTO fk_comp_child VALUES (12, 9, 9, 'bad')")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("fk_comp_child_parent"));
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("UPDATE fk_comp_child SET c_d_id = 9 WHERE id = 10")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("DELETE FROM fk_comp_parent WHERE w_id = 1 AND d_id = 1")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+
+    let result = executor
+        .execute(
+            &executor
+                .prepare("UPDATE fk_comp_parent SET d_id = 3 WHERE w_id = 1 AND d_id = 1")
+                .unwrap()[0],
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_foreign_key_blocks_dependent_alter_and_drop_table() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -1,0 +1,45 @@
+{
+  "id": "BENCHPROD-102",
+  "title": "Bounded recursive CTE support for LDBC frontier",
+  "status": "completed_with_next_gap",
+  "created_at": "2026-05-29",
+  "completed_at": "2026-05-29",
+  "scope": [
+    "src/execution/query/mod.rs",
+    "tests/sql_set_subquery.rs",
+    "tests/sql_join.rs"
+  ],
+  "summary": "Implemented bounded recursive CTE materialization for UNION/UNION ALL shapes, added regression coverage, and moved LDBC Query 14 beyond the original WITH RECURSIVE unsupported blocker.",
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed",
+      "detail": "15/15"
+    },
+    {
+      "command": "cargo test --test sql_join test_comma_join_projection_keeps_right_columns_without_join_pushdown",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --release --test pg_integration",
+      "status": "passed",
+      "detail": "25/25"
+    },
+    {
+      "command": "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 20 --operation-count 10 --tool-timeout 180 --preload-timeout 180 --run-name ldbc_snb_native_benchprod102_join_projection_frontier_20rows_10ops_20260529 --fail-on-gap",
+      "status": "expected_gap",
+      "detail": "LdbcQuery14 now fails at correlated NOT EXISTS / Column k_person2id not found"
+    }
+  ],
+  "result": {
+    "ldbc_full_native_pass": false,
+    "bounded_recursive_cte_supported": true,
+    "frontier_before": "WITH RECURSIVE is not supported",
+    "frontier_after": "LdbcQuery14 correlated NOT EXISTS outer-column reference"
+  },
+  "next": "BENCHPROD-103 should implement correlated EXISTS / NOT EXISTS evaluation for simple SELECT subqueries against the current outer row."
+}

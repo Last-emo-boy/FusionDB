@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-090",
+  "title": "pgbench compatibility bridge smoke",
+  "status": "completed",
+  "started_at": "2026-05-28T01:45:07",
+  "completed_at": "2026-05-28T02:00:27",
+  "objective": "Move from generic PgWire/JDBC readiness toward official pgbench initialization compatibility without claiming an official pgbench result.",
+  "scope": [
+    "Support official-shape pgbench ALTER TABLE ONLY ... ADD CONSTRAINT ... PRIMARY KEY for first-column single-column keys.",
+    "Validate the behavior with Rust DDL tests and the JDBC-backed pgbench compatibility smoke.",
+    "Expose pgbench compatibility evidence in external smoke reports."
+  ],
+  "out_of_scope": [
+    "Installing or running the official pgbench binary.",
+    "Claiming official pgbench benchmark scores.",
+    "Supporting arbitrary non-first-column primary keys or composite primary keys."
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo test --test pg_integration -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python pgbench_compat_smoke.py --run-name pgbench_compat_benchprod090_add_primary_key_20260528 --jdbc-driver E:\\Playground\\tools\\postgresql-jdbc\\postgresql-42.7.11.jar",
+    "python -m py_compile external_smoke.py pgbench_compat_smoke.py jdbc_smoke.py pgwire_smoke.py fusiondb_matrix.py",
+    "python external_smoke.py --run-name external_smoke_benchprod090_pgbench_compat_evidence_20260528 --target pgbench --pgwire-evidence runs\\pgwire_smoke_benchprod087_jdbc_catalog_final_20260527\\pgwire_smoke_summary.json --jdbc-evidence runs\\jdbc_smoke_benchprod089_txn_extended_final_20260528\\jdbc_smoke_summary.json --pgbench-compat-evidence runs\\pgbench_compat_benchprod090_add_primary_key_20260528\\pgbench_compat_smoke_summary.json"
+  ],
+  "next_candidates": [
+    "Install official PostgreSQL client tools and run real pgbench --version/init against FusionDB.",
+    "Bootstrap BenchBase artifact and start TPC-C load/run gap capture.",
+    "Expand pgbench compatibility probe from schema/init bridge to official transaction script parity."
+  ]
+}

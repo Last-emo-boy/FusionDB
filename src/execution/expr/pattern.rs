@@ -67,7 +67,12 @@ impl Executor {
         };
 
         if pattern.starts_with('%') {
-            let Some(index) = remainder.find(first) else {
+            let index = if parts.peek().is_none() && !pattern.ends_with('%') {
+                remainder.rfind(first)
+            } else {
+                remainder.find(first)
+            };
+            let Some(index) = index else {
                 return false;
             };
             remainder = &remainder[index + first.len()..];

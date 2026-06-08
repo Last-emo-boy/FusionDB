@@ -47,6 +47,7 @@ async fn handle_connection(
 
     let mut header_buf = [0u8; 7]; // 2 Magic + 1 Op + 4 Len
     let mut active_txn: Option<Box<dyn Transaction>> = None;
+    let mut active_txn_may_change_query_results = false;
 
     loop {
         // Read Header
@@ -80,8 +81,15 @@ async fn handle_connection(
                 handle_vector_search(&mut writer, &payload, &storage).await?;
             }
             OP_SQL_QUERY => {
-                handle_sql_query(&mut writer, &payload, &executor, &storage, &mut active_txn)
-                    .await?;
+                handle_sql_query(
+                    &mut writer,
+                    &payload,
+                    &executor,
+                    &storage,
+                    &mut active_txn,
+                    &mut active_txn_may_change_query_results,
+                )
+                .await?;
             }
             _ => {
                 return Err(std::io::Error::new(
@@ -100,6 +108,7 @@ async fn handle_sql_query<W: AsyncWriteExt + Unpin>(
     executor: &Arc<Executor>,
     storage: &Arc<dyn Storage>,
     active_txn: &mut Option<Box<dyn Transaction>>,
+    active_txn_may_change_query_results: &mut bool,
 ) -> std::io::Result<()> {
     let sql = String::from_utf8(payload.to_vec()).map_err(|e| {
         std::io::Error::new(
@@ -136,6 +145,7 @@ async fn handle_sql_query<W: AsyncWriteExt + Unpin>(
                         .await
                         .map_err(|e| std::io::Error::other(e.to_string()))?,
                 );
+                *active_txn_may_change_query_results = false;
                 Ok(QueryResult::Success {
                     message: "Transaction started".to_string(),
                 })
@@ -146,6 +156,10 @@ async fn handle_sql_query<W: AsyncWriteExt + Unpin>(
                 txn.commit()
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
+                if *active_txn_may_change_query_results {
+                    executor.invalidate_query_result_cache();
+                }
+                *active_txn_may_change_query_results = false;
                 Ok(QueryResult::Success {
                     message: "Transaction committed".to_string(),
                 })
@@ -160,6 +174,7 @@ async fn handle_sql_query<W: AsyncWriteExt + Unpin>(
                 txn.rollback()
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
+                *active_txn_may_change_query_results = false;
                 Ok(QueryResult::Success {
                     message: "Transaction rolled back".to_string(),
                 })
@@ -171,6 +186,8 @@ async fn handle_sql_query<W: AsyncWriteExt + Unpin>(
         }
         _ => {
             if let Some(txn) = active_txn.as_mut() {
+                *active_txn_may_change_query_results |=
+                    Executor::statement_may_change_query_results(stmt);
                 executor
                     .execute_in_transaction(stmt, &mut **txn)
                     .await

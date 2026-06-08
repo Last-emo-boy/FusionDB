@@ -272,6 +272,7 @@ impl SsTable {
             file_len: self.file_len,
             current_block_idx: start_idx,
             current_block_entries: std::collections::VecDeque::new(),
+            lower_bound: start_key.map(|key| key.to_vec()),
         })
     }
 }
@@ -288,6 +289,7 @@ pub struct SsTableIterator {
     file_len: u64,
     current_block_idx: usize,
     current_block_entries: std::collections::VecDeque<(Vec<u8>, Vec<u8>)>,
+    lower_bound: Option<Vec<u8>>,
 }
 
 impl SsTableIterator {
@@ -357,7 +359,11 @@ impl SsTableIterator {
                     break;
                 }
 
-                self.current_block_entries.push_back((k_buf, v_buf));
+                if self.lower_bound.as_ref().map_or(true, |lower_bound| {
+                    k_buf.as_slice() >= lower_bound.as_slice()
+                }) {
+                    self.current_block_entries.push_back((k_buf, v_buf));
+                }
             }
         }
     }

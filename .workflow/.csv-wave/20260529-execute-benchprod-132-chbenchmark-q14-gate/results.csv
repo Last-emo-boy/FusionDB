@@ -1,0 +1,6 @@
+task,status,evidence
+release_build,passed,"cargo build --release"
+chbenchmark_q14_probe,passed,"E:\Playground\FusionDB-bench\runs\chbenchmark_query_class_matrix_benchprod132_q14_probe_20260529\chbenchmark_query_class_matrix_summary.json"
+chbenchmark_q1_q14_matrix,passed,"E:\Playground\FusionDB-bench\runs\chbenchmark_query_class_matrix_benchprod132_q1_q2_q3_q4_q5_q6_q7_q8_q9_q10_q11_q12_q13_q14_20260529\chbenchmark_query_class_matrix_summary.json"
+strict_gate_explicit,passed,"E:\Playground\FusionDB-bench\runs\gate_benchprod132_strict_explicit_q1_q14_20260529\bench_gate_summary.json"
+medium_gate_explicit,passed,"E:\Playground\FusionDB-bench\runs\gate_benchprod132_medium_explicit_q1_q14_20260529\bench_gate_summary.json"

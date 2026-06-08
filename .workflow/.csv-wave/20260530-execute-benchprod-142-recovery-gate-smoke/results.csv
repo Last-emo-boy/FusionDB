@@ -1,0 +1,3 @@
+task,status,evidence
+recovery_smoke_current,passed,"E:\Playground\FusionDB-bench\runs\recovery_smoke_benchprod142_current_20260530\recovery_smoke_summary.json"
+medium_gate_with_recovery,passed,"E:\Playground\FusionDB-bench\runs\gate_benchprod142_medium_recovery_current_20260530\bench_gate_summary.json"

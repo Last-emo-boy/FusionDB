@@ -1,0 +1,45 @@
+{
+  "id": "BENCHPROD-100",
+  "title": "LDBC Query 14 recursive CTE gap isolation",
+  "date": "2026-05-29",
+  "status": "completed_with_next_gap",
+  "steps": [
+    {
+      "step": "Inspect Query 14 SQL and executor unsupported SELECT path",
+      "status": "completed"
+    },
+    {
+      "step": "Support parenthesized query bodies represented as SetExpr::Query",
+      "status": "completed"
+    },
+    {
+      "step": "Report WITH RECURSIVE as a specific unsupported feature",
+      "status": "completed"
+    },
+    {
+      "step": "Add focused SQL regression tests",
+      "status": "completed"
+    },
+    {
+      "step": "Rebuild release binary and rerun LDBC expanded smoke",
+      "status": "completed"
+    },
+    {
+      "step": "Refresh docs, external smoke, and strict native gate",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "sql_set_subquery": "cargo test --test sql_set_subquery: 13 passed",
+    "pg_integration_release": "cargo test --release --test pg_integration: 25 passed",
+    "release_binary": "cargo build --release --bin fusiondb: passed",
+    "ldbc_recursive_cte_gap": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod100_recursive_cte_gap_20260529\\ldbc_snb_native_smoke_summary.json",
+    "external_smoke": "E:\\Playground\\FusionDB-bench\\runs\\external_smoke_benchprod100_recursive_cte_gap_20260529\\external_smoke_summary.json",
+    "strict_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod100_recursive_cte_gap_strict_20260529\\bench_gate_summary.json"
+  },
+  "remaining_blockers": [
+    "memtier native tool missing",
+    "LDBC native expanded workload blocked by WITH RECURSIVE in LdbcQuery14"
+  ],
+  "next_task": "BENCHPROD-101: bounded recursive CTE support or semantically equivalent Query 14 adapter path"
+}

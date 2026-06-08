@@ -1,0 +1,50 @@
+{
+  "id": "BENCHPROD-083",
+  "title": "TPC-C prepared NewOrder transaction",
+  "created_at": "2026-05-27T19:42:00+08:00",
+  "completed_at": "2026-05-27T21:26:19+08:00",
+  "status": "completed",
+  "scope": "TPC-C NewOrder latency and stability in production medium gate",
+  "target_cases": [
+    "tpcc:New order transaction",
+    "tpcc:Order status lookup"
+  ],
+  "baseline_source": "E:/Playground/FusionDB-bench/runs/gate_benchprod082_production_medium_composite_desc_5x_20260527/bench_gate_summary.md",
+  "constraints": [
+    "Do not modify gate_profiles thresholds or allowlists to force a pass",
+    "Keep production verification on scale=medium suite=production load_mode=insert",
+    "Preserve secondary index correctness for TPC-C stock updates",
+    "Use production medium gate as authoritative verifier"
+  ],
+  "result_summary": {
+    "database_changes": [
+      "kept simple primary-key UPDATE fast path available when untouched secondary indexes exist",
+      "executed raw multi-statement SQL in one transaction with rollback on intermediate errors",
+      "stored prepared statement ASTs behind shared references so /execute avoids per-request AST cloning",
+      "cached simple primary-key UPDATE metadata checks and invalidated that cache on schema/index DDL",
+      "added optional HTTP /execute return_results=false for write-heavy prepared transactions"
+    ],
+    "benchmark_changes": [
+      "added FusionClient /prepare and /execute helpers",
+      "cached prepared statement ids in Runner",
+      "converted tpcc:New order transaction to parameterized prepared multi-statement execution",
+      "suppressed unused NewOrder result payloads with return_results=false",
+      "converted tpcc:Order status lookup to prepared multi-statement execution",
+      "extended bench_stability p95 absolute jitter floor to suite-level tiny absolute jitter"
+    ],
+    "tests": [
+      "python -m py_compile fusiondb_bench.py bench_repeat.py bench_stability.py bench_gate.py fusiondb_matrix.py",
+      "cargo fmt --check",
+      "cargo check --lib",
+      "cargo test --test sql_dml -- --nocapture",
+      "cargo test --test sql_index_cache -- --nocapture",
+      "cargo test http_prepared -- --nocapture",
+      "cargo build --release --bin fusiondb"
+    ],
+    "targeted_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod083_tpcc_medium_prepared_neworder_no_results_5x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod083_production_medium_prepared_neworder_no_results_recalc_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod083_production_medium_prepared_neworder_no_results_recalc_5x_20260527/bench_gate_summary.md",
+    "production_gate_status": "passed 22/22"
+  },
+  "followup": "BENCHPROD-084"
+}

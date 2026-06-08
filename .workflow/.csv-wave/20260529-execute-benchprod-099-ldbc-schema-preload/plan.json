@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "session_id": "20260529-execute-benchprod-099-ldbc-schema-preload",
+  "source": "maestro-execute",
+  "objective": "BENCHPROD-099: add bounded LDBC SNB schema/import preload coverage before official PostgreSQL implementation command-mode execution",
+  "created_at": "2026-05-29T04:15:00+08:00",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-099"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-099",
+      "title": "LDBC schema/import preload",
+      "status": "completed",
+      "files": [
+        "E:/Playground/FusionDB-bench/ldbc_snb_native_smoke.py",
+        "E:/Playground/FusionDB-bench/external_smoke.py",
+        "E:/Playground/FusionDB-bench/external_bootstrap.py",
+        "E:/Playground/FusionDB-bench/README.md"
+      ],
+      "convergence": [
+        "ldbc_snb_native_smoke.py can preload bounded official PostgreSQL implementation test-data through JDBC CopyManager before command-mode execution",
+        "LDBC command-mode evidence no longer fails with Table knows not found",
+        "strict native gate preserves LDBC as a real native gap until official workload command passes"
+      ]
+    }
+  ]
+}

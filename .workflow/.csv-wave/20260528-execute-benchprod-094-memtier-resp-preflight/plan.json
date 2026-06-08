@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-094",
+  "title": "memtier native RESP preflight evidence",
+  "status": "completed",
+  "started_at": "2026-05-28T23:40:00+08:00",
+  "completed_at": "2026-05-28T23:59:00+08:00",
+  "objective": "Move native memtier readiness forward while the real memtier_benchmark binary is still missing by proving FusionDB's Redis-compatible endpoint with direct RESP commands and keeping the native blocker explicit.",
+  "scope": [
+    "Add a direct RESP preflight to memtier_native_smoke.py.",
+    "Expose RESP preflight evidence through external_smoke.py.",
+    "Fix install_external_tools.ps1 WSL probe quoting so memtier install diagnostics are repeatable.",
+    "Document the new preflight and native memtier distinction.",
+    "Refresh production and strict native gate reports."
+  ],
+  "verification": [
+    "python -m py_compile memtier_native_smoke.py external_smoke.py fusiondb_matrix.py bench_gate.py",
+    "powershell -NoProfile -ExecutionPolicy Bypass -File .\\install_external_tools.ps1 -Target memtier",
+    "python memtier_native_smoke.py --run-name memtier_native_benchprod094_resp_preflight_20260528 --detect-wsl --start-fusiondb --resp-preflight --attempt-protocol-probe --target-port 6379 --fail-on-gap",
+    "python external_smoke.py --run-name external_smoke_benchprod094_memtier_resp_preflight_20260528 --target benchbase-tpcc,memtier,tsbs,ldbc,chbenchmark --memtier-native-evidence runs\\memtier_native_benchprod094_resp_preflight_20260528\\memtier_native_smoke_summary.json --chbenchmark-native-evidence runs\\chbenchmark_native_benchbase_full_after_q6_q8_fix_20260528\\chbenchmark_native_smoke_summary.json",
+    "python bench_gate.py --gate-profile gate_profiles\\production_medium.json --repeat-report runs\\benchprod_current_medium_production_3x_20260528_fix2\\bench_repeat_summary.json --external-smoke-report runs\\external_smoke_benchprod094_memtier_resp_preflight_20260528\\external_smoke_summary.json --recovery-smoke-report runs\\recovery_smoke_benchprod086_pgtest_port_fix_20260528\\recovery_smoke_summary.json --run-name gate_benchprod094_memtier_resp_preflight_relaxed_20260528",
+    "python bench_gate.py --gate-profile gate_profiles\\production_medium_strict_native.json --repeat-report runs\\benchprod_current_medium_production_3x_20260528_fix2\\bench_repeat_summary.json --external-smoke-report runs\\external_smoke_benchprod094_memtier_resp_preflight_20260528\\external_smoke_summary.json --recovery-smoke-report runs\\recovery_smoke_benchprod086_pgtest_port_fix_20260528\\recovery_smoke_summary.json --run-name gate_benchprod094_memtier_resp_preflight_strict_20260528"
+  ],
+  "verification_status": "passed_with_expected_strict_blockers",
+  "current_environment_result": "FusionDB RESP preflight passed, but native memtier remains tool_missing because real memtier_benchmark is not installed. WSL sudo is interactive and required build packages are missing.",
+  "next_candidates": [
+    "Install required WSL packages and build memtier_benchmark.",
+    "Run the real memtier protocol probe against FusionDB's Redis-compatible endpoint.",
+    "Start BENCHPROD-095 for LDBC SNB native artifact discovery and adapter smoke."
+  ]
+}

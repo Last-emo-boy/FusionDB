@@ -1,0 +1,20 @@
+{
+  "id": "BENCHPROD-108",
+  "title": "Reduce Q14 correlated EXISTS overhead with membership caching",
+  "date": "2026-05-29",
+  "status": "completed",
+  "files_touched": [
+    "src/execution/expr/subquery.rs",
+    "tests/sql_set_subquery.rs"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo test --release --test pg_integration -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --operation-count 10 --tool-timeout 180 --preload-timeout 360 --run-name ldbc_snb_native_benchprod108_exists_membership_full_testdata_10ops_20260529"
+  ],
+  "result": "EXISTS membership cache regression and PgWire/Rust tests passed, but full test-data non-isolation LDBC remains gap because Q14 still times out after 4 operations.",
+  "evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod108_exists_membership_full_testdata_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+  "next_task": "BENCHPROD-109"
+}

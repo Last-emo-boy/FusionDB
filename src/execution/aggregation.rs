@@ -10,6 +10,7 @@ pub(crate) enum AggregateAccumulator {
     Avg(f64, i64),  // sum, count
     Min(Option<Value>),
     Max(Option<Value>),
+    ArrayAgg(Vec<Value>),
     StringAgg(Vec<String>, String), // values, separator
 }
 
@@ -22,6 +23,7 @@ impl AggregateAccumulator {
             "AVG" => AggregateAccumulator::Avg(0.0, 0),
             "MIN" => AggregateAccumulator::Min(None),
             "MAX" => AggregateAccumulator::Max(None),
+            "ARRAY_AGG" => AggregateAccumulator::ArrayAgg(Vec::new()),
             "STRING_AGG" | "GROUP_CONCAT" => {
                 AggregateAccumulator::StringAgg(Vec::new(), ",".to_string())
             }
@@ -47,6 +49,12 @@ impl AggregateAccumulator {
                     *is_int = false;
                     *sum += *f;
                 }
+                Value::Decimal(s) => {
+                    if let Ok(value) = s.parse::<f64>() {
+                        *is_int = false;
+                        *sum += value;
+                    }
+                }
                 _ => {}
             },
             AggregateAccumulator::Avg(sum, count) => match val {
@@ -57,6 +65,12 @@ impl AggregateAccumulator {
                 Value::Float(f) => {
                     *sum += *f;
                     *count += 1;
+                }
+                Value::Decimal(s) => {
+                    if let Ok(value) = s.parse::<f64>() {
+                        *sum += value;
+                        *count += 1;
+                    }
                 }
                 _ => {}
             },
@@ -84,12 +98,18 @@ impl AggregateAccumulator {
                     }
                 }
             }
+            AggregateAccumulator::ArrayAgg(vals) => {
+                if *val != Value::Null {
+                    vals.push(val.clone());
+                }
+            }
             AggregateAccumulator::StringAgg(vals, _sep) => {
                 if *val != Value::Null {
                     let s = match val {
                         Value::String(s) => s.clone(),
                         Value::Integer(i) => i.to_string(),
                         Value::Float(f) => f.to_string(),
+                        Value::Decimal(s) => s.clone(),
                         Value::Boolean(b) => b.to_string(),
                         _ => return,
                     };
@@ -119,6 +139,7 @@ impl AggregateAccumulator {
             }
             AggregateAccumulator::Min(min) => min.clone().unwrap_or(Value::Null),
             AggregateAccumulator::Max(max) => max.clone().unwrap_or(Value::Null),
+            AggregateAccumulator::ArrayAgg(vals) => Value::Array(vals.clone()),
             AggregateAccumulator::StringAgg(vals, sep) => {
                 if vals.is_empty() {
                     Value::Null
@@ -167,6 +188,14 @@ mod tests {
         acc.update(&Value::Integer(10));
         acc.update(&Value::Float(2.5));
         assert_eq!(acc.finalize(), Value::Float(12.5));
+    }
+
+    #[test]
+    fn test_sum_decimal_accumulator() {
+        let mut acc = AggregateAccumulator::new("SUM");
+        acc.update(&Value::Decimal("12.5".to_string()));
+        acc.update(&Value::Decimal("7.75".to_string()));
+        assert_eq!(acc.finalize(), Value::Float(20.25));
     }
 
     #[test]

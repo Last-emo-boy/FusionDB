@@ -1,0 +1,3 @@
+{"type":"environment_gap","id":"BENCHPROD-091","source":"runs/pgbench_native_benchprod091_tool_missing_20260528/pgbench_native_smoke_summary.md","detail":"No official pgbench binary is available on PATH in the current environment."}
+{"type":"bench_capability","id":"BENCHPROD-091","source":"pgbench_native_smoke.py","detail":"Native pgbench runner can execute official pgbench init/run when the binary is available and records concrete command gaps."}
+{"type":"evidence_chain","id":"BENCHPROD-091","source":"runs/external_smoke_benchprod091_pgbench_native_evidence_20260528/external_smoke_summary.md","detail":"External smoke now includes PgWire, JDBC, pgbench compatibility bridge, and native pgbench evidence for the pgbench target."}

@@ -204,6 +204,13 @@ impl FusionStorage {
         }
 
         let next_id = sstables_vec.last().map(|s| s.id + 1).unwrap_or(2);
+        let max_sstable_ts = sstables_vec
+            .iter()
+            .flat_map(|sst| [&sst.meta.first_key, &sst.meta.last_key])
+            .filter(|key| key.len() >= TS_SIZE)
+            .map(|key| Self::decode_key(key).1)
+            .max()
+            .unwrap_or(0);
 
         // Replay WAL
         // We need to replay committed transactions into the active memtable.
@@ -243,10 +250,10 @@ impl FusionStorage {
         };
 
         // Apply Replay
+        let mut max_replay_ts = 0;
         if !replay_entries.is_empty() {
             println!("Replaying {} WAL entries...", replay_entries.len());
             // Use active_memtable logic but with manual rotation
-            let mut max_ts = 0;
 
             for entry in replay_entries {
                 match entry {
@@ -258,8 +265,8 @@ impl FusionStorage {
 
                         if k.len() > TS_SIZE {
                             let (_, ts) = Self::decode_key(&k);
-                            if ts > max_ts {
-                                max_ts = ts;
+                            if ts > max_replay_ts {
+                                max_replay_ts = ts;
                             }
                         }
 
@@ -274,6 +281,12 @@ impl FusionStorage {
                         }
                     }
                     WalEntry::Delete(k) => {
+                        if k.len() > TS_SIZE {
+                            let (_, ts) = Self::decode_key(&k);
+                            if ts > max_replay_ts {
+                                max_replay_ts = ts;
+                            }
+                        }
                         let needs_rotate = {
                             let active = storage.active_memtable.read().unwrap();
                             active.insert(k, Vec::new());
@@ -286,9 +299,10 @@ impl FusionStorage {
                     }
                 }
             }
-            storage.current_ts.store(max_ts, Ordering::SeqCst);
-            println!("WAL Replay complete. Restored TS: {}", max_ts);
+            println!("WAL Replay complete. Restored TS: {}", max_replay_ts);
         }
+        let restored_ts = max_sstable_ts.max(max_replay_ts);
+        storage.current_ts.store(restored_ts, Ordering::SeqCst);
 
         // Start flush thread
         let s = storage.clone();

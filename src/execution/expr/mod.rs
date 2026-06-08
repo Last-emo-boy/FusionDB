@@ -71,9 +71,15 @@ impl Executor {
 
                 match op {
                     BinaryOperator::Eq => {
+                        if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
+                            return Ok(false);
+                        }
                         Ok(left_val.compare(&right_val) == std::cmp::Ordering::Equal)
                     }
                     BinaryOperator::NotEq => {
+                        if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
+                            return Ok(false);
+                        }
                         Ok(left_val.compare(&right_val) != std::cmp::Ordering::Equal)
                     }
                     BinaryOperator::Gt => self.compare_values(&left_val, &right_val, |l, r| l > r),
@@ -167,6 +173,21 @@ impl Executor {
                     Ok(found)
                 }
             }
+            Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+                ..
+            } => self.evaluate_quantified_array_comparison(
+                left, compare_op, right, false, row, schema, params,
+            ),
+            Expr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => self.evaluate_quantified_array_comparison(
+                left, compare_op, right, true, row, schema, params,
+            ),
             Expr::Like {
                 expr,
                 pattern,
@@ -276,7 +297,14 @@ impl Executor {
                 let name = func.name.to_string().to_uppercase();
                 if matches!(
                     name.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "GROUP_CONCAT"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "ARRAY_AGG"
+                        | "STRING_AGG"
+                        | "GROUP_CONCAT"
                 ) {
                     // Check for DISTINCT modifier (e.g., COUNT(DISTINCT col))
                     let is_distinct = if let FunctionArguments::List(args) = &func.args {
@@ -308,6 +336,7 @@ impl Executor {
             Expr::Nested(expr) => self.extract_aggregates_from_expr(expr, aggregates),
             Expr::UnaryOp { expr, .. } => self.extract_aggregates_from_expr(expr, aggregates),
             Expr::Cast { expr, .. } => self.extract_aggregates_from_expr(expr, aggregates),
+            Expr::Extract { expr, .. } => self.extract_aggregates_from_expr(expr, aggregates),
             _ => {}
         }
     }
@@ -327,6 +356,23 @@ impl Executor {
             Expr::Nested(expr) => self.extract_columns_from_expr(expr, cols),
             Expr::UnaryOp { expr, .. } => self.extract_columns_from_expr(expr, cols),
             Expr::Cast { expr, .. } => self.extract_columns_from_expr(expr, cols),
+            Expr::Extract { expr, .. } => self.extract_columns_from_expr(expr, cols),
+            Expr::Array(array) => {
+                for elem in &array.elem {
+                    self.extract_columns_from_expr(elem, cols);
+                }
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                self.extract_columns_from_expr(root, cols);
+                for access in access_chain {
+                    if let sqlparser::ast::AccessExpr::Subscript(
+                        sqlparser::ast::Subscript::Index { index },
+                    ) = access
+                    {
+                        self.extract_columns_from_expr(index, cols);
+                    }
+                }
+            }
             Expr::Function(func) => {
                 if let FunctionArguments::List(args) = &func.args {
                     for arg in &args.args {
@@ -334,6 +380,20 @@ impl Executor {
                             self.extract_columns_from_expr(e, cols);
                         }
                     }
+                }
+            }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                self.extract_columns_from_expr(expr, cols);
+                if let Some(from) = substring_from {
+                    self.extract_columns_from_expr(from, cols);
+                }
+                if let Some(for_expr) = substring_for {
+                    self.extract_columns_from_expr(for_expr, cols);
                 }
             }
             Expr::InList { expr, list, .. } => {
@@ -348,6 +408,10 @@ impl Executor {
                 self.extract_columns_from_expr(expr, cols);
                 self.extract_columns_from_expr(low, cols);
                 self.extract_columns_from_expr(high, cols);
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                self.extract_columns_from_expr(left, cols);
+                self.extract_columns_from_expr(right, cols);
             }
             Expr::IsNull(expr) => self.extract_columns_from_expr(expr, cols),
             Expr::IsNotNull(expr) => self.extract_columns_from_expr(expr, cols),
@@ -397,29 +461,153 @@ impl Executor {
         // 3. Recurse / Evaluate
         match expr {
             Expr::BinaryOp { left, op, right } => {
-                let l = self.evaluate_final_group_expr(left, group_key, group_exprs, agg_map, _schema, _params)?;
-                let r = self.evaluate_final_group_expr(right, group_key, group_exprs, agg_map, _schema, _params)?;
+                let l = self.evaluate_final_group_expr(
+                    left,
+                    group_key,
+                    group_exprs,
+                    agg_map,
+                    _schema,
+                    _params,
+                )?;
+                let r = self.evaluate_final_group_expr(
+                    right,
+                    group_key,
+                    group_exprs,
+                    agg_map,
+                    _schema,
+                    _params,
+                )?;
                 self.evaluate_binary_op(l, op, r)
-            },
-            Expr::Nested(e) => self.evaluate_final_group_expr(e, group_key, group_exprs, agg_map, _schema, _params),
-            Expr::Value(v) => Ok(self.sql_value_to_fusion_value(&v.value)),
-            Expr::Identifier(ident) => {
-                Err(FusionError::Execution(format!("Column '{}' must appear in the GROUP BY clause or be used in an aggregate function", ident.value)))
-            },
+            }
+            Expr::Nested(e) => {
+                self.evaluate_final_group_expr(e, group_key, group_exprs, agg_map, _schema, _params)
+            }
+            Expr::Value(v) => {
+                if let SqlValue::Placeholder(p) = &v.value {
+                    let idx = Self::placeholder_index(p);
+                    if idx > 0 && idx <= _params.len() {
+                        return Ok(_params[idx - 1].clone());
+                    }
+                }
+                Ok(self.sql_value_to_fusion_value(&v.value))
+            }
+            Expr::Array(_) | Expr::TypedString(_) => {
+                self.evaluate_value(expr, &[], _schema, _params)
+            }
+            Expr::Function(func) if func.name.to_string().eq_ignore_ascii_case("COALESCE") => {
+                let FunctionArguments::List(args) = &func.args else {
+                    return Ok(Value::Null);
+                };
+                for arg in &args.args {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+                        continue;
+                    };
+                    let value = self.evaluate_final_group_expr(
+                        expr,
+                        group_key,
+                        group_exprs,
+                        agg_map,
+                        _schema,
+                        _params,
+                    )?;
+                    if value != Value::Null {
+                        return Ok(value);
+                    }
+                }
+                Ok(Value::Null)
+            }
+            Expr::Function(func) => {
+                let FunctionArguments::List(args) = &func.args else {
+                    return Err(FusionError::Execution(
+                        "Unsupported function argument format".to_string(),
+                    ));
+                };
+                let mut evaluated_row = Vec::with_capacity(args.args.len());
+                let mut evaluated_args = Vec::with_capacity(args.args.len());
+                for (index, arg) in args.args.iter().enumerate() {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+                        return Err(FusionError::Execution(
+                            "Unsupported function argument type".to_string(),
+                        ));
+                    };
+                    let value = self.evaluate_final_group_expr(
+                        expr,
+                        group_key,
+                        group_exprs,
+                        agg_map,
+                        _schema,
+                        _params,
+                    )?;
+                    let arg_name = format!("__group_fn_arg_{}", index);
+                    evaluated_row.push(value);
+                    evaluated_args.push(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                        Expr::Identifier(sqlparser::ast::Ident::new(arg_name)),
+                    )));
+                }
+
+                let mut evaluated_func = func.clone();
+                evaluated_func.args = FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+                    duplicate_treatment: None,
+                    args: evaluated_args,
+                    clauses: vec![],
+                });
+                let function_schema = TableSchema::new(
+                    "__group_function_args".to_string(),
+                    (0..evaluated_row.len())
+                        .map(|index| crate::catalog::Column {
+                            name: format!("__group_fn_arg_{}", index),
+                            data_type: "UNKNOWN".to_string(),
+                            is_primary: false,
+                            is_indexed: false,
+                            index_type: crate::catalog::IndexType::None,
+                            default_value: None,
+                            is_nullable: true,
+                            is_unique: false,
+                            check_expr: None,
+                        })
+                        .collect(),
+                );
+
+                self.evaluate_function(&evaluated_func, &evaluated_row, &function_schema, _params)
+            }
+            Expr::Substring { .. } => {
+                if let Some(idx) = group_exprs.iter().position(|e| e == expr) {
+                    Ok(group_key[idx].clone())
+                } else {
+                    Err(FusionError::Execution(
+                        "SUBSTRING expression must appear in the GROUP BY clause or be used in an aggregate function".to_string(),
+                    ))
+                }
+            }
+            Expr::Identifier(ident) => Err(FusionError::Execution(format!(
+                "Column '{}' must appear in the GROUP BY clause or be used in an aggregate function",
+                ident.value
+            ))),
             Expr::UnaryOp { op, expr } => {
-                 let val = self.evaluate_final_group_expr(expr, group_key, group_exprs, agg_map, _schema, _params)?;
-                 match op {
-                     sqlparser::ast::UnaryOperator::Minus => {
-                         match val {
-                             Value::Integer(i) => Ok(Value::Integer(-i)),
-                             Value::Float(f) => Ok(Value::Float(-f)),
-                             _ => Err(FusionError::Execution("Unary minus on non-number".to_string())),
-                         }
-                     },
-                     _ => Err(FusionError::Execution("Unsupported unary operator in GROUP BY".to_string())),
-                 }
-            },
-            _ => Err(FusionError::Execution("Unsupported expression in GROUP BY projection".to_string())),
+                let val = self.evaluate_final_group_expr(
+                    expr,
+                    group_key,
+                    group_exprs,
+                    agg_map,
+                    _schema,
+                    _params,
+                )?;
+                match op {
+                    sqlparser::ast::UnaryOperator::Minus => match val {
+                        Value::Integer(i) => Ok(Value::Integer(-i)),
+                        Value::Float(f) => Ok(Value::Float(-f)),
+                        _ => Err(FusionError::Execution(
+                            "Unary minus on non-number".to_string(),
+                        )),
+                    },
+                    _ => Err(FusionError::Execution(
+                        "Unsupported unary operator in GROUP BY".to_string(),
+                    )),
+                }
+            }
+            _ => Err(FusionError::Execution(
+                "Unsupported expression in GROUP BY projection".to_string(),
+            )),
         }
     }
 
@@ -468,6 +656,7 @@ mod tests {
         assert!(Executor::like_match("Alice", "Ali%"));
         assert!(Executor::like_match("Alice", "%ce"));
         assert!(Executor::like_match("Charlie", "%li%"));
+        assert!(Executor::like_match("brand-a", "%a"));
         assert!(Executor::like_match("alphabet soup", "a%bet%soup"));
         assert!(!Executor::like_match("alphabet soup", "a%bet%soap"));
     }

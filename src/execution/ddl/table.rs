@@ -1,10 +1,28 @@
 use crate::catalog::{Column, IndexType, TableSchema};
-use crate::common::{FusionError, Result};
+use crate::common::{FusionError, Result, Value};
 use crate::monitor;
 use crate::storage::Transaction;
-use sqlparser::ast::{ColumnOption, TableConstraint};
+use sqlparser::ast::{ColumnOption, Expr, TableConstraint};
+use std::collections::HashSet;
 
 use super::super::{Executor, QueryResult};
+
+struct TablePrimaryKeySpec {
+    name: Option<String>,
+    columns: Vec<String>,
+}
+
+impl TablePrimaryKeySpec {
+    fn single_primary_column(&self) -> Option<&String> {
+        (self.columns.len() == 1).then_some(&self.columns[0])
+    }
+
+    fn has_column(&self, name: &str) -> bool {
+        self.columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(name))
+    }
+}
 
 impl Executor {
     pub(crate) async fn handle_create_table(
@@ -31,14 +49,23 @@ impl Executor {
                 )));
             }
         }
+        let table_primary_key = Self::extract_table_primary_key(columns, constraints)?;
         let cols: Vec<Column> = columns
             .iter()
             .map(|c| {
-                let is_primary = c.options.iter().any(|opt| match &opt.option {
-                    ColumnOption::Unique(_) => false,
-                    ColumnOption::PrimaryKey(_) => true,
-                    _ => false,
-                });
+                let col_name = c.name.to_string();
+                let column_primary = c
+                    .options
+                    .iter()
+                    .any(|opt| matches!(&opt.option, ColumnOption::PrimaryKey(_)));
+                let is_primary = column_primary
+                    || table_primary_key
+                        .as_ref()
+                        .and_then(|pk| pk.single_primary_column())
+                        .is_some_and(|pk_name| pk_name.eq_ignore_ascii_case(&col_name));
+                let is_composite_primary = table_primary_key
+                    .as_ref()
+                    .is_some_and(|pk| pk.columns.len() > 1 && pk.has_column(&col_name));
                 let default_value = c.options.iter().find_map(|opt| {
                     if let ColumnOption::Default(expr) = &opt.option {
                         Some(format!("{}", expr))
@@ -47,7 +74,7 @@ impl Executor {
                     }
                 });
                 Column {
-                    name: c.name.to_string(),
+                    name: col_name,
                     data_type: format!("{}", c.data_type),
                     is_primary,
                     is_indexed: is_primary,
@@ -58,6 +85,7 @@ impl Executor {
                     },
                     default_value,
                     is_nullable: !is_primary
+                        && !is_composite_primary
                         && !c
                             .options
                             .iter()
@@ -79,14 +107,16 @@ impl Executor {
 
         let foreign_keys = Self::collect_foreign_keys(&table_name, columns, constraints)?;
         for fk in &foreign_keys {
-            if cols
-                .iter()
-                .all(|column| !column.name.eq_ignore_ascii_case(&fk.child_column))
-            {
-                return Err(FusionError::Execution(format!(
-                    "FOREIGN KEY child column {} not found",
-                    fk.child_column
-                )));
+            for child_column in fk.child_columns() {
+                if cols
+                    .iter()
+                    .all(|column| !column.name.eq_ignore_ascii_case(&child_column))
+                {
+                    return Err(FusionError::Execution(format!(
+                        "FOREIGN KEY child column {} not found",
+                        child_column
+                    )));
+                }
             }
 
             let parent_key = format!("schema:{}", fk.parent_table);
@@ -95,15 +125,17 @@ impl Executor {
             })?;
             let parent_schema: TableSchema = bincode::deserialize(&parent_schema_bytes)
                 .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
-            if parent_schema
-                .columns
-                .iter()
-                .all(|column| !column.name.eq_ignore_ascii_case(&fk.parent_column))
-            {
-                return Err(FusionError::Execution(format!(
-                    "Referenced column {}.{} not found",
-                    fk.parent_table, fk.parent_column
-                )));
+            for parent_column in fk.parent_columns() {
+                if parent_schema
+                    .columns
+                    .iter()
+                    .all(|column| !column.name.eq_ignore_ascii_case(&parent_column))
+                {
+                    return Err(FusionError::Execution(format!(
+                        "Referenced column {}.{} not found",
+                        fk.parent_table, parent_column
+                    )));
+                }
             }
         }
 
@@ -113,12 +145,143 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema serialization error: {}", e)))?;
 
         txn.put(key.as_bytes(), &value).await?;
+        self.ensure_composite_index_directory_marker(&table_name, txn)
+            .await?;
+        if let Some(primary_key) = table_primary_key.as_ref() {
+            if primary_key.columns.len() > 1 {
+                self.store_composite_primary_key_index(&table_name, primary_key, txn)
+                    .await?;
+            }
+        }
         self.store_foreign_keys(&table_name, &foreign_keys, txn)
             .await?;
 
         Ok(QueryResult::Success {
             message: format!("Table {} created", table_name),
         })
+    }
+
+    fn extract_table_primary_key(
+        columns: &[sqlparser::ast::ColumnDef],
+        constraints: &[TableConstraint],
+    ) -> Result<Option<TablePrimaryKeySpec>> {
+        let column_primary_count = columns
+            .iter()
+            .filter(|column| {
+                column
+                    .options
+                    .iter()
+                    .any(|opt| matches!(&opt.option, ColumnOption::PrimaryKey(_)))
+            })
+            .count();
+        let primary_constraints: Vec<&sqlparser::ast::PrimaryKeyConstraint> = constraints
+            .iter()
+            .filter_map(|constraint| {
+                if let TableConstraint::PrimaryKey(pk) = constraint {
+                    Some(pk)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if column_primary_count > 0 && !primary_constraints.is_empty() {
+            return Err(FusionError::Execution(
+                "Multiple PRIMARY KEY constraints are not supported".to_string(),
+            ));
+        }
+        if primary_constraints.len() > 1 {
+            return Err(FusionError::Execution(
+                "Multiple PRIMARY KEY constraints are not supported".to_string(),
+            ));
+        }
+
+        let Some(pk) = primary_constraints.first() else {
+            return Ok(None);
+        };
+        let mut pk_columns = Vec::with_capacity(pk.columns.len());
+        for column in &pk.columns {
+            let column_name = match &column.column.expr {
+                Expr::Identifier(ident) => ident.value.clone(),
+                _ => {
+                    return Err(FusionError::Execution(
+                        "PRIMARY KEY only supports simple column references".to_string(),
+                    ))
+                }
+            };
+            if columns
+                .iter()
+                .all(|column| !column.name.value.eq_ignore_ascii_case(&column_name))
+            {
+                return Err(FusionError::Execution(format!(
+                    "Column {} not found",
+                    column_name
+                )));
+            }
+            pk_columns.push(column_name);
+        }
+
+        if pk_columns.is_empty() {
+            return Err(FusionError::Execution(
+                "PRIMARY KEY requires at least one column".to_string(),
+            ));
+        }
+        if pk_columns.len() == 1 {
+            let column_name = &pk_columns[0];
+            let column_idx = columns
+                .iter()
+                .position(|column| column.name.value.eq_ignore_ascii_case(column_name))
+                .ok_or_else(|| {
+                    FusionError::Execution(format!("Column {} not found", column_name))
+                })?;
+            if column_idx != 0 {
+                return Err(FusionError::Execution(format!(
+                    "Table-level PRIMARY KEY currently requires the primary key column to be the first column; {} is at position {}",
+                    column_name,
+                    column_idx + 1
+                )));
+            }
+        } else if !columns
+            .first()
+            .is_some_and(|column| pk_columns[0].eq_ignore_ascii_case(&column.name.value))
+        {
+            return Err(FusionError::Execution(format!(
+                "Composite PRIMARY KEY currently requires the first key column to be the first table column; {} is first in the key",
+                pk_columns[0]
+            )));
+        }
+
+        Ok(Some(TablePrimaryKeySpec {
+            name: pk
+                .name
+                .as_ref()
+                .or(pk.index_name.as_ref())
+                .map(|ident| ident.value.clone()),
+            columns: pk_columns,
+        }))
+    }
+
+    async fn store_composite_primary_key_index(
+        &self,
+        table_name: &str,
+        primary_key: &TablePrimaryKeySpec,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let index_name = primary_key
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}_pkey", table_name));
+        let meta_key = format!("index_meta:{}", index_name);
+        if txn.get(meta_key.as_bytes()).await?.is_some() {
+            return Err(FusionError::Execution(format!(
+                "Index {} already exists",
+                index_name
+            )));
+        }
+        let meta_val = Self::composite_unique_meta_value(table_name, &primary_key.columns);
+        txn.put(meta_key.as_bytes(), meta_val.as_bytes()).await?;
+        self.rebuild_composite_index_directory_for_table(table_name, txn)
+            .await
     }
 
     pub(crate) async fn handle_drop_table(
@@ -304,10 +467,11 @@ impl Executor {
                                 }
                                 let child_foreign_keys =
                                     self.load_child_foreign_keys(&table_name, txn).await?;
-                                if child_foreign_keys
-                                    .iter()
-                                    .any(|fk| fk.child_column.eq_ignore_ascii_case(&col_name))
-                                {
+                                if child_foreign_keys.iter().any(|fk| {
+                                    fk.child_columns()
+                                        .iter()
+                                        .any(|column| column.eq_ignore_ascii_case(&col_name))
+                                }) {
                                     return Err(FusionError::Execution(format!(
                                         "Cannot drop column {} because a FOREIGN KEY depends on it",
                                         col_name
@@ -315,10 +479,11 @@ impl Executor {
                                 }
                                 let parent_foreign_keys =
                                     self.load_parent_foreign_keys(&table_name, txn).await?;
-                                if parent_foreign_keys
-                                    .iter()
-                                    .any(|fk| fk.parent_column.eq_ignore_ascii_case(&col_name))
-                                {
+                                if parent_foreign_keys.iter().any(|fk| {
+                                    fk.parent_columns()
+                                        .iter()
+                                        .any(|column| column.eq_ignore_ascii_case(&col_name))
+                                }) {
                                     return Err(FusionError::Execution(format!(
                                         "Cannot drop column {} because it is referenced by a FOREIGN KEY",
                                         col_name
@@ -393,10 +558,11 @@ impl Executor {
                             }
                             let child_foreign_keys =
                                 self.load_child_foreign_keys(&table_name, txn).await?;
-                            if child_foreign_keys
-                                .iter()
-                                .any(|fk| fk.child_column.eq_ignore_ascii_case(&old_name))
-                            {
+                            if child_foreign_keys.iter().any(|fk| {
+                                fk.child_columns()
+                                    .iter()
+                                    .any(|column| column.eq_ignore_ascii_case(&old_name))
+                            }) {
                                 return Err(FusionError::Execution(format!(
                                     "Cannot rename column {} because a FOREIGN KEY depends on it",
                                     old_name
@@ -404,10 +570,11 @@ impl Executor {
                             }
                             let parent_foreign_keys =
                                 self.load_parent_foreign_keys(&table_name, txn).await?;
-                            if parent_foreign_keys
-                                .iter()
-                                .any(|fk| fk.parent_column.eq_ignore_ascii_case(&old_name))
-                            {
+                            if parent_foreign_keys.iter().any(|fk| {
+                                fk.parent_columns()
+                                    .iter()
+                                    .any(|column| column.eq_ignore_ascii_case(&old_name))
+                            }) {
                                 return Err(FusionError::Execution(format!(
                                     "Cannot rename column {} because it is referenced by a FOREIGN KEY",
                                     old_name
@@ -423,6 +590,31 @@ impl Executor {
                             )));
                         }
                     }
+                }
+                sqlparser::ast::AlterTableOperation::AddConstraint {
+                    constraint:
+                        TableConstraint::PrimaryKey(sqlparser::ast::PrimaryKeyConstraint {
+                            name,
+                            index_name,
+                            columns,
+                            ..
+                        }),
+                    ..
+                } => {
+                    let constraint_name = name
+                        .as_ref()
+                        .or(index_name.as_ref())
+                        .map(|ident| ident.value.clone());
+                    let message = self
+                        .handle_alter_table_add_primary_key(
+                            &table_name,
+                            &mut schema,
+                            constraint_name,
+                            columns,
+                            txn,
+                        )
+                        .await?;
+                    messages.push(message);
                 }
                 other => {
                     return Err(FusionError::Execution(format!(
@@ -441,5 +633,297 @@ impl Executor {
         Ok(QueryResult::Success {
             message: messages.join("; "),
         })
+    }
+
+    async fn handle_alter_table_add_primary_key(
+        &self,
+        table_name: &str,
+        schema: &mut TableSchema,
+        constraint_name: Option<String>,
+        columns: &[sqlparser::ast::IndexColumn],
+        txn: &mut dyn Transaction,
+    ) -> Result<String> {
+        if columns.len() != 1 {
+            return Err(FusionError::Execution(
+                "ALTER TABLE ADD PRIMARY KEY currently supports exactly one column".to_string(),
+            ));
+        }
+
+        if schema.get_primary_key_index().is_some() {
+            return Err(FusionError::Execution(format!(
+                "Table {} already has a PRIMARY KEY",
+                table_name
+            )));
+        }
+
+        let column_name = match &columns[0].column.expr {
+            Expr::Identifier(ident) => ident.value.clone(),
+            _ => {
+                return Err(FusionError::Execution(
+                    "PRIMARY KEY only supports simple column references".to_string(),
+                ))
+            }
+        };
+        let column_idx = schema
+            .get_column_index(&column_name)
+            .ok_or_else(|| FusionError::Execution(format!("Column {} not found", column_name)))?;
+
+        if column_idx != 0 {
+            return Err(FusionError::Execution(format!(
+                "ALTER TABLE ADD PRIMARY KEY currently requires the primary key column to be the first column; {} is at position {}",
+                column_name,
+                column_idx + 1
+            )));
+        }
+
+        let data_prefix = format!("data:{}:", table_name);
+        let rows = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut rewrites = Vec::with_capacity(rows.len());
+
+        for (key, value) in rows {
+            let key_str = std::str::from_utf8(&key)
+                .map_err(|e| FusionError::Execution(format!("Data key decode error: {}", e)))?;
+            let old_row_id = key_str
+                .rsplit(':')
+                .next()
+                .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?
+                .to_string();
+
+            let pk_value = if let Some(row) = self.row_cache.get(key_str) {
+                monitor::inc_row_cache_hit();
+                row.get(column_idx).cloned().unwrap_or(Value::Null)
+            } else {
+                crate::common::encoding::RowDecoder::decode_column(&value, column_idx)
+                    .map_err(|e| {
+                        FusionError::Execution(format!("Data deserialization error: {}", e))
+                    })?
+                    .unwrap_or(Value::Null)
+            };
+
+            if pk_value == Value::Null {
+                return Err(FusionError::Execution(format!(
+                    "PRIMARY KEY column '{}' contains NULL values",
+                    column_name
+                )));
+            }
+
+            let pk_key = Self::value_to_primary_row_id(&pk_value).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "PRIMARY KEY column '{}' has unsupported value '{}'",
+                    column_name, pk_value
+                ))
+            })?;
+            if !seen.insert(pk_key.clone()) {
+                return Err(FusionError::Execution(format!(
+                    "PRIMARY KEY constraint violated for column '{}': duplicate value '{}'",
+                    column_name, pk_value
+                )));
+            }
+
+            rewrites.push((key, old_row_id, pk_key, value));
+        }
+
+        let index_name =
+            constraint_name.unwrap_or_else(|| format!("{}_{}_pkey", table_name, column_name));
+        let meta_key = format!("index_meta:{}", index_name);
+        if txn.get(meta_key.as_bytes()).await?.is_some() {
+            return Err(FusionError::Execution(format!(
+                "Index {} already exists",
+                index_name
+            )));
+        }
+        let meta_val = format!("{}:{}", table_name, column_name);
+
+        let column = &mut schema.columns[column_idx];
+        column.is_primary = true;
+        column.is_unique = true;
+        column.is_nullable = false;
+        column.is_indexed = true;
+        column.index_type = IndexType::BTree;
+
+        for (old_key, old_row_id, new_row_id, value) in rewrites {
+            let new_key = format!("data:{}:{}", table_name, new_row_id);
+            let old_key_str = std::str::from_utf8(&old_key)
+                .map_err(|e| FusionError::Execution(format!("Data key decode error: {}", e)))?
+                .to_string();
+            if old_key_str != new_key {
+                if txn.get(new_key.as_bytes()).await?.is_some() {
+                    return Err(FusionError::Execution(format!(
+                        "PRIMARY KEY constraint violated for column '{}': duplicate storage key",
+                        column_name
+                    )));
+                }
+                txn.delete(&old_key).await?;
+                txn.put(new_key.as_bytes(), &value).await?;
+                self.row_cache.invalidate(&old_key_str);
+                self.row_cache.invalidate(&new_key);
+                self.rewrite_row_id_references_for_primary_key(
+                    table_name,
+                    schema,
+                    &old_row_id,
+                    &new_row_id,
+                    &value,
+                    txn,
+                )
+                .await?;
+            }
+        }
+
+        let rows_after_rewrite = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
+        for (key, value) in rows_after_rewrite {
+            let row_id = Self::row_id_from_key(&key)
+                .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?;
+            let pk_value = crate::common::encoding::RowDecoder::decode_column(&value, column_idx)
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+                .unwrap_or(Value::Null);
+            if let Some(index_value) = self.value_to_index_string(&pk_value) {
+                let index_key = format!(
+                    "index:{}:{}:{}:{}",
+                    table_name, column_name, index_value, row_id
+                );
+                txn.put(index_key.as_bytes(), &[]).await?;
+            }
+        }
+
+        txn.put(meta_key.as_bytes(), meta_val.as_bytes()).await?;
+
+        Ok(format!(
+            "Added PRIMARY KEY {} on {}({})",
+            index_name, table_name, column_name
+        ))
+    }
+
+    async fn rewrite_row_id_references_for_primary_key(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        old_row_id: &str,
+        new_row_id: &str,
+        row_bytes: &[u8],
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        for column in &schema.columns {
+            if !column.is_indexed || column.is_primary {
+                continue;
+            }
+            match column.index_type {
+                IndexType::BTree => {
+                    let old_suffix = format!(":{}", old_row_id);
+                    let prefix = format!("index:{}:{}:", table_name, column.name);
+                    let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                    for (index_key, index_value) in entries {
+                        let Ok(index_key_str) = std::str::from_utf8(&index_key) else {
+                            continue;
+                        };
+                        if !index_key_str.ends_with(&old_suffix) {
+                            continue;
+                        }
+                        let Some(value_part) = index_key_str
+                            .strip_prefix(&prefix)
+                            .and_then(|suffix| suffix.rsplit_once(':').map(|(value, _)| value))
+                        else {
+                            continue;
+                        };
+                        let new_index_key = format!("{}{}:{}", prefix, value_part, new_row_id);
+                        txn.delete(&index_key).await?;
+                        txn.put(new_index_key.as_bytes(), &index_value).await?;
+                    }
+                }
+                IndexType::FTS => {
+                    let old_suffix = format!(":{}", old_row_id);
+                    let prefix = format!("fts:{}:{}:", table_name, column.name);
+                    let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                    for (index_key, index_value) in entries {
+                        let Ok(index_key_str) = std::str::from_utf8(&index_key) else {
+                            continue;
+                        };
+                        if !index_key_str.ends_with(&old_suffix) {
+                            continue;
+                        }
+                        let Some(token) = index_key_str
+                            .strip_prefix(&prefix)
+                            .and_then(|suffix| suffix.rsplit_once(':').map(|(token, _)| token))
+                        else {
+                            continue;
+                        };
+                        let new_index_key = format!("{}{}:{}", prefix, token, new_row_id);
+                        txn.delete(&index_key).await?;
+                        txn.put(new_index_key.as_bytes(), &index_value).await?;
+                    }
+                }
+                IndexType::HNSW => {
+                    if let Some(col_idx) = schema.get_column_index(&column.name) {
+                        if let Some(Value::Vector(vector)) =
+                            crate::common::encoding::RowDecoder::decode_column(row_bytes, col_idx)
+                                .map_err(|e| {
+                                FusionError::Execution(format!("Data deserialization error: {}", e))
+                            })?
+                        {
+                            let index_name = format!("hnsw_{}_{}", table_name, column.name);
+                            self.vector_index.delete(&index_name, old_row_id)?;
+                            self.vector_index.insert(
+                                &index_name,
+                                new_row_id.to_string(),
+                                vector,
+                            )?;
+                        }
+                    }
+                }
+                IndexType::None => {}
+            }
+        }
+
+        let composite_indexes = self
+            .load_composite_indexes_for_table(table_name, txn)
+            .await?;
+        if !composite_indexes.is_empty() {
+            let row = crate::common::encoding::RowDecoder::decode(row_bytes).map_err(|e| {
+                FusionError::Execution(format!("Data deserialization error: {}", e))
+            })?;
+            self.delete_loaded_composite_indexes_for_row(
+                &composite_indexes,
+                table_name,
+                schema,
+                &row,
+                old_row_id,
+                txn,
+            )
+            .await?;
+            self.put_loaded_composite_indexes_for_row(
+                &composite_indexes,
+                table_name,
+                schema,
+                &row,
+                new_row_id,
+                txn,
+            )
+            .await?;
+        }
+
+        let trigram_column_indices = Self::indexed_trigram_text_columns(schema);
+        if !trigram_column_indices.is_empty() {
+            let row = crate::common::encoding::RowDecoder::decode(row_bytes).map_err(|e| {
+                FusionError::Execution(format!("Data deserialization error: {}", e))
+            })?;
+            self.update_trigram_index_for_delete(
+                table_name,
+                schema,
+                &row,
+                old_row_id,
+                &trigram_column_indices,
+                txn,
+            );
+            self.update_trigram_index_for_insert(
+                table_name,
+                schema,
+                &row,
+                new_row_id,
+                &trigram_column_indices,
+                txn,
+            );
+        }
+
+        Ok(())
     }
 }

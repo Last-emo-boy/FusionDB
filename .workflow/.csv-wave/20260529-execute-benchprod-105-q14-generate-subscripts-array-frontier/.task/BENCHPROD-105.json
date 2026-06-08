@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-105",
+  "title": "Advance LDBC Query 14 past generate_subscripts and grouped projection gaps",
+  "date": "2026-05-29",
+  "status": "completed_with_next_gap",
+  "files_touched": [
+    "src/execution/aggregation.rs",
+    "src/execution/expr/mod.rs",
+    "src/execution/expr/value.rs",
+    "src/execution/query/mod.rs",
+    "src/execution/scan/mod.rs",
+    "src/execution/scan/join.rs",
+    "src/server/pg_server.rs",
+    "tests/sql_set_subquery.rs"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo test --test sql_expr_functions test_string_concat_operator -- --nocapture",
+    "cargo test --release --test pg_integration -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 40 --operation-count 10 --tool-timeout 180 --preload-timeout 180 --run-name ldbc_snb_native_benchprod105_pg_describe_prefix40_10ops_20260529 --fail-on-gap"
+  ],
+  "result": "Q14 reachable-prefix smoke advanced through generate_subscripts, grouped projection, and PgWire RowDescription; current gap is JDBC PgArray decoding for the returned nested path array.",
+  "next_task": "BENCHPROD-106"
+}

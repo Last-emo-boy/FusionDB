@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-113",
+  "title": "Optimize LDBC Query6 with indexes and EXISTS membership cache",
+  "date": "2026-05-29",
+  "status": "completed",
+  "files_touched": [
+    "E:\\Playground\\FusionDB\\src\\execution\\expr\\subquery.rs",
+    "E:\\Playground\\FusionDB\\tests\\sql_set_subquery.rs",
+    "E:\\Playground\\FusionDB-bench\\ldbc_snb_native_smoke.py"
+  ],
+  "verification": [
+    "python -m py_compile ldbc_snb_native_smoke.py external_bootstrap.py",
+    "cargo fmt --check",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --disable-read-query LdbcQuery1 --disable-read-query LdbcQuery2 --disable-read-query LdbcQuery3 --disable-read-query LdbcQuery4 --disable-read-query LdbcQuery5 --disable-read-query LdbcQuery7 --disable-read-query LdbcQuery8 --disable-read-query LdbcQuery9 --disable-read-query LdbcQuery10 --disable-read-query LdbcQuery11 --disable-read-query LdbcQuery12 --disable-read-query LdbcQuery13 --disable-read-query LdbcQuery14 --disable-read-query LdbcShortQuery1PersonProfile --disable-read-query LdbcShortQuery2PersonPosts --disable-read-query LdbcShortQuery3PersonFriends --disable-read-query LdbcShortQuery4MessageContent --disable-read-query LdbcShortQuery5MessageCreator --disable-read-query LdbcShortQuery6MessageForum --disable-read-query LdbcShortQuery7MessageReplies --create-q6-indexes --operation-count 3 --duration 10 --warmup 0 --tool-timeout 180 --preload-timeout 360 --run-name ldbc_snb_native_benchprod113_isolate_q6_existscache_schemafast_20260529",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --create-q14-indexes --create-q6-indexes --operation-count 80 --duration 20 --warmup 0 --tool-timeout 240 --preload-timeout 360 --run-name ldbc_snb_native_benchprod113_q6_q14_indexes_80ops_20260529"
+  ],
+  "result": "Q6 command-mode isolation improved from the BENCHPROD-112 180-second timeout to a 3-operation pass with mean runtime 789.3333333333334 ms after Q6 indexes and a schema-fast two-table EXISTS membership cache.",
+  "evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_isolate_q6_existscache_schemafast_20260529\\ldbc_snb_native_smoke_summary.json",
+  "metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_isolate_q6_existscache_schemafast_20260529\\ldbc_results\\fusiondb-results.json",
+  "broad_smoke_evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_q6_q14_indexes_80ops_20260529\\ldbc_snb_native_smoke_summary.json",
+  "broad_smoke_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_q6_q14_indexes_80ops_20260529\\ldbc_results\\fusiondb-results.json",
+  "labels": [
+    "native-command-mode-smoke",
+    "q6-isolation-pass",
+    "q6-indexes",
+    "exists-membership-cache",
+    "q14-enabled",
+    "80-requested-operations",
+    "updates-disabled",
+    "not-full-official-ldbc-pass"
+  ],
+  "known_limits": [
+    "This is not a full official LDBC benchmark pass.",
+    "Q6 isolation summaries intentionally remain gap because isolation mode disables other read queries.",
+    "The final 80-op broad smoke passed but did not sample LdbcQuery6 in metrics.",
+    "Updates are still disabled in generated LDBC properties.",
+    "Q4 remains slow at about 39.4 seconds.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-114"
+}

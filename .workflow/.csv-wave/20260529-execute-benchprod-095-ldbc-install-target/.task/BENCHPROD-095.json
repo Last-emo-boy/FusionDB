@@ -1,0 +1,14 @@
+{
+  "id": "BENCHPROD-095",
+  "title": "LDBC SNB install target and blocker refresh",
+  "status": "completed",
+  "kind": "benchprod-execute",
+  "scope": [
+    "E:\\Playground\\FusionDB-bench\\install_external_tools.ps1",
+    "E:\\Playground\\FusionDB-bench\\runs\\external_bootstrap_benchprod095_ldbc_install_target_20260529",
+    "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod095_install_target_20260529",
+    "E:\\Playground\\FusionDB-bench\\runs\\external_smoke_benchprod095_ldbc_install_target_20260529"
+  ],
+  "result": "Added a bounded LDBC install/bootstrap target and refreshed artifact_missing evidence.",
+  "next": "Install/provide LDBC SNB artifact, then move from artifact_missing to help/command workload smoke."
+}

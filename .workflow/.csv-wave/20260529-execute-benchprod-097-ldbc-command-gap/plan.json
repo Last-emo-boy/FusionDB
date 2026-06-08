@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "session_id": "20260529-execute-benchprod-097-ldbc-command-gap",
+  "source": "maestro-execute",
+  "objective": "BENCHPROD-097: move LDBC native evidence from help readiness to command-mode execution and capture the first real FusionDB compatibility gap",
+  "created_at": "2026-05-29T03:38:00+08:00",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-097"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-097",
+      "title": "LDBC command-mode gap capture",
+      "status": "completed",
+      "files": [
+        "E:/Playground/FusionDB-bench/ldbc_snb_native_smoke.py",
+        "E:/Playground/FusionDB-bench/README.md"
+      ],
+      "convergence": [
+        "ldbc_snb_native_smoke.py supports a built-in postgres-interactive command preset",
+        "command-mode evidence uses official org.ldbcouncil.snb.driver.Client and PostgreSQL implementation jar",
+        "strict native gate no longer fails LDBC due to help/readiness mode; it fails on native_status=gap instead"
+      ]
+    }
+  ]
+}

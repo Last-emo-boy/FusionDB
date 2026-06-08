@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-111",
+  "title": "Retry Q14-enabled native LDBC command-mode smoke",
+  "date": "2026-05-29",
+  "status": "completed",
+  "files_touched": [
+    "E:\\Playground\\FusionDB\\src\\execution\\expr\\mod.rs",
+    "E:\\Playground\\FusionDB\\tests\\sql_set_subquery.rs",
+    "E:\\Playground\\FusionDB\\tests\\pg_integration.rs",
+    "E:\\Playground\\FusionDB-bench\\ldbc_snb_native_smoke.py",
+    "E:\\Playground\\FusionDB-bench\\external_bootstrap.py"
+  ],
+  "verification": [
+    "python -m py_compile external_bootstrap.py ldbc_snb_native_smoke.py ldbc_q14_profile.py",
+    "cargo fmt --check",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "cargo test --release --test pg_integration -- --nocapture",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --create-q14-indexes --operation-count 10 --duration 10 --warmup 0 --tool-timeout 240 --preload-timeout 360 --run-name ldbc_snb_native_benchprod111_q14_enabled_full_testdata_10ops_indexes_arrayfix_20260529"
+  ],
+  "result": "Q14-enabled native LDBC command-mode smoke passed after adding Q14 index creation and fixing Expr::Array projection dependency extraction for nested array aggregates.",
+  "evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod111_q14_enabled_full_testdata_10ops_indexes_arrayfix_20260529\\ldbc_snb_native_smoke_summary.json",
+  "labels": [
+    "native-command-mode-smoke",
+    "q14-enabled",
+    "full-testdata-preload",
+    "not-full-official-ldbc-pass"
+  ],
+  "next_task": "BENCHPROD-112"
+}

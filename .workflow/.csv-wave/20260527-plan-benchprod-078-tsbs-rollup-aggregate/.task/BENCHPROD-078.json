@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-078",
+  "title": "Optimize grouped aggregate rollup paths for TSBS fleet rollup",
+  "status": "pending",
+  "created_at": "2026-05-27T14:10:00+08:00",
+  "scope": "database core grouped aggregate and rollup query execution",
+  "target_cases": [
+    "tsbs:Fleet rollup by region",
+    "chbench:Warehouse revenue rollup",
+    "ldbc:Tag popularity"
+  ],
+  "baseline": {
+    "source": "BENCHPROD-077 production medium repeat",
+    "repeat_report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod077_production_medium_composite_meta_3x_20260527/bench_repeat_summary.json",
+    "gate_report": "E:/Playground/FusionDB-bench/runs/gate_benchprod077_production_medium_composite_meta_20260527/bench_gate_summary.json",
+    "gate": "passed 22/22",
+    "tsbs_p95_median_ms": 12.016,
+    "chbench_p95_median_ms": 10.283,
+    "ldbc_p95_median_ms": 2.084
+  },
+  "hypothesis": [
+    "Fleet rollup latency is dominated by grouped aggregate scan work and row decoding over the TSBS metrics table.",
+    "Improving grouped aggregate scan shape can help TSBS and may also reduce CH-benCHmark and LDBC rollup/BI query latency.",
+    "Benchmark thresholds and allowlists must stay unchanged; improvements should come from database core execution changes."
+  ],
+  "candidate_files": [
+    "src/execution/query/column_scan.rs",
+    "src/execution/query/mod.rs",
+    "src/execution/aggregation.rs",
+    "tests/sql_group_aggregate.rs",
+    "E:/Playground/FusionDB-bench/fusiondb_bench.py"
+  ],
+  "verification_plan": [
+    "cargo fmt --check",
+    "cargo check --lib",
+    "cargo test --test sql_group_aggregate -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python bench_repeat.py --scale medium --suite tsbs --repeats 3 --threads 4 --run-name repeat_benchprod078_tsbs_medium_rollup_3x_20260527 --suite-timeout 1800",
+    "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod078_production_medium_rollup_3x_20260527 --suite-timeout 3600",
+    "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod078_production_medium_rollup_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod078_production_medium_rollup_20260527"
+  ]
+}

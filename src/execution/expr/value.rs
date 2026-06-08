@@ -1,6 +1,9 @@
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
-use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue};
+use chrono::{Datelike, Timelike};
+use sqlparser::ast::{
+    AccessExpr, BinaryOperator, DateTimeField, Expr, Subscript, Value as SqlValue,
+};
 use std::cmp::Ordering;
 
 use super::Executor;
@@ -24,7 +27,49 @@ impl Executor {
                 let idx = self.resolve_column_index(&col_name, schema)?;
                 Ok(row[idx].clone())
             }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let mut value = self.evaluate_value(root, row, schema, params)?;
+                for access in access_chain {
+                    value = self.evaluate_access(value, access, row, schema, params)?;
+                }
+                Ok(value)
+            }
             Expr::Function(func) => self.evaluate_function(func, row, schema, params),
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let val = self.evaluate_value(expr, row, schema, params)?;
+                let s = match val {
+                    Value::String(s) => s,
+                    _ => return Ok(Value::Null),
+                };
+                let start = if let Some(from) = substring_from {
+                    match self.evaluate_value(from, row, schema, params)? {
+                        Value::Integer(n) => (n - 1).max(0) as usize,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                let len = if let Some(for_expr) = substring_for {
+                    match self.evaluate_value(for_expr, row, schema, params)? {
+                        Value::Integer(n) => Some(n.max(0) as usize),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let chars: Vec<char> = s.chars().collect();
+                let end = len
+                    .map(|value| (start + value).min(chars.len()))
+                    .unwrap_or(chars.len());
+                Ok(Value::String(
+                    chars[start.min(chars.len())..end].iter().collect(),
+                ))
+            }
             Expr::Ceil { expr, .. } => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
                 match val {
@@ -87,6 +132,10 @@ impl Executor {
                     },
                 )
             }
+            Expr::Extract { field, expr, .. } => {
+                let val = self.evaluate_value(expr, row, schema, params)?;
+                Self::extract_datetime_field(field, val)
+            }
             Expr::Value(v) => {
                 if let SqlValue::Placeholder(p) = &v.value {
                     let idx = Self::placeholder_index(p);
@@ -106,28 +155,37 @@ impl Executor {
                 let left_val = self.evaluate_value(left, row, schema, params)?;
                 let right_val = self.evaluate_value(right, row, schema, params)?;
                 match op {
-                    BinaryOperator::Plus => {
-                        self.compute_math_op(&left_val, &right_val, |a, b| a + b, |a, b| a + b)
-                    }
-                    BinaryOperator::Minus => {
-                        self.compute_math_op(&left_val, &right_val, |a, b| a - b, |a, b| a - b)
-                    }
-                    BinaryOperator::Multiply => {
-                        self.compute_math_op(&left_val, &right_val, |a, b| a * b, |a, b| a * b)
-                    }
+                    BinaryOperator::Plus => self.compute_add_op(&left_val, &right_val),
+                    BinaryOperator::Minus => self.compute_subtract_op(&left_val, &right_val),
+                    BinaryOperator::Multiply => self.compute_multiply_op(&left_val, &right_val),
                     BinaryOperator::Divide => {
                         match &right_val {
                             Value::Integer(0) | Value::Float(0.0) => {
-                                return Err(FusionError::Execution("Division by zero".to_string()))
+                                return Err(FusionError::Execution("Division by zero".to_string()));
                             }
                             _ => {}
                         }
-                        self.compute_math_op(&left_val, &right_val, |a, b| a / b, |a, b| a / b)
+                        self.compute_divide_op(&left_val, &right_val)
                     }
                     BinaryOperator::Modulo => {
                         self.compute_math_op(&left_val, &right_val, |a, b| a % b, |a, b| a % b)
                     }
                     BinaryOperator::StringConcat => {
+                        if let (Value::Array(mut left), Value::Array(right)) =
+                            (left_val.clone(), right_val.clone())
+                        {
+                            left.extend(right);
+                            return Ok(Value::Array(left));
+                        }
+                        if let Value::Array(mut left) = left_val.clone() {
+                            left.push(right_val);
+                            return Ok(Value::Array(left));
+                        }
+                        if let Value::Array(mut right) = right_val.clone() {
+                            right.insert(0, left_val);
+                            return Ok(Value::Array(right));
+                        }
+
                         let l = match left_val {
                             Value::String(s) => s,
                             Value::Integer(n) => n.to_string(),
@@ -252,6 +310,21 @@ impl Executor {
                 let val = self.evaluate_value(inner, row, schema, params)?;
                 Ok(Value::Boolean(val != Value::Null))
             }
+            Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+                ..
+            } => Ok(Value::Boolean(self.evaluate_quantified_array_comparison(
+                left, compare_op, right, false, row, schema, params,
+            )?)),
+            Expr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => Ok(Value::Boolean(self.evaluate_quantified_array_comparison(
+                left, compare_op, right, true, row, schema, params,
+            )?)),
             _ => Err(FusionError::Execution(format!(
                 "Unsupported value expression: {:?}",
                 expr
@@ -382,14 +455,29 @@ impl Executor {
         if let Some(idx) = schema.columns.iter().position(|c| c.name == col_name) {
             return Ok(idx);
         }
+        if let Some(idx) = schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+        {
+            return Ok(idx);
+        }
 
         let fallback_name = col_name.rsplit('.').next().unwrap_or(col_name);
         let suffix = format!(".{}", fallback_name);
+        let fallback_lower = fallback_name.to_ascii_lowercase();
+        let suffix_lower = suffix.to_ascii_lowercase();
         let matches: Vec<usize> = schema
             .columns
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.name == fallback_name || c.name.ends_with(&suffix))
+            .filter(|(_, c)| {
+                c.name == fallback_name
+                    || c.name.ends_with(&suffix)
+                    || c.name.eq_ignore_ascii_case(fallback_name)
+                    || c.name.to_ascii_lowercase().ends_with(&suffix_lower)
+                    || c.name.to_ascii_lowercase() == fallback_lower
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -434,11 +522,106 @@ impl Executor {
         }
     }
 
+    fn compute_add_op(&self, left: &Value, right: &Value) -> Result<Value> {
+        match (left, right) {
+            (Value::Timestamp(micros), Value::Interval(delta))
+            | (Value::Interval(delta), Value::Timestamp(micros)) => {
+                Ok(Value::Timestamp(micros.saturating_add(*delta)))
+            }
+            (Value::Date(days), Value::Interval(delta)) => Self::date_plus_interval(*days, *delta),
+            (Value::Interval(delta), Value::Date(days)) => Self::date_plus_interval(*days, *delta),
+            (Value::Interval(left), Value::Interval(right)) => {
+                Ok(Value::Interval(left.saturating_add(*right)))
+            }
+            _ => self.compute_math_op(left, right, |a, b| a + b, |a, b| a + b),
+        }
+    }
+
+    fn compute_subtract_op(&self, left: &Value, right: &Value) -> Result<Value> {
+        match (left, right) {
+            (Value::Timestamp(micros), Value::Interval(delta)) => {
+                Ok(Value::Timestamp(micros.saturating_sub(*delta)))
+            }
+            (Value::Timestamp(left), Value::Timestamp(right)) => {
+                Ok(Value::Interval(left.saturating_sub(*right)))
+            }
+            (Value::Date(days), Value::Interval(delta)) => {
+                Self::date_plus_interval(*days, delta.saturating_neg())
+            }
+            (Value::Date(left), Value::Date(right)) => Ok(Value::Integer((*left - *right) as i64)),
+            (Value::Interval(left), Value::Interval(right)) => {
+                Ok(Value::Interval(left.saturating_sub(*right)))
+            }
+            _ => self.compute_math_op(left, right, |a, b| a - b, |a, b| a - b),
+        }
+    }
+
+    fn compute_multiply_op(&self, left: &Value, right: &Value) -> Result<Value> {
+        match (left, right) {
+            (Value::Interval(micros), Value::Integer(multiplier))
+            | (Value::Integer(multiplier), Value::Interval(micros)) => {
+                Ok(Value::Interval(micros.saturating_mul(*multiplier)))
+            }
+            (Value::Interval(micros), Value::Float(multiplier))
+            | (Value::Float(multiplier), Value::Interval(micros)) => Ok(Value::Interval(
+                (*micros as f64 * *multiplier).round() as i64,
+            )),
+            (Value::Interval(micros), Value::Decimal(multiplier))
+            | (Value::Decimal(multiplier), Value::Interval(micros)) => {
+                let multiplier = multiplier.parse::<f64>().map_err(|_| {
+                    FusionError::Execution("Invalid decimal interval multiplier".to_string())
+                })?;
+                Ok(Value::Interval((*micros as f64 * multiplier).round() as i64))
+            }
+            _ => self.compute_math_op(left, right, |a, b| a * b, |a, b| a * b),
+        }
+    }
+
+    fn compute_divide_op(&self, left: &Value, right: &Value) -> Result<Value> {
+        match (left, right) {
+            (Value::Interval(_), Value::Integer(0)) | (Value::Interval(_), Value::Float(0.0)) => {
+                Err(FusionError::Execution("Division by zero".to_string()))
+            }
+            (Value::Interval(micros), Value::Integer(divisor)) => {
+                Ok(Value::Interval(micros / divisor))
+            }
+            (Value::Interval(micros), Value::Float(divisor)) => {
+                Ok(Value::Interval((*micros as f64 / *divisor).round() as i64))
+            }
+            (Value::Interval(micros), Value::Decimal(divisor)) => {
+                let divisor = divisor.parse::<f64>().map_err(|_| {
+                    FusionError::Execution("Invalid decimal interval divisor".to_string())
+                })?;
+                if divisor == 0.0 {
+                    return Err(FusionError::Execution("Division by zero".to_string()));
+                }
+                Ok(Value::Interval((*micros as f64 / divisor).round() as i64))
+            }
+            _ => self.compute_math_op(left, right, |a, b| a / b, |a, b| a / b),
+        }
+    }
+
+    fn date_plus_interval(days: i32, delta_micros: i64) -> Result<Value> {
+        let Some(date) = chrono::NaiveDate::from_num_days_from_ce_opt(days) else {
+            return Err(FusionError::Execution("Invalid DATE value".to_string()));
+        };
+        let Some(datetime) = date.and_hms_opt(0, 0, 0) else {
+            return Err(FusionError::Execution("Invalid DATE midnight".to_string()));
+        };
+        Ok(Value::Timestamp(
+            datetime
+                .and_utc()
+                .timestamp_micros()
+                .saturating_add(delta_micros),
+        ))
+    }
+
     pub(crate) fn compare_values<CF>(&self, left: &Value, right: &Value, op: CF) -> Result<bool>
     where
         CF: Fn(&f64, &f64) -> bool,
     {
         match (left, right) {
+            (Value::Null, _) | (_, Value::Null) => Ok(false),
             (Value::Integer(l), Value::Integer(r)) => Ok(op(&(*l as f64), &(*r as f64))),
             (Value::Float(l), Value::Float(r)) => Ok(op(l, r)),
             (Value::Integer(l), Value::Float(r)) => Ok(op(&(*l as f64), r)),
@@ -462,6 +645,79 @@ impl Executor {
                 "Type mismatch in comparison".to_string(),
             )),
         }
+    }
+
+    pub(crate) fn compare_binary_predicate(
+        &self,
+        left: &Value,
+        op: &BinaryOperator,
+        right: &Value,
+    ) -> Result<bool> {
+        match op {
+            BinaryOperator::Eq => {
+                if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                    return Ok(false);
+                }
+                Ok(left.compare(right) == Ordering::Equal)
+            }
+            BinaryOperator::NotEq => {
+                if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                    return Ok(false);
+                }
+                Ok(left.compare(right) != Ordering::Equal)
+            }
+            BinaryOperator::Gt => self.compare_values(left, right, |l, r| l > r),
+            BinaryOperator::Lt => self.compare_values(left, right, |l, r| l < r),
+            BinaryOperator::GtEq => self.compare_values(left, right, |l, r| l >= r),
+            BinaryOperator::LtEq => self.compare_values(left, right, |l, r| l <= r),
+            _ => Err(FusionError::Execution(format!(
+                "Unsupported quantified comparison operator: {}",
+                op
+            ))),
+        }
+    }
+
+    pub(crate) fn evaluate_quantified_array_comparison(
+        &self,
+        left_expr: &Expr,
+        compare_op: &BinaryOperator,
+        right_expr: &Expr,
+        require_all: bool,
+        row: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Result<bool> {
+        let left_value = self.evaluate_value(left_expr, row, schema, params)?;
+        let right_value = self.evaluate_value(right_expr, row, schema, params)?;
+        let Value::Array(values) = right_value else {
+            return Err(FusionError::Execution(format!(
+                "Quantified comparison requires an array on the right side, got {:?}",
+                right_value
+            )));
+        };
+
+        if values.is_empty() {
+            return Ok(require_all);
+        }
+
+        for value in values {
+            let (left, right) = self.align_comparison_values(
+                left_expr,
+                left_value.clone(),
+                right_expr,
+                value,
+                schema,
+            )?;
+            let matched = self.compare_binary_predicate(&left, compare_op, &right)?;
+            if require_all && !matched {
+                return Ok(false);
+            }
+            if !require_all && matched {
+                return Ok(true);
+            }
+        }
+
+        Ok(require_all)
     }
 
     pub(crate) fn sql_value_to_fusion_value(&self, v: &SqlValue) -> Value {
@@ -542,6 +798,111 @@ impl Executor {
                 Some(crate::common::encoding::encode_i64_comparable(*micros))
             }
             _ => None,
+        }
+    }
+
+    fn extract_datetime_field(field: &DateTimeField, value: Value) -> Result<Value> {
+        let micros = match value {
+            Value::Timestamp(micros) => micros,
+            Value::Date(days) => {
+                let Some(date) = chrono::NaiveDate::from_num_days_from_ce_opt(days) else {
+                    return Err(FusionError::Execution(format!(
+                        "Cannot extract {} from invalid DATE",
+                        field
+                    )));
+                };
+                date.and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_micros()
+            }
+            Value::String(s) => match Value::timestamp_from_str(&s) {
+                Some(Value::Timestamp(micros)) => micros,
+                _ => {
+                    return Err(FusionError::Execution(format!(
+                        "Cannot extract {} from '{}'",
+                        field, s
+                    )));
+                }
+            },
+            other => {
+                return Err(FusionError::Execution(format!(
+                    "Cannot extract {} from {:?}",
+                    field, other
+                )));
+            }
+        };
+
+        let Some(dt) = chrono::DateTime::from_timestamp_micros(micros) else {
+            return Err(FusionError::Execution(format!(
+                "Cannot extract {} from timestamp {}",
+                field, micros
+            )));
+        };
+        let dt = dt.naive_utc();
+        let value = match field {
+            DateTimeField::Epoch => {
+                if micros % 1_000_000 == 0 {
+                    Value::Integer(micros / 1_000_000)
+                } else {
+                    Value::Float(micros as f64 / 1_000_000.0)
+                }
+            }
+            DateTimeField::Year | DateTimeField::Years => Value::Integer(dt.year() as i64),
+            DateTimeField::Month | DateTimeField::Months => Value::Integer(dt.month() as i64),
+            DateTimeField::Day | DateTimeField::Days => Value::Integer(dt.day() as i64),
+            DateTimeField::Hour | DateTimeField::Hours => Value::Integer(dt.hour() as i64),
+            DateTimeField::Minute | DateTimeField::Minutes => Value::Integer(dt.minute() as i64),
+            DateTimeField::Second | DateTimeField::Seconds => Value::Integer(dt.second() as i64),
+            DateTimeField::Microsecond | DateTimeField::Microseconds => {
+                Value::Integer(dt.and_utc().timestamp_subsec_micros() as i64)
+            }
+            DateTimeField::Millisecond | DateTimeField::Milliseconds => {
+                Value::Integer(dt.and_utc().timestamp_subsec_millis() as i64)
+            }
+            DateTimeField::Doy | DateTimeField::DayOfYear => Value::Integer(dt.ordinal() as i64),
+            DateTimeField::Dow | DateTimeField::DayOfWeek => {
+                Value::Integer(dt.weekday().num_days_from_sunday() as i64)
+            }
+            DateTimeField::Isodow => Value::Integer(dt.weekday().number_from_monday() as i64),
+            DateTimeField::Isoyear => Value::Integer(dt.iso_week().year() as i64),
+            DateTimeField::IsoWeek => Value::Integer(dt.iso_week().week() as i64),
+            _ => {
+                return Err(FusionError::Execution(format!(
+                    "Unsupported EXTRACT field: {}",
+                    field
+                )));
+            }
+        };
+        Ok(value)
+    }
+
+    fn evaluate_access(
+        &self,
+        value: Value,
+        access: &AccessExpr,
+        row: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Result<Value> {
+        match access {
+            AccessExpr::Subscript(Subscript::Index { index }) => {
+                let index = match self.evaluate_value(index, row, schema, params)? {
+                    Value::Integer(value) => value,
+                    _ => return Ok(Value::Null),
+                };
+                let Value::Array(values) = value else {
+                    return Ok(Value::Null);
+                };
+                if index <= 0 {
+                    return Ok(Value::Null);
+                }
+                Ok(values
+                    .get((index - 1) as usize)
+                    .cloned()
+                    .unwrap_or(Value::Null))
+            }
+            _ => Ok(Value::Null),
         }
     }
 }

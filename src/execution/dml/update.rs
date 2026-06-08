@@ -40,8 +40,27 @@ impl Executor {
             params,
             &allowed_qualifiers,
         );
+        if let Some(row_id) = target_row_id.as_deref() {
+            if let Some(result) = self
+                .try_handle_simple_primary_key_update(
+                    update,
+                    &table_name_str,
+                    &schema,
+                    &prefix,
+                    row_id,
+                    txn,
+                    params,
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
         let composite_indexes = self
             .load_composite_indexes_for_table(&table_name_str, txn)
+            .await?;
+        let composite_unique_indexes = self
+            .load_composite_unique_indexes_for_table(&table_name_str, txn)
             .await?;
         let child_foreign_keys = self.load_child_foreign_keys(&table_name_str, txn).await?;
         let parent_foreign_keys = self.load_parent_foreign_keys(&table_name_str, txn).await?;
@@ -125,9 +144,9 @@ impl Executor {
                 }
 
                 // Enforce CHECK constraints after UPDATE
-                for (idx, col) in schema.columns.iter().enumerate() {
+                for col in schema.columns.iter() {
                     if let Some(ref check_sql) = col.check_expr {
-                        if !self.evaluate_check_constraint(check_sql, &col.name, &row[idx]) {
+                        if !self.evaluate_check_constraint(check_sql, &schema, &row) {
                             return Err(FusionError::Execution(format!(
                                 "CHECK constraint violated for column '{}': {}",
                                 col.name, check_sql
@@ -152,6 +171,16 @@ impl Executor {
                     txn,
                 )
                 .await?;
+                let row_id = Self::row_id_from_data_key(&k)?;
+                self.validate_composite_unique_constraints(
+                    &composite_unique_indexes,
+                    &table_name_str,
+                    &schema,
+                    &row,
+                    Some(row_id),
+                    txn,
+                )
+                .await?;
 
                 let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
                 txn.put(&k, &new_value_bytes).await?;
@@ -159,7 +188,6 @@ impl Executor {
                     self.row_cache.invalidate(key_str);
                 }
 
-                let row_id = Self::row_id_from_data_key(&k)?;
                 self.update_trigram_index_for_update(
                     &table_name_str,
                     &schema,
@@ -253,5 +281,131 @@ impl Executor {
         Ok(QueryResult::Success {
             message: format!("Updated {} rows", updated_count),
         })
+    }
+
+    async fn try_handle_simple_primary_key_update(
+        &self,
+        update: &sqlparser::ast::Update,
+        table_name: &str,
+        schema: &TableSchema,
+        prefix: &str,
+        row_id: &str,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if update.returning.is_some() {
+            return Ok(None);
+        }
+        if schema
+            .columns
+            .iter()
+            .any(|column| column.check_expr.is_some())
+        {
+            return Ok(None);
+        }
+        let mut assignment_indices = Vec::with_capacity(update.assignments.len());
+        for assignment in &update.assignments {
+            let col_name = match &assignment.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => name.to_string(),
+                _ => return Ok(None),
+            };
+            let Some(col_idx) = schema.get_column_index(&col_name) else {
+                return Err(FusionError::Execution(format!(
+                    "Column {} not found in assignment",
+                    col_name
+                )));
+            };
+            if schema.columns[col_idx].is_indexed
+                && !(schema.columns[col_idx].is_primary
+                    && schema.columns[col_idx].index_type == IndexType::BTree)
+            {
+                return Ok(None);
+            }
+            assignment_indices.push(col_idx);
+        }
+        let metadata_cache_key = table_name.to_string();
+        let metadata_allows_fast_path = if let Some(cached) = self
+            .simple_pk_update_fast_path_cache
+            .get(&metadata_cache_key)
+        {
+            cached
+        } else {
+            let has_composite_index = txn
+                .scan_prefix(
+                    Self::composite_index_table_prefix(table_name).as_bytes(),
+                    Some(2),
+                )
+                .await?
+                .iter()
+                .any(|(key, _)| {
+                    std::str::from_utf8(key)
+                        .ok()
+                        .is_some_and(|key| !key.ends_with(":__marker"))
+                });
+            let has_foreign_key = txn
+                .scan_prefix(format!("fk_meta:child:{}:", table_name).as_bytes(), Some(1))
+                .await?
+                .len()
+                > 0
+                || txn
+                    .scan_prefix(
+                        format!("fk_meta:parent:{}:", table_name).as_bytes(),
+                        Some(1),
+                    )
+                    .await?
+                    .len()
+                    > 0;
+            let allowed = !has_composite_index && !has_foreign_key;
+            self.simple_pk_update_fast_path_cache
+                .insert(metadata_cache_key, allowed);
+            allowed
+        };
+        if !metadata_allows_fast_path {
+            return Ok(None);
+        }
+
+        let key = format!("{}{}", prefix, row_id);
+        let Some(value) = txn.get(key.as_bytes()).await? else {
+            return Ok(Some(QueryResult::Success {
+                message: "Updated 0 rows".to_string(),
+            }));
+        };
+
+        let mut row: Vec<Value> = if let Some(cached) = self.row_cache.get(&key) {
+            monitor::inc_row_cache_hit();
+            cached
+        } else {
+            crate::common::encoding::RowDecoder::decode(&value)
+                .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+        };
+        let old_row = row.clone();
+
+        for (assignment, &col_idx) in update.assignments.iter().zip(&assignment_indices) {
+            let new_val = self.evaluate_value(&assignment.value, &old_row, schema, params)?;
+            let new_val =
+                Self::coerce_value_to_column_type(new_val, &schema.columns[col_idx].data_type)?;
+            if schema.columns[col_idx].is_primary && old_row.get(col_idx) != Some(&new_val) {
+                return Ok(None);
+            }
+            row[col_idx] = new_val;
+        }
+
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if !col.is_nullable && row[idx] == Value::Null {
+                return Err(FusionError::Execution(format!(
+                    "NOT NULL constraint violated for column '{}' during UPDATE",
+                    col.name
+                )));
+            }
+        }
+
+        let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
+        txn.put(key.as_bytes(), &new_value_bytes).await?;
+        self.row_cache.invalidate(&key);
+        monitor::inc_row_write();
+
+        Ok(Some(QueryResult::Success {
+            message: "Updated 1 rows".to_string(),
+        }))
     }
 }

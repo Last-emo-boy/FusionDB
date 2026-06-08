@@ -1,0 +1,172 @@
+{
+  "id": "BENCHPROD-113",
+  "title": "Optimize LDBC Query6 with Q6 indexes and two-table EXISTS membership cache",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-112 Q6 isolation timeout evidence",
+      "status": "completed"
+    },
+    {
+      "step": "Add an independent --create-q6-indexes path to the LDBC native smoke harness",
+      "status": "completed"
+    },
+    {
+      "step": "Run Q6 isolation with Q6 indexes to prove the timeout can complete",
+      "status": "completed"
+    },
+    {
+      "step": "Add a two-table correlated EXISTS membership cache for the LDBC Q6 tag/message_tag shape",
+      "status": "completed"
+    },
+    {
+      "step": "Avoid per-candidate-row table scans during EXISTS plan detection by using schema metadata",
+      "status": "completed"
+    },
+    {
+      "step": "Add regression coverage for the Q6-style two-table EXISTS shape",
+      "status": "completed"
+    },
+    {
+      "step": "Rerun Q6 isolation after the schema-fast EXISTS cache",
+      "status": "completed"
+    },
+    {
+      "step": "Run an 80-op native command-mode smoke with Q6 and Q14 indexes",
+      "status": "completed"
+    },
+    {
+      "step": "Record conservative evidence boundaries and next frontier",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "bench_script": "E:\\Playground\\FusionDB-bench\\ldbc_snb_native_smoke.py",
+    "starting_q6_timeout_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_isolate_q6_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q6_indexes_isolation_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_isolate_q6_indexes_20260529_retry\\ldbc_snb_native_smoke_summary.json",
+    "q6_indexes_isolation_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_isolate_q6_indexes_20260529_retry\\ldbc_results\\fusiondb-results.json",
+    "q6_exists_cache_isolation_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_isolate_q6_existscache_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q6_exists_cache_isolation_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_isolate_q6_existscache_20260529\\ldbc_results\\fusiondb-results.json",
+    "q6_schema_fast_isolation_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_isolate_q6_existscache_schemafast_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q6_schema_fast_isolation_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_isolate_q6_existscache_schemafast_20260529\\ldbc_results\\fusiondb-results.json",
+    "q6_q14_80op_smoke_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_q6_q14_indexes_80ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q6_q14_80op_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_q6_q14_indexes_80ops_20260529\\ldbc_results\\fusiondb-results.json",
+    "verification": [
+      "python -m py_compile ldbc_snb_native_smoke.py external_bootstrap.py: passed",
+      "cargo fmt --check: passed",
+      "cargo test --test sql_set_subquery -- --nocapture: 35/35 passed",
+      "cargo test --test sql_join -- --nocapture: 23/23 passed",
+      "cargo build --release --bin fusiondb: passed"
+    ]
+  },
+  "result": {
+    "full_official_ldbc_pass": false,
+    "native_ldbc_q6_isolation_command_pass": true,
+    "native_ldbc_q6_q14_80op_smoke_pass": true,
+    "updates_covered": false,
+    "q6_isolation_metrics": {
+      "starting_benchprod112": "timed out after 180 seconds with 2 of 3 operations completed",
+      "q6_indexes_only": {
+        "reported_status": "gap",
+        "ldbc_command": "passed",
+        "isolation_mode": true,
+        "count": 3,
+        "total_duration_ms": 156431,
+        "throughput_ops_per_second": 0.019177784454487923,
+        "mean_ms": 52143.666666666664,
+        "min_ms": 51382,
+        "max_ms": 53182
+      },
+      "q6_indexes_plus_initial_exists_cache": {
+        "reported_status": "gap",
+        "ldbc_command": "passed",
+        "isolation_mode": true,
+        "count": 3,
+        "total_duration_ms": 101541,
+        "throughput_ops_per_second": 0.029544715927556357,
+        "mean_ms": 33847.0,
+        "min_ms": 32333,
+        "max_ms": 34904
+      },
+      "q6_indexes_plus_schema_fast_exists_cache": {
+        "reported_status": "gap",
+        "ldbc_command": "passed",
+        "isolation_mode": true,
+        "count": 3,
+        "total_duration_ms": 2369,
+        "throughput_ops_per_second": 1.2663571127057829,
+        "mean_ms": 789.3333333333334,
+        "min_ms": 741,
+        "max_ms": 831
+      }
+    },
+    "final_80op_smoke_metrics": {
+      "reported_status": "passed",
+      "reported_operation_count": 80,
+      "reported_total_duration_ms": 44040,
+      "reported_throughput_ops_per_second": 1.8165304268846503,
+      "query6_sampled": false,
+      "complex_queries_exercised": {
+        "LdbcQuery1": {
+          "count": 1,
+          "ms": 101
+        },
+        "LdbcQuery2": {
+          "count": 1,
+          "ms": 30
+        },
+        "LdbcQuery3": {
+          "count": 1,
+          "ms": 139
+        },
+        "LdbcQuery4": {
+          "count": 1,
+          "ms": 39368
+        },
+        "LdbcQuery5": {
+          "count": 1,
+          "ms": 213
+        },
+        "LdbcQuery8": {
+          "count": 1,
+          "ms": 35
+        },
+        "LdbcQuery9": {
+          "count": 1,
+          "ms": 91
+        },
+        "LdbcQuery10": {
+          "count": 1,
+          "ms": 1035
+        },
+        "LdbcQuery11": {
+          "count": 1,
+          "ms": 40
+        },
+        "LdbcQuery14": {
+          "count": 1,
+          "ms": 1080
+        }
+      },
+      "short_queries_exercised": {
+        "LdbcShortQuery1PersonProfile": 10,
+        "LdbcShortQuery2PersonPosts": 10,
+        "LdbcShortQuery3PersonFriends": 10,
+        "LdbcShortQuery4MessageContent": 10,
+        "LdbcShortQuery5MessageCreator": 10,
+        "LdbcShortQuery6MessageForum": 10,
+        "LdbcShortQuery7MessageReplies": 10
+      }
+    }
+  },
+  "remaining_blockers": [
+    "This is not a full official LDBC benchmark pass.",
+    "Q6 evidence is command-mode isolation evidence; the top-level isolation summary intentionally remains gap because other read queries are disabled.",
+    "The final 80-op broad smoke passed with Q6 and Q14 indexes, but it did not sample LdbcQuery6 in metrics.",
+    "Updates remain disabled in generated LDBC properties: LdbcUpdate1AddPerson_enable=false through LdbcUpdate8AddFriendship_enable=false.",
+    "LdbcQuery4 remains the dominant broad-smoke bottleneck at about 39.4 seconds for one operation.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-114 candidate: optimize LdbcQuery4 performance, starting from the 80-op smoke metric at 39,368 ms."
+}

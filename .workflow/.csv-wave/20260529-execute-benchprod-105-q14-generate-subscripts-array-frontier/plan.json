@@ -1,0 +1,62 @@
+{
+  "id": "BENCHPROD-105",
+  "title": "Advance LDBC Query 14 past generate_subscripts and grouped projection gaps",
+  "date": "2026-05-29",
+  "status": "completed_with_next_gap",
+  "steps": [
+    {
+      "step": "Verify BENCHPROD-104 20-row Q14 row-budget gap against reachable preload prefixes",
+      "status": "completed"
+    },
+    {
+      "step": "Run a 40-row reachable-prefix LDBC diagnostic smoke to expose the next blocker",
+      "status": "completed"
+    },
+    {
+      "step": "Implement minimal FROM generate_subscripts support for array literals and dependent joins",
+      "status": "completed"
+    },
+    {
+      "step": "Implement Q14 downstream array subscript, array_agg, and COALESCE aggregate projection coverage",
+      "status": "completed"
+    },
+    {
+      "step": "Fix PgWire Describe for SELECT * FROM derived subqueries so JDBC receives field structure",
+      "status": "completed"
+    },
+    {
+      "step": "Run targeted SQL tests, pg integration, release build, and LDBC reachable-prefix smoke",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "reachability_probe": "First 20 person_knows rows do not connect Q14 parameter pair; first 40 rows connect it at distance 4.",
+    "initial_prefix40_frontier": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod105_q14_reachable_prefix40_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "after_generate_subscripts_frontier": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod105_generate_subscripts_prefix40_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "after_group_projection_frontier": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod105_group_projection_prefix40_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "final_ldbc_array_decode_frontier": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod105_pg_describe_prefix40_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "fmt": "cargo fmt --check: passed",
+    "sql_set_subquery": "cargo test --test sql_set_subquery -- --nocapture: 25 passed",
+    "sql_expr_functions_targeted": "cargo test --test sql_expr_functions test_string_concat_operator -- --nocapture: passed",
+    "pg_integration_release": "cargo test --release --test pg_integration -- --nocapture: 25 passed",
+    "release_binary": "cargo build --release --bin fusiondb: passed"
+  },
+  "result": {
+    "ldbc_full_native_pass": false,
+    "q14_20row_gap_reclassified": "The 20-row preload row-budget gap is partly a harness/data-prefix artifact because the Q14 parameter pair is unreachable in the first 20 knows rows.",
+    "prefix40_progression": [
+      "Table generate_subscripts not found",
+      "Unsupported expression in GROUP BY projection",
+      "Received resultset tuples, but no field structure for them",
+      "JDBC PgArray ArrayIndexOutOfBoundsException while converting Q14 path array"
+    ],
+    "current_frontier": "LDBC Query 14 now reaches result conversion in the PostgreSQL implementation, but PgWire array type/text encoding is not compatible with JDBC PgArray decoding."
+  },
+  "remaining_blockers": [
+    "PostgreSQL array wire/text compatibility for nested path arrays returned by Q14",
+    "Full LDBC workload still unproven beyond the Q14 array conversion frontier",
+    "20-row LDBC diagnostic preload can create unreachable parameter-pair artifacts; reachable-prefix smoke should use at least 40 rows for this parameter file",
+    "native memtier real tool/probe missing"
+  ],
+  "next_task": "BENCHPROD-106: implement PostgreSQL-compatible array result typing/encoding for nested arrays, then rerun Q14 reachable-prefix smoke"
+}

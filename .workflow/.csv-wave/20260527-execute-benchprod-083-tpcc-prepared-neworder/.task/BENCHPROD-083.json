@@ -1,0 +1,12 @@
+{
+  "id": "BENCHPROD-083",
+  "status": "completed",
+  "title": "TPC-C prepared NewOrder transaction",
+  "completed_at": "2026-05-27T21:26:19+08:00",
+  "artifacts": {
+    "tpcc_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod083_tpcc_medium_prepared_neworder_no_results_5x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod083_production_medium_prepared_neworder_no_results_recalc_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod083_production_medium_prepared_neworder_no_results_recalc_5x_20260527/bench_gate_summary.md"
+  },
+  "followup": "BENCHPROD-084"
+}

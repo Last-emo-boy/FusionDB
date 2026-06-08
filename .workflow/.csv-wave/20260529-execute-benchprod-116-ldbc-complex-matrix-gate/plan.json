@@ -1,0 +1,89 @@
+{
+  "id": "BENCHPROD-116",
+  "title": "Wire LDBC complex-query matrix into benchmark gate profiles",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-115 full Q1-Q14 command-mode isolation matrix evidence",
+      "status": "completed"
+    },
+    {
+      "step": "Inspect bench_gate.py external smoke, profile-default, CLI, report, and markdown integration points",
+      "status": "completed"
+    },
+    {
+      "step": "Add LDBC complex matrix discovery, profile defaults, CLI flags, evaluator checks, and report fields",
+      "status": "completed"
+    },
+    {
+      "step": "Enable external_smoke.ldbc_complex_matrix in production_medium and production_medium_strict_native profiles",
+      "status": "completed"
+    },
+    {
+      "step": "Verify explicit report and run-root discovery gate paths against BENCHPROD-115 full matrix evidence",
+      "status": "completed"
+    },
+    {
+      "step": "Record evidence conservatively as command-mode isolation matrix, not a full official LDBC pass",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "bench_gate": "E:\\Playground\\FusionDB-bench\\bench_gate.py",
+    "profiles": [
+      "E:\\Playground\\FusionDB-bench\\gate_profiles\\production_medium.json",
+      "E:\\Playground\\FusionDB-bench\\gate_profiles\\production_medium_strict_native.json"
+    ],
+    "matrix_source": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_complex_matrix_benchprod115_all_q1_q14_20260529\\ldbc_snb_complex_matrix_summary.json",
+    "explicit_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod116_ldbc_complex_matrix_only_20260529\\bench_gate_summary.json",
+    "discovery_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod116_ldbc_complex_matrix_discovery_20260529\\bench_gate_summary.json",
+    "strict_profile_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod116_strict_ldbc_complex_matrix_20260529\\bench_gate_summary.json",
+    "verification": [
+      "python -m py_compile bench_gate.py ldbc_snb_complex_matrix.py: passed",
+      "python bench_gate.py ... --ldbc-complex-matrix-report ...: passed 31/31",
+      "python bench_gate.py ... without --ldbc-complex-matrix-report: passed 31/31 via discovery",
+      "python bench_gate.py --gate-profile production_medium_strict_native.json ...: passed 31/31"
+    ]
+  },
+  "result": {
+    "gate_integration": true,
+    "profile_defaults_enabled": true,
+    "required_queries": [
+      "LdbcQuery1",
+      "LdbcQuery2",
+      "LdbcQuery3",
+      "LdbcQuery4",
+      "LdbcQuery5",
+      "LdbcQuery6",
+      "LdbcQuery7",
+      "LdbcQuery8",
+      "LdbcQuery9",
+      "LdbcQuery10",
+      "LdbcQuery11",
+      "LdbcQuery12",
+      "LdbcQuery13",
+      "LdbcQuery14"
+    ],
+    "min_passed_count": 14,
+    "checks_added": [
+      "external_smoke.ldbc_complex_matrix.exists",
+      "external_smoke.ldbc_complex_matrix.status",
+      "external_smoke.ldbc_complex_matrix.passed_count",
+      "external_smoke.ldbc_complex_matrix.required_queries",
+      "external_smoke.ldbc_complex_matrix.required_status",
+      "external_smoke.ldbc_complex_matrix.command_status",
+      "external_smoke.ldbc_complex_matrix.metrics",
+      "external_smoke.ldbc_complex_matrix.scope"
+    ],
+    "full_official_ldbc_pass": false,
+    "updates_covered": false
+  },
+  "remaining_blockers": [
+    "This gate integration covers the command-mode isolation matrix only, not a full official LDBC benchmark pass.",
+    "Official mixed scheduling semantics remain outside this artifact.",
+    "LDBC updates remain disabled unless separately proven.",
+    "Native memtier remains blocked until a real memtier_benchmark binary is available."
+  ],
+  "next_task": "BENCHPROD-117 candidate: integrate another non-optional coverage matrix for TSBS query shapes or CH-benCHmark query classes, or advance full official LDBC mixed workload support."
+}

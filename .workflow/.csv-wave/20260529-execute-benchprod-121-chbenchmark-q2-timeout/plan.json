@@ -1,0 +1,70 @@
+{
+  "id": "BENCHPROD-121",
+  "title": "Fix CH-benCHmark Q2 one-hot timeout",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Use BENCHPROD-120 one-hot Q2 timeout as the regression frontier",
+      "status": "completed"
+    },
+    {
+      "step": "Profile Q2 SQL shape and identify join planning bottlenecks",
+      "status": "completed"
+    },
+    {
+      "step": "Extend conservative comma-join reordering beyond the LDBC Q4 special case",
+      "status": "completed"
+    },
+    {
+      "step": "Teach join planning derived-table aliases and predicates accurately enough for Q2",
+      "status": "completed"
+    },
+    {
+      "step": "Add expression join probe/hash-join paths for MOD((s_w_id*s_i_id),10000)=su_suppkey shapes",
+      "status": "completed"
+    },
+    {
+      "step": "Add miniature CH-benCHmark Q2 shape regression coverage",
+      "status": "completed"
+    },
+    {
+      "step": "Verify sql_join tests, release build, Q2 matrix, Q1/Q2/Q3 matrix, and explicit strict gate",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "modified_files": [
+      "E:\\Playground\\FusionDB\\src\\execution\\scan\\join.rs",
+      "E:\\Playground\\FusionDB\\tests\\sql_join.rs"
+    ],
+    "failure_frontier": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_query_class_matrix_benchprod120_q1_q3_probe_20260529\\chbenchmark_query_class_matrix_summary.json",
+    "q2_positive_matrix": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_query_class_matrix_benchprod121_q2_probe_20260529\\chbenchmark_query_class_matrix_summary.json",
+    "q1_q2_q3_matrix": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_query_class_matrix_benchprod121_q1_q2_q3_20260529\\chbenchmark_query_class_matrix_summary.json",
+    "strict_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod121_strict_explicit_q1_q2_q3_20260529\\bench_gate_summary.json",
+    "verification": [
+      "cargo test --test sql_join: passed 25/25",
+      "cargo build --release: passed",
+      "CH-benCHmark Q2 one-hot query-class matrix: passed 1/1; Q2 completed_count=2",
+      "CH-benCHmark Q1,Q2,Q3 one-hot query-class matrix: passed 3/3",
+      "Strict explicit production gate with Q1,Q2,Q3 matrix report: passed 54/54"
+    ]
+  },
+  "result": {
+    "q2_timeout_fixed": true,
+    "covered_queries": [
+      "Q1",
+      "Q2",
+      "Q3"
+    ],
+    "query_matrix_scope": "BenchBase command-mode one-hot query-class matrix",
+    "full_official_chbenchmark_score": false,
+    "long_duration_htap_certification": false
+  },
+  "remaining_blockers": [
+    "The default CH-benCHmark query matrix gate profile still requires Q1 and Q3 only; adding Q2 to profile defaults is intentionally left for a separate decision.",
+    "Broad CH Q1-Q22 query-class coverage remains incomplete.",
+    "This matrix is command-mode one-hot query-class coverage, not an official CH-benCHmark score and not sustained mixed HTAP certification."
+  ],
+  "next_task": "Pause here per user instruction; do not start the next BENCHPROD task in this turn."
+}

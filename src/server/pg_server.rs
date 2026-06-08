@@ -10,12 +10,10 @@ use pgwire::api::auth::{
     finish_authentication, protocol_negotiation, save_startup_parameters_to_metadata,
     DefaultServerParameterProvider, LoginInfo, StartupHandler,
 };
-use pgwire::api::copy::CopyHandler;
+use pgwire::api::copy::{self as pg_copy, CopyHandler};
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{
-    CopyResponse, DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag,
-};
+use pgwire::api::results::{CopyResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::NoopQueryParser;
 use pgwire::api::{ClientInfo, PgWireConnectionState, Type};
 use pgwire::error::{PgWireError, PgWireResult};
@@ -24,7 +22,8 @@ use pgwire::messages::data::{NoData, ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, Describe, Execute, Parse, ParseComplete, Sync as PgSync,
 };
-use pgwire::messages::response::CommandComplete;
+use pgwire::messages::response::{CommandComplete, ReadyForQuery, TransactionStatus};
+use pgwire::messages::simplequery::Query as SimpleQuery;
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::PgWireFrontendMessage;
@@ -33,13 +32,15 @@ use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement,
 };
 
+use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Value}; // Import FusionError
-use crate::execution::{Executor, QueryResult};
+use crate::execution::{Executor, ForeignKeyMeta, QueryResult};
 use crate::parser::parse_sql;
 use crate::storage::{Storage, Transaction};
 
 struct Session {
     transaction: Option<Box<dyn Transaction>>,
+    transaction_may_change_query_results: bool,
     statements: HashMap<String, StatementData>, // name -> statement data
     portals: HashMap<String, PortalData>,       // name -> portal data
     copy_in: Option<CopyInState>,
@@ -55,11 +56,21 @@ struct PortalData {
     statement_name: String,
     query: String,
     params: Vec<Value>,
+    result_format_codes: Vec<i16>,
 }
 
 struct CopyInState {
     statement: Statement,
     data: Vec<u8>,
+    simple_query: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PgTypeInfo {
+    oid: i64,
+    name: &'static str,
+    element_oid: Option<i64>,
+    delimiter: char,
 }
 
 pub struct PgHandler {
@@ -79,6 +90,7 @@ impl PgHandler {
             query_parser: Arc::new(NoopQueryParser::new()),
             session: Arc::new(Mutex::new(Session {
                 transaction: None,
+                transaction_may_change_query_results: false,
                 statements: HashMap::new(),
                 portals: HashMap::new(),
                 copy_in: None,
@@ -93,6 +105,14 @@ impl PgHandler {
             .to_string()
     }
 
+    fn is_postgresql_jdbc_client<C: ClientInfo>(client: &C) -> bool {
+        client
+            .metadata()
+            .get("application_name")
+            .map(|value| value.eq_ignore_ascii_case("PostgreSQL JDBC Driver"))
+            .unwrap_or(false)
+    }
+
     fn auth_error(message: impl Into<String>) -> pgwire::error::ErrorInfo {
         pgwire::error::ErrorInfo::new("ERROR".to_string(), "42501".to_string(), message.into())
     }
@@ -101,8 +121,2478 @@ impl PgHandler {
         pgwire::error::ErrorInfo::new("ERROR".to_string(), "XX000".to_string(), message.into())
     }
 
+    fn fusion_error(prefix: &str, error: &FusionError) -> pgwire::error::ErrorInfo {
+        pgwire::error::ErrorInfo::new(
+            "ERROR".to_string(),
+            Self::sqlstate_for_fusion_error(error).to_string(),
+            format!("{}: {:?}", prefix, error),
+        )
+    }
+
+    fn sqlstate_for_fusion_error(error: &FusionError) -> &'static str {
+        match error {
+            FusionError::Storage(message) if message.starts_with("Write conflict:") => "40001",
+            _ => "XX000",
+        }
+    }
+
     fn sink_error() -> PgWireError {
         PgWireError::IoError(std::io::Error::other("Sink Error"))
+    }
+
+    fn trace_enabled() -> bool {
+        std::env::var("FUSIONDB_PGWIRE_TRACE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    }
+
+    fn trace(message: impl AsRef<str>) {
+        if Self::trace_enabled() {
+            eprintln!("[pgwire-trace] {}", message.as_ref());
+        }
+    }
+
+    fn trace_query(event: &str, query: &str) {
+        if Self::trace_enabled() {
+            let compact = query.split_whitespace().collect::<Vec<_>>().join(" ");
+            let preview = if compact.len() > 240 {
+                format!("{}...", &compact[..240])
+            } else {
+                compact
+            };
+            eprintln!("[pgwire-trace] {event}: {preview}");
+        }
+    }
+
+    fn is_pg_metadata_query(query: &str) -> bool {
+        let upper = query.trim().trim_end_matches(';').to_ascii_uppercase();
+        upper.contains("INFORMATION_SCHEMA.")
+            || upper.contains("PG_CATALOG.")
+            || upper.contains("FROM PG_DATABASE")
+            || upper.contains("FROM PG_TABLES")
+            || upper.contains("FROM PG_STAT_")
+            || upper.contains("FROM PG_STATIO_")
+            || upper.contains("CURRENT_SCHEMA()")
+            || upper.contains("CURRENT_CATALOG")
+            || upper.contains("VERSION()")
+            || upper.contains("CURRENT_DATABASE()")
+            || upper.contains("CURRENT_SETTING(")
+            || upper == "SHOW ALL"
+            || upper == "SHOW SERVER_VERSION"
+            || upper == "SHOW SERVER_ENCODING"
+            || upper == "SHOW TRANSACTION ISOLATION LEVEL"
+    }
+
+    async fn try_execute_pg_metadata_query(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        if !Self::is_pg_metadata_query(query) {
+            return Ok(None);
+        }
+
+        if let Some(result) = Self::pg_metadata_show(query) {
+            return Ok(Some(result));
+        }
+
+        if let Some(result) = Self::pg_jdbc_pg_type_metadata(query, params)? {
+            return Ok(Some(result));
+        }
+
+        if let Some(result) = self.pg_jdbc_get_tables(query, params).await? {
+            return Ok(Some(result));
+        }
+        if let Some(result) = self.pg_jdbc_get_columns(query, params).await? {
+            return Ok(Some(result));
+        }
+        if let Some(result) = self.pg_jdbc_get_index_info(query, params).await? {
+            return Ok(Some(result));
+        }
+        if let Some(result) = self.pg_jdbc_foreign_key_metadata(query, params).await? {
+            return Ok(Some(result));
+        }
+
+        let statements = parse_sql(query)
+            .map_err(|e| FusionError::Execution(format!("Parse Error: {:?}", e)))?;
+        let Some(Statement::Query(parsed_query)) = statements.first() else {
+            return Ok(None);
+        };
+        let SetExpr::Select(select) = parsed_query.body.as_ref() else {
+            return Ok(None);
+        };
+
+        if select.from.is_empty() {
+            return Self::pg_metadata_scalar_select(select);
+        }
+
+        if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+            return Ok(None);
+        }
+        let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return Ok(None);
+        };
+        let relation = name.to_string().to_ascii_lowercase();
+        match relation.as_str() {
+            "information_schema.tables" => self.pg_information_schema_tables(select).await,
+            "information_schema.columns" => self.pg_information_schema_columns(select).await,
+            "pg_catalog.pg_type" => Self::pg_catalog_pg_type(select),
+            "pg_catalog.pg_namespace" => Self::pg_catalog_pg_namespace(select),
+            "pg_catalog.pg_class" => self.pg_catalog_pg_class(select).await,
+            "pg_catalog.pg_attribute" => self.pg_catalog_pg_attribute(select).await,
+            "pg_catalog.pg_database" | "pg_database" => {
+                Self::pg_catalog_pg_database(select, params)
+            }
+            "pg_catalog.pg_settings" => Self::pg_catalog_pg_settings(select),
+            "pg_catalog.pg_tables" | "pg_tables" => self.pg_catalog_pg_tables(select).await,
+            "pg_catalog.pg_stat_archiver" | "pg_stat_archiver" => Self::pg_stat_archiver(select),
+            "pg_catalog.pg_stat_bgwriter" | "pg_stat_bgwriter" => Self::pg_stat_bgwriter(select),
+            "pg_catalog.pg_stat_database" | "pg_stat_database" => Self::pg_stat_database(select),
+            "pg_catalog.pg_stat_database_conflicts" | "pg_stat_database_conflicts" => {
+                Self::pg_stat_database_conflicts(select)
+            }
+            "pg_catalog.pg_stat_user_tables" | "pg_stat_user_tables" => {
+                self.pg_stat_user_tables(select).await
+            }
+            "pg_catalog.pg_statio_user_tables" | "pg_statio_user_tables" => {
+                self.pg_statio_user_tables(select).await
+            }
+            "pg_catalog.pg_stat_user_indexes" | "pg_stat_user_indexes" => {
+                self.pg_stat_user_indexes(select).await
+            }
+            "pg_catalog.pg_statio_user_indexes" | "pg_statio_user_indexes" => {
+                self.pg_statio_user_indexes(select).await
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn pg_jdbc_get_tables(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let upper = query.to_ascii_uppercase();
+        if !upper.contains("FROM PG_CATALOG.PG_NAMESPACE N, PG_CATALOG.PG_CLASS C")
+            || !upper.contains("TABLE_NAME")
+            || !upper.contains("TABLE_TYPE")
+        {
+            return Ok(None);
+        }
+
+        let schema_pattern = params
+            .first()
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .unwrap_or_else(|| "public".to_string());
+        let table_pattern = params
+            .get(1)
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .unwrap_or_else(|| "%".to_string());
+
+        let columns = vec![
+            "TABLE_CAT".to_string(),
+            "TABLE_SCHEM".to_string(),
+            "TABLE_NAME".to_string(),
+            "TABLE_TYPE".to_string(),
+            "REMARKS".to_string(),
+            "TYPE_CAT".to_string(),
+            "TYPE_SCHEM".to_string(),
+            "TYPE_NAME".to_string(),
+            "SELF_REFERENCING_COL_NAME".to_string(),
+            "REF_GENERATION".to_string(),
+        ];
+        let rows = self
+            .load_pg_table_schemas()
+            .await?
+            .into_iter()
+            .filter(|schema| {
+                Self::metadata_like_matches("public", &schema_pattern)
+                    && Self::metadata_like_matches(&schema.name, &table_pattern)
+            })
+            .map(|schema| {
+                vec![
+                    Value::String("fusiondb".to_string()),
+                    Value::String("public".to_string()),
+                    Value::String(schema.name),
+                    Value::String("TABLE".to_string()),
+                    Value::Null,
+                    Value::String(String::new()),
+                    Value::String(String::new()),
+                    Value::String(String::new()),
+                    Value::String(String::new()),
+                    Value::String(String::new()),
+                ]
+            })
+            .collect();
+        Ok(Some(QueryResult::Select { columns, rows }))
+    }
+
+    fn pg_jdbc_pg_type_metadata(
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let upper = query.to_ascii_uppercase();
+        if !upper.contains("PG_CATALOG.PG_TYPE") {
+            return Ok(None);
+        }
+
+        if upper.contains("T.TYPELEM = E.OID")
+            && upper.contains("T.OID =")
+            && upper.contains("E.TYPDELIM")
+        {
+            let array_oid = Self::first_metadata_i64_param_or_literal(query, params);
+            let rows = array_oid
+                .and_then(Self::pg_array_element_type_for_oid)
+                .map(|element| vec![vec![Value::String(element.delimiter.to_string())]])
+                .into_iter()
+                .flatten()
+                .collect();
+            return Ok(Some(QueryResult::Select {
+                columns: vec!["typdelim".to_string()],
+                rows,
+            }));
+        }
+
+        if upper.contains("T.TYPELEM = E.OID")
+            && upper.contains("T.OID =")
+            && upper.contains("E.OID")
+            && upper.contains("E.TYPNAME")
+        {
+            let array_oid = Self::first_metadata_i64_param_or_literal(query, params);
+            let rows = array_oid
+                .and_then(Self::pg_array_element_type_for_oid)
+                .map(|element| {
+                    vec![vec![
+                        Value::Integer(element.oid),
+                        Value::Boolean(true),
+                        Value::String("pg_catalog".to_string()),
+                        Value::String(element.name.to_string()),
+                    ]]
+                })
+                .unwrap_or_default();
+            return Ok(Some(QueryResult::Select {
+                columns: vec![
+                    "oid".to_string(),
+                    "?column?".to_string(),
+                    "nspname".to_string(),
+                    "typname".to_string(),
+                ],
+                rows,
+            }));
+        }
+
+        if upper.contains("N.NSPNAME = ANY(CURRENT_SCHEMAS(TRUE))")
+            && upper.contains("T.TYPNAME")
+            && upper.contains("T.OID")
+        {
+            let oid = Self::first_metadata_i64_param_or_literal(query, params);
+            let rows = oid
+                .and_then(Self::pg_type_info_for_oid)
+                .map(|ty| {
+                    vec![vec![
+                        Value::Boolean(true),
+                        Value::String("pg_catalog".to_string()),
+                        Value::String(ty.name.to_string()),
+                    ]]
+                })
+                .unwrap_or_default();
+            return Ok(Some(QueryResult::Select {
+                columns: vec![
+                    "?column?".to_string(),
+                    "nspname".to_string(),
+                    "typname".to_string(),
+                ],
+                rows,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn metadata_param_as_string(value: &Value) -> Option<String> {
+        match value {
+            Value::Null => None,
+            Value::String(value) | Value::Decimal(value) => Some(value.clone()),
+            Value::Integer(value) => Some(value.to_string()),
+            Value::Float(value) => Some(value.to_string()),
+            Value::Boolean(value) => Some(if *value { "true" } else { "false" }.to_string()),
+            _ => None,
+        }
+    }
+
+    async fn pg_jdbc_get_columns(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let upper = query.to_ascii_uppercase();
+        if !upper.contains("JOIN PG_CATALOG.PG_ATTRIBUTE A")
+            || !upper.contains("JOIN PG_CATALOG.PG_TYPE T")
+            || !upper.contains("C.RELNAME LIKE")
+        {
+            return Ok(None);
+        }
+
+        let schema_pattern = params
+            .first()
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .unwrap_or_else(|| "public".to_string());
+        let table_pattern = params
+            .get(1)
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .or_else(|| Self::metadata_literal_like_pattern(query, "c.relname"))
+            .unwrap_or_else(|| "%".to_string());
+        let column_pattern = params
+            .get(2)
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .or_else(|| Self::metadata_literal_like_pattern(query, "a.attname"))
+            .unwrap_or_else(|| "%".to_string());
+
+        let columns = vec![
+            "current_database".to_string(),
+            "nspname".to_string(),
+            "relname".to_string(),
+            "attname".to_string(),
+            "atttypid".to_string(),
+            "attnotnull".to_string(),
+            "atttypmod".to_string(),
+            "attlen".to_string(),
+            "typtypmod".to_string(),
+            "attnum".to_string(),
+            "attidentity".to_string(),
+            "attgenerated".to_string(),
+            "adsrc".to_string(),
+            "description".to_string(),
+            "typbasetype".to_string(),
+            "typtype".to_string(),
+        ];
+        let mut rows = Vec::new();
+        for schema in self.load_pg_table_schemas().await? {
+            if !Self::metadata_like_matches("public", &schema_pattern)
+                || !Self::metadata_like_matches(&schema.name, &table_pattern)
+            {
+                continue;
+            }
+            for (idx, column) in schema.columns.iter().enumerate() {
+                if !Self::metadata_like_matches(&column.name, &column_pattern) {
+                    continue;
+                }
+                rows.push(vec![
+                    Value::String("fusiondb".to_string()),
+                    Value::String("public".to_string()),
+                    Value::String(schema.name.clone()),
+                    Value::String(column.name.clone()),
+                    Value::Integer(Self::pg_type_oid_for_column_type(&column.data_type)),
+                    Value::Boolean(!column.is_nullable),
+                    Value::Integer(-1),
+                    Value::Integer(Self::pg_type_len_for_column_type(&column.data_type)),
+                    Value::Integer(-1),
+                    Value::Integer((idx + 1) as i64),
+                    Value::String(String::new()),
+                    Value::String(String::new()),
+                    column
+                        .default_value
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                    Value::Null,
+                    Value::Integer(0),
+                    Value::String("b".to_string()),
+                ]);
+            }
+        }
+
+        Ok(Some(QueryResult::Select { columns, rows }))
+    }
+
+    async fn pg_jdbc_get_index_info(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let upper = query.to_ascii_uppercase();
+        if !upper.contains("PG_CATALOG.PG_INDEX")
+            || !upper.contains("PG_CATALOG.PG_AM")
+            || !upper.contains("PG_GET_INDEXDEF")
+            || !upper.contains("INDEX_NAME")
+            || !upper.contains("ORDINAL_POSITION")
+        {
+            return Ok(None);
+        }
+
+        let schema_pattern = params
+            .first()
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .or_else(|| Self::metadata_literal_filter_pattern(query, "n.nspname"))
+            .unwrap_or_else(|| "public".to_string());
+        let table_pattern = params
+            .get(1)
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .or_else(|| Self::metadata_literal_filter_pattern(query, "ct.relname"))
+            .or_else(|| Self::metadata_literal_filter_pattern(query, "c.relname"))
+            .unwrap_or_else(|| "%".to_string());
+
+        let columns = vec![
+            "TABLE_CAT".to_string(),
+            "TABLE_SCHEM".to_string(),
+            "TABLE_NAME".to_string(),
+            "NON_UNIQUE".to_string(),
+            "INDEX_QUALIFIER".to_string(),
+            "INDEX_NAME".to_string(),
+            "TYPE".to_string(),
+            "ORDINAL_POSITION".to_string(),
+            "COLUMN_NAME".to_string(),
+            "ASC_OR_DESC".to_string(),
+            "CARDINALITY".to_string(),
+            "PAGES".to_string(),
+            "FILTER_CONDITION".to_string(),
+        ];
+
+        let mut rows = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let schemas = self.load_pg_table_schemas().await?;
+        let index_metas = self.load_pg_index_metadata().await?;
+
+        for schema in schemas {
+            if !Self::metadata_like_matches("public", &schema_pattern)
+                || !Self::metadata_like_matches(&schema.name, &table_pattern)
+            {
+                continue;
+            }
+
+            if let Some(pk_idx) = schema.get_primary_key_index() {
+                let index_name = format!("{}_pkey", schema.name);
+                let column_name = schema.columns[pk_idx].name.clone();
+                Self::push_pg_index_info_row(
+                    &mut rows,
+                    &mut seen,
+                    &schema.name,
+                    &index_name,
+                    false,
+                    1,
+                    &column_name,
+                );
+            }
+
+            for (index_name, meta_str) in &index_metas {
+                let Some(meta) = Executor::parse_index_meta(index_name, meta_str) else {
+                    continue;
+                };
+                if !meta.table.eq_ignore_ascii_case(&schema.name) {
+                    continue;
+                }
+                let non_unique = !meta_str.starts_with("u3:") && !index_name.ends_with("_pkey");
+                for (idx, column_name) in meta.columns.iter().enumerate() {
+                    if schema
+                        .columns
+                        .iter()
+                        .all(|column| !column.name.eq_ignore_ascii_case(column_name))
+                    {
+                        continue;
+                    }
+                    Self::push_pg_index_info_row(
+                        &mut rows,
+                        &mut seen,
+                        &schema.name,
+                        index_name,
+                        non_unique,
+                        (idx + 1) as i64,
+                        column_name,
+                    );
+                }
+            }
+        }
+
+        rows.sort_by(|left, right| {
+            let left_non_unique = matches!(left.get(3), Some(Value::Boolean(true)));
+            let right_non_unique = matches!(right.get(3), Some(Value::Boolean(true)));
+            left_non_unique
+                .cmp(&right_non_unique)
+                .then_with(|| {
+                    Self::metadata_row_string(left, 5).cmp(&Self::metadata_row_string(right, 5))
+                })
+                .then_with(|| {
+                    Self::metadata_row_integer(left, 7).cmp(&Self::metadata_row_integer(right, 7))
+                })
+        });
+
+        Ok(Some(QueryResult::Select { columns, rows }))
+    }
+
+    async fn load_pg_index_metadata(
+        &self,
+    ) -> std::result::Result<Vec<(String, String)>, FusionError> {
+        let txn = self.storage.begin_transaction().await?;
+        let entries = txn.scan_prefix(b"index_meta:", None).await?;
+        let mut metas = Vec::new();
+        for (key, value) in entries {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            let Some(index_name) = key_str.strip_prefix("index_meta:") else {
+                continue;
+            };
+            let Ok(meta_str) = String::from_utf8(value) else {
+                continue;
+            };
+            metas.push((index_name.to_string(), meta_str));
+        }
+        metas.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(metas)
+    }
+
+    fn push_pg_index_info_row(
+        rows: &mut Vec<Vec<Value>>,
+        seen: &mut std::collections::HashSet<(String, String, i64, String)>,
+        table_name: &str,
+        index_name: &str,
+        non_unique: bool,
+        ordinal_position: i64,
+        column_name: &str,
+    ) {
+        let key = (
+            table_name.to_ascii_lowercase(),
+            index_name.to_ascii_lowercase(),
+            ordinal_position,
+            column_name.to_ascii_lowercase(),
+        );
+        if !seen.insert(key) {
+            return;
+        }
+        rows.push(vec![
+            Value::Null,
+            Value::String("public".to_string()),
+            Value::String(table_name.to_string()),
+            Value::Boolean(non_unique),
+            Value::Null,
+            Value::String(index_name.to_string()),
+            Value::Integer(3),
+            Value::Integer(ordinal_position),
+            Value::String(column_name.to_string()),
+            Value::String("A".to_string()),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Null,
+        ]);
+    }
+
+    fn metadata_row_string(row: &[Value], idx: usize) -> String {
+        match row.get(idx) {
+            Some(Value::String(value)) => value.clone(),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        }
+    }
+
+    fn metadata_row_integer(row: &[Value], idx: usize) -> i64 {
+        match row.get(idx) {
+            Some(Value::Integer(value)) => *value,
+            _ => 0,
+        }
+    }
+
+    async fn pg_jdbc_foreign_key_metadata(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let upper = query.to_ascii_uppercase();
+        if !upper.contains("PG_CATALOG.PG_CONSTRAINT")
+            || !upper.contains("CON.CONTYPE = 'F'")
+            || !upper.contains("PKTABLE_NAME")
+            || !upper.contains("FKTABLE_NAME")
+            || !upper.contains("FKCOLUMN_NAME")
+        {
+            return Ok(None);
+        }
+
+        let child_schema_pattern = params
+            .first()
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .or_else(|| Self::metadata_literal_filter_pattern(query, "fkn.nspname"))
+            .unwrap_or_else(|| "%".to_string());
+        let child_table_pattern = params
+            .get(1)
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .or_else(|| Self::metadata_literal_filter_pattern(query, "fkc.relname"))
+            .unwrap_or_else(|| "%".to_string());
+        let parent_schema_pattern = params
+            .get(2)
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .or_else(|| Self::metadata_literal_filter_pattern(query, "pkn.nspname"))
+            .unwrap_or_else(|| "%".to_string());
+        let parent_table_pattern = params
+            .get(3)
+            .and_then(|value| Self::metadata_param_as_string(value))
+            .or_else(|| Self::metadata_literal_filter_pattern(query, "pkc.relname"))
+            .unwrap_or_else(|| "%".to_string());
+
+        let columns = vec![
+            "PKTABLE_CAT".to_string(),
+            "PKTABLE_SCHEM".to_string(),
+            "PKTABLE_NAME".to_string(),
+            "PKCOLUMN_NAME".to_string(),
+            "FKTABLE_CAT".to_string(),
+            "FKTABLE_SCHEM".to_string(),
+            "FKTABLE_NAME".to_string(),
+            "FKCOLUMN_NAME".to_string(),
+            "KEY_SEQ".to_string(),
+            "UPDATE_RULE".to_string(),
+            "DELETE_RULE".to_string(),
+            "FK_NAME".to_string(),
+            "PK_NAME".to_string(),
+            "DEFERRABILITY".to_string(),
+        ];
+
+        let mut rows = Vec::new();
+        for fk in self.load_pg_foreign_key_metadata().await? {
+            if !Self::metadata_like_matches("public", &child_schema_pattern)
+                || !Self::metadata_like_matches(&fk.child_table, &child_table_pattern)
+                || !Self::metadata_like_matches("public", &parent_schema_pattern)
+                || !Self::metadata_like_matches(&fk.parent_table, &parent_table_pattern)
+            {
+                continue;
+            }
+
+            let child_columns = fk.child_columns();
+            let parent_columns = fk.parent_columns();
+            for (idx, (child_column, parent_column)) in
+                child_columns.iter().zip(parent_columns.iter()).enumerate()
+            {
+                rows.push(vec![
+                    Value::Null,
+                    Value::String("public".to_string()),
+                    Value::String(fk.parent_table.clone()),
+                    Value::String(parent_column.clone()),
+                    Value::Null,
+                    Value::String("public".to_string()),
+                    Value::String(fk.child_table.clone()),
+                    Value::String(child_column.clone()),
+                    Value::Integer((idx + 1) as i64),
+                    Value::Integer(3),
+                    Value::Integer(0),
+                    Value::String(fk.name.clone()),
+                    Value::String(format!("{}_pkey", fk.parent_table)),
+                    Value::Integer(7),
+                ]);
+            }
+        }
+
+        rows.sort_by(|left, right| {
+            Self::metadata_row_string(left, 1)
+                .cmp(&Self::metadata_row_string(right, 1))
+                .then_with(|| {
+                    Self::metadata_row_string(left, 2).cmp(&Self::metadata_row_string(right, 2))
+                })
+                .then_with(|| {
+                    Self::metadata_row_string(left, 11).cmp(&Self::metadata_row_string(right, 11))
+                })
+                .then_with(|| {
+                    Self::metadata_row_integer(left, 8).cmp(&Self::metadata_row_integer(right, 8))
+                })
+        });
+
+        Ok(Some(QueryResult::Select { columns, rows }))
+    }
+
+    async fn load_pg_foreign_key_metadata(
+        &self,
+    ) -> std::result::Result<Vec<ForeignKeyMeta>, FusionError> {
+        let txn = self.storage.begin_transaction().await?;
+        let entries = txn.scan_prefix(b"fk_meta:child:", None).await?;
+        let mut foreign_keys = Vec::new();
+        for (_, value) in entries {
+            let Ok(fk) = bincode::deserialize::<ForeignKeyMeta>(&value) else {
+                continue;
+            };
+            foreign_keys.push(fk);
+        }
+        foreign_keys.sort_by(|left, right| {
+            left.child_table
+                .cmp(&right.child_table)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(foreign_keys)
+    }
+
+    fn metadata_literal_like_pattern(query: &str, column: &str) -> Option<String> {
+        let lower_query = query.to_ascii_lowercase();
+        let lower_column = column.to_ascii_lowercase();
+        let mut offset = 0;
+        while let Some(pos) = lower_query[offset..].find(&lower_column) {
+            let start = offset + pos + lower_column.len();
+            let rest = query.get(start..)?.trim_start();
+            if !rest
+                .get(..4)
+                .map(|head| head.eq_ignore_ascii_case("LIKE"))
+                .unwrap_or(false)
+            {
+                offset = start;
+                continue;
+            }
+            let after_like = rest.get(4..)?.trim_start();
+            if !after_like.starts_with('\'') {
+                return None;
+            }
+            let mut value = String::new();
+            let mut chars = after_like[1..].chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        value.push('\'');
+                        continue;
+                    }
+                    return Some(value);
+                }
+                value.push(ch);
+            }
+            return None;
+        }
+        None
+    }
+
+    fn metadata_literal_filter_pattern(query: &str, column: &str) -> Option<String> {
+        let lower_query = query.to_ascii_lowercase();
+        let lower_column = column.to_ascii_lowercase();
+        let mut offset = 0;
+        while let Some(pos) = lower_query[offset..].find(&lower_column) {
+            let start = offset + pos + lower_column.len();
+            let rest = query.get(start..)?.trim_start();
+            let after_operator = if rest
+                .get(..4)
+                .map(|head| head.eq_ignore_ascii_case("LIKE"))
+                .unwrap_or(false)
+            {
+                rest.get(4..)?.trim_start()
+            } else if rest.starts_with('=') {
+                rest.get(1..)?.trim_start()
+            } else {
+                offset = start;
+                continue;
+            };
+            if !after_operator.starts_with('\'') {
+                return None;
+            }
+            let mut value = String::new();
+            let mut chars = after_operator[1..].chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        value.push('\'');
+                        continue;
+                    }
+                    return Some(value);
+                }
+                value.push(ch);
+            }
+            return None;
+        }
+        None
+    }
+
+    fn metadata_like_matches(value: &str, pattern: &str) -> bool {
+        fn matches_at(value: &[u8], pattern: &[u8]) -> bool {
+            if pattern.is_empty() {
+                return value.is_empty();
+            }
+            match pattern[0] {
+                b'%' => {
+                    matches_at(value, &pattern[1..])
+                        || (!value.is_empty() && matches_at(&value[1..], pattern))
+                }
+                b'_' => !value.is_empty() && matches_at(&value[1..], &pattern[1..]),
+                ch => {
+                    !value.is_empty()
+                        && value[0].eq_ignore_ascii_case(&ch)
+                        && matches_at(&value[1..], &pattern[1..])
+                }
+            }
+        }
+
+        matches_at(value.as_bytes(), pattern.as_bytes())
+    }
+
+    fn pg_metadata_show(query: &str) -> Option<QueryResult> {
+        let upper = query.trim().trim_end_matches(';').to_ascii_uppercase();
+        let (column, value) = match upper.as_str() {
+            "SHOW SERVER_VERSION" => ("server_version", Self::pg_server_version()),
+            "SHOW SERVER_ENCODING" => ("server_encoding", "UTF8".to_string()),
+            "SHOW TRANSACTION ISOLATION LEVEL" => {
+                ("transaction_isolation", "read committed".to_string())
+            }
+            "SHOW ALL" => return Some(Executor::show_all_settings_result()),
+            _ => return None,
+        };
+        Some(QueryResult::Select {
+            columns: vec![column.to_string()],
+            rows: vec![vec![Value::String(value)]],
+        })
+    }
+
+    fn parse_set_application_name(query: &str) -> Option<String> {
+        let trimmed = query.trim().trim_end_matches(';').trim();
+        let prefix = "SET application_name";
+        if !trimmed
+            .get(..prefix.len())
+            .map(|head| head.eq_ignore_ascii_case(prefix))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let value = trimmed[prefix.len()..].trim();
+        let value = value.strip_prefix('=').unwrap_or(value).trim();
+        if value.is_empty() {
+            return None;
+        }
+        Some(Self::unquote_sql_string(value))
+    }
+
+    fn unquote_sql_string(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+            trimmed[1..trimmed.len() - 1].replace("''", "'")
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    fn pg_server_version() -> String {
+        "15.0".to_string()
+    }
+
+    fn pg_version_string() -> String {
+        format!(
+            "PostgreSQL {}-compatible FusionDB 0.1.0",
+            Self::pg_server_version()
+        )
+    }
+
+    async fn load_pg_table_schemas(&self) -> std::result::Result<Vec<TableSchema>, FusionError> {
+        let txn = self.storage.begin_transaction().await?;
+        let pairs = txn.scan_prefix(b"schema:", None).await?;
+        let mut schemas = Vec::new();
+        for (_, value) in pairs {
+            if let Ok(schema) = bincode::deserialize::<TableSchema>(&value) {
+                schemas.push(schema);
+            }
+        }
+        schemas.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(schemas)
+    }
+
+    fn pg_metadata_scalar_select(
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let mut columns = Vec::new();
+        let mut row = Vec::new();
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    if let Some((name, value)) = Self::pg_metadata_scalar_expr(expr, None) {
+                        columns.push(name);
+                        row.push(value);
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    if let Some((_, value)) =
+                        Self::pg_metadata_scalar_expr(expr, Some(&alias.value))
+                    {
+                        columns.push(alias.value.clone());
+                        row.push(value);
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(QueryResult::Select {
+            columns,
+            rows: vec![row],
+        }))
+    }
+
+    fn pg_metadata_scalar_expr(expr: &Expr, alias: Option<&str>) -> Option<(String, Value)> {
+        if let Expr::Identifier(ident) = expr {
+            if ident.value.eq_ignore_ascii_case("current_catalog") {
+                let column = "current_catalog".to_string();
+                return Some((
+                    alias.unwrap_or(&column).to_string(),
+                    Value::String("fusiondb".to_string()),
+                ));
+            }
+        };
+
+        let Expr::Function(func) = expr else {
+            return None;
+        };
+        let name = func.name.to_string().to_ascii_lowercase();
+        let (column, value) = match name.as_str() {
+            "current_schema" => (
+                "current_schema".to_string(),
+                Value::String("public".to_string()),
+            ),
+            "current_catalog" => (
+                "current_catalog".to_string(),
+                Value::String("fusiondb".to_string()),
+            ),
+            "current_database" => (
+                "current_database".to_string(),
+                Value::String("fusiondb".to_string()),
+            ),
+            "version" => (
+                "version".to_string(),
+                Value::String(Self::pg_version_string()),
+            ),
+            "current_setting" => {
+                let setting = Self::pg_function_first_string_arg(expr)?;
+                let value = match setting.to_ascii_lowercase().as_str() {
+                    "server_version" => Self::pg_server_version(),
+                    "server_encoding" | "client_encoding" => "UTF8".to_string(),
+                    "search_path" => "public".to_string(),
+                    "application_name" => String::new(),
+                    _ => return None,
+                };
+                ("current_setting".to_string(), Value::String(value))
+            }
+            _ => return None,
+        };
+        Some((alias.unwrap_or(&column).to_string(), value))
+    }
+
+    fn pg_function_first_string_arg(expr: &Expr) -> Option<String> {
+        let Expr::Function(func) = expr else {
+            return None;
+        };
+        match &func.args {
+            FunctionArguments::List(list) => {
+                let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))) = list.args.first()
+                else {
+                    return None;
+                };
+                Self::pg_metadata_string_value(arg)
+            }
+            _ => None,
+        }
+    }
+
+    async fn pg_information_schema_tables(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let schemas = self.load_pg_table_schemas().await?;
+        let columns = vec![
+            "table_catalog".to_string(),
+            "table_schema".to_string(),
+            "table_name".to_string(),
+            "table_type".to_string(),
+        ];
+        let rows = schemas
+            .into_iter()
+            .filter(|schema| {
+                Self::pg_schema_row_matches(select.selection.as_ref(), &schema.name, None)
+            })
+            .map(|schema| {
+                vec![
+                    Value::String("fusiondb".to_string()),
+                    Value::String("public".to_string()),
+                    Value::String(schema.name),
+                    Value::String("BASE TABLE".to_string()),
+                ]
+            })
+            .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_information_schema_columns(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let schemas = self.load_pg_table_schemas().await?;
+        let columns = vec![
+            "table_catalog".to_string(),
+            "table_schema".to_string(),
+            "table_name".to_string(),
+            "column_name".to_string(),
+            "ordinal_position".to_string(),
+            "is_nullable".to_string(),
+            "column_default".to_string(),
+            "data_type".to_string(),
+        ];
+        let mut rows = Vec::new();
+        for schema in schemas {
+            if !Self::pg_schema_row_matches(select.selection.as_ref(), &schema.name, None) {
+                continue;
+            }
+            for (idx, column) in schema.columns.iter().enumerate() {
+                if !Self::pg_schema_row_matches(
+                    select.selection.as_ref(),
+                    &schema.name,
+                    Some(&column.name),
+                ) {
+                    continue;
+                }
+                rows.push(vec![
+                    Value::String("fusiondb".to_string()),
+                    Value::String("public".to_string()),
+                    Value::String(schema.name.clone()),
+                    Value::String(column.name.clone()),
+                    Value::Integer((idx + 1) as i64),
+                    Value::String(if column.is_nullable { "YES" } else { "NO" }.to_string()),
+                    column
+                        .default_value
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                    Value::String(Self::pg_information_schema_data_type(&column.data_type)),
+                ]);
+            }
+        }
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    fn pg_information_schema_data_type(data_type: &str) -> String {
+        let upper = data_type.trim().to_ascii_uppercase();
+        if Self::pg_type_for_column_type(&upper) == Type::INT2
+            || Self::pg_type_for_column_type(&upper) == Type::INT4
+            || Self::pg_type_for_column_type(&upper) == Type::INT8
+        {
+            "integer".to_string()
+        } else if Self::pg_type_for_column_type(&upper) == Type::FLOAT4
+            || Self::pg_type_for_column_type(&upper) == Type::FLOAT8
+        {
+            "double precision".to_string()
+        } else if Self::pg_type_for_column_type(&upper) == Type::NUMERIC {
+            "numeric".to_string()
+        } else if Self::pg_type_for_column_type(&upper) == Type::DATE {
+            "date".to_string()
+        } else if matches!(
+            Self::pg_type_for_column_type(&upper),
+            Type::TIMESTAMP | Type::TIMESTAMPTZ
+        ) {
+            "timestamp without time zone".to_string()
+        } else if Self::pg_type_for_column_type(&upper) == Type::INTERVAL {
+            "interval".to_string()
+        } else if Self::pg_type_for_column_type(&upper) == Type::BOOL {
+            "boolean".to_string()
+        } else {
+            "text".to_string()
+        }
+    }
+
+    fn pg_catalog_pg_type(
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "oid".to_string(),
+            "typname".to_string(),
+            "typnamespace".to_string(),
+            "typelem".to_string(),
+            "typdelim".to_string(),
+            "typarray".to_string(),
+        ];
+        let rows = Self::pg_builtin_type_infos()
+            .iter()
+            .filter(|info| {
+                Self::pg_metadata_name_matches(select.selection.as_ref(), "typname", info.name)
+            })
+            .map(|info| {
+                vec![
+                    Value::Integer(info.oid),
+                    Value::String(info.name.to_string()),
+                    Value::Integer(11),
+                    info.element_oid.map(Value::Integer).unwrap_or(Value::Null),
+                    Value::String(info.delimiter.to_string()),
+                    Self::pg_array_oid_for_element_oid(info.oid)
+                        .map(Value::Integer)
+                        .unwrap_or(Value::Integer(0)),
+                ]
+            })
+            .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    fn pg_catalog_pg_namespace(
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "oid".to_string(),
+            "nspname".to_string(),
+            "nspowner".to_string(),
+            "nspacl".to_string(),
+        ];
+        let rows = [
+            (11, "pg_catalog"),
+            (2200, "public"),
+            (13207, "information_schema"),
+        ]
+        .into_iter()
+        .filter(|(_, name)| {
+            Self::pg_metadata_name_matches(select.selection.as_ref(), "nspname", name)
+        })
+        .map(|(oid, name)| {
+            vec![
+                Value::Integer(oid),
+                Value::String(name.to_string()),
+                Value::Integer(10),
+                Value::Null,
+            ]
+        })
+        .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_catalog_pg_class(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let schemas = self.load_pg_table_schemas().await?;
+        let columns = vec![
+            "oid".to_string(),
+            "relname".to_string(),
+            "relnamespace".to_string(),
+            "relkind".to_string(),
+            "relowner".to_string(),
+            "relhasindex".to_string(),
+            "relpersistence".to_string(),
+        ];
+        let rows = schemas
+            .into_iter()
+            .filter(|schema| {
+                Self::pg_metadata_name_matches(select.selection.as_ref(), "relname", &schema.name)
+            })
+            .enumerate()
+            .map(|(idx, schema)| {
+                vec![
+                    Value::Integer(10_000 + idx as i64),
+                    Value::String(schema.name),
+                    Value::Integer(2200),
+                    Value::String("r".to_string()),
+                    Value::Integer(10),
+                    Value::Boolean(true),
+                    Value::String("p".to_string()),
+                ]
+            })
+            .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_catalog_pg_attribute(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let schemas = self.load_pg_table_schemas().await?;
+        let columns = vec![
+            "attrelid".to_string(),
+            "attname".to_string(),
+            "atttypid".to_string(),
+            "attnum".to_string(),
+            "attnotnull".to_string(),
+            "attisdropped".to_string(),
+            "attlen".to_string(),
+            "atttypmod".to_string(),
+        ];
+        let mut rows = Vec::new();
+        for (table_idx, schema) in schemas.into_iter().enumerate() {
+            let relid = 10_000 + table_idx as i64;
+            for (column_idx, column) in schema.columns.iter().enumerate() {
+                if !Self::pg_attribute_row_matches(select.selection.as_ref(), relid, &column.name) {
+                    continue;
+                }
+                rows.push(vec![
+                    Value::Integer(relid),
+                    Value::String(column.name.clone()),
+                    Value::Integer(Self::pg_type_oid_for_column_type(&column.data_type)),
+                    Value::Integer((column_idx + 1) as i64),
+                    Value::Boolean(!column.is_nullable),
+                    Value::Boolean(false),
+                    Value::Integer(Self::pg_type_len_for_column_type(&column.data_type)),
+                    Value::Integer(-1),
+                ]);
+            }
+        }
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_catalog_pg_tables(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "schemaname".to_string(),
+            "tablename".to_string(),
+            "tableowner".to_string(),
+            "tablespace".to_string(),
+            "hasindexes".to_string(),
+            "hasrules".to_string(),
+            "hastriggers".to_string(),
+            "rowsecurity".to_string(),
+        ];
+        let rows = self
+            .load_pg_table_schemas()
+            .await?
+            .into_iter()
+            .filter(|schema| {
+                Self::pg_metadata_name_matches(select.selection.as_ref(), "tablename", &schema.name)
+            })
+            .map(|schema| {
+                vec![
+                    Value::String("public".to_string()),
+                    Value::String(schema.name),
+                    Value::String("postgres".to_string()),
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                ]
+            })
+            .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    fn pg_catalog_pg_database(
+        select: &sqlparser::ast::Select,
+        params: &[Value],
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "oid".to_string(),
+            "datname".to_string(),
+            "datdba".to_string(),
+            "encoding".to_string(),
+            "datistemplate".to_string(),
+            "datallowconn".to_string(),
+        ];
+        let rows = [(5, "fusiondb")]
+            .into_iter()
+            .filter(|(_, name)| {
+                Self::pg_metadata_name_matches_with_params(
+                    select.selection.as_ref(),
+                    "datname",
+                    name,
+                    params,
+                )
+            })
+            .map(|(oid, name)| {
+                vec![
+                    Value::Integer(oid),
+                    Value::String(name.to_string()),
+                    Value::Integer(10),
+                    Value::Integer(6),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ]
+            })
+            .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    fn pg_catalog_pg_settings(
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "name".to_string(),
+            "setting".to_string(),
+            "unit".to_string(),
+            "category".to_string(),
+            "short_desc".to_string(),
+            "extra_desc".to_string(),
+            "context".to_string(),
+            "vartype".to_string(),
+            "source".to_string(),
+            "min_val".to_string(),
+            "max_val".to_string(),
+        ];
+        let rows = [
+            (
+                "max_index_keys",
+                "32",
+                "",
+                "Preset Options",
+                "Shows the maximum number of index columns.",
+                "FusionDB reports PostgreSQL-compatible metadata for JDBC clients.",
+                "internal",
+                "integer",
+                "default",
+                "1",
+                "32",
+            ),
+            (
+                "server_version",
+                "15.0",
+                "",
+                "Preset Options",
+                "Shows the server version.",
+                "",
+                "internal",
+                "string",
+                "default",
+                "",
+                "",
+            ),
+            (
+                "server_encoding",
+                "UTF8",
+                "",
+                "Client Connection Defaults / Locale and Formatting",
+                "Sets the server character set encoding.",
+                "",
+                "internal",
+                "string",
+                "default",
+                "",
+                "",
+            ),
+        ]
+        .into_iter()
+        .filter(|(name, ..)| {
+            Self::pg_metadata_name_matches(select.selection.as_ref(), "name", name)
+        })
+        .map(
+            |(
+                name,
+                setting,
+                unit,
+                category,
+                short_desc,
+                extra_desc,
+                context,
+                vartype,
+                source,
+                min_val,
+                max_val,
+            )| {
+                vec![
+                    Value::String(name.to_string()),
+                    Value::String(setting.to_string()),
+                    Value::String(unit.to_string()),
+                    Value::String(category.to_string()),
+                    Value::String(short_desc.to_string()),
+                    Value::String(extra_desc.to_string()),
+                    Value::String(context.to_string()),
+                    Value::String(vartype.to_string()),
+                    Value::String(source.to_string()),
+                    Value::String(min_val.to_string()),
+                    Value::String(max_val.to_string()),
+                ]
+            },
+        )
+        .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    fn pg_stat_archiver(
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "archived_count".to_string(),
+            "last_archived_wal".to_string(),
+            "last_archived_time".to_string(),
+            "failed_count".to_string(),
+            "last_failed_wal".to_string(),
+            "last_failed_time".to_string(),
+            "stats_reset".to_string(),
+        ];
+        let rows = vec![vec![
+            Value::Integer(0),
+            Value::Null,
+            Value::Null,
+            Value::Integer(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]];
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    fn pg_stat_bgwriter(
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "checkpoints_timed".to_string(),
+            "checkpoints_req".to_string(),
+            "checkpoint_write_time".to_string(),
+            "checkpoint_sync_time".to_string(),
+            "buffers_checkpoint".to_string(),
+            "buffers_clean".to_string(),
+            "maxwritten_clean".to_string(),
+            "buffers_backend".to_string(),
+            "buffers_backend_fsync".to_string(),
+            "buffers_alloc".to_string(),
+            "stats_reset".to_string(),
+        ];
+        let rows = vec![vec![
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Null,
+        ]];
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    fn pg_stat_database(
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "datid".to_string(),
+            "datname".to_string(),
+            "numbackends".to_string(),
+            "xact_commit".to_string(),
+            "xact_rollback".to_string(),
+            "blks_read".to_string(),
+            "blks_hit".to_string(),
+            "tup_returned".to_string(),
+            "tup_fetched".to_string(),
+            "tup_inserted".to_string(),
+            "tup_updated".to_string(),
+            "tup_deleted".to_string(),
+            "conflicts".to_string(),
+            "temp_files".to_string(),
+            "temp_bytes".to_string(),
+            "deadlocks".to_string(),
+            "checksum_failures".to_string(),
+            "checksum_last_failure".to_string(),
+            "blk_read_time".to_string(),
+            "blk_write_time".to_string(),
+            "session_time".to_string(),
+            "active_time".to_string(),
+            "idle_in_transaction_time".to_string(),
+            "sessions".to_string(),
+            "sessions_abandoned".to_string(),
+            "sessions_fatal".to_string(),
+            "sessions_killed".to_string(),
+            "stats_reset".to_string(),
+        ];
+        let rows = vec![vec![
+            Value::Integer(5),
+            Value::String("fusiondb".to_string()),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Null,
+            Value::Null,
+            Value::Float(0.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Null,
+        ]];
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    fn pg_stat_database_conflicts(
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "datid".to_string(),
+            "datname".to_string(),
+            "confl_tablespace".to_string(),
+            "confl_lock".to_string(),
+            "confl_snapshot".to_string(),
+            "confl_bufferpin".to_string(),
+            "confl_deadlock".to_string(),
+        ];
+        let rows = vec![vec![
+            Value::Integer(5),
+            Value::String("fusiondb".to_string()),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+        ]];
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_stat_user_tables(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "relid".to_string(),
+            "schemaname".to_string(),
+            "relname".to_string(),
+            "seq_scan".to_string(),
+            "seq_tup_read".to_string(),
+            "idx_scan".to_string(),
+            "idx_tup_fetch".to_string(),
+            "n_tup_ins".to_string(),
+            "n_tup_upd".to_string(),
+            "n_tup_del".to_string(),
+            "n_tup_hot_upd".to_string(),
+            "n_tup_newpage_upd".to_string(),
+            "n_live_tup".to_string(),
+            "n_dead_tup".to_string(),
+            "n_mod_since_analyze".to_string(),
+            "n_ins_since_vacuum".to_string(),
+            "last_vacuum".to_string(),
+            "last_autovacuum".to_string(),
+            "last_analyze".to_string(),
+            "last_autoanalyze".to_string(),
+            "vacuum_count".to_string(),
+            "autovacuum_count".to_string(),
+            "analyze_count".to_string(),
+            "autoanalyze_count".to_string(),
+        ];
+        let rows = self
+            .load_pg_table_schemas()
+            .await?
+            .into_iter()
+            .enumerate()
+            .filter(|(_, schema)| {
+                Self::pg_metadata_name_matches(select.selection.as_ref(), "relname", &schema.name)
+            })
+            .map(|(idx, schema)| {
+                vec![
+                    Value::Integer(10_000 + idx as i64),
+                    Value::String("public".to_string()),
+                    Value::String(schema.name),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                ]
+            })
+            .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_statio_user_tables(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "relid".to_string(),
+            "schemaname".to_string(),
+            "relname".to_string(),
+            "heap_blks_read".to_string(),
+            "heap_blks_hit".to_string(),
+            "idx_blks_read".to_string(),
+            "idx_blks_hit".to_string(),
+            "toast_blks_read".to_string(),
+            "toast_blks_hit".to_string(),
+            "tidx_blks_read".to_string(),
+            "tidx_blks_hit".to_string(),
+        ];
+        let rows = self
+            .load_pg_table_schemas()
+            .await?
+            .into_iter()
+            .enumerate()
+            .filter(|(_, schema)| {
+                Self::pg_metadata_name_matches(select.selection.as_ref(), "relname", &schema.name)
+            })
+            .map(|(idx, schema)| {
+                vec![
+                    Value::Integer(10_000 + idx as i64),
+                    Value::String("public".to_string()),
+                    Value::String(schema.name),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                ]
+            })
+            .collect();
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_stat_user_indexes(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "relid".to_string(),
+            "indexrelid".to_string(),
+            "schemaname".to_string(),
+            "relname".to_string(),
+            "indexrelname".to_string(),
+            "idx_scan".to_string(),
+            "idx_tup_read".to_string(),
+            "idx_tup_fetch".to_string(),
+        ];
+        let rows = self.pg_stat_index_rows(select).await?;
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_statio_user_indexes(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Option<QueryResult>, FusionError> {
+        let columns = vec![
+            "relid".to_string(),
+            "indexrelid".to_string(),
+            "schemaname".to_string(),
+            "relname".to_string(),
+            "indexrelname".to_string(),
+            "idx_blks_read".to_string(),
+            "idx_blks_hit".to_string(),
+        ];
+        let rows = self.pg_statio_index_rows(select).await?;
+        Ok(Some(Self::project_pg_metadata_result(
+            select, columns, rows,
+        )?))
+    }
+
+    async fn pg_stat_index_rows(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Vec<Vec<Value>>, FusionError> {
+        let mut rows = Vec::new();
+        for (relid, indexrelid, relname, indexrelname) in self.pg_user_index_entries().await? {
+            if !Self::pg_index_stat_row_matches(select.selection.as_ref(), &relname, &indexrelname)
+            {
+                continue;
+            }
+            rows.push(vec![
+                Value::Integer(relid),
+                Value::Integer(indexrelid),
+                Value::String("public".to_string()),
+                Value::String(relname),
+                Value::String(indexrelname),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+            ]);
+        }
+        Ok(rows)
+    }
+
+    async fn pg_statio_index_rows(
+        &self,
+        select: &sqlparser::ast::Select,
+    ) -> std::result::Result<Vec<Vec<Value>>, FusionError> {
+        let mut rows = Vec::new();
+        for (relid, indexrelid, relname, indexrelname) in self.pg_user_index_entries().await? {
+            if !Self::pg_index_stat_row_matches(select.selection.as_ref(), &relname, &indexrelname)
+            {
+                continue;
+            }
+            rows.push(vec![
+                Value::Integer(relid),
+                Value::Integer(indexrelid),
+                Value::String("public".to_string()),
+                Value::String(relname),
+                Value::String(indexrelname),
+                Value::Integer(0),
+                Value::Integer(0),
+            ]);
+        }
+        Ok(rows)
+    }
+
+    async fn pg_user_index_entries(
+        &self,
+    ) -> std::result::Result<Vec<(i64, i64, String, String)>, FusionError> {
+        let schemas = self.load_pg_table_schemas().await?;
+        let index_metas = self.load_pg_index_metadata().await?;
+        let mut rows = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (table_idx, schema) in schemas.into_iter().enumerate() {
+            let relid = 10_000 + table_idx as i64;
+            let mut ordinal = 0i64;
+
+            if schema.get_primary_key_index().is_some() {
+                ordinal += 1;
+                let index_name = format!("{}_pkey", schema.name);
+                if seen.insert((schema.name.to_ascii_lowercase(), index_name.clone())) {
+                    rows.push((
+                        relid,
+                        20_000 + table_idx as i64 * 100 + ordinal,
+                        schema.name.clone(),
+                        index_name,
+                    ));
+                }
+            }
+
+            for (index_name, meta_str) in &index_metas {
+                let Some(meta) = Executor::parse_index_meta(index_name, meta_str) else {
+                    continue;
+                };
+                if !meta.table.eq_ignore_ascii_case(&schema.name) {
+                    continue;
+                }
+                if !seen.insert((schema.name.to_ascii_lowercase(), index_name.clone())) {
+                    continue;
+                }
+                ordinal += 1;
+                rows.push((
+                    relid,
+                    20_000 + table_idx as i64 * 100 + ordinal,
+                    schema.name.clone(),
+                    index_name.clone(),
+                ));
+            }
+        }
+
+        rows.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.3.cmp(&right.3)));
+        Ok(rows)
+    }
+
+    fn project_pg_metadata_result(
+        select: &sqlparser::ast::Select,
+        base_columns: Vec<String>,
+        base_rows: Vec<Vec<Value>>,
+    ) -> std::result::Result<QueryResult, FusionError> {
+        let wildcard = select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            )
+        });
+        if wildcard {
+            return Ok(QueryResult::Select {
+                columns: base_columns,
+                rows: base_rows,
+            });
+        }
+
+        enum MetadataProjection {
+            Column(usize),
+            Constant(Value),
+        }
+
+        let mut projected_columns = Vec::with_capacity(select.projection.len());
+        let mut projections = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            let (projection, output_name) = match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    if let Some(value) = Self::pg_metadata_constant_value(expr) {
+                        (MetadataProjection::Constant(value), expr.to_string())
+                    } else {
+                        let Some(name) = Self::pg_metadata_column_name(expr) else {
+                            return Err(FusionError::Execution(format!(
+                                "Unsupported metadata projection: {}",
+                                expr
+                            )));
+                        };
+                        let Some(index) = base_columns
+                            .iter()
+                            .position(|column| column.eq_ignore_ascii_case(name))
+                        else {
+                            return Err(FusionError::Execution(format!(
+                                "Unknown metadata column: {}",
+                                name
+                            )));
+                        };
+                        (MetadataProjection::Column(index), name.to_string())
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    if let Some(value) = Self::pg_metadata_constant_value(expr) {
+                        (MetadataProjection::Constant(value), alias.value.clone())
+                    } else {
+                        let Some(name) = Self::pg_metadata_column_name(expr) else {
+                            return Err(FusionError::Execution(format!(
+                                "Unsupported metadata projection: {}",
+                                expr
+                            )));
+                        };
+                        let Some(index) = base_columns
+                            .iter()
+                            .position(|column| column.eq_ignore_ascii_case(name))
+                        else {
+                            return Err(FusionError::Execution(format!(
+                                "Unknown metadata column: {}",
+                                name
+                            )));
+                        };
+                        (MetadataProjection::Column(index), alias.value.clone())
+                    }
+                }
+                _ => {
+                    return Err(FusionError::Execution(format!(
+                        "Unsupported metadata projection: {}",
+                        item
+                    )))
+                }
+            };
+            projections.push(projection);
+            projected_columns.push(output_name);
+        }
+
+        let rows = base_rows
+            .into_iter()
+            .map(|row| {
+                projections
+                    .iter()
+                    .map(|projection| match projection {
+                        MetadataProjection::Column(index) => {
+                            row.get(*index).cloned().unwrap_or(Value::Null)
+                        }
+                        MetadataProjection::Constant(value) => value.clone(),
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(QueryResult::Select {
+            columns: projected_columns,
+            rows,
+        })
+    }
+
+    fn pg_metadata_constant_value(expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::Value(value) => match &value.value {
+                sqlparser::ast::Value::Number(s, _) => s
+                    .parse::<i64>()
+                    .map(Value::Integer)
+                    .or_else(|_| s.parse::<f64>().map(Value::Float))
+                    .ok(),
+                sqlparser::ast::Value::SingleQuotedString(s)
+                | sqlparser::ast::Value::DoubleQuotedString(s)
+                | sqlparser::ast::Value::EscapedStringLiteral(s)
+                | sqlparser::ast::Value::NationalStringLiteral(s) => Some(Value::String(s.clone())),
+                sqlparser::ast::Value::Boolean(value) => Some(Value::Boolean(*value)),
+                sqlparser::ast::Value::Null => Some(Value::Null),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn pg_schema_row_matches(
+        selection: Option<&Expr>,
+        table_name: &str,
+        column_name: Option<&str>,
+    ) -> bool {
+        let Some(expr) = selection else {
+            return true;
+        };
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                use sqlparser::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::And => {
+                        Self::pg_schema_row_matches(Some(left), table_name, column_name)
+                            && Self::pg_schema_row_matches(Some(right), table_name, column_name)
+                    }
+                    BinaryOperator::Or => {
+                        Self::pg_schema_row_matches(Some(left), table_name, column_name)
+                            || Self::pg_schema_row_matches(Some(right), table_name, column_name)
+                    }
+                    BinaryOperator::Eq => {
+                        let Some(column) = Self::pg_metadata_column_name(left)
+                            .or_else(|| Self::pg_metadata_column_name(right))
+                        else {
+                            return true;
+                        };
+                        let Some(value) = Self::pg_metadata_string_value(left)
+                            .or_else(|| Self::pg_metadata_string_value(right))
+                        else {
+                            return true;
+                        };
+                        match column {
+                            "table_catalog" => value.eq_ignore_ascii_case("fusiondb"),
+                            "table_schema" => value.eq_ignore_ascii_case("public"),
+                            "table_name" => value.eq_ignore_ascii_case(table_name),
+                            "column_name" => column_name
+                                .map(|name| value.eq_ignore_ascii_case(name))
+                                .unwrap_or(true),
+                            _ => true,
+                        }
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    fn pg_metadata_name_matches(selection: Option<&Expr>, column_name: &str, value: &str) -> bool {
+        Self::pg_metadata_name_matches_with_params(selection, column_name, value, &[])
+    }
+
+    fn pg_metadata_name_matches_with_params(
+        selection: Option<&Expr>,
+        column_name: &str,
+        value: &str,
+        params: &[Value],
+    ) -> bool {
+        let Some(expr) = selection else {
+            return true;
+        };
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                use sqlparser::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::And => {
+                        Self::pg_metadata_name_matches_with_params(
+                            Some(left),
+                            column_name,
+                            value,
+                            params,
+                        ) && Self::pg_metadata_name_matches_with_params(
+                            Some(right),
+                            column_name,
+                            value,
+                            params,
+                        )
+                    }
+                    BinaryOperator::Or => {
+                        Self::pg_metadata_name_matches_with_params(
+                            Some(left),
+                            column_name,
+                            value,
+                            params,
+                        ) || Self::pg_metadata_name_matches_with_params(
+                            Some(right),
+                            column_name,
+                            value,
+                            params,
+                        )
+                    }
+                    BinaryOperator::Eq => {
+                        let Some(column) = Self::pg_metadata_column_name(left)
+                            .or_else(|| Self::pg_metadata_column_name(right))
+                        else {
+                            return true;
+                        };
+                        if !column.eq_ignore_ascii_case(column_name) {
+                            return true;
+                        }
+                        let Some(expected) = Self::pg_metadata_string_value_with_params(
+                            left, params,
+                        )
+                        .or_else(|| Self::pg_metadata_string_value_with_params(right, params)) else {
+                            return true;
+                        };
+                        expected.eq_ignore_ascii_case(value)
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    fn pg_attribute_row_matches(selection: Option<&Expr>, relid: i64, attname: &str) -> bool {
+        let Some(expr) = selection else {
+            return true;
+        };
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                use sqlparser::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::And => {
+                        Self::pg_attribute_row_matches(Some(left), relid, attname)
+                            && Self::pg_attribute_row_matches(Some(right), relid, attname)
+                    }
+                    BinaryOperator::Or => {
+                        Self::pg_attribute_row_matches(Some(left), relid, attname)
+                            || Self::pg_attribute_row_matches(Some(right), relid, attname)
+                    }
+                    BinaryOperator::Eq => {
+                        let Some(column) = Self::pg_metadata_column_name(left)
+                            .or_else(|| Self::pg_metadata_column_name(right))
+                        else {
+                            return true;
+                        };
+                        if column.eq_ignore_ascii_case("attname") {
+                            let Some(expected) = Self::pg_metadata_string_value(left)
+                                .or_else(|| Self::pg_metadata_string_value(right))
+                            else {
+                                return true;
+                            };
+                            return expected.eq_ignore_ascii_case(attname);
+                        }
+                        if column.eq_ignore_ascii_case("attrelid") {
+                            let Some(expected) = Self::pg_metadata_i64_value(left)
+                                .or_else(|| Self::pg_metadata_i64_value(right))
+                            else {
+                                return true;
+                            };
+                            return expected == relid;
+                        }
+                        true
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    fn pg_index_stat_row_matches(
+        selection: Option<&Expr>,
+        relname: &str,
+        indexrelname: &str,
+    ) -> bool {
+        let Some(expr) = selection else {
+            return true;
+        };
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                use sqlparser::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::And => {
+                        Self::pg_index_stat_row_matches(Some(left), relname, indexrelname)
+                            && Self::pg_index_stat_row_matches(Some(right), relname, indexrelname)
+                    }
+                    BinaryOperator::Or => {
+                        Self::pg_index_stat_row_matches(Some(left), relname, indexrelname)
+                            || Self::pg_index_stat_row_matches(Some(right), relname, indexrelname)
+                    }
+                    BinaryOperator::Eq => {
+                        let Some(column) = Self::pg_metadata_column_name(left)
+                            .or_else(|| Self::pg_metadata_column_name(right))
+                        else {
+                            return true;
+                        };
+                        let Some(expected) = Self::pg_metadata_string_value(left)
+                            .or_else(|| Self::pg_metadata_string_value(right))
+                        else {
+                            return true;
+                        };
+                        match column {
+                            name if name.eq_ignore_ascii_case("relname") => {
+                                expected.eq_ignore_ascii_case(relname)
+                            }
+                            name if name.eq_ignore_ascii_case("indexrelname") => {
+                                expected.eq_ignore_ascii_case(indexrelname)
+                            }
+                            name if name.eq_ignore_ascii_case("schemaname") => {
+                                expected.eq_ignore_ascii_case("public")
+                            }
+                            _ => true,
+                        }
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    fn pg_metadata_column_name(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.as_str()),
+            Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.as_str()),
+            _ => None,
+        }
+    }
+
+    fn pg_metadata_string_value(expr: &Expr) -> Option<String> {
+        Self::pg_metadata_string_value_with_params(expr, &[])
+    }
+
+    fn pg_metadata_string_value_with_params(expr: &Expr, params: &[Value]) -> Option<String> {
+        match expr {
+            Expr::Value(value) => match &value.value {
+                sqlparser::ast::Value::SingleQuotedString(s)
+                | sqlparser::ast::Value::DoubleQuotedString(s)
+                | sqlparser::ast::Value::EscapedStringLiteral(s)
+                | sqlparser::ast::Value::NationalStringLiteral(s) => Some(s.clone()),
+                sqlparser::ast::Value::Placeholder(placeholder) => placeholder
+                    .strip_prefix('$')
+                    .and_then(|idx| idx.parse::<usize>().ok())
+                    .and_then(|idx| params.get(idx.saturating_sub(1)))
+                    .and_then(Self::metadata_param_as_string),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn pg_metadata_i64_value(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Value(value) => match &value.value {
+                sqlparser::ast::Value::Number(s, _) => s.parse::<i64>().ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn first_metadata_i64_param_or_literal(query: &str, params: &[Value]) -> Option<i64> {
+        params
+            .iter()
+            .find_map(|param| match param {
+                Value::Integer(value) => Some(*value),
+                Value::String(value) => value.parse::<i64>().ok(),
+                _ => None,
+            })
+            .or_else(|| Self::first_i64_literal_after_equals(query))
+    }
+
+    fn first_i64_literal_after_equals(query: &str) -> Option<i64> {
+        for part in query.split('=') {
+            let token = part
+                .trim_start()
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(value) = token.parse::<i64>() {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn pg_builtin_type_infos() -> &'static [PgTypeInfo] {
+        &[
+            PgTypeInfo {
+                oid: 16,
+                name: "bool",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1000,
+                name: "_bool",
+                element_oid: Some(16),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 20,
+                name: "int8",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1016,
+                name: "_int8",
+                element_oid: Some(20),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 21,
+                name: "int2",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1005,
+                name: "_int2",
+                element_oid: Some(21),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 23,
+                name: "int4",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1007,
+                name: "_int4",
+                element_oid: Some(23),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 25,
+                name: "text",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1009,
+                name: "_text",
+                element_oid: Some(25),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 700,
+                name: "float4",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1021,
+                name: "_float4",
+                element_oid: Some(700),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 701,
+                name: "float8",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1022,
+                name: "_float8",
+                element_oid: Some(701),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1082,
+                name: "date",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1182,
+                name: "_date",
+                element_oid: Some(1082),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1114,
+                name: "timestamp",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1115,
+                name: "_timestamp",
+                element_oid: Some(1114),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1184,
+                name: "timestamptz",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1185,
+                name: "_timestamptz",
+                element_oid: Some(1184),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1186,
+                name: "interval",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1187,
+                name: "_interval",
+                element_oid: Some(1186),
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1700,
+                name: "numeric",
+                element_oid: None,
+                delimiter: ',',
+            },
+            PgTypeInfo {
+                oid: 1231,
+                name: "_numeric",
+                element_oid: Some(1700),
+                delimiter: ',',
+            },
+        ]
+    }
+
+    fn pg_type_info_for_oid(oid: i64) -> Option<PgTypeInfo> {
+        Self::pg_builtin_type_infos()
+            .iter()
+            .copied()
+            .find(|info| info.oid == oid)
+    }
+
+    fn pg_array_element_type_for_oid(oid: i64) -> Option<PgTypeInfo> {
+        let array_type = Self::pg_type_info_for_oid(oid)?;
+        let element_oid = array_type.element_oid?;
+        Self::pg_type_info_for_oid(element_oid)
+    }
+
+    fn pg_array_oid_for_element_oid(oid: i64) -> Option<i64> {
+        Self::pg_builtin_type_infos()
+            .iter()
+            .find(|info| info.element_oid == Some(oid))
+            .map(|info| info.oid)
+    }
+
+    fn pg_type_oid_for_column_type(data_type: &str) -> i64 {
+        match Self::pg_type_for_column_type(data_type) {
+            Type::BOOL => 16,
+            Type::INT8 => 20,
+            Type::INT2 => 21,
+            Type::INT4 => 23,
+            Type::TEXT => 25,
+            Type::FLOAT4 => 700,
+            Type::FLOAT8 => 701,
+            Type::DATE => 1082,
+            Type::TIMESTAMP => 1114,
+            Type::TIMESTAMPTZ => 1184,
+            Type::INTERVAL => 1186,
+            Type::NUMERIC => 1700,
+            Type::BOOL_ARRAY => 1000,
+            Type::INT8_ARRAY => 1016,
+            Type::INT2_ARRAY => 1005,
+            Type::INT4_ARRAY => 1007,
+            Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => 1009,
+            Type::FLOAT4_ARRAY => 1021,
+            Type::FLOAT8_ARRAY => 1022,
+            Type::DATE_ARRAY => 1182,
+            Type::TIMESTAMP_ARRAY => 1115,
+            Type::TIMESTAMPTZ_ARRAY => 1185,
+            Type::INTERVAL_ARRAY => 1187,
+            Type::NUMERIC_ARRAY => 1231,
+            _ => 25,
+        }
+    }
+
+    fn pg_type_len_for_column_type(data_type: &str) -> i64 {
+        match Self::pg_type_for_column_type(data_type) {
+            Type::BOOL => 1,
+            Type::INT2 => 2,
+            Type::INT4 => 4,
+            Type::INT8 | Type::FLOAT8 | Type::TIMESTAMP | Type::TIMESTAMPTZ => 8,
+            Type::FLOAT4 | Type::DATE => 4,
+            _ => -1,
+        }
+    }
+
+    fn pg_command_tag(message: &str) -> String {
+        let trimmed = message.trim();
+        let lower = trimmed.to_ascii_lowercase();
+
+        if lower.starts_with("inserted ") {
+            let rows = Self::first_i64_token(trimmed).unwrap_or(0);
+            return format!("INSERT 0 {}", rows);
+        }
+        if lower.starts_with("updated ") {
+            let rows = Self::first_i64_token(trimmed).unwrap_or(0);
+            return format!("UPDATE {}", rows);
+        }
+        if lower.starts_with("deleted ") {
+            let rows = Self::first_i64_token(trimmed).unwrap_or(0);
+            return format!("DELETE {}", rows);
+        }
+        if lower.starts_with("copied ") || lower.starts_with("copy ") {
+            let rows = Self::first_i64_token(trimmed).unwrap_or(0);
+            return format!("COPY {}", rows);
+        }
+        if lower.starts_with("table ") && lower.contains(" created") {
+            return "CREATE TABLE".to_string();
+        }
+        if lower.starts_with("index ") && lower.contains(" created") {
+            return "CREATE INDEX".to_string();
+        }
+        if lower.starts_with("view ") && lower.contains(" created") {
+            return "CREATE VIEW".to_string();
+        }
+        if lower.starts_with("dropped ") {
+            return "DROP".to_string();
+        }
+        if lower.starts_with("truncated ") {
+            return "TRUNCATE TABLE".to_string();
+        }
+        if lower.contains(" column ") || lower.starts_with("renamed column ") {
+            return "ALTER TABLE".to_string();
+        }
+        if matches!(trimmed, "BEGIN" | "COMMIT" | "ROLLBACK") {
+            return trimmed.to_string();
+        }
+        trimmed.to_string()
+    }
+
+    fn first_i64_token(message: &str) -> Option<i64> {
+        message
+            .split(|ch: char| !ch.is_ascii_digit())
+            .find(|part| !part.is_empty())
+            .and_then(|part| part.parse::<i64>().ok())
+    }
+
+    async fn send_row_description_or_nodata<C>(
+        &self,
+        client: &mut C,
+        fields: Vec<FieldInfo>,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
+    {
+        if fields.is_empty() {
+            client
+                .send(PgWireBackendMessage::NoData(NoData::new()))
+                .await
+                .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+        } else {
+            client
+                .send(PgWireBackendMessage::RowDescription(RowDescription::new(
+                    fields.iter().map(Into::into).collect(),
+                )))
+                .await
+                .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+        }
+        Ok(())
     }
 
     fn is_copy_from_stdin_statement(stmt: &Statement) -> bool {
@@ -166,6 +2656,7 @@ impl PgHandler {
         session.copy_in = Some(CopyInState {
             statement: stmt,
             data: Vec::new(),
+            simple_query: true,
         });
         Ok(Response::CopyIn(response))
     }
@@ -180,16 +2671,41 @@ impl PgHandler {
             Value::Timestamp(_) => Type::TIMESTAMP,
             Value::Interval(_) => Type::INTERVAL,
             Value::Blob(_) => Type::BYTEA,
-            Value::String(_)
-            | Value::Vector(_)
-            | Value::Array(_)
-            | Value::Object(_)
-            | Value::Null => Type::TEXT,
+            Value::Array(values) => Self::pg_array_type_for_values(values),
+            Value::String(_) | Value::Vector(_) | Value::Object(_) | Value::Null => Type::TEXT,
+        }
+    }
+
+    fn pg_array_type_for_values(values: &[Value]) -> Type {
+        values
+            .iter()
+            .find_map(Self::pg_array_type_for_value_member)
+            .unwrap_or(Type::TEXT_ARRAY)
+    }
+
+    fn pg_array_type_for_value_member(value: &Value) -> Option<Type> {
+        match value {
+            Value::Null => None,
+            Value::Boolean(_) => Some(Type::BOOL_ARRAY),
+            Value::Integer(_) => Some(Type::INT8_ARRAY),
+            Value::Float(_) => Some(Type::FLOAT8_ARRAY),
+            Value::Decimal(_) => Some(Type::NUMERIC_ARRAY),
+            Value::String(_) => Some(Type::TEXT_ARRAY),
+            Value::Date(_) => Some(Type::DATE_ARRAY),
+            Value::Timestamp(_) => Some(Type::TIMESTAMP_ARRAY),
+            Value::Interval(_) => Some(Type::INTERVAL_ARRAY),
+            Value::Blob(_) => Some(Type::BYTEA_ARRAY),
+            Value::Array(values) => Some(Self::pg_array_type_for_values(values)),
+            Value::Vector(_) | Value::Object(_) => Some(Type::TEXT_ARRAY),
         }
     }
 
     fn pg_type_for_column_type(data_type: &str) -> Type {
         let upper = data_type.trim().to_uppercase();
+        if let Some(scalar) = Self::strip_array_suffixes(&upper) {
+            let scalar_type = Self::pg_type_for_column_type(scalar);
+            return Self::pg_array_type_for_scalar_type(&scalar_type);
+        }
         match upper.as_str() {
             "BOOL" | "BOOLEAN" => Type::BOOL,
             "SMALLINT" | "INT2" => Type::INT2,
@@ -218,9 +2734,25 @@ impl PgHandler {
         }
     }
 
+    fn strip_array_suffixes(data_type: &str) -> Option<&str> {
+        let mut scalar = data_type.trim();
+        let mut saw_array = false;
+        while let Some(stripped) = scalar.strip_suffix("[]") {
+            scalar = stripped.trim_end();
+            saw_array = true;
+        }
+        saw_array.then_some(scalar)
+    }
+
     fn pg_type_for_sql_type(data_type: &sqlparser::ast::DataType) -> Type {
-        use sqlparser::ast::DataType;
+        use sqlparser::ast::{ArrayElemTypeDef, DataType};
         match data_type {
+            DataType::Array(array_type) => match array_type {
+                ArrayElemTypeDef::AngleBracket(inner)
+                | ArrayElemTypeDef::SquareBracket(inner, _)
+                | ArrayElemTypeDef::Parenthesis(inner) => Self::pg_array_type_for_sql_type(inner),
+                ArrayElemTypeDef::None => Type::TEXT_ARRAY,
+            },
             DataType::Bool | DataType::Boolean => Type::BOOL,
             DataType::TinyInt(_)
             | DataType::TinyIntUnsigned(_)
@@ -284,6 +2816,62 @@ impl PgHandler {
         }
     }
 
+    fn pg_array_type_for_sql_type(data_type: &sqlparser::ast::DataType) -> Type {
+        let scalar_type = Self::pg_type_for_sql_type(data_type);
+        if Self::is_pg_array_type(&scalar_type) {
+            scalar_type
+        } else {
+            Self::pg_array_type_for_scalar_type(&scalar_type)
+        }
+    }
+
+    fn pg_array_type_for_scalar_type(data_type: &Type) -> Type {
+        if Self::is_pg_array_type(data_type) {
+            return data_type.clone();
+        }
+        match *data_type {
+            Type::BOOL => Type::BOOL_ARRAY,
+            Type::INT2 => Type::INT2_ARRAY,
+            Type::INT4 => Type::INT4_ARRAY,
+            Type::INT8 => Type::INT8_ARRAY,
+            Type::FLOAT4 => Type::FLOAT4_ARRAY,
+            Type::FLOAT8 => Type::FLOAT8_ARRAY,
+            Type::NUMERIC => Type::NUMERIC_ARRAY,
+            Type::DATE => Type::DATE_ARRAY,
+            Type::TIMESTAMP => Type::TIMESTAMP_ARRAY,
+            Type::TIMESTAMPTZ => Type::TIMESTAMPTZ_ARRAY,
+            Type::TIME => Type::TIME_ARRAY,
+            Type::INTERVAL => Type::INTERVAL_ARRAY,
+            Type::BYTEA => Type::BYTEA_ARRAY,
+            Type::JSON => Type::JSON_ARRAY,
+            Type::JSONB => Type::JSONB_ARRAY,
+            Type::TEXT | Type::VARCHAR => Type::TEXT_ARRAY,
+            _ => Type::TEXT_ARRAY,
+        }
+    }
+
+    fn pg_scalar_type_for_array_type(data_type: &Type) -> Type {
+        match *data_type {
+            Type::BOOL_ARRAY => Type::BOOL,
+            Type::BYTEA_ARRAY => Type::BYTEA,
+            Type::INT2_ARRAY => Type::INT2,
+            Type::INT4_ARRAY => Type::INT4,
+            Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => Type::TEXT,
+            Type::INT8_ARRAY => Type::INT8,
+            Type::FLOAT4_ARRAY => Type::FLOAT4,
+            Type::FLOAT8_ARRAY => Type::FLOAT8,
+            Type::TIMESTAMP_ARRAY => Type::TIMESTAMP,
+            Type::DATE_ARRAY => Type::DATE,
+            Type::TIME_ARRAY => Type::TIME,
+            Type::TIMESTAMPTZ_ARRAY => Type::TIMESTAMPTZ,
+            Type::INTERVAL_ARRAY => Type::INTERVAL,
+            Type::NUMERIC_ARRAY => Type::NUMERIC,
+            Type::JSON_ARRAY => Type::JSON,
+            Type::JSONB_ARRAY => Type::JSONB,
+            _ => Type::TEXT,
+        }
+    }
+
     fn value_as_pg_text(value: Value) -> Option<String> {
         match value {
             Value::Null => None,
@@ -306,9 +2894,67 @@ impl PgHandler {
                 Some(out)
             }
             Value::Vector(v) => Some(format!("{:?}", v)),
-            Value::Array(v) => Some(format!("{:?}", v)),
+            Value::Array(v) => Some(Self::pg_array_text(&v)),
             Value::Object(v) => Some(format!("{:?}", v)),
         }
+    }
+
+    fn pg_array_text(values: &[Value]) -> String {
+        let mut out = String::from("{");
+        for (idx, value) in values.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            out.push_str(&Self::pg_array_element_text(value));
+        }
+        out.push('}');
+        out
+    }
+
+    fn pg_array_element_text(value: &Value) -> String {
+        match value {
+            Value::Null => "NULL".to_string(),
+            Value::Array(values) => Self::pg_array_text(values),
+            Value::Boolean(value) => {
+                if *value {
+                    "t".to_string()
+                } else {
+                    "f".to_string()
+                }
+            }
+            Value::Integer(value) => value.to_string(),
+            Value::Float(value) => value.to_string(),
+            Value::Decimal(value) => value.clone(),
+            Value::Date(days) => Value::format_date(*days),
+            Value::Timestamp(micros) => Value::format_timestamp(*micros),
+            Value::Interval(micros) => Value::format_interval(*micros),
+            Value::Blob(bytes) => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let mut out = String::with_capacity(2 + bytes.len() * 2);
+                out.push_str("\\x");
+                for byte in bytes {
+                    out.push(HEX[(byte >> 4) as usize] as char);
+                    out.push(HEX[(byte & 0x0f) as usize] as char);
+                }
+                Self::quote_pg_array_element(&out)
+            }
+            Value::String(value) => Self::quote_pg_array_element(value),
+            Value::Vector(value) => Self::quote_pg_array_element(&format!("{:?}", value)),
+            Value::Object(value) => Self::quote_pg_array_element(&format!("{:?}", value)),
+        }
+    }
+
+    fn quote_pg_array_element(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for ch in value.chars() {
+            if matches!(ch, '"' | '\\') {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+        out
     }
 
     fn infer_text_fields(columns: &[String], rows: &[Vec<Value>]) -> Arc<Vec<FieldInfo>> {
@@ -330,7 +2976,11 @@ impl PgHandler {
         )
     }
 
-    fn infer_binary_fields(columns: &[String], rows: &[Vec<Value>]) -> Arc<Vec<FieldInfo>> {
+    fn fields_with_format(
+        columns: &[String],
+        rows: &[Vec<Value>],
+        result_format_codes: &[i16],
+    ) -> Arc<Vec<FieldInfo>> {
         Arc::new(
             columns
                 .iter()
@@ -343,28 +2993,88 @@ impl PgHandler {
                         .map(Self::pg_type_for_value)
                         .unwrap_or(Type::TEXT);
 
-                    FieldInfo::new(name.clone(), None, None, datatype, FieldFormat::Binary)
+                    FieldInfo::new(
+                        name.clone(),
+                        None,
+                        None,
+                        datatype.clone(),
+                        Self::result_field_format_for_type(&datatype, result_format_codes, idx),
+                    )
                 })
                 .collect::<Vec<_>>(),
         )
     }
 
-    fn encode_row(
+    fn result_field_format(result_format_codes: &[i16], idx: usize) -> FieldFormat {
+        match result_format_codes {
+            [] => FieldFormat::Text,
+            [format] => FieldFormat::from(*format),
+            formats => FieldFormat::from(formats.get(idx).copied().unwrap_or(0)),
+        }
+    }
+
+    fn result_field_format_for_type(
+        data_type: &Type,
+        result_format_codes: &[i16],
+        idx: usize,
+    ) -> FieldFormat {
+        if Self::is_pg_array_type(data_type) {
+            FieldFormat::Text
+        } else {
+            Self::result_field_format(result_format_codes, idx)
+        }
+    }
+
+    fn is_pg_array_type(data_type: &Type) -> bool {
+        matches!(
+            *data_type,
+            Type::BOOL_ARRAY
+                | Type::BYTEA_ARRAY
+                | Type::INT2_ARRAY
+                | Type::INT4_ARRAY
+                | Type::TEXT_ARRAY
+                | Type::VARCHAR_ARRAY
+                | Type::INT8_ARRAY
+                | Type::FLOAT4_ARRAY
+                | Type::FLOAT8_ARRAY
+                | Type::TIMESTAMP_ARRAY
+                | Type::DATE_ARRAY
+                | Type::TIME_ARRAY
+                | Type::TIMESTAMPTZ_ARRAY
+                | Type::INTERVAL_ARRAY
+                | Type::NUMERIC_ARRAY
+                | Type::JSON_ARRAY
+                | Type::JSONB_ARRAY
+        )
+    }
+
+    fn apply_result_formats(fields: Vec<FieldInfo>, result_format_codes: &[i16]) -> Vec<FieldInfo> {
+        fields
+            .into_iter()
+            .enumerate()
+            .map(|(idx, field)| {
+                FieldInfo::new(
+                    field.name().to_string(),
+                    None,
+                    None,
+                    field.datatype().clone(),
+                    Self::result_field_format_for_type(field.datatype(), result_format_codes, idx),
+                )
+            })
+            .collect()
+    }
+
+    fn encode_row_for_fields(
         fields: Arc<Vec<FieldInfo>>,
         row: Vec<Value>,
     ) -> PgWireResult<pgwire::messages::data::DataRow> {
-        let mut encoder = DataRowEncoder::new(fields);
-        for val in row {
-            let text = Self::value_as_pg_text(val);
-            encoder.encode_field(&text)?;
-        }
-        Ok(encoder.take_row())
+        Self::encode_row_with_formats(fields, row)
     }
 
-    fn encode_binary_row(
+    fn encode_row_with_formats(
         fields: Arc<Vec<FieldInfo>>,
         row: Vec<Value>,
-    ) -> pgwire::messages::data::DataRow {
+    ) -> PgWireResult<pgwire::messages::data::DataRow> {
         let mut out = BytesMut::with_capacity(row.len() * 16);
         let mut field_count = 0i16;
 
@@ -375,16 +3085,33 @@ impl PgHandler {
                 continue;
             };
 
-            let mut value_buf = BytesMut::with_capacity(16);
-            if Self::put_binary_value(&mut value_buf, field.datatype(), value) {
-                out.put_i32(value_buf.len() as i32);
-                out.extend_from_slice(&value_buf);
+            if matches!(field.format(), FieldFormat::Binary) {
+                let mut value_buf = BytesMut::with_capacity(16);
+                if Self::put_binary_value(&mut value_buf, field.datatype(), value) {
+                    out.put_i32(value_buf.len() as i32);
+                    out.extend_from_slice(&value_buf);
+                } else {
+                    out.put_i32(-1);
+                }
+                continue;
+            }
+
+            if let Some(text) = Self::value_as_pg_text(value) {
+                out.put_i32(text.len() as i32);
+                out.extend_from_slice(text.as_bytes());
             } else {
                 out.put_i32(-1);
             }
         }
 
-        pgwire::messages::data::DataRow::new(out, field_count)
+        Ok(pgwire::messages::data::DataRow::new(out, field_count))
+    }
+
+    fn encode_row(
+        fields: Arc<Vec<FieldInfo>>,
+        row: Vec<Value>,
+    ) -> PgWireResult<pgwire::messages::data::DataRow> {
+        Self::encode_row_with_formats(fields, row)
     }
 
     fn put_binary_value(out: &mut BytesMut, data_type: &Type, value: Value) -> bool {
@@ -459,7 +3186,7 @@ impl PgHandler {
                 true
             }
             Value::Array(v) => {
-                out.extend_from_slice(format!("{:?}", v).as_bytes());
+                out.extend_from_slice(Self::pg_array_text(&v).as_bytes());
                 true
             }
             Value::Object(v) => {
@@ -538,7 +3265,12 @@ impl PgHandler {
         true
     }
 
-    fn infer_parameter_types_from_query(query: &str, provided_oids: &[u32]) -> Vec<Type> {
+    async fn infer_parameter_types_from_query(
+        &self,
+        query: &str,
+        provided_oids: &[u32],
+    ) -> Vec<Type> {
+        Self::trace_query("infer-params start", query);
         let placeholder_count = parse_sql(query)
             .ok()
             .map(|statements| {
@@ -551,102 +3283,348 @@ impl PgHandler {
             .unwrap_or_else(|| Self::max_placeholder_in_text(query));
         let count = placeholder_count.max(provided_oids.len());
         let mut types = vec![Type::TEXT; count];
+        let mut client_provided = vec![false; count];
         for (idx, oid) in provided_oids.iter().enumerate() {
             if let Some(ty) = Type::from_oid(*oid) {
                 if idx < types.len() {
                     types[idx] = ty;
+                    client_provided[idx] = true;
                 }
             }
         }
 
         if let Ok(statements) = parse_sql(query) {
+            let schemas = self.load_parameter_inference_schemas(&statements).await;
             for stmt in &statements {
-                Self::infer_parameter_types_from_statement(stmt, &mut types);
+                Self::infer_parameter_types_from_statement(
+                    stmt,
+                    &schemas,
+                    &client_provided,
+                    &mut types,
+                );
             }
         }
 
+        if Self::trace_enabled() {
+            Self::trace(format!(
+                "infer-params done: placeholders={} provided_oids={} inferred_oids={:?}",
+                placeholder_count,
+                provided_oids.len(),
+                types.iter().map(Type::oid).collect::<Vec<_>>()
+            ));
+        }
         types
     }
 
-    fn infer_parameter_types_from_statement(stmt: &Statement, types: &mut [Type]) {
+    async fn load_parameter_inference_schemas(
+        &self,
+        statements: &[Statement],
+    ) -> HashMap<String, TableSchema> {
+        let mut table_names = Vec::new();
+        for stmt in statements {
+            Self::collect_inference_table_names_from_statement(stmt, &mut table_names);
+        }
+        table_names.sort();
+        table_names.dedup();
+
+        let Ok(txn) = self.storage.begin_transaction().await else {
+            return HashMap::new();
+        };
+        let mut schemas = HashMap::new();
+        for table_name in table_names {
+            let schema_key = format!("schema:{}", table_name);
+            let Some(schema_bytes) = (match txn.get(schema_key.as_bytes()).await {
+                Ok(bytes) => bytes,
+                Err(_) => None,
+            }) else {
+                continue;
+            };
+            let Ok(schema) = bincode::deserialize::<TableSchema>(&schema_bytes) else {
+                continue;
+            };
+            schemas.insert(table_name.to_ascii_lowercase(), schema);
+        }
+        schemas
+    }
+
+    fn collect_inference_table_names_from_statement(
+        stmt: &Statement,
+        table_names: &mut Vec<String>,
+    ) {
         match stmt {
-            Statement::Query(query) => Self::infer_parameter_types_from_query_ast(query, types),
+            Statement::Query(query) => {
+                Self::collect_inference_table_names_from_query(query, table_names)
+            }
+            Statement::Insert(insert) => table_names.push(insert.table.to_string()),
             Statement::Update(update) => {
-                if let Some(selection) = &update.selection {
-                    Self::infer_parameter_types_from_expr(selection, None, types);
-                }
-                for assignment in &update.assignments {
-                    Self::infer_parameter_types_from_expr(&assignment.value, None, types);
-                }
+                Self::collect_inference_table_names_from_table_with_joins(
+                    &update.table,
+                    table_names,
+                );
             }
             Statement::Delete(delete) => {
-                if let Some(selection) = &delete.selection {
-                    Self::infer_parameter_types_from_expr(selection, None, types);
-                }
-            }
-            Statement::Insert(insert) => {
-                if let Some(source) = &insert.source {
-                    Self::infer_parameter_types_from_query_ast(source, types);
-                }
+                Self::collect_inference_table_names_from_delete(delete, table_names)
             }
             Statement::Explain { statement, .. } => {
-                Self::infer_parameter_types_from_statement(statement, types)
+                Self::collect_inference_table_names_from_statement(statement, table_names)
             }
             _ => {}
         }
     }
 
-    fn infer_parameter_types_from_query_ast(query: &sqlparser::ast::Query, types: &mut [Type]) {
-        if let SetExpr::Select(select) = query.body.as_ref() {
-            let schema = select.from.first().and_then(|table| {
-                if table.joins.is_empty() {
-                    if let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation {
-                        Some((name.to_string(), Vec::<(String, Type)>::new()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+    fn collect_inference_table_names_from_query(
+        query: &sqlparser::ast::Query,
+        table_names: &mut Vec<String>,
+    ) {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                Self::collect_inference_table_names_from_query(&cte.query, table_names);
+            }
+        }
+        Self::collect_inference_table_names_from_set_expr(query.body.as_ref(), table_names);
+    }
+
+    fn collect_inference_table_names_from_set_expr(
+        set_expr: &SetExpr,
+        table_names: &mut Vec<String>,
+    ) {
+        match set_expr {
+            SetExpr::Select(select) => {
+                for table in &select.from {
+                    Self::collect_inference_table_names_from_table_with_joins(table, table_names);
                 }
-            });
+            }
+            SetExpr::Query(query) => {
+                Self::collect_inference_table_names_from_query(query, table_names)
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                Self::collect_inference_table_names_from_set_expr(left, table_names);
+                Self::collect_inference_table_names_from_set_expr(right, table_names);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_inference_table_names_from_table_with_joins(
+        table: &sqlparser::ast::TableWithJoins,
+        table_names: &mut Vec<String>,
+    ) {
+        if let Some(table_name) = Self::inference_table_name_from_factor(&table.relation) {
+            table_names.push(table_name);
+        }
+        for join in &table.joins {
+            if let Some(table_name) = Self::inference_table_name_from_factor(&join.relation) {
+                table_names.push(table_name);
+            }
+        }
+    }
+
+    fn collect_inference_table_names_from_delete(
+        delete: &sqlparser::ast::Delete,
+        table_names: &mut Vec<String>,
+    ) {
+        let tables = match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables)
+            | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+        };
+        for table in tables {
+            Self::collect_inference_table_names_from_table_with_joins(table, table_names);
+        }
+    }
+
+    fn inference_table_name_from_factor(factor: &sqlparser::ast::TableFactor) -> Option<String> {
+        match factor {
+            sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
+            _ => None,
+        }
+    }
+
+    fn infer_parameter_types_from_statement(
+        stmt: &Statement,
+        schemas: &HashMap<String, TableSchema>,
+        client_provided: &[bool],
+        types: &mut [Type],
+    ) {
+        match stmt {
+            Statement::Query(query) => {
+                Self::infer_parameter_types_from_query_ast(query, schemas, client_provided, types)
+            }
+            Statement::Update(update) => {
+                let schema = Self::single_schema_for_table_with_joins(&update.table, schemas);
+                if let Some(selection) = &update.selection {
+                    Self::infer_parameter_types_from_expr(
+                        selection,
+                        schema.as_ref(),
+                        client_provided,
+                        types,
+                    );
+                }
+                for assignment in &update.assignments {
+                    Self::infer_parameter_types_from_expr(
+                        &assignment.value,
+                        schema.as_ref(),
+                        client_provided,
+                        types,
+                    );
+                }
+            }
+            Statement::Delete(delete) => {
+                let schema = Self::single_schema_for_delete(delete, schemas);
+                if let Some(selection) = &delete.selection {
+                    Self::infer_parameter_types_from_expr(
+                        selection,
+                        schema.as_ref(),
+                        client_provided,
+                        types,
+                    );
+                }
+            }
+            Statement::Insert(insert) => {
+                Self::infer_parameter_types_from_insert(insert, schemas, client_provided, types);
+                if let Some(source) = &insert.source {
+                    Self::infer_parameter_types_from_query_ast(
+                        source,
+                        schemas,
+                        client_provided,
+                        types,
+                    );
+                }
+            }
+            Statement::Explain { statement, .. } => Self::infer_parameter_types_from_statement(
+                statement,
+                schemas,
+                client_provided,
+                types,
+            ),
+            _ => {}
+        }
+    }
+
+    fn infer_parameter_types_from_query_ast(
+        query: &sqlparser::ast::Query,
+        schemas: &HashMap<String, TableSchema>,
+        client_provided: &[bool],
+        types: &mut [Type],
+    ) {
+        if let SetExpr::Select(select) = query.body.as_ref() {
+            let schema = select
+                .from
+                .first()
+                .and_then(|table| Self::single_schema_for_table_with_joins(table, schemas));
 
             if let Some(selection) = &select.selection {
-                Self::infer_parameter_types_from_expr(selection, schema.as_ref(), types);
+                Self::infer_parameter_types_from_expr(
+                    selection,
+                    schema.as_ref(),
+                    client_provided,
+                    types,
+                );
             }
             for item in &select.projection {
                 if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item
                 {
-                    Self::infer_parameter_types_from_expr(expr, schema.as_ref(), types);
+                    Self::infer_parameter_types_from_expr(
+                        expr,
+                        schema.as_ref(),
+                        client_provided,
+                        types,
+                    );
                 }
+            }
+        }
+    }
+
+    fn single_schema_for_table_with_joins(
+        table: &sqlparser::ast::TableWithJoins,
+        schemas: &HashMap<String, TableSchema>,
+    ) -> Option<TableSchema> {
+        if !table.joins.is_empty() {
+            return None;
+        }
+        let table_name = Self::inference_table_name_from_factor(&table.relation)?;
+        schemas.get(&table_name.to_ascii_lowercase()).cloned()
+    }
+
+    fn single_schema_for_delete(
+        delete: &sqlparser::ast::Delete,
+        schemas: &HashMap<String, TableSchema>,
+    ) -> Option<TableSchema> {
+        let tables = match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables)
+            | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+        };
+        let table = tables.first()?;
+        if tables.len() == 1 {
+            Self::single_schema_for_table_with_joins(table, schemas)
+        } else {
+            None
+        }
+    }
+
+    fn infer_parameter_types_from_insert(
+        insert: &sqlparser::ast::Insert,
+        schemas: &HashMap<String, TableSchema>,
+        client_provided: &[bool],
+        types: &mut [Type],
+    ) {
+        let Some(schema) = schemas.get(&insert.table.to_string().to_ascii_lowercase()) else {
+            return;
+        };
+        let Some(source) = &insert.source else {
+            return;
+        };
+        let SetExpr::Values(values) = source.body.as_ref() else {
+            return;
+        };
+
+        let column_indices: Vec<usize> = if insert.columns.is_empty() {
+            (0..schema.columns.len()).collect()
+        } else {
+            insert
+                .columns
+                .iter()
+                .filter_map(|ident| {
+                    schema
+                        .columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(&ident.value))
+                })
+                .collect()
+        };
+        for row in &values.rows {
+            for (expr, column_idx) in row.iter().zip(column_indices.iter().copied()) {
+                let ty = Self::pg_type_for_column_type(&schema.columns[column_idx].data_type);
+                Self::assign_placeholder_type(expr, ty, client_provided, types);
             }
         }
     }
 
     fn infer_parameter_types_from_expr(
         expr: &Expr,
-        _schema_hint: Option<&(String, Vec<(String, Type)>)>,
+        schema_hint: Option<&TableSchema>,
+        client_provided: &[bool],
         types: &mut [Type],
     ) {
         match expr {
             Expr::BinaryOp { left, op, right }
                 if matches!(op, sqlparser::ast::BinaryOperator::Eq) =>
             {
-                if let Some((idx, ty)) = Self::placeholder_column_type_pair(left, right) {
-                    if let Some(slot) = types.get_mut(idx.saturating_sub(1)) {
-                        *slot = ty;
-                    }
+                if let Some((idx, ty)) =
+                    Self::placeholder_column_type_pair(left, right, schema_hint)
+                {
+                    Self::assign_parameter_type(idx, ty, client_provided, types);
                 }
-                if let Some((idx, ty)) = Self::placeholder_column_type_pair(right, left) {
-                    if let Some(slot) = types.get_mut(idx.saturating_sub(1)) {
-                        *slot = ty;
-                    }
+                if let Some((idx, ty)) =
+                    Self::placeholder_column_type_pair(right, left, schema_hint)
+                {
+                    Self::assign_parameter_type(idx, ty, client_provided, types);
                 }
-                Self::infer_parameter_types_from_expr(left, None, types);
-                Self::infer_parameter_types_from_expr(right, None, types);
+                Self::infer_parameter_types_from_expr(left, schema_hint, client_provided, types);
+                Self::infer_parameter_types_from_expr(right, schema_hint, client_provided, types);
             }
             Expr::BinaryOp { left, right, .. } => {
-                Self::infer_parameter_types_from_expr(left, None, types);
-                Self::infer_parameter_types_from_expr(right, None, types);
+                Self::infer_parameter_types_from_expr(left, schema_hint, client_provided, types);
+                Self::infer_parameter_types_from_expr(right, schema_hint, client_provided, types);
             }
             Expr::UnaryOp { expr, .. }
             | Expr::Nested(expr)
@@ -656,30 +3634,40 @@ impl PgHandler {
             | Expr::IsNull(expr)
             | Expr::IsNotNull(expr)
             | Expr::InSubquery { expr, .. } => {
-                Self::infer_parameter_types_from_expr(expr, None, types)
+                Self::infer_parameter_types_from_expr(expr, schema_hint, client_provided, types)
             }
             Expr::Between {
                 expr, low, high, ..
             } => {
-                Self::infer_parameter_types_from_expr(expr, None, types);
-                Self::infer_parameter_types_from_expr(low, None, types);
-                Self::infer_parameter_types_from_expr(high, None, types);
+                Self::infer_parameter_types_from_expr(expr, schema_hint, client_provided, types);
+                Self::infer_parameter_types_from_expr(low, schema_hint, client_provided, types);
+                Self::infer_parameter_types_from_expr(high, schema_hint, client_provided, types);
             }
             Expr::InList { expr, list, .. } => {
-                Self::infer_parameter_types_from_expr(expr, None, types);
+                Self::infer_parameter_types_from_expr(expr, schema_hint, client_provided, types);
                 for item in list {
-                    Self::infer_parameter_types_from_expr(item, None, types);
+                    Self::infer_parameter_types_from_expr(
+                        item,
+                        schema_hint,
+                        client_provided,
+                        types,
+                    );
                 }
             }
             Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-                Self::infer_parameter_types_from_expr(expr, None, types);
-                Self::infer_parameter_types_from_expr(pattern, None, types);
+                Self::infer_parameter_types_from_expr(expr, schema_hint, client_provided, types);
+                Self::infer_parameter_types_from_expr(pattern, schema_hint, client_provided, types);
             }
             Expr::Function(func) => {
                 if let FunctionArguments::List(args) = &func.args {
                     for arg in &args.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
-                            Self::infer_parameter_types_from_expr(expr, None, types);
+                            Self::infer_parameter_types_from_expr(
+                                expr,
+                                schema_hint,
+                                client_provided,
+                                types,
+                            );
                         }
                     }
                 }
@@ -691,50 +3679,109 @@ impl PgHandler {
                 ..
             } => {
                 if let Some(expr) = operand {
-                    Self::infer_parameter_types_from_expr(expr, None, types);
+                    Self::infer_parameter_types_from_expr(
+                        expr,
+                        schema_hint,
+                        client_provided,
+                        types,
+                    );
                 }
                 for when in conditions {
-                    Self::infer_parameter_types_from_expr(&when.condition, None, types);
-                    Self::infer_parameter_types_from_expr(&when.result, None, types);
+                    Self::infer_parameter_types_from_expr(
+                        &when.condition,
+                        schema_hint,
+                        client_provided,
+                        types,
+                    );
+                    Self::infer_parameter_types_from_expr(
+                        &when.result,
+                        schema_hint,
+                        client_provided,
+                        types,
+                    );
                 }
                 if let Some(expr) = else_result {
-                    Self::infer_parameter_types_from_expr(expr, None, types);
+                    Self::infer_parameter_types_from_expr(
+                        expr,
+                        schema_hint,
+                        client_provided,
+                        types,
+                    );
                 }
             }
             Expr::Array(array) => {
                 for expr in &array.elem {
-                    Self::infer_parameter_types_from_expr(expr, None, types);
+                    Self::infer_parameter_types_from_expr(
+                        expr,
+                        schema_hint,
+                        client_provided,
+                        types,
+                    );
                 }
             }
             _ => {}
         }
     }
 
-    fn placeholder_column_type_pair(
-        placeholder_expr: &Expr,
-        column_expr: &Expr,
-    ) -> Option<(usize, Type)> {
-        let Expr::Value(value) = placeholder_expr else {
+    fn assign_placeholder_type(
+        expr: &Expr,
+        ty: Type,
+        client_provided: &[bool],
+        types: &mut [Type],
+    ) {
+        if let Some(idx) = Self::placeholder_index(expr) {
+            Self::assign_parameter_type(idx, ty, client_provided, types);
+        }
+    }
+
+    fn assign_parameter_type(idx: usize, ty: Type, client_provided: &[bool], types: &mut [Type]) {
+        let slot_idx = idx.saturating_sub(1);
+        if client_provided.get(slot_idx).copied().unwrap_or(false) {
+            return;
+        }
+        if let Some(slot) = types.get_mut(slot_idx) {
+            *slot = ty;
+        }
+    }
+
+    fn placeholder_index(expr: &Expr) -> Option<usize> {
+        let Expr::Value(value) = expr else {
             return None;
         };
         let sqlparser::ast::Value::Placeholder(p) = &value.value else {
             return None;
         };
-        let idx = p
-            .strip_prefix('$')
+        p.strip_prefix('$')
             .unwrap_or(p)
             .parse::<usize>()
             .ok()
-            .filter(|idx| *idx > 0)?;
+            .filter(|idx| *idx > 0)
+    }
+
+    fn placeholder_column_type_pair(
+        placeholder_expr: &Expr,
+        column_expr: &Expr,
+        schema_hint: Option<&TableSchema>,
+    ) -> Option<(usize, Type)> {
+        let idx = Self::placeholder_index(placeholder_expr)?;
 
         let column_name = match column_expr {
             Expr::Identifier(ident) => ident.value.as_str(),
             Expr::CompoundIdentifier(idents) => idents.last()?.value.as_str(),
             _ => return None,
         };
+        if let Some(schema) = schema_hint {
+            if let Some(column) = schema
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(column_name))
+            {
+                return Some((idx, Self::pg_type_for_column_type(&column.data_type)));
+            }
+        }
         let upper = column_name.to_ascii_uppercase();
         let ty = if upper.ends_with("ID") || upper == "ID" || upper.ends_with("_ID") {
-            Type::INT8
+            Type::INT4
         } else if upper.contains("AMOUNT")
             || upper.contains("BALANCE")
             || upper.contains("PRICE")
@@ -1118,7 +4165,43 @@ impl PgHandler {
         }
     }
 
-    async fn describe_query_fields(&self, query: &str) -> PgWireResult<Vec<FieldInfo>> {
+    async fn describe_query_fields(
+        &self,
+        query: &str,
+        params: &[Value],
+        result_format_codes: &[i16],
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        Self::trace_query("describe start", query);
+        match self.try_execute_pg_metadata_query(query, params).await {
+            Ok(Some(QueryResult::Select { columns, rows })) => {
+                Self::trace(format!(
+                    "describe metadata result: columns={} rows={}",
+                    columns.len(),
+                    rows.len()
+                ));
+                return Ok(
+                    Self::fields_with_format(&columns, &rows, result_format_codes)
+                        .iter()
+                        .map(|field| {
+                            FieldInfo::new(
+                                field.name().to_string(),
+                                None,
+                                None,
+                                field.datatype().clone(),
+                                field.format(),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            Ok(Some(QueryResult::Success { .. })) | Ok(None) => {}
+            Err(e) => {
+                return Err(PgWireError::ApiError(Box::new(std::io::Error::other(
+                    format!("Metadata describe error: {:?}", e),
+                ))));
+            }
+        }
+
         let statements = parse_sql(query).map_err(|e| {
             PgWireError::ApiError(Box::new(std::io::Error::other(format!(
                 "Parse Error: {:?}",
@@ -1126,9 +4209,12 @@ impl PgHandler {
             ))))
         })?;
         let Some(stmt) = statements.first() else {
+            Self::trace("describe done: empty statement");
             return Ok(Vec::new());
         };
-        self.describe_statement_fields(stmt).await
+        let fields = self.describe_statement_fields(stmt).await?;
+        Self::trace(format!("describe done: fields={}", fields.len()));
+        Ok(Self::apply_result_formats(fields, result_format_codes))
     }
 
     async fn describe_statement_fields(&self, stmt: &Statement) -> PgWireResult<Vec<FieldInfo>> {
@@ -1153,10 +4239,26 @@ impl PgHandler {
         &self,
         query: &sqlparser::ast::Query,
     ) -> PgWireResult<Vec<FieldInfo>> {
+        if let Some(fields) = self.describe_query_fields_from_ctes(query).await? {
+            return Ok(fields);
+        }
+
         let SetExpr::Select(select) = query.body.as_ref() else {
             return Ok(Vec::new());
         };
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+            return Ok(self.describe_projection_fallback(&select.projection));
+        }
+        if let sqlparser::ast::TableFactor::Derived { subquery, .. } = &select.from[0].relation {
+            let wildcard = select.projection.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                )
+            });
+            if wildcard {
+                return Box::pin(self.describe_select_query_fields(subquery)).await;
+            }
             return Ok(self.describe_projection_fallback(&select.projection));
         }
         let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
@@ -1242,6 +4344,7 @@ impl PgHandler {
     }
 
     fn describe_projection_fallback(&self, projection: &[SelectItem]) -> Vec<FieldInfo> {
+        let empty_schema = TableSchema::new("__describe_fallback".to_string(), Vec::new());
         projection
             .iter()
             .filter_map(|item| match item {
@@ -1249,19 +4352,432 @@ impl PgHandler {
                     expr.to_string(),
                     None,
                     None,
-                    Self::pg_type_for_literal_expr(expr).unwrap_or(Type::TEXT),
+                    Self::pg_type_for_literal_expr(expr)
+                        .unwrap_or_else(|| self.pg_type_for_projection_expr(expr, &empty_schema)),
                     FieldFormat::Text,
                 )),
                 SelectItem::ExprWithAlias { expr, alias } => Some(FieldInfo::new(
                     alias.value.clone(),
                     None,
                     None,
-                    Self::pg_type_for_literal_expr(expr).unwrap_or(Type::TEXT),
+                    Self::pg_type_for_literal_expr(expr)
+                        .unwrap_or_else(|| self.pg_type_for_projection_expr(expr, &empty_schema)),
                     FieldFormat::Text,
                 )),
                 _ => None,
             })
             .collect()
+    }
+
+    async fn describe_query_fields_from_ctes(
+        &self,
+        query: &sqlparser::ast::Query,
+    ) -> PgWireResult<Option<Vec<FieldInfo>>> {
+        let Some(with) = &query.with else {
+            return Ok(None);
+        };
+
+        let mut schemas: HashMap<String, TableSchema> = HashMap::new();
+        for cte in &with.cte_tables {
+            let Some(schema) = self.describe_cte_schema(cte, &schemas).await? else {
+                continue;
+            };
+            schemas.insert(cte.alias.name.value.to_ascii_lowercase(), schema);
+        }
+
+        let Some(fields) = self
+            .describe_query_fields_from_schema_map(query, &schemas)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(fields))
+    }
+
+    async fn describe_cte_schema(
+        &self,
+        cte: &sqlparser::ast::Cte,
+        schemas: &HashMap<String, TableSchema>,
+    ) -> PgWireResult<Option<TableSchema>> {
+        let Some(fields) =
+            Box::pin(self.describe_query_fields_from_schema_map(&cte.query, schemas)).await?
+        else {
+            return Ok(None);
+        };
+
+        let columns = fields
+            .into_iter()
+            .enumerate()
+            .map(|(idx, field)| {
+                let name = cte
+                    .alias
+                    .columns
+                    .get(idx)
+                    .map(|column| column.name.value.clone())
+                    .unwrap_or_else(|| field.name().to_string());
+                Self::catalog_column_from_pg_type(name, field.datatype())
+            })
+            .collect();
+
+        Ok(Some(TableSchema::new(
+            cte.alias.name.value.clone(),
+            columns,
+        )))
+    }
+
+    async fn describe_query_fields_from_schema_map(
+        &self,
+        query: &sqlparser::ast::Query,
+        schemas: &HashMap<String, TableSchema>,
+    ) -> PgWireResult<Option<Vec<FieldInfo>>> {
+        if let Some(with) = &query.with {
+            let mut local_schemas = schemas.clone();
+            for cte in &with.cte_tables {
+                let Some(schema) = self.describe_cte_schema(cte, &local_schemas).await? else {
+                    continue;
+                };
+                local_schemas.insert(cte.alias.name.value.to_ascii_lowercase(), schema);
+            }
+            let body_query = sqlparser::ast::Query {
+                with: None,
+                body: query.body.clone(),
+                order_by: query.order_by.clone(),
+                limit_clause: query.limit_clause.clone(),
+                fetch: query.fetch.clone(),
+                locks: query.locks.clone(),
+                for_clause: query.for_clause.clone(),
+                settings: query.settings.clone(),
+                format_clause: query.format_clause.clone(),
+                pipe_operators: query.pipe_operators.clone(),
+            };
+            return Box::pin(
+                self.describe_query_fields_from_schema_map(&body_query, &local_schemas),
+            )
+            .await;
+        }
+
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            SetExpr::Query(query) => {
+                return Box::pin(self.describe_query_fields_from_schema_map(query, schemas)).await;
+            }
+            SetExpr::SetOperation { left, .. } => {
+                let query = sqlparser::ast::Query {
+                    with: None,
+                    body: left.clone(),
+                    order_by: None,
+                    limit_clause: None,
+                    fetch: None,
+                    locks: Vec::new(),
+                    for_clause: None,
+                    settings: None,
+                    format_clause: None,
+                    pipe_operators: Vec::new(),
+                };
+                return Box::pin(self.describe_query_fields_from_schema_map(&query, schemas)).await;
+            }
+            _ => return Ok(None),
+        };
+
+        let relation_schemas = self.describe_relation_schemas(select, schemas).await?;
+        if relation_schemas.is_empty() {
+            return Ok(Some(self.describe_projection_fallback(&select.projection)));
+        }
+
+        let fields =
+            self.describe_projection_with_relation_schemas(&select.projection, &relation_schemas);
+        Ok(Some(fields))
+    }
+
+    async fn describe_relation_schemas(
+        &self,
+        select: &sqlparser::ast::Select,
+        cte_schemas: &HashMap<String, TableSchema>,
+    ) -> PgWireResult<Vec<TableSchema>> {
+        let mut schemas = Vec::new();
+        for table in &select.from {
+            if let Some(schema) = self
+                .describe_table_factor_schema(&table.relation, cte_schemas)
+                .await?
+            {
+                schemas.push(schema);
+            }
+            for join in &table.joins {
+                if let Some(schema) = self
+                    .describe_table_factor_schema(&join.relation, cte_schemas)
+                    .await?
+                {
+                    schemas.push(schema);
+                }
+            }
+        }
+        Ok(schemas)
+    }
+
+    async fn describe_table_factor_schema(
+        &self,
+        relation: &sqlparser::ast::TableFactor,
+        cte_schemas: &HashMap<String, TableSchema>,
+    ) -> PgWireResult<Option<TableSchema>> {
+        match relation {
+            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+                let table_name = name.to_string();
+                if let Some(schema) = cte_schemas.get(&table_name.to_ascii_lowercase()) {
+                    return Ok(Some(Self::schema_with_table_alias(schema, alias.as_ref())));
+                }
+                self.load_schema_for_describe(&table_name).await
+            }
+            sqlparser::ast::TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let Some(fields) =
+                    Box::pin(self.describe_query_fields_from_schema_map(subquery, cte_schemas))
+                        .await?
+                else {
+                    return Ok(None);
+                };
+                let table_name = alias
+                    .as_ref()
+                    .map(|alias| alias.name.value.clone())
+                    .unwrap_or_else(|| "derived".to_string());
+                let columns = fields
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, field)| {
+                        let name = alias
+                            .as_ref()
+                            .and_then(|alias| alias.columns.get(idx))
+                            .map(|column| column.name.value.clone())
+                            .unwrap_or_else(|| field.name().to_string());
+                        Self::catalog_column_from_pg_type(name, field.datatype())
+                    })
+                    .collect();
+                Ok(Some(TableSchema::new(table_name, columns)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn load_schema_for_describe(
+        &self,
+        table_name: &str,
+    ) -> PgWireResult<Option<TableSchema>> {
+        let txn = self.storage.begin_transaction().await.map_err(|e| {
+            PgWireError::ApiError(Box::new(std::io::Error::other(format!(
+                "Describe storage error: {:?}",
+                e
+            ))))
+        })?;
+        let schema_key = format!("schema:{}", table_name);
+        let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await.map_err(|e| {
+            PgWireError::ApiError(Box::new(std::io::Error::other(format!(
+                "Describe schema error: {:?}",
+                e
+            ))))
+        })?
+        else {
+            return Ok(None);
+        };
+        let schema = bincode::deserialize::<TableSchema>(&schema_bytes).map_err(|e| {
+            PgWireError::ApiError(Box::new(std::io::Error::other(format!(
+                "Schema deserialization error: {}",
+                e
+            ))))
+        })?;
+        Ok(Some(schema))
+    }
+
+    fn schema_with_table_alias(
+        schema: &TableSchema,
+        alias: Option<&sqlparser::ast::TableAlias>,
+    ) -> TableSchema {
+        let mut schema = schema.clone();
+        if let Some(alias) = alias {
+            schema.name = alias.name.value.clone();
+            for (idx, alias_column) in alias.columns.iter().enumerate() {
+                if let Some(column) = schema.columns.get_mut(idx) {
+                    column.name = alias_column.name.value.clone();
+                    if let Some(data_type) = &alias_column.data_type {
+                        column.data_type = Self::pg_type_name_for_sql_type(data_type);
+                    }
+                }
+            }
+        }
+        schema
+    }
+
+    fn catalog_column_from_pg_type(name: String, data_type: &Type) -> Column {
+        Column {
+            name,
+            data_type: Self::pg_type_name_for_type(data_type),
+            is_primary: false,
+            is_indexed: false,
+            index_type: IndexType::None,
+            default_value: None,
+            is_nullable: true,
+            is_unique: false,
+            check_expr: None,
+        }
+    }
+
+    fn describe_projection_with_relation_schemas(
+        &self,
+        projection: &[SelectItem],
+        relation_schemas: &[TableSchema],
+    ) -> Vec<FieldInfo> {
+        let wildcard = projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            )
+        });
+        if wildcard {
+            return relation_schemas
+                .iter()
+                .flat_map(|schema| {
+                    schema.columns.iter().map(|column| {
+                        FieldInfo::new(
+                            column.name.clone(),
+                            None,
+                            None,
+                            Self::pg_type_for_column_type(&column.data_type),
+                            FieldFormat::Text,
+                        )
+                    })
+                })
+                .collect();
+        }
+
+        projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::UnnamedExpr(expr) => Some(FieldInfo::new(
+                    Self::projection_output_name(expr),
+                    None,
+                    None,
+                    self.pg_type_for_projection_expr_in_relations(expr, relation_schemas),
+                    FieldFormat::Text,
+                )),
+                SelectItem::ExprWithAlias { expr, alias } => Some(FieldInfo::new(
+                    alias.value.clone(),
+                    None,
+                    None,
+                    self.pg_type_for_projection_expr_in_relations(expr, relation_schemas),
+                    FieldFormat::Text,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn projection_output_name(expr: &Expr) -> String {
+        match expr {
+            Expr::Identifier(ident) => ident.value.clone(),
+            Expr::CompoundIdentifier(idents) => idents
+                .last()
+                .map(|ident| ident.value.clone())
+                .unwrap_or_else(|| expr.to_string()),
+            _ => expr.to_string(),
+        }
+    }
+
+    fn pg_type_for_projection_expr_in_relations(
+        &self,
+        expr: &Expr,
+        relation_schemas: &[TableSchema],
+    ) -> Type {
+        match expr {
+            Expr::Identifier(ident) => relation_schemas
+                .iter()
+                .find_map(|schema| {
+                    schema
+                        .columns
+                        .iter()
+                        .find(|column| column.name.eq_ignore_ascii_case(&ident.value))
+                        .map(|column| Self::pg_type_for_column_type(&column.data_type))
+                })
+                .unwrap_or_else(|| Self::pg_type_for_literal_expr(expr).unwrap_or(Type::TEXT)),
+            Expr::CompoundIdentifier(idents) => {
+                let Some(column_name) = idents.last().map(|ident| ident.value.as_str()) else {
+                    return Type::TEXT;
+                };
+                let qualifier = if idents.len() > 1 {
+                    idents
+                        .get(idents.len() - 2)
+                        .map(|ident| ident.value.as_str())
+                } else {
+                    None
+                };
+                relation_schemas
+                    .iter()
+                    .filter(|schema| {
+                        qualifier
+                            .is_none_or(|qualifier| schema.name.eq_ignore_ascii_case(qualifier))
+                    })
+                    .find_map(|schema| {
+                        schema
+                            .columns
+                            .iter()
+                            .find(|column| column.name.eq_ignore_ascii_case(column_name))
+                            .map(|column| Self::pg_type_for_column_type(&column.data_type))
+                    })
+                    .unwrap_or(Type::TEXT)
+            }
+            _ => {
+                let merged_schema = Self::merged_relation_schema(relation_schemas);
+                self.pg_type_for_projection_expr(expr, &merged_schema)
+            }
+        }
+    }
+
+    fn merged_relation_schema(relation_schemas: &[TableSchema]) -> TableSchema {
+        let columns = relation_schemas
+            .iter()
+            .flat_map(|schema| schema.columns.clone())
+            .collect();
+        TableSchema::new("__describe".to_string(), columns)
+    }
+
+    fn pg_type_name_for_sql_type(data_type: &sqlparser::ast::DataType) -> String {
+        Self::pg_type_name_for_type(&Self::pg_type_for_sql_type(data_type))
+    }
+
+    fn pg_type_name_for_type(data_type: &Type) -> String {
+        match *data_type {
+            Type::BOOL => "BOOLEAN",
+            Type::BOOL_ARRAY => "BOOLEAN[]",
+            Type::INT2 => "SMALLINT",
+            Type::INT2_ARRAY => "SMALLINT[]",
+            Type::INT4 => "INTEGER",
+            Type::INT4_ARRAY => "INTEGER[]",
+            Type::INT8 => "BIGINT",
+            Type::INT8_ARRAY => "BIGINT[]",
+            Type::FLOAT4 => "REAL",
+            Type::FLOAT4_ARRAY => "REAL[]",
+            Type::FLOAT8 => "DOUBLE PRECISION",
+            Type::FLOAT8_ARRAY => "DOUBLE PRECISION[]",
+            Type::NUMERIC => "NUMERIC",
+            Type::NUMERIC_ARRAY => "NUMERIC[]",
+            Type::DATE => "DATE",
+            Type::DATE_ARRAY => "DATE[]",
+            Type::TIMESTAMP => "TIMESTAMP",
+            Type::TIMESTAMP_ARRAY => "TIMESTAMP[]",
+            Type::TIMESTAMPTZ => "TIMESTAMPTZ",
+            Type::TIMESTAMPTZ_ARRAY => "TIMESTAMPTZ[]",
+            Type::TIME => "TIME",
+            Type::TIME_ARRAY => "TIME[]",
+            Type::INTERVAL => "INTERVAL",
+            Type::INTERVAL_ARRAY => "INTERVAL[]",
+            Type::BYTEA => "BYTEA",
+            Type::BYTEA_ARRAY => "BYTEA[]",
+            Type::JSON => "JSON",
+            Type::JSON_ARRAY => "JSON[]",
+            Type::JSONB => "JSONB",
+            Type::JSONB_ARRAY => "JSONB[]",
+            Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => "TEXT[]",
+            _ => "TEXT",
+        }
+        .to_string()
     }
 
     fn pg_type_for_projection_expr(
@@ -1288,7 +4804,28 @@ impl PgHandler {
                     .map(|column| Self::pg_type_for_column_type(&column.data_type))
                     .unwrap_or(Type::TEXT)
             }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let mut current_type = self.pg_type_for_projection_expr(root, schema);
+                for access in access_chain {
+                    if matches!(access, sqlparser::ast::AccessExpr::Subscript(_))
+                        && Self::is_pg_array_type(&current_type)
+                    {
+                        current_type = Self::pg_scalar_type_for_array_type(&current_type);
+                    }
+                }
+                current_type
+            }
             Expr::Cast { data_type, .. } => Self::pg_type_for_sql_type(data_type),
+            Expr::Array(array) => array
+                .elem
+                .iter()
+                .find_map(|expr| {
+                    let elem_type = self.pg_type_for_projection_expr(expr, schema);
+                    (elem_type != Type::TEXT
+                        || matches!(expr, Expr::Value(_) | Expr::Cast { .. } | Expr::Array(_)))
+                    .then_some(Self::pg_array_type_for_scalar_type(&elem_type))
+                })
+                .unwrap_or(Type::TEXT_ARRAY),
             Expr::BinaryOp { left, op, right } => match op {
                 sqlparser::ast::BinaryOperator::Eq
                 | sqlparser::ast::BinaryOperator::NotEq
@@ -1298,7 +4835,17 @@ impl PgHandler {
                 | sqlparser::ast::BinaryOperator::LtEq
                 | sqlparser::ast::BinaryOperator::And
                 | sqlparser::ast::BinaryOperator::Or => Type::BOOL,
-                sqlparser::ast::BinaryOperator::StringConcat => Type::TEXT,
+                sqlparser::ast::BinaryOperator::StringConcat => {
+                    let left_type = self.pg_type_for_projection_expr(left, schema);
+                    let right_type = self.pg_type_for_projection_expr(right, schema);
+                    if Self::is_pg_array_type(&left_type) {
+                        left_type
+                    } else if Self::is_pg_array_type(&right_type) {
+                        right_type
+                    } else {
+                        Type::TEXT
+                    }
+                }
                 _ => {
                     let left_type = self.pg_type_for_projection_expr(left, schema);
                     let right_type = self.pg_type_for_projection_expr(right, schema);
@@ -1317,10 +4864,29 @@ impl PgHandler {
             | Expr::Nested(expr)
             | Expr::Ceil { expr, .. }
             | Expr::Floor { expr, .. } => self.pg_type_for_projection_expr(expr, schema),
+            Expr::Subquery(subquery) => self.pg_type_for_scalar_subquery(subquery, schema),
             Expr::Function(func) => {
                 let name = func.name.to_string().to_uppercase();
                 match name.as_str() {
                     "COUNT" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" => Type::INT8,
+                    "ARRAY_AGG" => {
+                        if let FunctionArguments::List(args) = &func.args {
+                            args.args
+                                .iter()
+                                .find_map(|arg| {
+                                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
+                                        Some(Self::pg_array_type_for_scalar_type(
+                                            &self.pg_type_for_projection_expr(expr, schema),
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(Type::TEXT_ARRAY)
+                        } else {
+                            Type::TEXT_ARRAY
+                        }
+                    }
                     "SUM" | "AVG" | "MIN" | "MAX" => Type::FLOAT8,
                     "NOW" | "CURRENT_TIMESTAMP" => Type::TIMESTAMP,
                     "CURRENT_DATE" => Type::DATE,
@@ -1353,6 +4919,25 @@ impl PgHandler {
             Expr::Value(_) => Self::pg_type_for_literal_expr(expr).unwrap_or(Type::TEXT),
             _ => Type::TEXT,
         }
+    }
+
+    fn pg_type_for_scalar_subquery(
+        &self,
+        query: &sqlparser::ast::Query,
+        outer_schema: &crate::catalog::TableSchema,
+    ) -> Type {
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Type::TEXT;
+        };
+        let Some(item) = select.projection.first() else {
+            return Type::TEXT;
+        };
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) => expr,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => return Type::TEXT,
+        };
+        self.pg_type_for_projection_expr(expr, outer_schema)
     }
 
     fn pg_type_for_literal_expr(expr: &Expr) -> Option<Type> {
@@ -1390,8 +4975,53 @@ impl PgHandler {
             });
         };
 
+        match stmt {
+            Statement::StartTransaction { .. } => {
+                let mut session = self.session.lock().await;
+                if session.transaction.is_none() {
+                    session.transaction = Some(self.storage.begin_transaction().await?);
+                    session.transaction_may_change_query_results = false;
+                }
+                return Ok(QueryResult::Success {
+                    message: "BEGIN".to_string(),
+                });
+            }
+            Statement::Commit { .. } => {
+                let txn = {
+                    let mut session = self.session.lock().await;
+                    session.transaction_may_change_query_results = false;
+                    session.transaction.take()
+                };
+                if let Some(txn) = txn {
+                    txn.commit().await?;
+                    self.executor.invalidate_query_result_cache();
+                }
+                return Ok(QueryResult::Success {
+                    message: "COMMIT".to_string(),
+                });
+            }
+            Statement::Rollback { .. } => {
+                let txn = {
+                    let mut session = self.session.lock().await;
+                    session.transaction_may_change_query_results = false;
+                    session.transaction.take()
+                };
+                if let Some(txn) = txn {
+                    txn.rollback().await?;
+                }
+                return Ok(QueryResult::Success {
+                    message: "ROLLBACK".to_string(),
+                });
+            }
+            _ => {}
+        }
+
         let mut session = self.session.lock().await;
-        if let Some(txn) = session.transaction.as_mut() {
+        if session.transaction.is_some() {
+            if Executor::statement_may_change_query_results(stmt) {
+                session.transaction_may_change_query_results = true;
+            }
+            let txn = session.transaction.as_mut().expect("transaction checked");
             self.executor
                 .execute_in_transaction_with_params(stmt, &mut **txn, params)
                 .await
@@ -1404,6 +5034,9 @@ impl PgHandler {
                 .await;
             if res.is_ok() {
                 let _ = txn.commit().await;
+                if Executor::statement_may_change_query_results(stmt) {
+                    self.executor.invalidate_query_result_cache();
+                }
             } else {
                 let _ = txn.rollback().await;
             }
@@ -1530,11 +5163,92 @@ impl pgwire::api::PgWireServerHandlers for PgServerFactory {
 
 #[async_trait::async_trait]
 impl SimpleQueryHandler for PgHandler {
+    async fn on_query<C>(&self, client: &mut C, query: SimpleQuery) -> PgWireResult<()>
+    where
+        C: ClientInfo
+            + pgwire::api::ClientPortalStore
+            + Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let query_string = query.query.clone();
+        match Self::parse_copy_from_stdin_query(&query_string) {
+            Ok(Some(stmt)) => {
+                if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+                    return Err(PgWireError::NotReadyForQuery);
+                }
+
+                let username = Self::username_for_client(client);
+                if let Err(e) = self.executor.authorize_statement(&username, &stmt).await {
+                    client
+                        .send(PgWireBackendMessage::ErrorResponse(
+                            Self::auth_error(format!("Authorization Error: {:?}", e)).into(),
+                        ))
+                        .await
+                        .map_err(|_| Self::sink_error())?;
+                    client.set_state(PgWireConnectionState::ReadyForQuery);
+                    client
+                        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                            client.transaction_status().to_error_state(),
+                        )))
+                        .await
+                        .map_err(|_| Self::sink_error())?;
+                    return Ok(());
+                }
+
+                let response = Self::copy_in_response_for_statement(&stmt);
+                {
+                    let mut session = self.session.lock().await;
+                    session.copy_in = Some(CopyInState {
+                        statement: stmt,
+                        data: Vec::new(),
+                        simple_query: true,
+                    });
+                }
+                client.set_state(PgWireConnectionState::CopyInProgress(true));
+                pg_copy::send_copy_in_response(client, response).await?;
+                Ok(())
+            }
+            Ok(None) => self._on_query(client, query).await,
+            Err(e) => {
+                client
+                    .send(PgWireBackendMessage::ErrorResponse(
+                        pgwire::error::ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "42000".to_string(),
+                            format!("Parse Error: {:?}", e),
+                        )
+                        .into(),
+                    ))
+                    .await
+                    .map_err(|_| Self::sink_error())?;
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                client
+                    .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                        client.transaction_status().to_error_state(),
+                    )))
+                    .await
+                    .map_err(|_| Self::sink_error())?;
+                Ok(())
+            }
+        }
+    }
+
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
         eprintln!("PG Simple Query called: {}", query);
+
+        if let Some(application_name) = Self::parse_set_application_name(query) {
+            client
+                .metadata_mut()
+                .insert("application_name".to_string(), application_name);
+            return Ok(vec![Response::Execution(Tag::new("SET"))]);
+        }
 
         let username = Self::username_for_client(client);
         match Self::parse_copy_from_stdin_query(query) {
@@ -1564,6 +5278,35 @@ impl SimpleQueryHandler for PgHandler {
                 "Authorization Error: {:?}",
                 e
             ))))]);
+        }
+
+        match self.try_execute_pg_metadata_query(query, &[]).await {
+            Ok(Some(QueryResult::Select { columns, rows })) => {
+                let fields = Self::infer_text_fields(&columns, &rows);
+                let mut data_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    data_rows.push(Self::encode_row(fields.clone(), row)?);
+                }
+                return Ok(vec![Response::Query(QueryResponse::new(
+                    fields,
+                    futures::stream::iter(data_rows.into_iter().map(Ok)),
+                ))]);
+            }
+            Ok(Some(QueryResult::Success { message })) => {
+                return Ok(vec![Response::Execution(Tag::new(&Self::pg_command_tag(
+                    &message,
+                )))]);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Ok(vec![Response::Error(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        format!("Metadata Error: {:?}", e),
+                    ),
+                ))]);
+            }
         }
 
         let mut responses = Vec::new();
@@ -1596,7 +5339,8 @@ impl SimpleQueryHandler for PgHandler {
                         match self.storage.begin_transaction().await {
                             Ok(txn) => {
                                 session.transaction = Some(txn);
-                                responses.push(Response::Execution(Tag::new("BEGIN")));
+                                session.transaction_may_change_query_results = false;
+                                responses.push(Response::TransactionStart(Tag::new("BEGIN")));
                             }
                             Err(e) => {
                                 return Ok(vec![Response::Error(Box::new(
@@ -1614,15 +5358,18 @@ impl SimpleQueryHandler for PgHandler {
                 Statement::Commit { .. } => {
                     if let Some(txn) = session.transaction.take() {
                         match txn.commit().await {
-                            Ok(_) => responses.push(Response::Execution(Tag::new("COMMIT"))),
+                            Ok(_) => {
+                                if session.transaction_may_change_query_results {
+                                    self.executor.invalidate_query_result_cache();
+                                }
+                                session.transaction_may_change_query_results = false;
+                                responses.push(Response::TransactionEnd(Tag::new("COMMIT")));
+                            }
                             Err(e) => {
-                                return Ok(vec![Response::Error(Box::new(
-                                    pgwire::error::ErrorInfo::new(
-                                        "ERROR".to_string(),
-                                        "XX000".to_string(),
-                                        format!("Failed to commit transaction: {:?}", e),
-                                    ),
-                                ))]);
+                                return Ok(vec![Response::Error(Box::new(Self::fusion_error(
+                                    "Failed to commit transaction",
+                                    &e,
+                                )))]);
                             }
                         }
                     } else {
@@ -1635,7 +5382,10 @@ impl SimpleQueryHandler for PgHandler {
                 Statement::Rollback { .. } => {
                     if let Some(txn) = session.transaction.take() {
                         match txn.rollback().await {
-                            Ok(_) => responses.push(Response::Execution(Tag::new("ROLLBACK"))),
+                            Ok(_) => {
+                                session.transaction_may_change_query_results = false;
+                                responses.push(Response::TransactionEnd(Tag::new("ROLLBACK")));
+                            }
                             Err(e) => {
                                 return Ok(vec![Response::Error(Box::new(
                                     pgwire::error::ErrorInfo::new(
@@ -1657,8 +5407,12 @@ impl SimpleQueryHandler for PgHandler {
             }
 
             // Execute Normal Statements
-            let result = if let Some(txn) = session.transaction.as_mut() {
+            let result = if session.transaction.is_some() {
                 // Execute in current transaction
+                if Executor::statement_may_change_query_results(&stmt) {
+                    session.transaction_may_change_query_results = true;
+                }
+                let txn = session.transaction.as_mut().expect("transaction checked");
                 self.executor
                     .execute_in_transaction(&stmt, &mut **txn)
                     .await
@@ -1682,17 +5436,16 @@ impl SimpleQueryHandler for PgHandler {
                         )));
                     }
                     QueryResult::Success { message } => {
-                        responses.push(Response::Execution(Tag::new(&message)));
+                        responses.push(Response::Execution(Tag::new(&Self::pg_command_tag(
+                            &message,
+                        ))));
                     }
                 },
                 Err(e) => {
-                    return Ok(vec![Response::Error(Box::new(
-                        pgwire::error::ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            format!("Execution Error: {:?}", e),
-                        ),
-                    ))]);
+                    return Ok(vec![Response::Error(Box::new(Self::fusion_error(
+                        "Execution Error",
+                        &e,
+                    )))]);
                 }
             }
         }
@@ -1728,6 +5481,14 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
     {
+        Self::trace_query(
+            &format!(
+                "parse start name={} oids={:?}",
+                message.name.clone().unwrap_or_default(),
+                message.type_oids
+            ),
+            &message.query,
+        );
         let username = Self::username_for_client(client);
         let auth_result = match Self::parse_copy_from_stdin_query(&message.query) {
             Ok(Some(stmt)) => self.executor.authorize_statement(&username, &stmt).await,
@@ -1746,8 +5507,9 @@ impl ExtendedQueryHandler for PgHandler {
 
         let mut session = self.session.lock().await;
         let name = message.name.clone().unwrap_or_default();
-        let parameter_types =
-            Self::infer_parameter_types_from_query(&message.query, &message.type_oids);
+        let parameter_types = self
+            .infer_parameter_types_from_query(&message.query, &message.type_oids)
+            .await;
         session.statements.insert(
             name,
             StatementData {
@@ -1759,6 +5521,7 @@ impl ExtendedQueryHandler for PgHandler {
             .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await
             .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+        Self::trace("parse done");
         Ok(())
     }
 
@@ -1766,6 +5529,12 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
     {
+        Self::trace(format!(
+            "bind start portal={} statement={} params={}",
+            message.portal_name.clone().unwrap_or_default(),
+            message.statement_name.clone().unwrap_or_default(),
+            message.parameters.len()
+        ));
         let mut session = self.session.lock().await;
         let statement_name = message.statement_name.clone().unwrap_or_default();
 
@@ -1821,6 +5590,7 @@ impl ExtendedQueryHandler for PgHandler {
                 statement_name,
                 query,
                 params,
+                result_format_codes: message.result_column_format_codes.clone(),
             },
         );
 
@@ -1828,6 +5598,7 @@ impl ExtendedQueryHandler for PgHandler {
             .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
             .await
             .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+        Self::trace("bind done");
         Ok(())
     }
 
@@ -1835,11 +5606,20 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
     {
+        Self::trace(format!(
+            "execute start portal={} max_rows={}",
+            message.name.clone().unwrap_or_default(),
+            message.max_rows
+        ));
         let portal_name = message.name.clone().unwrap_or_default();
-        let (query, params) = {
+        let (query, params, result_format_codes) = {
             let session = self.session.lock().await;
             if let Some(portal) = session.portals.get(&portal_name) {
-                (portal.query.clone(), portal.params.clone())
+                (
+                    portal.query.clone(),
+                    portal.params.clone(),
+                    portal.result_format_codes.clone(),
+                )
             } else {
                 return Err(PgWireError::ApiError(Box::new(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -1851,6 +5631,14 @@ impl ExtendedQueryHandler for PgHandler {
         println!(
             "PG Execute Portal {}: {} params={:?}",
             portal_name, query, params
+        );
+        Self::trace_query(
+            &format!(
+                "execute query portal={} params={}",
+                portal_name,
+                params.len()
+            ),
+            &query,
         );
 
         let username = Self::username_for_client(client);
@@ -1876,6 +5664,7 @@ impl ExtendedQueryHandler for PgHandler {
                 session.copy_in = Some(CopyInState {
                     statement: stmt,
                     data: Vec::new(),
+                    simple_query: false,
                 });
             }
             client.set_state(PgWireConnectionState::CopyInProgress(true));
@@ -1902,14 +5691,28 @@ impl ExtendedQueryHandler for PgHandler {
             return Ok(());
         }
 
-        let result = self.execute_first_statement(&query, &params).await;
+        let jdbc_client = Self::is_postgresql_jdbc_client(client);
+        let (result, is_metadata_result) =
+            match self.try_execute_pg_metadata_query(&query, &params).await {
+                Ok(Some(result)) => (Ok(result), true),
+                Ok(None) => (self.execute_first_statement(&query, &params).await, false),
+                Err(e) => (Err(e), false),
+            };
 
         match result {
             Ok(res) => match res {
                 QueryResult::Select { columns, rows } => {
-                    let described_fields = self.describe_query_fields(&query).await?;
+                    let effective_result_format_codes =
+                        if !is_metadata_result && result_format_codes.is_empty() && !jdbc_client {
+                            vec![1]
+                        } else {
+                            result_format_codes.clone()
+                        };
+                    let described_fields = self
+                        .describe_query_fields(&query, &params, &effective_result_format_codes)
+                        .await?;
                     let fields = if described_fields.is_empty() {
-                        Self::infer_binary_fields(&columns, &rows)
+                        Self::fields_with_format(&columns, &rows, &effective_result_format_codes)
                     } else {
                         Arc::new(
                             described_fields
@@ -1920,7 +5723,7 @@ impl ExtendedQueryHandler for PgHandler {
                                         None,
                                         None,
                                         field.datatype().clone(),
-                                        FieldFormat::Binary,
+                                        field.format(),
                                     )
                                 })
                                 .collect::<Vec<_>>(),
@@ -1929,10 +5732,10 @@ impl ExtendedQueryHandler for PgHandler {
 
                     for row in rows {
                         client
-                            .send(PgWireBackendMessage::DataRow(Self::encode_binary_row(
+                            .send(PgWireBackendMessage::DataRow(Self::encode_row_for_fields(
                                 fields.clone(),
                                 row,
-                            )))
+                            )?))
                             .await
                             .map_err(|_| {
                                 PgWireError::IoError(std::io::Error::other("Sink Error"))
@@ -1949,7 +5752,7 @@ impl ExtendedQueryHandler for PgHandler {
                 QueryResult::Success { message } => {
                     client
                         .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
-                            message,
+                            Self::pg_command_tag(&message),
                         )))
                         .await
                         .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
@@ -1958,18 +5761,14 @@ impl ExtendedQueryHandler for PgHandler {
             Err(e) => {
                 client
                     .send(PgWireBackendMessage::ErrorResponse(
-                        pgwire::error::ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            format!("Execution Error: {:?}", e),
-                        )
-                        .into(),
+                        Self::fusion_error("Execution Error", &e).into(),
                     ))
                     .await
                     .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
             }
         }
 
+        Self::trace("execute done");
         Ok(())
     }
 
@@ -1977,6 +5776,7 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
     {
+        Self::trace("sync start");
         let transaction_status = {
             let session = self.session.lock().await;
             if session.transaction.is_some() {
@@ -1991,6 +5791,7 @@ impl ExtendedQueryHandler for PgHandler {
             ))
             .await
             .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+        Self::trace(format!("sync done status={:?}", transaction_status));
         Ok(())
     }
 
@@ -1998,6 +5799,11 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
     {
+        Self::trace(format!(
+            "describe message start target={} name={}",
+            message.target_type as char,
+            message.name.clone().unwrap_or_default()
+        ));
         let target_type = message.target_type;
         match target_type {
             b'S' => {
@@ -2027,23 +5833,24 @@ impl ExtendedQueryHandler for PgHandler {
                         .await
                         .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
                 } else {
-                    let fields = self.describe_query_fields(&query).await?;
-                    client
-                        .send(PgWireBackendMessage::RowDescription(RowDescription::new(
-                            fields.iter().map(Into::into).collect(),
-                        )))
-                        .await
-                        .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                    let fields = self.describe_query_fields(&query, &[], &[]).await?;
+                    self.send_row_description_or_nodata(client, fields).await?;
                 }
             }
             b'P' => {
-                let query = {
+                let (query, params, result_format_codes) = {
                     let session = self.session.lock().await;
                     let name = message.name.clone().unwrap_or_default();
                     session
                         .portals
                         .get(&name)
-                        .map(|portal| portal.query.clone())
+                        .map(|portal| {
+                            (
+                                portal.query.clone(),
+                                portal.params.clone(),
+                                portal.result_format_codes.clone(),
+                            )
+                        })
                         .unwrap_or_default()
                 };
                 if Self::parse_copy_from_stdin_query(&query)
@@ -2055,17 +5862,15 @@ impl ExtendedQueryHandler for PgHandler {
                         .await
                         .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
                 } else {
-                    let fields = self.describe_query_fields(&query).await?;
-                    client
-                        .send(PgWireBackendMessage::RowDescription(RowDescription::new(
-                            fields.iter().map(Into::into).collect(),
-                        )))
-                        .await
-                        .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+                    let fields = self
+                        .describe_query_fields(&query, &params, &result_format_codes)
+                        .await?;
+                    self.send_row_description_or_nodata(client, fields).await?;
                 }
             }
             _ => {}
         }
+        Self::trace("describe message done");
         Ok(())
     }
 
@@ -2102,8 +5907,16 @@ impl CopyHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         enum CopyDoneWork {
-            Count(usize),
-            ImplicitTransaction(Statement, Vec<u8>),
+            Count {
+                count: usize,
+                simple_query: bool,
+                in_transaction: bool,
+            },
+            ImplicitTransaction {
+                statement: Statement,
+                payload: Vec<u8>,
+                simple_query: bool,
+            },
         }
 
         let work = {
@@ -2114,6 +5927,11 @@ impl CopyHandler for PgHandler {
                 ))));
             };
 
+            Self::trace(format!(
+                "copy done received: simple={} bytes={}",
+                copy_in.simple_query,
+                copy_in.data.len()
+            ));
             if let Some(txn) = session.transaction.as_mut() {
                 let count = self
                     .executor
@@ -2125,15 +5943,40 @@ impl CopyHandler for PgHandler {
                             e
                         ))))
                     })?;
-                CopyDoneWork::Count(count)
+                session.transaction_may_change_query_results = true;
+                CopyDoneWork::Count {
+                    count,
+                    simple_query: copy_in.simple_query,
+                    in_transaction: true,
+                }
             } else {
-                CopyDoneWork::ImplicitTransaction(copy_in.statement, copy_in.data)
+                CopyDoneWork::ImplicitTransaction {
+                    statement: copy_in.statement,
+                    payload: copy_in.data,
+                    simple_query: copy_in.simple_query,
+                }
             }
         };
 
-        let count = match work {
-            CopyDoneWork::Count(count) => count,
-            CopyDoneWork::ImplicitTransaction(statement, payload) => {
+        let (count, simple_query, transaction_status) = match work {
+            CopyDoneWork::Count {
+                count,
+                simple_query,
+                in_transaction,
+            } => (
+                count,
+                simple_query,
+                if in_transaction {
+                    TransactionStatus::Transaction
+                } else {
+                    TransactionStatus::Idle
+                },
+            ),
+            CopyDoneWork::ImplicitTransaction {
+                statement,
+                payload,
+                simple_query,
+            } => {
                 let mut txn = self.storage.begin_transaction().await.map_err(|e| {
                     PgWireError::UserError(Box::new(Self::execution_error(format!(
                         "COPY failed to begin transaction: {:?}",
@@ -2152,7 +5995,8 @@ impl CopyHandler for PgHandler {
                                 e
                             ))))
                         })?;
-                        count
+                        self.executor.invalidate_query_result_cache();
+                        (count, simple_query, TransactionStatus::Idle)
                     }
                     Err(e) => {
                         let _ = txn.rollback().await;
@@ -2170,9 +6014,23 @@ impl CopyHandler for PgHandler {
             )))
             .await
             .map_err(|_| Self::sink_error())?;
-        if matches!(client.state(), PgWireConnectionState::CopyInProgress(true)) {
+
+        if simple_query {
+            client.set_transaction_status(transaction_status);
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+            client
+                .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                    transaction_status,
+                )))
+                .await
+                .map_err(|_| Self::sink_error())?;
+        } else if matches!(client.state(), PgWireConnectionState::CopyInProgress(true)) {
             client.set_state(PgWireConnectionState::ReadyForQuery);
         }
+        Self::trace(format!(
+            "copy done completed: count={} simple={} status={:?}",
+            count, simple_query, transaction_status
+        ));
         Ok(())
     }
 

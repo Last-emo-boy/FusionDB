@@ -10,9 +10,53 @@ use super::Executor;
 pub(crate) struct ForeignKeyMeta {
     pub name: String,
     pub child_table: String,
+    #[serde(default)]
     pub child_column: String,
+    #[serde(default)]
+    pub child_columns: Vec<String>,
     pub parent_table: String,
+    #[serde(default)]
     pub parent_column: String,
+    #[serde(default)]
+    pub parent_columns: Vec<String>,
+}
+
+impl ForeignKeyMeta {
+    fn new(
+        name: String,
+        child_table: String,
+        child_columns: Vec<String>,
+        parent_table: String,
+        parent_columns: Vec<String>,
+    ) -> Self {
+        let child_column = child_columns.first().cloned().unwrap_or_default();
+        let parent_column = parent_columns.first().cloned().unwrap_or_default();
+        Self {
+            name,
+            child_table,
+            child_column,
+            child_columns,
+            parent_table,
+            parent_column,
+            parent_columns,
+        }
+    }
+
+    pub(crate) fn child_columns(&self) -> Vec<String> {
+        if self.child_columns.is_empty() {
+            vec![self.child_column.clone()]
+        } else {
+            self.child_columns.clone()
+        }
+    }
+
+    pub(crate) fn parent_columns(&self) -> Vec<String> {
+        if self.parent_columns.is_empty() {
+            vec![self.parent_column.clone()]
+        } else {
+            self.parent_columns.clone()
+        }
+    }
 }
 
 impl Executor {
@@ -58,51 +102,68 @@ impl Executor {
                 "Composite foreign keys are not supported yet".to_string(),
             ));
         }
+        let parent_columns = fk
+            .referred_columns
+            .first()
+            .map(|ident| vec![ident.value.clone()])
+            .unwrap_or_else(|| vec!["id".to_string()]);
 
-        Ok(ForeignKeyMeta {
-            name: Self::foreign_key_name(
+        Ok(ForeignKeyMeta::new(
+            Self::foreign_key_name(
                 option.name.as_ref(),
                 table_name,
                 &[child_column.value.clone()],
                 &fk.foreign_table.to_string(),
             ),
-            child_table: table_name.to_string(),
-            child_column: child_column.value.clone(),
-            parent_table: fk.foreign_table.to_string(),
-            parent_column: fk
-                .referred_columns
-                .first()
-                .map(|ident| ident.value.clone())
-                .unwrap_or_else(|| "id".to_string()),
-        })
+            table_name.to_string(),
+            vec![child_column.value.clone()],
+            fk.foreign_table.to_string(),
+            parent_columns,
+        ))
     }
 
     fn foreign_key_meta_from_table_constraint(
         table_name: &str,
         fk: &ForeignKeyConstraint,
     ) -> Result<ForeignKeyMeta> {
-        if fk.columns.len() != 1 || fk.referred_columns.len() > 1 {
+        if fk.columns.is_empty() {
             return Err(FusionError::Execution(
-                "Only single-column foreign keys are supported yet".to_string(),
+                "FOREIGN KEY requires at least one child column".to_string(),
             ));
         }
+        let child_columns = fk
+            .columns
+            .iter()
+            .map(|ident| ident.value.clone())
+            .collect::<Vec<_>>();
+        let parent_columns = if fk.referred_columns.is_empty() {
+            vec!["id".to_string()]
+        } else {
+            fk.referred_columns
+                .iter()
+                .map(|ident| ident.value.clone())
+                .collect::<Vec<_>>()
+        };
+        if child_columns.len() != parent_columns.len() {
+            return Err(FusionError::Execution(format!(
+                "FOREIGN KEY column count mismatch: {} child column(s), {} parent column(s)",
+                child_columns.len(),
+                parent_columns.len()
+            )));
+        }
 
-        Ok(ForeignKeyMeta {
-            name: Self::foreign_key_name(
+        Ok(ForeignKeyMeta::new(
+            Self::foreign_key_name(
                 fk.name.as_ref(),
                 table_name,
-                &[fk.columns[0].value.clone()],
+                &child_columns,
                 &fk.foreign_table.to_string(),
             ),
-            child_table: table_name.to_string(),
-            child_column: fk.columns[0].value.clone(),
-            parent_table: fk.foreign_table.to_string(),
-            parent_column: fk
-                .referred_columns
-                .first()
-                .map(|ident| ident.value.clone())
-                .unwrap_or_else(|| "id".to_string()),
-        })
+            table_name.to_string(),
+            child_columns,
+            fk.foreign_table.to_string(),
+            parent_columns,
+        ))
     }
 
     fn foreign_key_name(
@@ -199,23 +260,37 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<()> {
         for fk in foreign_keys {
-            let Some(child_idx) = schema.get_column_index(&fk.child_column) else {
-                continue;
-            };
-            let Some(value) = row.get(child_idx) else {
-                continue;
-            };
-            if *value == Value::Null {
+            let child_columns = fk.child_columns();
+            let mut child_values = Vec::with_capacity(child_columns.len());
+            for child_column in &child_columns {
+                let Some(child_idx) = schema.get_column_index(child_column) else {
+                    continue;
+                };
+                let Some(value) = row.get(child_idx) else {
+                    continue;
+                };
+                child_values.push(value.clone());
+            }
+            if child_values.iter().any(|value| *value == Value::Null) {
                 continue;
             }
 
             if !self
-                .foreign_key_parent_exists(&fk.parent_table, &fk.parent_column, value, txn)
+                .foreign_key_parent_exists(
+                    &fk.parent_table,
+                    &fk.parent_columns(),
+                    &child_values,
+                    txn,
+                )
                 .await?
             {
                 return Err(FusionError::Execution(format!(
                     "FOREIGN KEY constraint '{}' violated: {}.{} references missing {}.{}",
-                    fk.name, fk.child_table, fk.child_column, fk.parent_table, fk.parent_column
+                    fk.name,
+                    fk.child_table,
+                    child_columns.join(","),
+                    fk.parent_table,
+                    fk.parent_columns().join(",")
                 )));
             }
         }
@@ -233,29 +308,44 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<()> {
         for fk in foreign_keys {
-            let Some(parent_idx) = schema.get_column_index(&fk.parent_column) else {
-                continue;
-            };
-            let Some(old_value) = old_row.get(parent_idx) else {
-                continue;
-            };
-            if *old_value == Value::Null {
+            let parent_columns = fk.parent_columns();
+            let mut old_values = Vec::with_capacity(parent_columns.len());
+            let mut new_values = Vec::with_capacity(parent_columns.len());
+            for parent_column in &parent_columns {
+                let Some(parent_idx) = schema.get_column_index(parent_column) else {
+                    continue;
+                };
+                let Some(old_value) = old_row.get(parent_idx) else {
+                    continue;
+                };
+                old_values.push(old_value.clone());
+                if let Some(new_row) = new_row {
+                    if let Some(new_value) = new_row.get(parent_idx) {
+                        new_values.push(new_value.clone());
+                    }
+                }
+            }
+            if old_values.iter().any(|value| *value == Value::Null) {
                 continue;
             }
 
-            if let Some(new_row) = new_row {
-                if new_row.get(parent_idx) == Some(old_value) {
+            if new_row.is_some() {
+                if new_values == old_values {
                     continue;
                 }
             }
 
             if self
-                .foreign_key_child_exists(&fk.child_table, &fk.child_column, old_value, txn)
+                .foreign_key_child_exists(&fk.child_table, &fk.child_columns(), &old_values, txn)
                 .await?
             {
                 return Err(FusionError::Execution(format!(
                     "FOREIGN KEY constraint '{}' violated: {}.{} is still referenced by {}.{}",
-                    fk.name, table_name, fk.parent_column, fk.child_table, fk.child_column
+                    fk.name,
+                    table_name,
+                    parent_columns.join(","),
+                    fk.child_table,
+                    fk.child_columns().join(",")
                 )));
             }
         }
@@ -266,75 +356,145 @@ impl Executor {
     async fn foreign_key_parent_exists(
         &self,
         parent_table: &str,
-        parent_column: &str,
-        value: &Value,
+        parent_columns: &[String],
+        values: &[Value],
         txn: &mut dyn Transaction,
     ) -> Result<bool> {
-        let schema = self.load_table_schema(parent_table, txn).await?;
-        let Some(parent_idx) = schema.get_column_index(parent_column) else {
-            return Err(FusionError::Execution(format!(
-                "Referenced column {}.{} not found",
-                parent_table, parent_column
-            )));
-        };
-
-        if schema.get_primary_key_index() == Some(parent_idx) {
-            if let Some(row_id) = Self::value_to_primary_row_id(value) {
-                let key = format!("data:{}:{}", parent_table, row_id);
-                return Ok(txn.get(key.as_bytes()).await?.is_some());
-            }
+        if parent_columns.len() != values.len() {
             return Ok(false);
         }
+        let schema = self.load_table_schema(parent_table, txn).await?;
+        for parent_column in parent_columns {
+            if schema.get_column_index(parent_column).is_none() {
+                return Err(FusionError::Execution(format!(
+                    "Referenced column {}.{} not found",
+                    parent_table, parent_column
+                )));
+            }
+        }
 
-        self.table_has_column_value(parent_table, parent_idx, value, txn)
+        if parent_columns.len() == 1 {
+            let parent_idx = schema.get_column_index(&parent_columns[0]).unwrap();
+            if schema.get_primary_key_index() == Some(parent_idx) {
+                if let Some(row_id) = Self::value_to_primary_row_id(&values[0]) {
+                    let key = format!("data:{}:{}", parent_table, row_id);
+                    return Ok(txn.get(key.as_bytes()).await?.is_some());
+                }
+                return Ok(false);
+            }
+            return self
+                .table_has_column_values(parent_table, &schema, parent_columns, values, txn)
+                .await;
+        }
+
+        for index in self
+            .load_composite_unique_indexes_for_table(parent_table, txn)
+            .await?
+        {
+            if !index.name.ends_with("_pkey")
+                || !Self::columns_match_ignore_case(&index.columns, parent_columns)
+            {
+                continue;
+            }
+            if let Some(row_id) = self.composite_index_value_key_for_meta_values(&index, values) {
+                let key = format!("data:{}:{}", parent_table, row_id);
+                if txn.get(key.as_bytes()).await?.is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+
+        for index in self
+            .load_composite_unique_indexes_for_table(parent_table, txn)
+            .await?
+        {
+            if !Self::columns_match_ignore_case(&index.columns, parent_columns) {
+                continue;
+            }
+            if let Some(value_key) = self.composite_index_value_key_for_meta_values(&index, values)
+            {
+                let prefix = format!(
+                    "{}{}:",
+                    Self::composite_index_prefix(parent_table, &index.columns),
+                    value_key
+                );
+                if !txn
+                    .scan_prefix(prefix.as_bytes(), Some(1))
+                    .await?
+                    .is_empty()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+
+        self.table_has_column_values(parent_table, &schema, parent_columns, values, txn)
             .await
     }
 
     async fn foreign_key_child_exists(
         &self,
         child_table: &str,
-        child_column: &str,
-        value: &Value,
+        child_columns: &[String],
+        values: &[Value],
         txn: &mut dyn Transaction,
     ) -> Result<bool> {
         let schema = self.load_table_schema(child_table, txn).await?;
-        let Some(child_idx) = schema.get_column_index(child_column) else {
-            return Ok(false);
-        };
 
-        self.table_has_column_value(child_table, child_idx, value, txn)
+        self.table_has_column_values(child_table, &schema, child_columns, values, txn)
             .await
     }
 
-    async fn table_has_column_value(
+    async fn table_has_column_values(
         &self,
         table_name: &str,
-        column_idx: usize,
-        value: &Value,
+        schema: &TableSchema,
+        columns: &[String],
+        values: &[Value],
         txn: &mut dyn Transaction,
     ) -> Result<bool> {
+        if columns.len() != values.len() {
+            return Ok(false);
+        }
+        let mut column_indexes = Vec::with_capacity(columns.len());
+        for column in columns {
+            let Some(column_idx) = schema.get_column_index(column) else {
+                return Ok(false);
+            };
+            column_indexes.push(column_idx);
+        }
         let prefix = format!("data:{}:", table_name);
         let rows = txn.scan_prefix(prefix.as_bytes(), None).await?;
         for (key, bytes) in rows {
-            let current = if let Ok(key_str) = std::str::from_utf8(&key) {
+            let row = if let Ok(key_str) = std::str::from_utf8(&key) {
                 if let Some(row) = self.row_cache.get(key_str) {
-                    row.get(column_idx).cloned().unwrap_or(Value::Null)
+                    row
                 } else {
-                    crate::common::encoding::RowDecoder::decode_column(&bytes, column_idx)
+                    crate::common::encoding::RowDecoder::decode(&bytes)
                         .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
-                        .unwrap_or(Value::Null)
                 }
             } else {
-                crate::common::encoding::RowDecoder::decode_column(&bytes, column_idx)
+                crate::common::encoding::RowDecoder::decode(&bytes)
                     .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
-                    .unwrap_or(Value::Null)
             };
 
-            if current == *value {
+            if column_indexes
+                .iter()
+                .zip(values)
+                .all(|(idx, expected)| row.get(*idx) == Some(expected))
+            {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    fn columns_match_ignore_case(left: &[String], right: &[String]) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
     }
 
     async fn load_table_schema(

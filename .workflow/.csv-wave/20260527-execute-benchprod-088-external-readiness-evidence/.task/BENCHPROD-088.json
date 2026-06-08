@@ -1,0 +1,16 @@
+{
+  "id": "BENCHPROD-088",
+  "status": "completed",
+  "title": "External benchmark readiness report with PgWire evidence",
+  "completed_at": "2026-05-27T23:38:28+08:00",
+  "artifacts": {
+    "external_smoke": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod088_pgwire_evidence_20260527/external_smoke_summary.md",
+    "pgwire_evidence": "E:/Playground/FusionDB-bench/runs/pgwire_smoke_benchprod087_jdbc_catalog_final_20260527/pgwire_smoke_summary.md"
+  },
+  "verification": [
+    "python -m py_compile external_smoke.py pgwire_smoke.py",
+    "python external_smoke.py --target pgbench,benchbase-tpcc,ldbc,chbenchmark --run-name external_smoke_benchprod088_pgwire_evidence_20260527 --pgwire-evidence runs/pgwire_smoke_benchprod087_jdbc_catalog_final_20260527/pgwire_smoke_summary.json",
+    "python -m py_compile pgwire_smoke.py fusiondb_bench.py bench_repeat.py bench_stability.py bench_gate.py fusiondb_matrix.py external_smoke.py external_bootstrap.py"
+  ],
+  "followup": "BENCHPROD-089"
+}

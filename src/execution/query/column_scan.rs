@@ -1,3 +1,4 @@
+use crate::catalog::IndexType;
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use crate::storage::{ScanVisitor, Transaction};
@@ -40,6 +41,10 @@ pub(super) struct ColumnPredicateScanPlan {
 
 impl ColumnPredicateTerm {
     fn matches(&self, value: &Value) -> bool {
+        if matches!(value, Value::Null) || matches!(self.value, Value::Null) {
+            return false;
+        }
+
         match self.op {
             BinaryOperator::Eq => value == &self.value,
             BinaryOperator::NotEq => value != &self.value,
@@ -132,6 +137,13 @@ impl ColumnAggregateState {
                     self.count += 1;
                     self.is_int = false;
                 }
+                Value::Decimal(value) => {
+                    if let Ok(value) = value.parse::<f64>() {
+                        self.sum += value;
+                        self.count += 1;
+                        self.is_int = false;
+                    }
+                }
                 _ => {}
             },
             ColumnAggregateKind::Min => {
@@ -162,6 +174,7 @@ impl ColumnAggregateState {
                 Value::String(value) => self.strings.push(value),
                 Value::Integer(value) => self.strings.push(value.to_string()),
                 Value::Float(value) => self.strings.push(value.to_string()),
+                Value::Decimal(value) => self.strings.push(value),
                 Value::Boolean(value) => self.strings.push(value.to_string()),
                 Value::Null => {}
                 _ => {}
@@ -197,6 +210,51 @@ impl ColumnAggregateState {
                 }
             }
         }
+    }
+}
+
+struct ColumnAggregateScanVisitor<'a> {
+    plans: &'a [ColumnAggregateScanPlan],
+    predicate: Option<&'a ColumnPredicateScanPlan>,
+    states: &'a mut [ColumnAggregateState],
+    predicate_values: Vec<Value>,
+    error: Option<FusionError>,
+}
+
+impl ColumnAggregateScanVisitor<'_> {
+    fn visit_row(&mut self, data: &[u8]) -> Result<()> {
+        Executor::decode_predicate_values(data, self.predicate, &mut self.predicate_values)?;
+        if let Some(predicate) = self.predicate {
+            if !predicate.matches_values(&self.predicate_values) {
+                return Ok(());
+            }
+        }
+
+        for (state, plan) in self.states.iter_mut().zip(self.plans.iter()) {
+            if let Some(column_index) = plan.column_index {
+                let value = Executor::decode_column_or_reuse_predicate(
+                    data,
+                    column_index,
+                    self.predicate,
+                    &self.predicate_values,
+                )?;
+                state.update(value);
+            } else {
+                state.update(Value::Integer(1));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ScanVisitor for ColumnAggregateScanVisitor<'_> {
+    fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        if let Err(error) = self.visit_row(value) {
+            self.error = Some(error);
+            return false;
+        }
+        true
     }
 }
 
@@ -294,6 +352,68 @@ impl ScanVisitor for GroupAggregateScanVisitor<'_> {
     }
 }
 
+struct SingleGroupAggregateScanVisitor<'a> {
+    group_column_index: usize,
+    aggregate_plans: &'a [GroupColumnAggregateScanPlan],
+    predicate: Option<&'a ColumnPredicateScanPlan>,
+    groups: &'a mut HashMap<Value, Vec<GroupColumnAggregateState>>,
+    predicate_values: Vec<Value>,
+    error: Option<FusionError>,
+}
+
+impl SingleGroupAggregateScanVisitor<'_> {
+    fn visit_row(&mut self, data: &[u8]) -> Result<()> {
+        Executor::decode_predicate_values(data, self.predicate, &mut self.predicate_values)?;
+        if let Some(predicate) = self.predicate {
+            if !predicate.matches_values(&self.predicate_values) {
+                return Ok(());
+            }
+        }
+
+        let group_value = Executor::decode_column_or_reuse_predicate(
+            data,
+            self.group_column_index,
+            self.predicate,
+            &self.predicate_values,
+        )?;
+
+        let states = self.groups.entry(group_value).or_insert_with(|| {
+            self.aggregate_plans
+                .iter()
+                .map(|plan| GroupColumnAggregateState::new(plan.kind))
+                .collect()
+        });
+
+        for (state, plan) in states.iter_mut().zip(self.aggregate_plans.iter()) {
+            if let Some(column_index) = plan.column_index {
+                let value = Executor::decode_column_or_reuse_predicate(
+                    data,
+                    column_index,
+                    self.predicate,
+                    &self.predicate_values,
+                )?;
+                state.update_value(value);
+            } else {
+                state.update_count_star();
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ScanVisitor for SingleGroupAggregateScanVisitor<'_> {
+    fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        match self.visit_row(value) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(err);
+                false
+            }
+        }
+    }
+}
+
 struct GroupCountScanVisitor<'a> {
     group_column_index: usize,
     predicate: Option<&'a ColumnPredicateScanPlan>,
@@ -375,6 +495,13 @@ impl GroupColumnAggregateState {
                     self.count += 1;
                     self.is_int = false;
                 }
+                Value::Decimal(value) => {
+                    if let Ok(value) = value.parse::<f64>() {
+                        self.sum += value;
+                        self.count += 1;
+                        self.is_int = false;
+                    }
+                }
                 _ => {}
             },
             GroupColumnAggregateKind::Avg => match value {
@@ -386,6 +513,13 @@ impl GroupColumnAggregateState {
                     self.sum += value;
                     self.count += 1;
                     self.is_int = false;
+                }
+                Value::Decimal(value) => {
+                    if let Ok(value) = value.parse::<f64>() {
+                        self.sum += value;
+                        self.count += 1;
+                        self.is_int = false;
+                    }
                 }
                 _ => {}
             },
@@ -417,6 +551,7 @@ impl GroupColumnAggregateState {
                 Value::String(value) => self.strings.push(value),
                 Value::Integer(value) => self.strings.push(value.to_string()),
                 Value::Float(value) => self.strings.push(value.to_string()),
+                Value::Decimal(value) => self.strings.push(value),
                 Value::Boolean(value) => self.strings.push(value.to_string()),
                 Value::Null => {}
                 _ => {}
@@ -595,40 +730,126 @@ impl Executor {
         table_name: &str,
         plans: &[ColumnAggregateScanPlan],
         predicate: Option<&ColumnPredicateScanPlan>,
+        schema: Option<&TableSchema>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Value>> {
+        if let (Some(predicate), Some(schema)) = (predicate, schema) {
+            if let Some(values) = self
+                .simple_column_aggregate_index_scan(table_name, plans, predicate, schema, txn)
+                .await?
+            {
+                return Ok(values);
+            }
+        }
+
         let prefix = format!("data:{}:", table_name);
-        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let mut states: Vec<ColumnAggregateState> = plans
             .iter()
             .map(|plan| ColumnAggregateState::new(plan.kind))
             .collect();
-        let mut predicate_values = Vec::new();
 
-        for (_, data) in kv_pairs {
-            Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
-            if let Some(predicate) = predicate {
-                if !predicate.matches_values(&predicate_values) {
-                    continue;
-                }
-            }
+        let scan_error = {
+            let mut visitor = ColumnAggregateScanVisitor {
+                plans,
+                predicate,
+                states: &mut states,
+                predicate_values: Vec::new(),
+                error: None,
+            };
+            txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
+                .await?;
+            visitor.error
+        };
 
-            for (state, plan) in states.iter_mut().zip(plans.iter()) {
-                if let Some(column_index) = plan.column_index {
-                    let value = Self::decode_column_or_reuse_predicate(
-                        &data,
-                        column_index,
-                        predicate,
-                        &predicate_values,
-                    )?;
-                    state.update(value);
-                } else {
-                    state.update(Value::Integer(1));
-                }
-            }
+        if let Some(err) = scan_error {
+            return Err(err);
         }
 
         Ok(states.iter().map(ColumnAggregateState::finalize).collect())
+    }
+
+    async fn simple_column_aggregate_index_scan(
+        &self,
+        table_name: &str,
+        plans: &[ColumnAggregateScanPlan],
+        predicate: &ColumnPredicateScanPlan,
+        schema: &TableSchema,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<Vec<Value>>> {
+        let mut index_probe: Option<(usize, String, Value)> = None;
+        for term in &predicate.terms {
+            if term.op != BinaryOperator::Eq {
+                continue;
+            }
+            let Some(&column_index) = predicate.column_indices.get(term.value_slot) else {
+                continue;
+            };
+            let Some(column) = schema.columns.get(column_index) else {
+                continue;
+            };
+            if column.is_primary {
+                let value =
+                    Self::coerce_value_to_column_type(term.value.clone(), &column.data_type)
+                        .unwrap_or(Value::Null);
+                index_probe = Some((column_index, column.name.clone(), value));
+                break;
+            }
+            if column.is_indexed && column.index_type == IndexType::BTree {
+                let value =
+                    Self::coerce_value_to_column_type(term.value.clone(), &column.data_type)
+                        .unwrap_or(Value::Null);
+                index_probe = Some((column_index, column.name.clone(), value));
+                break;
+            }
+        }
+
+        let Some((column_index, column_name, value)) = index_probe else {
+            return Ok(None);
+        };
+
+        let mut row_ids = Vec::new();
+        let column = &schema.columns[column_index];
+        if column.is_primary {
+            if let Some(row_id) = Self::value_to_primary_row_id(&value) {
+                row_ids.push(row_id);
+            } else {
+                return Ok(None);
+            }
+        } else if let Some(value_key) = self.value_to_index_string(&value) {
+            let index_prefix = format!("index:{}:{}:{}:", table_name, column_name, value_key);
+            let entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
+            row_ids.reserve(entries.len());
+            for (key, _) in entries {
+                if let Some(row_id) = Self::row_id_from_key(&key) {
+                    row_ids.push(row_id.to_string());
+                }
+            }
+        } else {
+            return Ok(None);
+        }
+
+        let mut states: Vec<ColumnAggregateState> = plans
+            .iter()
+            .map(|plan| ColumnAggregateState::new(plan.kind))
+            .collect();
+        let mut visitor = ColumnAggregateScanVisitor {
+            plans,
+            predicate: Some(predicate),
+            states: &mut states,
+            predicate_values: Vec::new(),
+            error: None,
+        };
+
+        for row_id in row_ids {
+            let data_key = format!("data:{}:{}", table_name, row_id);
+            if let Some(data) = txn.get(data_key.as_bytes()).await? {
+                visitor.visit_row(&data)?;
+            }
+        }
+
+        Ok(Some(
+            states.iter().map(ColumnAggregateState::finalize).collect(),
+        ))
     }
 
     pub(super) fn simple_column_predicate_scan_plan(
@@ -666,6 +887,11 @@ impl Executor {
                     return None;
                 }
                 let value = self.evaluate_value(&right, &[], schema, params).ok()?;
+                let value = Self::coerce_value_to_column_type(
+                    value,
+                    &schema.columns[column_index].data_type,
+                )
+                .ok()?;
                 let value_slot = match column_indices.iter().position(|&idx| idx == column_index) {
                     Some(slot) => slot,
                     None => {
@@ -688,6 +914,11 @@ impl Executor {
                     return None;
                 }
                 let value = self.evaluate_value(&left, &[], schema, params).ok()?;
+                let value = Self::coerce_value_to_column_type(
+                    value,
+                    &schema.columns[column_index].data_type,
+                )
+                .ok()?;
                 let op = match op {
                     BinaryOperator::Eq => BinaryOperator::Eq,
                     BinaryOperator::NotEq => BinaryOperator::NotEq,
@@ -1144,6 +1375,18 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
+        if let [group_column_index] = group_column_indices {
+            return self
+                .group_by_single_column_aggregate_scan(
+                    table_name,
+                    *group_column_index,
+                    aggregate_plans,
+                    predicate,
+                    txn,
+                )
+                .await;
+        }
+
         let prefix = format!("data:{}:", table_name);
         let mut groups: HashMap<Vec<Value>, Vec<GroupColumnAggregateState>> =
             HashMap::with_capacity(4096);
@@ -1171,6 +1414,47 @@ impl Executor {
             .map(|(group_values, states)| {
                 let mut row = Vec::with_capacity(group_values.len() + states.len());
                 row.extend(group_values);
+                row.extend(states.iter().map(GroupColumnAggregateState::finalize));
+                row
+            })
+            .collect())
+    }
+
+    async fn group_by_single_column_aggregate_scan(
+        &self,
+        table_name: &str,
+        group_column_index: usize,
+        aggregate_plans: &[GroupColumnAggregateScanPlan],
+        predicate: Option<&ColumnPredicateScanPlan>,
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<Vec<Value>>> {
+        let prefix = format!("data:{}:", table_name);
+        let mut groups: HashMap<Value, Vec<GroupColumnAggregateState>> =
+            HashMap::with_capacity(4096);
+
+        let scan_error = {
+            let mut visitor = SingleGroupAggregateScanVisitor {
+                group_column_index,
+                aggregate_plans,
+                predicate,
+                groups: &mut groups,
+                predicate_values: Vec::new(),
+                error: None,
+            };
+            txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
+                .await?;
+            visitor.error
+        };
+
+        if let Some(err) = scan_error {
+            return Err(err);
+        }
+
+        Ok(groups
+            .into_iter()
+            .map(|(group_value, states)| {
+                let mut row = Vec::with_capacity(1 + states.len());
+                row.push(group_value);
                 row.extend(states.iter().map(GroupColumnAggregateState::finalize));
                 row
             })

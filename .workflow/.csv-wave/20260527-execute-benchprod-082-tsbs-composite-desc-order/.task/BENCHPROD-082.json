@@ -1,0 +1,12 @@
+{
+  "id": "BENCHPROD-082",
+  "status": "completed",
+  "title": "TSBS composite DESC order scan",
+  "completed_at": "2026-05-27T19:11:38+08:00",
+  "artifacts": {
+    "tsbs_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod082_tsbs_medium_composite_desc_5x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod082_production_medium_composite_desc_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod082_production_medium_composite_desc_5x_20260527/bench_gate_summary.md"
+  },
+  "followup": "BENCHPROD-083"
+}

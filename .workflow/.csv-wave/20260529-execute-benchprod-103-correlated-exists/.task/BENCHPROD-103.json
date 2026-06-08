@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-103",
+  "title": "Correlated EXISTS / NOT EXISTS support for LDBC Query 14 frontier",
+  "date": "2026-05-29",
+  "status": "completed_with_next_gap",
+  "files_touched": [
+    "src/execution/expr/subquery.rs",
+    "src/execution/query/mod.rs",
+    "tests/sql_set_subquery.rs"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test --test sql_set_subquery",
+    "cargo test --test sql_join test_comma_join_projection_keeps_right_columns_without_join_pushdown",
+    "cargo build --release --bin fusiondb",
+    "cargo test --release --test pg_integration",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 20 --operation-count 10 --tool-timeout 180 --preload-timeout 180 --run-name ldbc_snb_native_benchprod103_correlated_exists_frontier_20rows_10ops_20260529 --fail-on-gap"
+  ],
+  "result": "Correlated EXISTS subset implemented; LDBC frontier moved from `Column k_person2id not found` to Q14 timeout after one operation.",
+  "next_task": "BENCHPROD-104"
+}

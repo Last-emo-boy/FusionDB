@@ -1,0 +1,36 @@
+{
+  "id": "BENCHPROD-100",
+  "title": "Isolate LDBC Query 14 recursive CTE blocker",
+  "status": "completed_with_next_gap",
+  "scope": [
+    "E:\\Playground\\FusionDB\\src\\execution\\query\\mod.rs",
+    "E:\\Playground\\FusionDB\\tests\\sql_set_subquery.rs",
+    "E:\\Playground\\FusionDB-bench\\external_bootstrap.py",
+    "E:\\Playground\\FusionDB-bench\\README.md"
+  ],
+  "deliverables": [
+    "SetExpr::Query execution support",
+    "Specific WITH RECURSIVE unsupported error",
+    "Focused SQL regression tests",
+    "Updated LDBC docs/hints",
+    "Native LDBC recursive CTE gap evidence",
+    "External smoke and strict gate refresh"
+  ],
+  "verification": [
+    "cargo test --test sql_set_subquery",
+    "cargo build --release --bin fusiondb",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 20 --operation-count 10 --tool-timeout 180 --preload-timeout 180 --run-name ldbc_snb_native_benchprod100_recursive_cte_gap_20260529 --fail-on-gap",
+    "python -m py_compile external_bootstrap.py external_smoke.py bench_gate.py ldbc_snb_native_smoke.py",
+    "python external_smoke.py --target benchbase-tpcc,memtier,tsbs,ldbc,chbenchmark --ldbc-native-evidence runs\\ldbc_snb_native_benchprod100_recursive_cte_gap_20260529\\ldbc_snb_native_smoke_summary.json --run-name external_smoke_benchprod100_recursive_cte_gap_20260529",
+    "python bench_gate.py --gate-profile gate_profiles\\production_medium_strict_native.json --repeat-report runs\\benchprod_current_medium_production_3x_20260528_fix2\\bench_repeat_summary.json --external-smoke-report runs\\external_smoke_benchprod100_recursive_cte_gap_20260529\\external_smoke_summary.json --recovery-smoke-report runs\\recovery_smoke_benchprod086_pgtest_port_fix_20260528\\recovery_smoke_summary.json --run-name gate_benchprod100_recursive_cte_gap_strict_20260529",
+    "cargo test --release --test pg_integration"
+  ],
+  "result": {
+    "ldbc_expanded_native_status": "gap",
+    "ldbc_gap": "WITH RECURSIVE is not supported",
+    "strict_gate_status": "failed",
+    "strict_gate_passed_checks": 59,
+    "strict_gate_total_checks": 62
+  },
+  "next": "BENCHPROD-101: implement bounded recursive CTE support or a semantically equivalent LDBC Query 14 adapter"
+}

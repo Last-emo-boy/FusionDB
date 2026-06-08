@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-112",
+  "title": "Generate LDBC compatibility queryDir and broaden native command-mode smoke",
+  "date": "2026-05-29",
+  "status": "completed",
+  "files_touched": [
+    "E:\\Playground\\FusionDB\\src\\execution\\expr\\value.rs",
+    "E:\\Playground\\FusionDB\\src\\execution\\query\\order.rs",
+    "E:\\Playground\\FusionDB\\src\\execution\\query\\mod.rs",
+    "E:\\Playground\\FusionDB\\tests\\sql_expr_functions.rs",
+    "E:\\Playground\\FusionDB\\tests\\sql_join.rs",
+    "E:\\Playground\\FusionDB-bench\\ldbc_snb_native_smoke.py"
+  ],
+  "verification": [
+    "python -m py_compile ldbc_snb_native_smoke.py external_bootstrap.py",
+    "cargo fmt --check",
+    "cargo test --test sql_expr_functions -- --nocapture",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo build --release --bin fusiondb",
+    "python ldbc_snb_native_smoke.py --ldbc-artifact E:\\Playground\\ldbc-snb\\driver\\target\\driver-standalone.jar --ldbc-postgres-jar E:\\Playground\\ldbc-snb\\impls\\postgres\\target\\postgres-1.2.0-SNAPSHOT.jar --run-mode command --ldbc-command-preset postgres-interactive --preload-postgres-test-data --preload-max-rows-per-file 0 --create-q14-indexes --operation-count 80 --duration 20 --warmup 0 --tool-timeout 240 --preload-timeout 360 --run-name ldbc_snb_native_benchprod112_q14_enabled_80ops_orderfix_20260529"
+  ],
+  "result": "Run-local LDBC queryDir compatibility generation removed PostgreSQL query-load stderr, and the Q14-enabled 80-op native command-mode smoke passed after interval arithmetic and ORDER BY projection fixes.",
+  "evidence": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_q14_enabled_80ops_orderfix_20260529\\ldbc_snb_native_smoke_summary.json",
+  "metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod112_q14_enabled_80ops_orderfix_20260529\\ldbc_results\\fusiondb-results.json",
+  "labels": [
+    "native-command-mode-smoke",
+    "q14-enabled",
+    "run-local-compat-querydir",
+    "80-requested-operations",
+    "updates-disabled",
+    "not-full-official-ldbc-pass"
+  ],
+  "known_limits": [
+    "This is not a full official LDBC benchmark pass.",
+    "Updates are still disabled in generated LDBC properties.",
+    "Q6 remains a performance blocker and timed out in isolation after 180 seconds.",
+    "Q4 is functionally passing but slow at about 41.3 seconds.",
+    "Q7, Q12, and Q13 isolation ldbc_command steps passed, but their isolation summaries intentionally remain gap."
+  ],
+  "next_task": "BENCHPROD-113"
+}

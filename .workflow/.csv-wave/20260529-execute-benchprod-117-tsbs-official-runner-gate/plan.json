@@ -1,0 +1,82 @@
+{
+  "id": "BENCHPROD-117",
+  "title": "Promote TSBS official runner evidence to independent benchmark gate coverage",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Inspect current TSBS official runner smoke artifacts and bench_gate integration",
+      "status": "completed"
+    },
+    {
+      "step": "Confirm BENCHPROD-084 TSBS evidence covers required query types, queries per type, data points, and result validation",
+      "status": "completed"
+    },
+    {
+      "step": "Add TSBS official runner report discovery and explicit report input to bench_gate.py",
+      "status": "completed"
+    },
+    {
+      "step": "Extract TSBS official runner checks into a reusable evaluator independent of external_smoke_summary.json",
+      "status": "completed"
+    },
+    {
+      "step": "Verify explicit report, run-root discovery, and strict profile discovery gate paths",
+      "status": "completed"
+    },
+    {
+      "step": "Record evidence conservatively as official runner compatibility smoke, not an official TSBS score",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "bench_gate": "E:\\Playground\\FusionDB-bench\\bench_gate.py",
+    "profiles": [
+      "E:\\Playground\\FusionDB-bench\\gate_profiles\\production_medium.json",
+      "E:\\Playground\\FusionDB-bench\\gate_profiles\\production_medium_strict_native.json"
+    ],
+    "tsbs_source": "E:\\Playground\\FusionDB-bench\\runs\\tsbs_official_runner_benchprod084_q3_points100_day_window_20260528\\tsbs_official_runner_smoke_summary.json",
+    "explicit_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod117_tsbs_official_runner_only_20260529\\bench_gate_summary.json",
+    "discovery_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod117_tsbs_official_runner_discovery_20260529\\bench_gate_summary.json",
+    "strict_profile_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod117_strict_tsbs_official_runner_discovery_20260529\\bench_gate_summary.json",
+    "verification": [
+      "python -m py_compile bench_gate.py tsbs_official_runner_smoke.py ldbc_snb_complex_matrix.py: passed",
+      "python -m json.tool gate_profiles/production_medium.json and production_medium_strict_native.json: passed",
+      "python bench_gate.py ... --tsbs-official-runner-report ...: passed 30/30",
+      "python bench_gate.py ... without --tsbs-official-runner-report: passed 30/30 via discovery",
+      "python bench_gate.py --gate-profile production_medium_strict_native.json ...: passed 30/30 via discovery"
+    ]
+  },
+  "result": {
+    "gate_integration": true,
+    "profile_defaults_enabled": true,
+    "required_query_types": [
+      "single-groupby-1-1-1",
+      "lastpoint",
+      "cpu-max-all-1",
+      "high-cpu-1",
+      "double-groupby-1",
+      "groupby-orderby-limit"
+    ],
+    "min_queries_per_type": 3,
+    "min_max_data_points": 100,
+    "require_results_validated": true,
+    "checks_added": [
+      "external_smoke.tsbs.official_runner.exists",
+      "external_smoke.tsbs.official_runner.status",
+      "external_smoke.tsbs.official_runner.query_types",
+      "external_smoke.tsbs.official_runner.queries_per_type",
+      "external_smoke.tsbs.official_runner.data_points",
+      "external_smoke.tsbs.official_runner.results_validated",
+      "external_smoke.tsbs.official_runner.query_results_validated"
+    ],
+    "official_tsbs_score": false
+  },
+  "remaining_blockers": [
+    "This gate integration covers official TSBS runner compatibility smoke only, not an official TSBS benchmark score.",
+    "Broader TSBS scale, longer duration, and oracle-level result correctness remain future production-readiness work.",
+    "Native memtier remains blocked until a real memtier_benchmark binary is available.",
+    "Full official LDBC mixed workload/update coverage remains separate from the command-mode isolation matrix."
+  ],
+  "next_task": "BENCHPROD-118 candidate: add an independent CH-benCHmark workload-shape gate or advance native memtier tooling from blocked to runnable."
+}

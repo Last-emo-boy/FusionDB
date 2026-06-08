@@ -1,5 +1,5 @@
 use fusiondb::common::Value;
-use fusiondb::execution::Executor;
+use fusiondb::execution::{Executor, QueryResult};
 use fusiondb::storage::memory::MemoryStorage;
 use fusiondb::storage::Storage;
 use std::sync::Arc;
@@ -17,6 +17,85 @@ async fn test_create_table() {
     )
     .await;
     assert!(msg.contains("created"));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_create_table_table_level_single_primary_key() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE table_pk (id INTEGER NOT NULL, name TEXT, PRIMARY KEY (id))",
+    )
+    .await;
+
+    let (cols, rows) = query(&executor, "EXPLAIN table_pk").await;
+    assert_eq!(cols, vec!["Field", "Type", "Key", "Index"]);
+    assert_eq!(rows[0][0], Value::String("id".to_string()));
+    assert_eq!(rows[0][2], Value::String("PRI".to_string()));
+    assert_eq!(rows[0][3], Value::String("BTree".to_string()));
+
+    exec_ok(&executor, "INSERT INTO table_pk VALUES (1, 'Alice')").await;
+    let (_, rows) = query(&executor, "SELECT name FROM table_pk WHERE id = 1").await;
+    assert_eq!(rows, vec![vec![Value::String("Alice".to_string())]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_create_table_table_level_composite_primary_key() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE composite_pk (w_id INTEGER, d_id INTEGER, name TEXT, PRIMARY KEY (w_id, d_id))",
+    )
+    .await;
+
+    let indexes = executor
+        .execute_sql("SHOW INDEXES FROM composite_pk")
+        .await
+        .unwrap();
+    if let Some(QueryResult::Select { rows, .. }) = indexes.first() {
+        assert!(rows.iter().any(|row| {
+            row[0] == Value::String("composite_pk_pkey".to_string())
+                && row[1] == Value::String("composite_pk".to_string())
+                && row[2] == Value::String("w_id,d_id".to_string())
+        }));
+    } else {
+        panic!("Expected Select result from SHOW INDEXES FROM");
+    }
+
+    exec_ok(
+        &executor,
+        "INSERT INTO composite_pk VALUES (1, 1, 'district-1')",
+    )
+    .await;
+    let stmts = executor
+        .prepare("INSERT INTO composite_pk VALUES (1, 1, 'duplicate')")
+        .unwrap();
+    let result = executor.execute(&stmts[0]).await;
+    assert!(result.is_err());
+    assert!(format!("{:?}", result.err().unwrap()).contains("PRIMARY KEY constraint violated"));
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT name FROM composite_pk WHERE w_id = 1 AND d_id = 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["name"]);
+    assert_eq!(rows, vec![vec![Value::String("district-1".to_string())]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_create_table_rejects_table_level_primary_key_not_first_column() {
+    let (executor, wal) = setup().await;
+    let stmts = executor
+        .prepare("CREATE TABLE table_pk_not_first (tenant INTEGER, id INTEGER, PRIMARY KEY (id))")
+        .unwrap();
+    let result = executor.execute(&stmts[0]).await;
+    assert!(result.is_err());
+    assert!(format!("{:?}", result.err().unwrap())
+        .contains("requires the primary key column to be the first column"));
     cleanup(&wal);
 }
 
@@ -369,6 +448,126 @@ async fn test_alter_table_rename_column() {
     assert!(cols.contains(&"new_name".to_string()));
     assert!(!cols.contains(&"old_name".to_string()));
     cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_alter_table_only_add_primary_key_pgbench_shape() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE pgbench_branches (bid INTEGER NOT NULL, bbalance INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO pgbench_branches VALUES (1, 0), (2, 10)",
+    )
+    .await;
+
+    let msg = exec_ok(
+        &executor,
+        "ALTER TABLE ONLY pgbench_branches ADD CONSTRAINT pgbench_branches_pkey PRIMARY KEY (bid)",
+    )
+    .await;
+    assert!(msg.contains("Added PRIMARY KEY pgbench_branches_pkey"));
+
+    let (cols, rows) = query(&executor, "EXPLAIN pgbench_branches").await;
+    assert_eq!(cols, vec!["Field", "Type", "Key", "Index"]);
+    assert_eq!(rows[0][0], Value::String("bid".to_string()));
+    assert_eq!(rows[0][2], Value::String("PRI".to_string()));
+    assert_eq!(rows[0][3], Value::String("BTree".to_string()));
+
+    let indexes = executor
+        .execute_sql("SHOW INDEXES FROM pgbench_branches")
+        .await
+        .unwrap();
+    if let Some(QueryResult::Select { rows, .. }) = indexes.first() {
+        assert!(rows.iter().any(|row| {
+            row[0] == Value::String("pgbench_branches_pkey".to_string())
+                && row[1] == Value::String("pgbench_branches".to_string())
+                && row[2] == Value::String("bid".to_string())
+        }));
+    } else {
+        panic!("Expected Select result from SHOW INDEXES FROM");
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT bbalance FROM pgbench_branches WHERE bid = 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["bbalance"]);
+    assert_eq!(rows, vec![vec![Value::Integer(10)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_alter_table_add_primary_key_rejects_existing_primary_key() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE already_pk (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+
+    let stmts = executor
+        .prepare("ALTER TABLE already_pk ADD CONSTRAINT already_pk_pkey PRIMARY KEY (id)")
+        .unwrap();
+    let result = executor.execute(&stmts[0]).await;
+    assert!(result.is_err());
+    assert!(format!("{:?}", result.err().unwrap()).contains("already has a PRIMARY KEY"));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_alter_table_add_primary_key_requires_first_column() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_not_first (tenant INTEGER, id INTEGER NOT NULL)",
+    )
+    .await;
+
+    let stmts = executor
+        .prepare("ALTER TABLE pk_not_first ADD CONSTRAINT pk_not_first_pkey PRIMARY KEY (id)")
+        .unwrap();
+    let result = executor.execute(&stmts[0]).await;
+    assert!(result.is_err());
+    assert!(format!("{:?}", result.err().unwrap())
+        .contains("requires the primary key column to be the first column"));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_alter_table_add_primary_key_rejects_existing_nulls() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_with_nulls (id INTEGER, name TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let key = "data:pk_with_nulls:manual_null";
+        let row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Null,
+            Value::String("bad".to_string()),
+        ]);
+        txn.put(key.as_bytes(), &row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let stmts = executor
+        .prepare("ALTER TABLE pk_with_nulls ADD CONSTRAINT pk_with_nulls_pkey PRIMARY KEY (id)")
+        .unwrap();
+    let result = executor.execute(&stmts[0]).await;
+    assert!(result.is_err());
+    assert!(format!("{:?}", result.err().unwrap()).contains("contains NULL values"));
+    cleanup(&wal_path);
 }
 
 #[tokio::test]

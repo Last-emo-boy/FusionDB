@@ -1,7 +1,8 @@
 use crate::common::{FusionError, Result, Value};
 use crate::storage::Transaction;
 use sqlparser::ast::{
-    CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Ident, Statement,
+    CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Ident, ObjectName,
+    ObjectNamePart, Statement,
 };
 use std::io::{Cursor, Read};
 
@@ -33,6 +34,18 @@ impl Default for CopyFromOptions {
 }
 
 impl Executor {
+    fn copy_trace_enabled() -> bool {
+        std::env::var("FUSIONDB_COPY_TRACE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    }
+
+    fn copy_trace(message: impl AsRef<str>) {
+        if Self::copy_trace_enabled() {
+            eprintln!("[copy-trace] {}", message.as_ref());
+        }
+    }
+
     pub(crate) async fn handle_copy(
         &self,
         source: &CopySource,
@@ -84,9 +97,19 @@ impl Executor {
         };
 
         let copy_options = Self::copy_from_options(options, legacy_options)?;
+        Self::copy_trace(format!(
+            "file copy read start table={} file={} csv={} delimiter={:?}",
+            table_name, filename, copy_options.format_csv, copy_options.delimiter as char
+        ));
         let rows = self.read_copy_file(filename, &copy_options)?;
+        let table_name = Self::copy_table_name(table_name)?;
+        Self::copy_trace(format!(
+            "file copy insert start table={} rows={}",
+            table_name,
+            rows.len()
+        ));
         let count = self
-            .insert_copy_rows(table_name.to_string(), columns, rows, txn)
+            .insert_copy_rows(table_name, columns, rows, txn)
             .await?;
 
         Ok(QueryResult::Success {
@@ -136,9 +159,38 @@ impl Executor {
         };
 
         let copy_options = Self::copy_from_options(options, legacy_options)?;
+        Self::copy_trace(format!(
+            "stdin copy read start statement={} bytes={} csv={} delimiter={:?}",
+            statement,
+            payload.len(),
+            copy_options.format_csv,
+            copy_options.delimiter as char
+        ));
         let rows = self.read_copy_bytes(payload, &copy_options)?;
-        self.insert_copy_rows(table_name.to_string(), columns, rows, txn)
-            .await
+        let table_name = Self::copy_table_name(table_name)?;
+        Self::copy_trace(format!(
+            "stdin copy insert start table={} columns={} rows={} first_row={:?}",
+            table_name,
+            columns.len(),
+            rows.len(),
+            rows.first()
+        ));
+        self.insert_copy_rows(table_name, columns, rows, txn).await
+    }
+
+    fn copy_table_name(table_name: &ObjectName) -> Result<String> {
+        table_name
+            .0
+            .last()
+            .and_then(ObjectNamePart::as_ident)
+            .map(|ident| ident.value.clone())
+            .ok_or_else(|| {
+                FusionError::Execution(format!("COPY table target {} is not supported", table_name))
+            })
+    }
+
+    fn copy_sql_identifier(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
     }
 
     fn copy_from_options(
@@ -318,9 +370,19 @@ impl Executor {
 
         let mut count = 0usize;
         for batch in rows.chunks(COPY_INSERT_BATCH_ROWS) {
+            Self::copy_trace(format!(
+                "copy batch insert start table={} batch_rows={} count_so_far={}",
+                table_name,
+                batch.len(),
+                count
+            ));
             self.insert_copy_batch(&table_name, columns, batch, txn)
                 .await?;
             count += batch.len();
+            Self::copy_trace(format!(
+                "copy batch insert done table={} count={}",
+                table_name, count
+            ));
         }
         Ok(count)
     }
@@ -352,15 +414,23 @@ impl Executor {
                 " ({})",
                 columns
                     .iter()
-                    .map(|column| column.value.as_str())
+                    .map(|column| Self::copy_sql_identifier(&column.value))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         };
         let sql = format!(
             "INSERT INTO {}{} VALUES {}",
-            table_name, column_list, values
+            Self::copy_sql_identifier(table_name),
+            column_list,
+            values
         );
+        Self::copy_trace(format!(
+            "copy batch parse insert table={} rows={} sql={}",
+            table_name,
+            rows.len(),
+            sql
+        ));
         let statements = crate::parser::parse_sql(&sql)?;
         let Some(Statement::Insert(insert)) = statements.first() else {
             return Err(FusionError::Execution(
@@ -370,7 +440,7 @@ impl Executor {
 
         let result = self
             .handle_insert(
-                insert.table.to_string(),
+                table_name.to_string(),
                 &insert.columns,
                 &insert.source,
                 &insert.returning,

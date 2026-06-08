@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-142-production-hardening",
+  "created_at": "2026-05-30",
+  "status": "planned",
+  "baseline": {
+    "medium_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod140_medium_explicit_q1_q22_20260529\\bench_gate_summary.json",
+    "strict_native_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod140_strict_explicit_q1_q22_20260529\\bench_gate_summary.json",
+    "chbenchmark_q1_q22": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_query_class_matrix_benchprod140_q1_q2_q3_q4_q5_q6_q7_q8_q9_q10_q11_q12_q13_q14_q15_q16_q17_q18_q19_q20_q21_q22_20260529\\chbenchmark_query_class_matrix_summary.json",
+    "chbenchmark_mixed_htap_60s": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_native_benchprod141_mixed_htap_60s_after_limit_fix_20260530\\chbenchmark_native_smoke_summary.json"
+  },
+  "tasks": [
+    {
+      "id": "BENCHPROD-142",
+      "title": "Recovery gate smoke",
+      "status": "done"
+    },
+    {
+      "id": "BENCHPROD-143",
+      "title": "CH-benCHmark longer mixed HTAP",
+      "status": "done",
+      "evidence": {
+        "chbenchmark_300s_t1": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_native_benchprod143_mixed_htap_300s_t1_20260530\\chbenchmark_native_smoke_summary.json",
+        "chbenchmark_300s_t2_gap": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_native_benchprod143_mixed_htap_300s_t2_20260530\\chbenchmark_native_smoke_summary.json",
+        "chbenchmark_120s_t2_after_40001": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_native_benchprod143_mixed_htap_120s_t2_after_40001_20260530\\chbenchmark_native_smoke_summary.json",
+        "chbenchmark_300s_t2_after_40001": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_native_benchprod143_mixed_htap_300s_t2_after_40001_20260530\\chbenchmark_native_smoke_summary.json",
+        "gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod143_medium_chbenchmark_300s_t2_40001_recovery_20260530\\bench_gate_summary.json"
+      }
+    },
+    {
+      "id": "BENCHPROD-144",
+      "title": "Native memtier completion",
+      "status": "pending"
+    },
+    {
+      "id": "BENCHPROD-145",
+      "title": "LDBC official-shape gap reduction",
+      "status": "pending"
+    },
+    {
+      "id": "BENCHPROD-146",
+      "title": "Larger-scale production repeat",
+      "status": "pending"
+    }
+  ]
+}

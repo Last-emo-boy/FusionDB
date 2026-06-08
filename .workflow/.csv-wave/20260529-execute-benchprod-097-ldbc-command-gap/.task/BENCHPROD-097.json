@@ -1,0 +1,17 @@
+{
+  "id": "BENCHPROD-097",
+  "title": "LDBC command-mode gap capture",
+  "status": "completed",
+  "description": "Add first-class LDBC PostgreSQL interactive command-mode support and capture the first real FusionDB compatibility gap beyond artifact/help readiness.",
+  "files": [
+    "E:/Playground/FusionDB-bench/ldbc_snb_native_smoke.py",
+    "E:/Playground/FusionDB-bench/README.md"
+  ],
+  "evidence": [
+    "E:/Playground/FusionDB-bench/runs/ldbc_snb_native_benchprod097_help_regression_20260529/ldbc_snb_native_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/ldbc_snb_native_benchprod097_postgres_interactive_command_flags_20260529/ldbc_snb_native_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod097_ldbc_command_gap_20260529/external_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod097_ldbc_command_gap_strict_20260529/bench_gate_summary.json"
+  ],
+  "result": "LDBC native smoke now reaches run_mode=command with the official PostgreSQL implementation jar. The captured blocker is FusionDB PgWire/JDBC transaction isolation metadata: SHOW TRANSACTION ISOLATION LEVEL does not return a result set for PostgreSQL JDBC/Hikari."
+}

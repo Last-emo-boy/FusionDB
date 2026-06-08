@@ -1,0 +1,114 @@
+{
+  "id": "BENCHPROD-077",
+  "title": "Optimize composite index metadata lookup with table-scoped directory",
+  "status": "completed",
+  "created_at": "2026-05-27T13:45:00+08:00",
+  "completed_at": "2026-05-27T14:05:00+08:00",
+  "scope": "database core DML and composite-index metadata lookup",
+  "target_cases": [
+    "tpcc:New order transaction",
+    "tpcc:Payment transaction",
+    "memtier:SET existing key",
+    "tsbs:Ingest one point",
+    "chbench:Hybrid OLTP/OLAP throughput"
+  ],
+  "baseline": {
+    "source": "BENCHPROD-076 production medium repeat",
+    "chbench_p95_median_ms": 10.547,
+    "ldbc_p95_median_ms": 2.127,
+    "memtier_p95_median_ms": 0.607,
+    "tpcc_p95_median_ms": 2.645,
+    "tsbs_p95_median_ms": 11.875,
+    "unstable_suites": 0,
+    "unstable_cases": 4,
+    "gate": "passed 22/22"
+  },
+  "implementation": {
+    "changed_files": [
+      "src/execution/composite_index.rs",
+      "src/execution/ddl/index.rs",
+      "src/execution/ddl/table.rs",
+      "tests/sql_dml.rs"
+    ],
+    "summary": [
+      "Added table-scoped composite index metadata keys under index_meta_table:<table>:.",
+      "CREATE TABLE writes a table metadata marker so new tables avoid legacy global index_meta scans.",
+      "CREATE INDEX rebuilds the table-scoped composite metadata directory while preserving legacy metadata values.",
+      "DROP INDEX and DROP TABLE clean table-scoped composite metadata.",
+      "DML loads composite metadata from the table directory when present and falls back to legacy scan for older tables.",
+      "Added regression coverage proving DML can maintain composite index entries after the global index_meta key is removed."
+    ]
+  },
+  "verification_results": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_dml composite_index -- --nocapture",
+      "status": "passed",
+      "tests": "2 passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache composite_index -- --nocapture",
+      "status": "passed",
+      "tests": "2 passed"
+    },
+    {
+      "command": "cargo test --test sql_dml -- --nocapture",
+      "status": "passed",
+      "tests": "24 passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed",
+      "tests": "35 passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod077_production_medium_composite_meta_3x_20260527 --suite-timeout 3600",
+      "status": "passed",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 2
+    },
+    {
+      "command": "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod077_production_medium_composite_meta_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod077_production_medium_composite_meta_20260527",
+      "status": "passed",
+      "checks": "22/22"
+    }
+  ],
+  "results": {
+    "production_repeat": {
+      "suite_status": "all_stable",
+      "matrix_passed": 3,
+      "case_errors": 0,
+      "unstable_suites": 0,
+      "unstable_cases": 2,
+      "chbench_p95_median_ms": 10.283,
+      "ldbc_p95_median_ms": 2.084,
+      "memtier_p95_median_ms": 0.653,
+      "tpcc_p95_median_ms": 2.73,
+      "tsbs_p95_median_ms": 12.016,
+      "report": "E:/Playground/FusionDB-bench/runs/repeat_benchprod077_production_medium_composite_meta_3x_20260527/stability/bench_stability_summary.md"
+    },
+    "gate": {
+      "status": "passed",
+      "checks": "22/22",
+      "report": "E:/Playground/FusionDB-bench/runs/gate_benchprod077_production_medium_composite_meta_20260527/bench_gate_summary.md"
+    }
+  },
+  "next_task_signals": [
+    "Production repeat still shows allowlisted low-latency variance in memtier SET and TPC-C stock level.",
+    "TSBS fleet rollup remains the largest suite-level latency contributor.",
+    "Continue with grouped aggregate and rollup path optimization, using production gate as the authoritative verifier."
+  ]
+}

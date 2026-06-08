@@ -1,0 +1,12 @@
+{
+  "id": "BENCHPROD-080",
+  "status": "completed",
+  "title": "LDBC PK probe projection and memtier update fast path",
+  "completed_at": "2026-05-27T18:17:15+08:00",
+  "artifacts": {
+    "ldbc_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod080_ldbc_medium_pk_probe_projection_5x_20260527",
+    "memtier_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod080_memtier_medium_pk_update_fast_5x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod080_production_medium_pk_probe_update_fast_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod080_production_medium_pk_probe_update_fast_5x_20260527/bench_gate_summary.md"
+  }
+}

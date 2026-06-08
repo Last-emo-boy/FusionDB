@@ -1,0 +1,13 @@
+{
+  "id": "BENCHPROD-081",
+  "status": "completed_with_followup",
+  "title": "CH-benCHmark customer order join group cache",
+  "completed_at": "2026-05-27T19:00:28+08:00",
+  "artifacts": {
+    "initial_chbench_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod081_chbench_medium_join_group_aggregate_3x_20260527",
+    "cached_chbench_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod081_chbench_medium_join_group_cache_3x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod081_production_medium_join_group_cache_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod081_production_medium_join_group_cache_5x_20260527/bench_gate_summary.md"
+  },
+  "followup": "BENCHPROD-082"
+}

@@ -1,0 +1,19 @@
+{
+  "id": "BENCHPROD-099",
+  "title": "LDBC schema/import preload",
+  "status": "completed",
+  "description": "Add bounded LDBC SNB schema/import adapter coverage so official PostgreSQL implementation tables exist before command-mode Query 1 execution.",
+  "files": [
+    "E:/Playground/FusionDB-bench/ldbc_snb_native_smoke.py",
+    "E:/Playground/FusionDB-bench/external_smoke.py",
+    "E:/Playground/FusionDB-bench/external_bootstrap.py",
+    "E:/Playground/FusionDB-bench/README.md"
+  ],
+  "evidence": [
+    "python -m py_compile external_bootstrap.py external_smoke.py ldbc_snb_native_smoke.py",
+    "E:/Playground/FusionDB-bench/runs/ldbc_snb_native_benchprod099_schema_preload_final_20260529/ldbc_snb_native_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod099_ldbc_schema_preload_env_20260529/external_smoke_summary.json",
+    "E:/Playground/FusionDB-bench/runs/gate_benchprod099_ldbc_schema_preload_strict_20260529/bench_gate_summary.json"
+  ],
+  "result": "LDBC native smoke can now create the official PostgreSQL implementation SNB table shape and load bounded test-data through JDBC CopyManager before command-mode execution. The official LDBC command progresses beyond missing table knows and now fails at Query 1 with FusionDB returning Invalid parameter placeholder: $1. Strict native gate remains failed, correctly, because LDBC native_status is gap and memtier/TSBS tools are not all available in the current PATH."
+}

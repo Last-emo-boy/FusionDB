@@ -1,0 +1,54 @@
+{
+  "id": "BENCHPROD-085",
+  "title": "PgWire protocol smoke readiness for production benchmark adapters",
+  "created_at": "2026-05-27T22:16:00+08:00",
+  "completed_at": "2026-05-27T22:29:11+08:00",
+  "status": "completed",
+  "scope": "BenchBase/JDBC/pgbench prerequisite protocol coverage in FusionDB-bench",
+  "target_areas": [
+    "PgWire startup/auth",
+    "Simple query",
+    "Extended Parse/Describe/Bind/Execute",
+    "DATE/TIMESTAMP/NUMERIC/INTERVAL metadata",
+    "COPY FROM STDIN CSV"
+  ],
+  "baseline_source": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod085_precheck_20260527/external_smoke_summary.md",
+  "constraints": [
+    "Do not claim official benchmark readiness from protocol smoke alone",
+    "Do not require psql/psycopg/JDBC artifacts for the first local smoke",
+    "Keep smoke self-contained and repeatable from FusionDB-bench"
+  ],
+  "steps": [
+    {
+      "step": "Precheck external benchmark tool/artifact availability",
+      "status": "completed"
+    },
+    {
+      "step": "Implement direct PgWire socket smoke",
+      "status": "completed"
+    },
+    {
+      "step": "Validate PgWire smoke against release FusionDB",
+      "status": "completed"
+    },
+    {
+      "step": "Document PgWire smoke in bench README",
+      "status": "completed"
+    }
+  ],
+  "result_summary": {
+    "benchmark_changes": [
+      "added pgwire_smoke.py as a self-contained PostgreSQL wire protocol smoke runner",
+      "validated cleartext auth, simple query, extended query metadata, parameterized execution, and COPY FROM STDIN CSV",
+      "documented pgwire_smoke.py usage in FusionDB-bench README"
+    ],
+    "tests": [
+      "python -m py_compile pgwire_smoke.py fusiondb_bench.py bench_repeat.py bench_stability.py bench_gate.py fusiondb_matrix.py external_smoke.py external_bootstrap.py",
+      "python pgwire_smoke.py --run-name pgwire_smoke_benchprod085_final_20260527"
+    ],
+    "external_precheck": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod085_precheck_20260527/external_smoke_summary.md",
+    "pgwire_smoke": "E:/Playground/FusionDB-bench/runs/pgwire_smoke_benchprod085_final_20260527/pgwire_smoke_summary.md",
+    "pgwire_smoke_status": "passed 8/8"
+  },
+  "followup": "BENCHPROD-086"
+}

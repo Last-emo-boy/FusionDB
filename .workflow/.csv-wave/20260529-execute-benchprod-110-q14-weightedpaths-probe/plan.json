@@ -1,0 +1,76 @@
+{
+  "id": "BENCHPROD-110",
+  "title": "Optimize LDBC Q14 weightedpaths expression-key indexed probe",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-109 where full test-data Q14 profiler isolated the active bottleneck to weightedpaths",
+      "status": "completed"
+    },
+    {
+      "step": "Add optional Q14 message indexes to the profiler harness and verify indexes alone do not solve the weightedpaths timeout",
+      "status": "completed"
+    },
+    {
+      "step": "Teach join planning to use indexed right-table probes when the left join key is an expression such as e[1]",
+      "status": "completed"
+    },
+    {
+      "step": "Preserve join projection pushdown and keyed probe decode safety for corrupted unused-column regressions",
+      "status": "completed"
+    },
+    {
+      "step": "Add focused regression coverage for p.creator_id = e[1] indexed expression probes",
+      "status": "completed"
+    },
+    {
+      "step": "Run Rust regression tests and release build",
+      "status": "completed"
+    },
+    {
+      "step": "Re-run prefix40 and full test-data Q14 profiler with indexes enabled",
+      "status": "completed"
+    },
+    {
+      "step": "Record evidence without claiming full native LDBC pass",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "bench_script": "E:\\Playground\\FusionDB-bench\\ldbc_q14_profile.py",
+    "pre_optimization_index_only_full_profile": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_q14_profile_benchprod110_full_testdata_indexes_20260529\\ldbc_q14_profile_summary.json",
+    "prefix40_expr_probe_profile": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_q14_profile_benchprod110_prefix40_indexes_20260529\\ldbc_q14_profile_summary.json",
+    "full_testdata_expr_probe_profile": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_q14_profile_benchprod110_full_testdata_expr_probe_20260529\\ldbc_q14_profile_summary.json",
+    "rust_verification": [
+      "cargo fmt --check: passed",
+      "cargo test --test sql_join -- --nocapture: 22/22 passed",
+      "cargo test --test sql_set_subquery -- --nocapture: 33/33 passed",
+      "cargo test --release --test pg_integration -- --nocapture: 27/27 passed",
+      "cargo build --release --bin fusiondb: passed"
+    ]
+  },
+  "result": {
+    "ldbc_full_native_pass": false,
+    "q14_profiler_full_testdata_pass": true,
+    "weightedpaths_before": {
+      "status": "gap",
+      "error": "command timed out after 90 seconds",
+      "run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_q14_profile_benchprod110_full_testdata_indexes_20260529\\ldbc_q14_profile_summary.json"
+    },
+    "weightedpaths_after": {
+      "status": "passed",
+      "elapsed_ms": 1116,
+      "weighted_path_count": 7,
+      "run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_q14_profile_benchprod110_full_testdata_expr_probe_20260529\\ldbc_q14_profile_summary.json"
+    },
+    "current_frontier": "Q14 weightedpaths profiler stage is no longer timing out on full test-data for the target pair. This remains targeted profiler evidence, not a full official/native LDBC workload pass."
+  },
+  "remaining_blockers": [
+    "Full native LDBC workload has not been reclassified as passed by this task.",
+    "Profiler success covers the Q14 target pair and staged query shape, not the full LDBC operation mix.",
+    "The LDBC PostgreSQL implementation command-mode update-query coverage remains unproven from earlier runs.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-111 candidate: run the native LDBC smoke with Q14 enabled after the weightedpaths fix and separate any remaining workload-driver blockers from database execution blockers."
+}

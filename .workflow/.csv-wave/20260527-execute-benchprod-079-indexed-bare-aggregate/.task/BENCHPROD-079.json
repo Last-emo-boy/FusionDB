@@ -1,0 +1,11 @@
+{
+  "id": "BENCHPROD-079",
+  "status": "completed",
+  "title": "Indexed filtered bare aggregate optimization",
+  "completed_at": "2026-05-27T17:38:32+08:00",
+  "artifacts": {
+    "targeted_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod079_tpcc_tsbs_medium_indexed_bareagg_3x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod079_production_medium_indexed_bareagg_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod079_production_medium_indexed_bareagg_5x_20260527/bench_gate_summary.md"
+  }
+}

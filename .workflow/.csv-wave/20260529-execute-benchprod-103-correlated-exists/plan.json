@@ -1,0 +1,48 @@
+{
+  "id": "BENCHPROD-103",
+  "title": "Correlated EXISTS / NOT EXISTS support for LDBC Query 14 frontier",
+  "date": "2026-05-29",
+  "status": "completed_with_next_gap",
+  "steps": [
+    {
+      "step": "Confirm BENCHPROD-102 blocker and current subquery materialization behavior",
+      "status": "completed"
+    },
+    {
+      "step": "Defer EXISTS / NOT EXISTS predicates that require an outer row",
+      "status": "completed"
+    },
+    {
+      "step": "Evaluate deferred EXISTS / NOT EXISTS predicates after scan/join row construction",
+      "status": "completed"
+    },
+    {
+      "step": "Add correlated NOT EXISTS regression coverage for CTE and LDBC join-alias shapes",
+      "status": "completed"
+    },
+    {
+      "step": "Run targeted SQL tests, release build, pg integration, and non-isolation LDBC smoke",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "sql_set_subquery": "cargo test --test sql_set_subquery: 18 passed",
+    "sql_join_targeted": "cargo test --test sql_join test_comma_join_projection_keeps_right_columns_without_join_pushdown: passed",
+    "fmt": "cargo fmt --check: passed",
+    "release_binary": "cargo build --release --bin fusiondb: passed",
+    "pg_integration_release": "cargo test --release --test pg_integration: 25 passed",
+    "ldbc_correlated_exists_frontier": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod103_correlated_exists_frontier_20rows_10ops_20260529\\ldbc_snb_native_smoke_summary.json"
+  },
+  "result": {
+    "correlated_exists_subset_supported": true,
+    "ldbc_full_native_pass": false,
+    "ldbc_frontier": "LDBC Query 14 executes past Column k_person2id not found and now times out after one operation at 180 seconds"
+  },
+  "remaining_blockers": [
+    "LDBC Query 14 recursive path expansion can run for longer than the smoke timeout with current naive per-row EXISTS execution",
+    "LDBC Query 14 array concatenation and multidimensional array access are still incomplete production risks",
+    "LDBC Query 14 generate_subscripts and weighted path aggregation remain unproven",
+    "native memtier real tool/probe missing"
+  ],
+  "next_task": "BENCHPROD-104: isolate LDBC Query 14 timeout with targeted SQL/profiling, then decide between recursion bound/pruning and array SQL support"
+}

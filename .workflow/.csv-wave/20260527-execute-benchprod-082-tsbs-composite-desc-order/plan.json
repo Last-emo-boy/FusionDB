@@ -1,0 +1,37 @@
+{
+  "id": "BENCHPROD-082",
+  "title": "TSBS composite DESC order scan",
+  "created_at": "2026-05-27T19:01:00+08:00",
+  "completed_at": "2026-05-27T19:11:38+08:00",
+  "status": "completed",
+  "scope": "database core composite index ordered scan for latest time-series reads",
+  "target_cases": [
+    "tsbs:Latest points for host"
+  ],
+  "baseline_source": "E:/Playground/FusionDB-bench/runs/gate_benchprod081_production_medium_join_group_cache_5x_20260527/bench_gate_summary.md",
+  "constraints": [
+    "Do not modify benchmark thresholds or gate profiles as an optimization lever",
+    "Keep benchmark artifacts under E:/Playground/FusionDB-bench/runs",
+    "Verify targeted TSBS repeat before production medium repeat",
+    "Use production medium gate as authoritative verifier"
+  ],
+  "result_summary": {
+    "database_changes": [
+      "extended composite index scan order matching to detect next-column ORDER BY direction",
+      "supported ordered composite index scans for equality-prefix plus ORDER BY next column DESC LIMIT N",
+      "reversed and truncated ordered row ids so latest-point queries avoid decoding older rows"
+    ],
+    "tests": [
+      "cargo fmt --check",
+      "cargo check --lib",
+      "cargo test --test sql_index_cache -- --nocapture",
+      "cargo test --test sql_join -- --nocapture",
+      "python -m py_compile bench_stability.py bench_gate.py bench_repeat.py fusiondb_matrix.py fusiondb_bench.py",
+      "cargo build --release --bin fusiondb"
+    ],
+    "targeted_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod082_tsbs_medium_composite_desc_5x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod082_production_medium_composite_desc_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod082_production_medium_composite_desc_5x_20260527/bench_gate_summary.md",
+    "production_gate_status": "passed 22/22"
+  }
+}

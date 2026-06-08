@@ -1,0 +1,8 @@
+task,status,evidence
+chbenchmark_mixed_htap_60s_jdk17,gap,"E:\Playground\FusionDB-bench\runs\chbenchmark_native_benchprod141_mixed_htap_60s_20260529\chbenchmark_native_smoke_summary.json"
+chbenchmark_mixed_htap_60s_jdk23_initial,gap,"E:\Playground\FusionDB-bench\runs\chbenchmark_native_benchprod141_mixed_htap_60s_jdk23_20260529\chbenchmark_native_smoke_summary.json"
+chbenchmark_mixed_htap_60s_after_limit_fix,passed,"E:\Playground\FusionDB-bench\runs\chbenchmark_native_benchprod141_mixed_htap_60s_after_limit_fix_20260530\chbenchmark_native_smoke_summary.json"
+sql_dml_regression,passed,"cargo test --test sql_dml"
+sql_index_cache_regression,passed,"cargo test --test sql_index_cache"
+cargo_check,passed,"cargo check"
+release_build,passed,"cargo build --release --bin fusiondb"

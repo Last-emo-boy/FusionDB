@@ -8,8 +8,65 @@ use std::collections::{HashMap, HashSet};
 use super::Executor;
 
 const JOIN_INDEX_PROBE_THRESHOLD: usize = 128;
+const JOIN_UNIQUE_INDEX_PROBE_THRESHOLD: usize = 16_384;
+
+struct ExprJoinProbePlan {
+    left_expr: Expr,
+    right_key_index: usize,
+    residual_expr: Option<Expr>,
+}
+
+struct ExprHashJoinPlan {
+    left_key_index: usize,
+    right_expr: Expr,
+    residual_expr: Option<Expr>,
+}
+
+struct CommaJoinRelationPlan {
+    table: TableWithJoins,
+    schema: TableSchema,
+    row_count: usize,
+}
 
 impl Executor {
+    fn apply_generate_subscripts_join(
+        &self,
+        left_schema: &TableSchema,
+        left_rows: Vec<Vec<Value>>,
+        relation: &TableFactor,
+        params: &[Value],
+        projection: &Option<Vec<String>>,
+    ) -> Result<Option<(TableSchema, Vec<Vec<Value>>)>> {
+        let Some(right_schema) = Self::generate_subscripts_schema(relation) else {
+            return Ok(None);
+        };
+        let mut prefixed_right_schema = right_schema.clone();
+        self.prefix_schema_columns(&mut prefixed_right_schema, relation)?;
+
+        let mut columns = left_schema.columns.clone();
+        columns.extend(prefixed_right_schema.columns.clone());
+        let joined_schema = TableSchema::new("join_result".to_string(), columns);
+        let mut joined_rows = Vec::new();
+
+        for left_row in left_rows {
+            let Some(result) =
+                self.evaluate_generate_subscripts(relation, &left_row, left_schema, params)
+            else {
+                return Ok(None);
+            };
+            let (_, right_rows) = result?;
+            for right_row in right_rows {
+                let mut row = Vec::with_capacity(left_row.len() + right_row.len());
+                row.extend_from_slice(&left_row);
+                row.extend(right_row);
+                joined_rows.push(row);
+            }
+        }
+
+        self.project_join_rows(joined_schema, joined_rows, projection)
+            .map(Some)
+    }
+
     async fn scan_join_base(
         &self,
         relation: &TableFactor,
@@ -20,17 +77,17 @@ impl Executor {
         params: &[Value],
     ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
         if projection.is_none() {
-            return self.scan_table_base(relation, txn).await;
+            return self.scan_table_base(relation, txn, params).await;
         }
 
         let TableFactor::Table { name, .. } = relation else {
-            return self.scan_table_base(relation, txn).await;
+            return self.scan_table_base(relation, txn, params).await;
         };
 
         let table_name = name.to_string();
         let schema_key = format!("schema:{}", table_name);
         let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
-            return self.scan_table_base(relation, txn).await;
+            return self.scan_table_base(relation, txn, params).await;
         };
 
         let schema: TableSchema = bincode::deserialize(&schema_bytes)
@@ -46,7 +103,7 @@ impl Executor {
         );
 
         let Some(stage_projection) = stage_projection else {
-            return self.scan_table_base(relation, txn).await;
+            return self.scan_table_base(relation, txn, params).await;
         };
 
         let base_projection: Vec<String> = stage_projection
@@ -59,7 +116,7 @@ impl Executor {
             .collect();
 
         if base_projection.is_empty() || base_projection.len() >= schema.columns.len() {
-            return self.scan_table_base(relation, txn).await;
+            return self.scan_table_base(relation, txn, params).await;
         }
 
         self.scan_single_table(
@@ -78,11 +135,19 @@ impl Executor {
 
     pub(crate) fn relation_names(&self, relation: &TableFactor) -> HashSet<String> {
         let mut names = HashSet::with_capacity(2);
-        if let TableFactor::Table { name, alias, .. } = relation {
-            names.insert(name.to_string());
-            if let Some(alias) = alias {
-                names.insert(alias.name.value.clone());
+        match relation {
+            TableFactor::Table { name, alias, .. } => {
+                names.insert(name.to_string());
+                if let Some(alias) = alias {
+                    names.insert(alias.name.value.clone());
+                }
             }
+            TableFactor::Derived { alias, .. } => {
+                if let Some(alias) = alias {
+                    names.insert(alias.name.value.clone());
+                }
+            }
+            _ => {}
         }
         names
     }
@@ -161,6 +226,155 @@ impl Executor {
                 Self::combine_predicates(residual),
             ))
         }
+    }
+
+    fn extract_expr_join_probe(
+        &self,
+        expr: &Expr,
+        left_schema: &TableSchema,
+        right_schema: &TableSchema,
+    ) -> Option<ExprJoinProbePlan> {
+        let predicates = Self::collect_conjunctive_predicates(expr);
+        let mut residual = Vec::with_capacity(predicates.len());
+        let mut probe = None;
+
+        for predicate in predicates {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = &predicate
+            else {
+                residual.push(predicate);
+                continue;
+            };
+
+            let left_in_right = self.resolve_schema_column_index_strict(left, right_schema);
+            let right_in_right = self.resolve_schema_column_index_strict(right, right_schema);
+
+            if probe.is_none()
+                && left_in_right.is_none()
+                && right_in_right.is_some()
+                && !matches!(
+                    left.as_ref(),
+                    Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+                )
+                && self.expr_uses_only_schema(left, left_schema, right_schema)
+            {
+                probe = Some((left.as_ref().clone(), right_in_right.unwrap()));
+                continue;
+            }
+
+            if probe.is_none()
+                && right_in_right.is_none()
+                && left_in_right.is_some()
+                && !matches!(
+                    right.as_ref(),
+                    Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+                )
+                && self.expr_uses_only_schema(right, left_schema, right_schema)
+            {
+                probe = Some((right.as_ref().clone(), left_in_right.unwrap()));
+                continue;
+            }
+
+            residual.push(predicate);
+        }
+
+        let (left_expr, right_key_index) = probe?;
+        let column = &right_schema.columns[right_key_index];
+        if !(column.is_primary || (column.is_indexed && column.index_type == IndexType::BTree)) {
+            return None;
+        }
+
+        Some(ExprJoinProbePlan {
+            left_expr,
+            right_key_index,
+            residual_expr: Self::combine_predicates(residual),
+        })
+    }
+
+    fn extract_expr_hash_join(
+        &self,
+        expr: &Expr,
+        left_schema: &TableSchema,
+        right_schema: &TableSchema,
+    ) -> Option<ExprHashJoinPlan> {
+        let predicates = Self::collect_conjunctive_predicates(expr);
+        let mut residual = Vec::with_capacity(predicates.len());
+        let mut plan = None;
+
+        for predicate in predicates {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = &predicate
+            else {
+                residual.push(predicate);
+                continue;
+            };
+
+            if plan.is_none() {
+                if let Some(left_key_index) =
+                    self.resolve_schema_column_index_strict(left, left_schema)
+                {
+                    if self
+                        .resolve_schema_column_index_strict(right, left_schema)
+                        .is_none()
+                        && self
+                            .resolve_schema_column_index_strict(right, right_schema)
+                            .is_none()
+                        && self.expr_uses_only_schema(right, right_schema, left_schema)
+                    {
+                        plan = Some((left_key_index, right.as_ref().clone()));
+                        continue;
+                    }
+                }
+
+                if let Some(left_key_index) =
+                    self.resolve_schema_column_index_strict(right, left_schema)
+                {
+                    if self
+                        .resolve_schema_column_index_strict(left, left_schema)
+                        .is_none()
+                        && self
+                            .resolve_schema_column_index_strict(left, right_schema)
+                            .is_none()
+                        && self.expr_uses_only_schema(left, right_schema, left_schema)
+                    {
+                        plan = Some((left_key_index, left.as_ref().clone()));
+                        continue;
+                    }
+                }
+            }
+
+            residual.push(predicate);
+        }
+
+        let (left_key_index, right_expr) = plan?;
+        Some(ExprHashJoinPlan {
+            left_key_index,
+            right_expr,
+            residual_expr: Self::combine_predicates(residual),
+        })
+    }
+
+    fn expr_uses_only_schema(
+        &self,
+        expr: &Expr,
+        target_schema: &TableSchema,
+        other_schema: &TableSchema,
+    ) -> bool {
+        let mut columns = HashSet::new();
+        self.extract_columns_from_expr(expr, &mut columns);
+        if columns.is_empty() {
+            return false;
+        }
+        columns.iter().all(|column| {
+            self.schema_contains_column_name_strict(column, target_schema)
+                && !self.schema_contains_column_name_strict(column, other_schema)
+        })
     }
 
     fn row_key(row: &[Value], indices: &[usize]) -> Vec<Value> {
@@ -503,35 +717,22 @@ impl Executor {
         }
     }
 
-    fn projection_requires_column(
-        &self,
-        projection: &Option<Vec<String>>,
-        schema: &TableSchema,
-        column_idx: usize,
-    ) -> bool {
-        let Some(columns) = projection.as_ref() else {
-            return true;
-        };
-        let target_name = &schema.columns[column_idx].name;
-        columns.iter().any(|column| {
-            if column == target_name {
-                return true;
-            }
-            if column.contains('.') {
-                return false;
-            }
-            self.resolve_column_index(column, schema)
-                .is_ok_and(|index| index == column_idx)
-        })
-    }
-
     fn remove_projection_column(
         &self,
         projection: &Option<Vec<String>>,
         schema: &TableSchema,
         column_idx: usize,
     ) -> Option<Vec<String>> {
-        let columns = projection.as_ref()?;
+        let Some(columns) = projection.as_ref() else {
+            let filtered = schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != column_idx)
+                .map(|(_, column)| column.name.clone())
+                .collect::<Vec<_>>();
+            return Some(filtered);
+        };
         let filtered = columns
             .iter()
             .filter(|column| {
@@ -576,18 +777,304 @@ impl Executor {
         left_rows_len: usize,
         distinct_probe_keys: usize,
         limit: Option<usize>,
+        unique_probe_key: bool,
     ) -> bool {
         distinct_probe_keys > 0
             && (left_rows_len <= JOIN_INDEX_PROBE_THRESHOLD
                 || distinct_probe_keys <= JOIN_INDEX_PROBE_THRESHOLD
-                || limit.is_some_and(|value| value <= JOIN_INDEX_PROBE_THRESHOLD))
+                || limit.is_some_and(|value| value <= JOIN_INDEX_PROBE_THRESHOLD)
+                || (unique_probe_key && distinct_probe_keys <= JOIN_UNIQUE_INDEX_PROBE_THRESHOLD))
     }
 
     fn combine_optional_predicates(predicates: Vec<Option<Expr>>) -> Option<Expr> {
         Self::combine_predicates(predicates.into_iter().flatten().collect())
     }
 
-    fn filter_rows_with_expr(
+    async fn reorder_comma_join_from(
+        &self,
+        from: &[TableWithJoins],
+        selection: &Option<Expr>,
+        _projection: &Option<Vec<String>>,
+        _has_deferred_subquery_filter: bool,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<Vec<TableWithJoins>>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        if from.len() < 3 || from.iter().any(|table| !table.joins.is_empty()) {
+            return Ok(None);
+        }
+
+        let mut relations = Vec::with_capacity(from.len());
+        let mut passthrough = Vec::new();
+        for (original_index, table) in from.iter().enumerate() {
+            let TableFactor::Table { name, args, .. } = &table.relation else {
+                passthrough.push((original_index, table.clone()));
+                continue;
+            };
+            if args.is_some() {
+                return Ok(None);
+            };
+            let table_name = name.to_string();
+            let schema_key = format!("schema:{}", name);
+            let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
+                return Ok(None);
+            };
+            let mut schema: TableSchema = bincode::deserialize(&schema_bytes).map_err(|e| {
+                FusionError::Execution(format!("Schema deserialization error: {}", e))
+            })?;
+            self.prefix_schema_columns(&mut schema, &table.relation)?;
+            let data_prefix = format!("data:{}:", table_name);
+            let row_count = txn
+                .count_prefix(data_prefix.as_bytes())
+                .await
+                .unwrap_or(usize::MAX);
+            relations.push(CommaJoinRelationPlan {
+                table: table.clone(),
+                schema,
+                row_count,
+            });
+        }
+
+        if relations.len() < 3 {
+            return Ok(None);
+        }
+
+        let predicates = Self::collect_conjunctive_predicates(selection);
+        let relation_count = relations.len();
+        let mut local_counts = vec![0usize; relation_count];
+        let mut edge_counts = vec![vec![0usize; relation_count]; relation_count];
+        let schemas = relations
+            .iter()
+            .map(|relation| relation.schema.clone())
+            .collect::<Vec<_>>();
+
+        for predicate in &predicates {
+            let Some(members) = self.predicate_schema_members(predicate, &schemas) else {
+                continue;
+            };
+
+            if members.len() == 1 {
+                local_counts[members[0]] += 1;
+            } else if members.len() == 2 {
+                edge_counts[members[0]][members[1]] += 1;
+                edge_counts[members[1]][members[0]] += 1;
+            }
+        }
+
+        let has_join_edge = edge_counts
+            .iter()
+            .any(|row| row.iter().any(|count| *count > 0));
+        if !has_join_edge {
+            return Ok(None);
+        }
+
+        let degree =
+            |index: usize, edge_counts: &[Vec<usize>]| -> usize { edge_counts[index].iter().sum() };
+
+        let mut remaining = vec![true; relation_count];
+        let mut order = Vec::with_capacity(relation_count);
+        let mut first = 0usize;
+        let mut first_score = 0usize;
+        let mut first_rows = usize::MAX;
+        for index in 0..relation_count {
+            let score = local_counts[index]
+                .saturating_mul(100)
+                .saturating_add(degree(index, &edge_counts));
+            let rows = relations[index].row_count;
+            if score > first_score
+                || (score == first_score && rows < first_rows)
+                || (score == first_score && rows == first_rows && index > first)
+            {
+                first = index;
+                first_score = score;
+                first_rows = rows;
+            }
+        }
+        remaining[first] = false;
+        order.push(first);
+
+        while remaining.iter().any(|value| *value) {
+            let mut next = None;
+            let mut next_score = 0usize;
+            let mut next_rows = usize::MAX;
+            for candidate in 0..relation_count {
+                if !remaining[candidate] {
+                    continue;
+                }
+                let connected_edges = order
+                    .iter()
+                    .map(|placed| edge_counts[candidate][*placed])
+                    .sum::<usize>();
+                let score = connected_edges
+                    .saturating_mul(1000)
+                    .saturating_add(local_counts[candidate].saturating_mul(100))
+                    .saturating_add(degree(candidate, &edge_counts));
+                let rows = relations[candidate].row_count;
+                if next.is_none()
+                    || score > next_score
+                    || (score == next_score && rows < next_rows)
+                    || (score == next_score
+                        && rows == next_rows
+                        && candidate > next.unwrap_or(candidate))
+                {
+                    next = Some(candidate);
+                    next_score = score;
+                    next_rows = rows;
+                }
+            }
+            let next = next.unwrap();
+            remaining[next] = false;
+            order.push(next);
+        }
+
+        let mut reordered: Vec<TableWithJoins> = order
+            .iter()
+            .map(|index| relations[*index].table.clone())
+            .collect();
+        passthrough.sort_by_key(|(original_index, _)| *original_index);
+        reordered.extend(passthrough.into_iter().map(|(_, table)| table));
+
+        let changed = reordered
+            .iter()
+            .zip(from.iter())
+            .any(|(left, right)| left.relation != right.relation);
+        if !changed {
+            return Ok(None);
+        }
+
+        Ok(Some(reordered))
+    }
+
+    fn predicate_schema_members(&self, expr: &Expr, schemas: &[TableSchema]) -> Option<Vec<usize>> {
+        let mut columns = HashSet::new();
+        self.extract_columns_from_expr(expr, &mut columns);
+        if columns.is_empty() {
+            return None;
+        }
+
+        let mut members = HashSet::new();
+        for column in columns {
+            let mut matched = false;
+            for (index, schema) in schemas.iter().enumerate() {
+                if self.schema_contains_column_name_strict(&column, schema) {
+                    members.insert(index);
+                    matched = true;
+                }
+            }
+            if !matched {
+                return None;
+            }
+        }
+
+        let mut members = members.into_iter().collect::<Vec<_>>();
+        members.sort_unstable();
+        Some(members)
+    }
+
+    fn schema_contains_column_name_strict(&self, col_name: &str, schema: &TableSchema) -> bool {
+        if col_name.contains('.') {
+            schema
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(col_name))
+        } else {
+            self.resolve_column_index(col_name, schema).is_ok()
+        }
+    }
+
+    fn predicate_schema_membership(&self, expr: &Expr, schema: &TableSchema) -> Option<bool> {
+        let mut columns = HashSet::new();
+        self.extract_columns_from_expr(expr, &mut columns);
+        if columns.is_empty() {
+            return None;
+        }
+
+        Some(
+            columns
+                .iter()
+                .any(|column| self.schema_contains_column_name_strict(column, schema)),
+        )
+    }
+
+    fn predicate_uses_only_target_schema(
+        &self,
+        expr: &Expr,
+        target_schema: &TableSchema,
+        other_schema: &TableSchema,
+    ) -> bool {
+        let mut columns = HashSet::new();
+        self.extract_columns_from_expr(expr, &mut columns);
+        if columns.is_empty() {
+            return false;
+        }
+
+        columns.iter().all(|column| {
+            self.schema_contains_column_name_strict(column, target_schema)
+                && !self.schema_contains_column_name_strict(column, other_schema)
+        })
+    }
+
+    fn predicate_spans_schema_pair(
+        &self,
+        expr: &Expr,
+        left_schema: &TableSchema,
+        right_schema: &TableSchema,
+    ) -> bool {
+        matches!(
+            (
+                self.predicate_schema_membership(expr, left_schema),
+                self.predicate_schema_membership(expr, right_schema),
+            ),
+            (Some(true), Some(true))
+        )
+    }
+
+    fn take_exclusive_schema_predicate(
+        &self,
+        predicates: &mut Vec<Expr>,
+        target_schema: &TableSchema,
+        other_schema: &TableSchema,
+    ) -> Option<Expr> {
+        let predicate_count = predicates.len();
+        let mut local = Vec::with_capacity(predicate_count);
+        let mut remaining = Vec::with_capacity(predicate_count);
+
+        for predicate in predicates.drain(..) {
+            if self.predicate_uses_only_target_schema(&predicate, target_schema, other_schema) {
+                local.push(predicate);
+            } else {
+                remaining.push(predicate);
+            }
+        }
+
+        *predicates = remaining;
+        Self::combine_predicates(local)
+    }
+
+    fn take_schema_pair_predicates(
+        &self,
+        predicates: &mut Vec<Expr>,
+        left_schema: &TableSchema,
+        right_schema: &TableSchema,
+    ) -> Vec<Expr> {
+        let predicate_count = predicates.len();
+        let mut join_predicates = Vec::with_capacity(predicate_count);
+        let mut remaining = Vec::with_capacity(predicate_count);
+
+        for predicate in predicates.drain(..) {
+            if self.predicate_spans_schema_pair(&predicate, left_schema, right_schema) {
+                join_predicates.push(predicate);
+            } else {
+                remaining.push(predicate);
+            }
+        }
+
+        *predicates = remaining;
+        join_predicates
+    }
+
+    pub(super) fn filter_rows_with_expr(
         &self,
         rows: Vec<Vec<Value>>,
         schema: &TableSchema,
@@ -608,20 +1095,26 @@ impl Executor {
         schema: &mut TableSchema,
         relation: &TableFactor,
     ) -> Result<()> {
-        if let TableFactor::Table { name, alias, .. } = relation {
-            let prefix = if let Some(a) = alias {
-                a.name.value.clone()
-            } else {
-                name.to_string()
-            };
+        let prefix = match relation {
+            TableFactor::Table { name, alias, .. } => alias
+                .as_ref()
+                .map(|alias| alias.name.value.clone())
+                .unwrap_or_else(|| name.to_string()),
+            TableFactor::Derived { alias, .. } => {
+                let Some(alias) = alias else {
+                    return Ok(());
+                };
+                alias.name.value.clone()
+            }
+            _ => return Ok(()),
+        };
 
-            for col in &mut schema.columns {
+        for col in &mut schema.columns {
+            if !col.name.contains('.') {
                 col.name = format!("{}.{}", prefix, col.name);
             }
-            Ok(())
-        } else {
-            Ok(())
         }
+        Ok(())
     }
 
     async fn apply_join_step(
@@ -651,9 +1144,15 @@ impl Executor {
             left_rows = self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
         }
 
-        let where_right = self.take_relation_predicate(pending_predicates, &right_relation_names);
-        let join_right = self.take_relation_predicate(&mut join_predicates, &right_relation_names);
-        let right_selection = Self::combine_optional_predicates(vec![where_right, join_right]);
+        if let Some(result) = self.apply_generate_subscripts_join(
+            &left_schema,
+            left_rows.clone(),
+            relation,
+            params,
+            projection,
+        )? {
+            return Ok(result);
+        }
 
         let right_table_name = match relation {
             TableFactor::Table { name, .. } => Some(name.to_string()),
@@ -673,6 +1172,42 @@ impl Executor {
             None
         };
 
+        let right_schema_for_predicates = schema_for_probe
+            .as_ref()
+            .map(|schema| {
+                let mut prefixed = schema.clone();
+                self.prefix_schema_columns(&mut prefixed, relation)?;
+                Ok::<TableSchema, FusionError>(prefixed)
+            })
+            .transpose()?;
+
+        if let Some(right_schema) = &right_schema_for_predicates {
+            if let Some(left_local) =
+                self.take_exclusive_schema_predicate(pending_predicates, &left_schema, right_schema)
+            {
+                left_rows =
+                    self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
+            }
+
+            if join_operator.is_none() {
+                join_predicates.extend(self.take_schema_pair_predicates(
+                    pending_predicates,
+                    &left_schema,
+                    right_schema,
+                ));
+            }
+        }
+
+        let where_right = self.take_relation_predicate(pending_predicates, &right_relation_names);
+        let where_right_schema = right_schema_for_predicates
+            .as_ref()
+            .and_then(|right_schema| {
+                self.take_exclusive_schema_predicate(pending_predicates, right_schema, &left_schema)
+            });
+        let join_right = self.take_relation_predicate(&mut join_predicates, &right_relation_names);
+        let right_selection =
+            Self::combine_optional_predicates(vec![where_right, where_right_schema, join_right]);
+
         let is_left_outer = matches!(
             join_operator,
             Some(
@@ -681,7 +1216,7 @@ impl Executor {
         );
         let supports_left_driven_probe = matches!(
             join_operator,
-            Some(
+            None | Some(
                 sqlparser::ast::JoinOperator::Inner(_)
                     | sqlparser::ast::JoinOperator::Join(_)
                     | sqlparser::ast::JoinOperator::LeftOuter(_)
@@ -737,6 +1272,7 @@ impl Executor {
                             left_rows.len(),
                             distinct_probe_keys.len(),
                             limit,
+                            probe_schema.columns[probe_right_idx].is_unique,
                         ) {
                             monitor::inc_plan();
                             let right_table_name = right_table_name.unwrap();
@@ -746,12 +1282,7 @@ impl Executor {
                                 && right_selection.is_none();
                             let probe_key_guaranteed =
                                 single_key_indexed_probe && probe_right_idx == right_key_indices[0];
-                            let probe_projection_indices = if probe_key_guaranteed
-                                && !self.projection_requires_column(
-                                    stage_projection_hint,
-                                    &right_schema_for_probe,
-                                    probe_right_idx,
-                                ) {
+                            let probe_projection_indices = if probe_key_guaranteed {
                                 let reduced_projection = self.remove_projection_column(
                                     &right_projection,
                                     probe_schema,
@@ -840,11 +1371,123 @@ impl Executor {
                             return self.project_join_rows(new_schema, probed_rows, projection);
                         }
                     }
+                } else if let Some(expr_probe) =
+                    self.extract_expr_join_probe(expr, &left_schema, &right_schema_for_probe)
+                {
+                    let mut distinct_probe_keys = HashSet::with_capacity(left_rows.len());
+                    for left_row in &left_rows {
+                        let probe_key = self.evaluate_value(
+                            &expr_probe.left_expr,
+                            left_row,
+                            &left_schema,
+                            params,
+                        )?;
+                        distinct_probe_keys.insert(probe_key);
+                    }
+
+                    if Self::should_attempt_join_probe(
+                        left_rows.len(),
+                        distinct_probe_keys.len(),
+                        limit,
+                        probe_schema.columns[expr_probe.right_key_index].is_unique,
+                    ) {
+                        monitor::inc_plan();
+                        let right_table_name = right_table_name.unwrap();
+                        let probe_projection_indices = right_projection_indices.clone();
+                        let probed_capacity =
+                            limit.map_or(left_rows.len(), |value| left_rows.len().min(value));
+                        let mut probed_rows = Vec::with_capacity(probed_capacity);
+                        let mut probe_cache: HashMap<Value, Vec<Vec<Value>>> =
+                            HashMap::with_capacity(distinct_probe_keys.len());
+
+                        for left_row in &left_rows {
+                            let probe_key = self.evaluate_value(
+                                &expr_probe.left_expr,
+                                left_row,
+                                &left_schema,
+                                params,
+                            )?;
+                            if let Some(candidates) = probe_cache.get(&probe_key) {
+                                for right_row in candidates {
+                                    let mut joined_row =
+                                        Vec::with_capacity(left_row.len() + right_row.len());
+                                    joined_row.extend_from_slice(left_row);
+                                    joined_row.extend_from_slice(right_row);
+                                    if let Some(residual) = &expr_probe.residual_expr {
+                                        if !self.evaluate_expr(
+                                            residual,
+                                            &joined_row,
+                                            &new_schema,
+                                            params,
+                                        )? {
+                                            continue;
+                                        }
+                                    }
+                                    probed_rows.push(joined_row);
+                                    if limit.is_some_and(|value| probed_rows.len() >= value) {
+                                        return self.project_join_rows(
+                                            new_schema,
+                                            probed_rows,
+                                            projection,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+
+                            let mut candidates = self
+                                .fetch_rows_by_join_key(
+                                    &right_table_name,
+                                    probe_schema,
+                                    expr_probe.right_key_index,
+                                    &probe_key,
+                                    probe_projection_indices.as_deref(),
+                                    txn,
+                                )
+                                .await?;
+                            if let Some(selection) = &right_selection {
+                                candidates = self.filter_rows_with_expr(
+                                    candidates,
+                                    probe_schema,
+                                    selection,
+                                    params,
+                                )?;
+                            }
+                            for right_row in &candidates {
+                                let mut joined_row =
+                                    Vec::with_capacity(left_row.len() + right_row.len());
+                                joined_row.extend_from_slice(left_row);
+                                joined_row.extend_from_slice(right_row);
+                                if let Some(residual) = &expr_probe.residual_expr {
+                                    if !self.evaluate_expr(
+                                        residual,
+                                        &joined_row,
+                                        &new_schema,
+                                        params,
+                                    )? {
+                                        continue;
+                                    }
+                                }
+                                probed_rows.push(joined_row);
+                                if limit.is_some_and(|value| probed_rows.len() >= value) {
+                                    probe_cache.insert(probe_key, candidates);
+                                    return self.project_join_rows(
+                                        new_schema,
+                                        probed_rows,
+                                        projection,
+                                    );
+                                }
+                            }
+                            probe_cache.insert(probe_key, candidates);
+                        }
+
+                        return self.project_join_rows(new_schema, probed_rows, projection);
+                    }
                 }
             }
         }
 
-        let (right_schema_base, right_rows) = if right_selection.is_some() {
+        let (right_schema_base, mut right_rows) = if right_selection.is_some() {
             let (schema, rows, _) = self
                 .scan_single_table(
                     relation,
@@ -872,6 +1515,35 @@ impl Executor {
         let mut right_schema = right_schema_base.clone();
         self.prefix_schema_columns(&mut right_schema, relation)?;
 
+        if right_schema_for_predicates.is_none() {
+            if let Some(left_local) = self.take_exclusive_schema_predicate(
+                pending_predicates,
+                &left_schema,
+                &right_schema,
+            ) {
+                left_rows =
+                    self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
+            }
+
+            if join_operator.is_none() {
+                join_predicates.extend(self.take_schema_pair_predicates(
+                    pending_predicates,
+                    &left_schema,
+                    &right_schema,
+                ));
+            }
+
+            if let Some(right_local) = self.take_exclusive_schema_predicate(
+                pending_predicates,
+                &right_schema,
+                &left_schema,
+            ) {
+                right_rows =
+                    self.filter_rows_with_expr(right_rows, &right_schema, &right_local, params)?;
+            }
+        }
+
+        let join_expr = Self::combine_predicates(join_predicates.clone());
         let mut new_columns = left_schema.columns.clone();
         new_columns.extend(right_schema.columns.clone());
         let new_schema = TableSchema::new("join_result".to_string(), new_columns);
@@ -882,7 +1554,7 @@ impl Executor {
 
         if !matches!(
             join_operator,
-            Some(sqlparser::ast::JoinOperator::CrossJoin(_)) | None
+            Some(sqlparser::ast::JoinOperator::CrossJoin(_))
         ) {
             if let Some(expr) = &join_expr {
                 if let Some((left_key_indices, right_key_indices, residual_expr)) =
@@ -976,6 +1648,57 @@ impl Executor {
                             }
                         }
                     }
+                } else if let Some(expr_plan) =
+                    self.extract_expr_hash_join(expr, &left_schema, &right_schema)
+                {
+                    hash_join_executed = true;
+                    monitor::inc_plan();
+
+                    let mut hash_map: HashMap<Value, Vec<&Vec<Value>>> =
+                        HashMap::with_capacity(left_rows.len());
+                    for left_row in &left_rows {
+                        hash_map
+                            .entry(left_row[expr_plan.left_key_index].clone())
+                            .or_default()
+                            .push(left_row);
+                    }
+
+                    for right_row in &right_rows {
+                        let right_key = self.evaluate_value(
+                            &expr_plan.right_expr,
+                            right_row,
+                            &right_schema,
+                            params,
+                        )?;
+                        if matches!(right_key, Value::Null) {
+                            continue;
+                        }
+                        if let Some(matches) = hash_map.get(&right_key) {
+                            for left_row in matches {
+                                let mut joined_row = Vec::with_capacity(row_width);
+                                joined_row.extend_from_slice(left_row);
+                                joined_row.extend_from_slice(right_row);
+                                if let Some(residual) = &expr_plan.residual_expr {
+                                    if !self.evaluate_expr(
+                                        residual,
+                                        &joined_row,
+                                        &new_schema,
+                                        params,
+                                    )? {
+                                        continue;
+                                    }
+                                }
+                                new_rows.push(joined_row);
+                                if limit.is_some_and(|value| new_rows.len() >= value) {
+                                    break;
+                                }
+                            }
+                        }
+
+                        if limit.is_some_and(|value| new_rows.len() >= value) {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1029,9 +1752,21 @@ impl Executor {
         txn: &mut dyn Transaction,
         params: &[Value],
         limit: Option<usize>,
+        has_deferred_subquery_filter: bool,
     ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
-        let first = &from[0];
-        let join_column_refs = self.collect_join_column_references(from);
+        let reordered_from = self
+            .reorder_comma_join_from(
+                from,
+                selection,
+                projection,
+                has_deferred_subquery_filter,
+                txn,
+            )
+            .await?;
+        let planned_from = reordered_from.as_deref().unwrap_or(from);
+
+        let first = &planned_from[0];
+        let join_column_refs = self.collect_join_column_references(planned_from);
         let mut pending_predicates = if let Some(expr) = selection {
             Self::collect_conjunctive_predicates(expr)
         } else {
@@ -1126,7 +1861,7 @@ impl Executor {
             )?;
         }
 
-        for table in from.iter().skip(1) {
+        for table in planned_from.iter().skip(1) {
             (schema, rows) = self
                 .apply_join_step(
                     schema,

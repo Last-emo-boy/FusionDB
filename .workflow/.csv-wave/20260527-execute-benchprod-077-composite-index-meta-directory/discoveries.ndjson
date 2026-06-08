@@ -1,0 +1,2 @@
+{"type":"code_pattern","id":"BENCHPROD-077","file":"src/execution/composite_index.rs","description":"Composite index metadata now has a table-scoped directory under index_meta_table:<table>: with marker-based fallback to legacy global index_meta scan."}
+{"type":"verification","id":"BENCHPROD-077","file":"E:/Playground/FusionDB-bench/runs/gate_benchprod077_production_medium_composite_meta_20260527/bench_gate_summary.md","description":"Production medium gate passed 22/22 after composite metadata directory optimization."}

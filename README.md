@@ -62,7 +62,7 @@
 
 | Feature | Description |
 |---|---|
-| **Protocol** | PostgreSQL wire protocol (pgwire) + HTTP JSON API |
+| **Protocol** | PostgreSQL wire protocol (pgwire) + HTTP JSON API + optional Redis-compatible RESP endpoint |
 | **Configuration** | TOML config file (`fusiondb.toml`) with all server/storage/auth settings |
 | **Authentication** | Configurable password auth, SHA-256 password hashing, RBAC (CREATE USER, GRANT, REVOKE) |
 | **Graceful Shutdown** | Ctrl+C → flush MemTable → save indexes → truncate WAL |
@@ -90,6 +90,7 @@ No config file found at fusiondb.toml. Using defaults.
 FusionDB v0.1.0 starting...
   HTTP:    127.0.0.1:8091
   PgWire:  127.0.0.1:8092
+  Redis:   disabled
   Data:    data
 Press Ctrl+C to shut down...
 ```
@@ -749,6 +750,8 @@ FusionDB uses a TOML configuration file (`fusiondb.toml`). Generate a default on
 [server]
 http_port = 8091          # HTTP JSON API port
 pg_port = 8092            # PostgreSQL wire protocol port
+redis_enabled = false     # Optional Redis-compatible RESP endpoint for native memtier probes
+redis_port = 6379         # Redis-compatible RESP endpoint port
 bind = "127.0.0.1"        # Bind address (use "0.0.0.0" for all interfaces)
 
 [storage]
@@ -771,6 +774,7 @@ password = "fusiondb"      # Password for PostgreSQL cleartext auth
 |---|---|---|---|
 | HTTP API | `8091` | HTTP/JSON | REST API, metrics, health check |
 | PostgreSQL | `8092` | pgwire | Standard PostgreSQL wire protocol |
+| Redis-compatible | `6379` | RESP | Optional endpoint for `memtier_benchmark --protocol=redis` (`PING`, `ECHO`, `SELECT 0`, `INFO`, `SET`, `SETEX`, `GET`, `MGET`, `MSET`, `EXISTS`, `DEL`, `INCR`, `QUIT`) |
 
 ### Authentication
 

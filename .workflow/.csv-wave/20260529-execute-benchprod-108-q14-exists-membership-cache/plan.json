@@ -1,0 +1,56 @@
+{
+  "id": "BENCHPROD-108",
+  "title": "Reduce Q14 correlated EXISTS overhead with membership caching",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Inspect the current LDBC full test-data frontier after BENCHPROD-107",
+      "status": "completed"
+    },
+    {
+      "step": "Target the Q14 recursive CTE path where per-row correlated EXISTS checks repeatedly scan the same sg delta CTE",
+      "status": "completed"
+    },
+    {
+      "step": "Add a narrow membership-cache fast path for single-table EXISTS subqueries of the form local_alias.column = outer_expr",
+      "status": "completed"
+    },
+    {
+      "step": "Keep all unsupported EXISTS shapes on the existing bound-subquery fallback path",
+      "status": "completed"
+    },
+    {
+      "step": "Add regression coverage for aliased NOT EXISTS membership filtering",
+      "status": "completed"
+    },
+    {
+      "step": "Run Rust regressions, release PgWire integration tests, release build, and a non-isolation full test-data LDBC smoke",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "previous_disable_q14_isolation": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod107_sq6fix_disable_q14_full_testdata_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "ldbc_full_testdata_non_isolation_probe": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod108_exists_membership_full_testdata_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "fmt": "cargo fmt --check: passed",
+    "sql_set_subquery": "cargo test --test sql_set_subquery -- --nocapture: 33 passed",
+    "pg_integration_release": "cargo test --release --test pg_integration -- --nocapture: 27 passed",
+    "release_binary": "cargo build --release --bin fusiondb: passed"
+  },
+  "result": {
+    "ldbc_full_native_pass": false,
+    "membership_cache_regression_passed": true,
+    "full_testdata_non_isolation_status": "gap",
+    "full_testdata_non_isolation_reason": "ldbc_command timed out after 180 seconds",
+    "operations_before_timeout": 4,
+    "current_frontier": "The correlated EXISTS membership cache is covered and does not break PgWire or SQL regressions, but full test-data non-isolation LDBC still stalls in the Q14 performance frontier."
+  },
+  "remaining_blockers": [
+    "Full test-data non-isolation LDBC still times out after 4 operations when Q14 is enabled.",
+    "This BENCHPROD-108 smoke is gap evidence, not a full official/native LDBC benchmark pass.",
+    "Q14 likely needs deeper recursive-CTE pruning, join ordering, indexed edge expansion, or a targeted Q14 profiler beyond the simple membership cache.",
+    "The configured LDBC PostgreSQL implementation still logs missing update-query files, so update coverage is not proven.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-109 candidate: build a targeted Q14 profiler/harness to measure recursive search_graph row growth and separate recursive expansion time from downstream paths/edges/weights aggregation."
+}

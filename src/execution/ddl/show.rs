@@ -5,6 +5,71 @@ use crate::storage::Transaction;
 use super::super::{Executor, QueryResult};
 
 impl Executor {
+    pub(crate) fn show_all_settings_result() -> QueryResult {
+        let rows = [
+            (
+                "application_name",
+                "",
+                "Sets the application name to be reported in statistics and logs.",
+            ),
+            (
+                "client_encoding",
+                "UTF8",
+                "Sets the client's character set encoding.",
+            ),
+            (
+                "DateStyle",
+                "ISO, MDY",
+                "Sets the display format for date and time values.",
+            ),
+            (
+                "default_transaction_isolation",
+                "read committed",
+                "Sets the transaction isolation level of each new transaction.",
+            ),
+            (
+                "integer_datetimes",
+                "on",
+                "Reports whether datetimes use integer storage.",
+            ),
+            (
+                "max_index_keys",
+                "32",
+                "Shows the maximum number of index columns.",
+            ),
+            ("search_path", "public", "Sets the schema search order."),
+            (
+                "server_encoding",
+                "UTF8",
+                "Shows the server character set encoding.",
+            ),
+            ("server_version", "15.0", "Shows the server version."),
+            (
+                "TimeZone",
+                "UTC",
+                "Sets the time zone for displaying and interpreting time stamps.",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, setting, description)| {
+            vec![
+                Value::String(name.to_string()),
+                Value::String(setting.to_string()),
+                Value::String(description.to_string()),
+            ]
+        })
+        .collect();
+
+        QueryResult::Select {
+            columns: vec![
+                "name".to_string(),
+                "setting".to_string(),
+                "description".to_string(),
+            ],
+            rows,
+        }
+    }
+
     pub(crate) async fn handle_describe_table(
         &self,
         table_name: &sqlparser::ast::ObjectName,

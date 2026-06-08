@@ -1,0 +1,14 @@
+{
+  "id": "BENCHPROD-089",
+  "title": "PostgreSQL JDBC driver smoke",
+  "status": "completed",
+  "completed_at": "2026-05-28",
+  "artifacts": {
+    "jdbc_smoke": "E:/Playground/FusionDB-bench/runs/jdbc_smoke_benchprod089_txn_extended_final_20260528/jdbc_smoke_summary.json",
+    "external_smoke": "E:/Playground/FusionDB-bench/runs/external_smoke_benchprod089_jdbc_evidence_20260528/external_smoke_summary.json"
+  },
+  "next": [
+    "BENCHPROD-090: configure pgbench or BenchBase/TPC-C artifact and capture first official-harness blocker set",
+    "Promote JDBC smoke into repeatable readiness gate evidence before claiming BenchBase compatibility"
+  ]
+}

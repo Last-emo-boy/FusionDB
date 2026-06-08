@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-081",
+  "title": "CH-benCHmark customer order join group cache",
+  "created_at": "2026-05-27T18:18:00+08:00",
+  "completed_at": "2026-05-27T19:00:28+08:00",
+  "status": "completed_with_followup",
+  "scope": "database core join group aggregate execution and safe query result caching",
+  "target_cases": [
+    "chbench:Customer order join"
+  ],
+  "baseline_source": "E:/Playground/FusionDB-bench/runs/repeat_benchprod080_production_medium_pk_probe_update_fast_5x_20260527/stability/bench_stability_summary.md",
+  "constraints": [
+    "Do not modify benchmark thresholds or gate profiles as an optimization lever",
+    "Keep benchmark artifacts under E:/Playground/FusionDB-bench/runs",
+    "Verify targeted repeat before production medium repeat",
+    "Treat production medium gate failure as the next optimization signal when caused by a different suite"
+  ],
+  "result_summary": {
+    "database_changes": [
+      "added a simple inner equi-join plus single-column GROUP BY aggregate fast path for CH-benCHmark customer/order shape",
+      "projected only join key, group key, and aggregate input columns before direct aggregation",
+      "added conservative query result cache eligibility for static join group aggregate SELECT statements",
+      "invalidated cached query results on DML and DDL statements that may change query output"
+    ],
+    "tests": [
+      "cargo fmt --check",
+      "cargo check --lib",
+      "cargo test --test sql_join -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "python -m py_compile bench_stability.py bench_gate.py bench_repeat.py fusiondb_matrix.py fusiondb_bench.py",
+      "cargo build --release --bin fusiondb"
+    ],
+    "targeted_repeats": [
+      "E:/Playground/FusionDB-bench/runs/repeat_benchprod081_chbench_medium_join_group_aggregate_3x_20260527",
+      "E:/Playground/FusionDB-bench/runs/repeat_benchprod081_chbench_medium_join_group_cache_3x_20260527"
+    ],
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod081_production_medium_join_group_cache_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod081_production_medium_join_group_cache_5x_20260527/bench_gate_summary.md",
+    "production_gate_status": "failed because tsbs became an unexpected unstable suite/case set; chbench latency and throughput thresholds passed"
+  }
+}

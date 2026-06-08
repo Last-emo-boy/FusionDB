@@ -1,0 +1,76 @@
+{
+  "id": "BENCHPROD-115",
+  "title": "Add LDBC complex-query isolation matrix coverage",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-114 final frontier: 80-op smoke did not force every complex query in one reproducible evidence artifact",
+      "status": "completed"
+    },
+    {
+      "step": "Inspect ldbc_snb_native_smoke.py for existing isolation controls and command-mode report artifacts",
+      "status": "completed"
+    },
+    {
+      "step": "Create an independent ldbc_snb_complex_matrix.py wrapper around the existing native smoke harness",
+      "status": "completed"
+    },
+    {
+      "step": "Run a representative Q4/Q6/Q10/Q14 matrix subset to validate recent optimization, prior Q6 gap, Q10 regression guard, and Q14 frontier",
+      "status": "completed"
+    },
+    {
+      "step": "Run full Q1-Q14 complex-query isolation matrix and capture per-query metrics",
+      "status": "completed"
+    },
+    {
+      "step": "Record evidence conservatively as command-mode isolation matrix, not a full official LDBC pass",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "bench_script": "E:\\Playground\\FusionDB-bench\\ldbc_snb_complex_matrix.py",
+    "underlying_smoke_script": "E:\\Playground\\FusionDB-bench\\ldbc_snb_native_smoke.py",
+    "representative_subset_summary": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_complex_matrix_benchprod115_q4_q6_q10_q14_20260529\\ldbc_snb_complex_matrix_summary.json",
+    "full_matrix_summary": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_complex_matrix_benchprod115_all_q1_q14_20260529\\ldbc_snb_complex_matrix_summary.json",
+    "full_matrix_markdown": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_complex_matrix_benchprod115_all_q1_q14_20260529\\ldbc_snb_complex_matrix_summary.md",
+    "verification": [
+      "python -m py_compile ldbc_snb_complex_matrix.py ldbc_snb_native_smoke.py external_bootstrap.py: passed",
+      "python ldbc_snb_complex_matrix.py --queries Q4,Q6,Q10,Q14 ...: passed 4/4",
+      "python ldbc_snb_complex_matrix.py --queries all ...: passed 14/14"
+    ]
+  },
+  "result": {
+    "full_official_ldbc_pass": false,
+    "updates_covered": false,
+    "complex_query_matrix_pass": true,
+    "case_count": 14,
+    "passed_count": 14,
+    "matrix_scope": "command-mode isolation matrix; each case enables exactly one LDBC complex query and disables the other complex queries plus all short reads",
+    "full_matrix_metrics": {
+      "LdbcQuery1": 101.0,
+      "LdbcQuery2": 54.0,
+      "LdbcQuery3": 160.0,
+      "LdbcQuery4": 140.0,
+      "LdbcQuery5": 195.0,
+      "LdbcQuery6": 841.0,
+      "LdbcQuery7": 62.0,
+      "LdbcQuery8": 43.0,
+      "LdbcQuery9": 71.0,
+      "LdbcQuery10": 73.0,
+      "LdbcQuery11": 44.0,
+      "LdbcQuery12": 161.0,
+      "LdbcQuery13": 95.0,
+      "LdbcQuery14": 1034.0
+    }
+  },
+  "remaining_blockers": [
+    "This is not a full official LDBC benchmark pass.",
+    "Each matrix case is an isolation run, so it proves per-query command-mode coverage but not official mixed scheduling semantics.",
+    "Updates remain disabled in the underlying generated LDBC properties.",
+    "Short reads are intentionally disabled in matrix cases.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-116 candidate: wire the LDBC complex matrix into production gate profiles, or add an equivalent coverage matrix for another target suite such as TSBS or CH-benCHmark."
+}

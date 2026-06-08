@@ -1,5 +1,4 @@
 use crate::catalog::{IndexType, TableSchema};
-use crate::common::encoding::encode_key;
 use crate::common::{FusionError, Result, Value};
 use crate::monitor;
 use crate::storage::Transaction;
@@ -8,6 +7,86 @@ use sqlparser::ast::SetExpr;
 use super::super::{Executor, QueryResult};
 
 impl Executor {
+    fn insert_trace_enabled() -> bool {
+        std::env::var("FUSIONDB_INSERT_TRACE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    }
+
+    fn insert_trace(message: impl AsRef<str>) {
+        if Self::insert_trace_enabled() {
+            eprintln!("[insert-trace] {}", message.as_ref());
+        }
+    }
+
+    fn serial_default_candidate_column_indexes(schema: &TableSchema) -> Vec<usize> {
+        schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, column)| {
+                let ty = column.data_type.trim().to_ascii_uppercase();
+                matches!(
+                    ty.as_str(),
+                    "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL"
+                )
+                .then_some(idx)
+            })
+            .collect()
+    }
+
+    async fn next_serial_default_value(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        column_idx: usize,
+        txn: &mut dyn Transaction,
+    ) -> Result<Value> {
+        let prefix = format!("data:{}:", table_name);
+        let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let mut max_seen = 0_i64;
+        for (key, value) in existing {
+            let candidate = if let Ok(key_str) = std::str::from_utf8(&key) {
+                if let Some(row) = self.row_cache.get(key_str) {
+                    row.get(column_idx).cloned()
+                } else {
+                    crate::common::encoding::RowDecoder::decode_column(&value, column_idx)
+                        .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
+                }
+            } else {
+                crate::common::encoding::RowDecoder::decode_column(&value, column_idx)
+                    .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
+            };
+            if let Some(Value::Integer(value)) = candidate {
+                max_seen = max_seen.max(value);
+            }
+        }
+
+        let column = &schema.columns[column_idx];
+        let next = max_seen.checked_add(1).ok_or_else(|| {
+            FusionError::Execution(format!("SERIAL column {} exhausted", column.name))
+        })?;
+        Ok(Value::Integer(next))
+    }
+
+    async fn apply_missing_serial_defaults(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        row_values: &mut [Value],
+        missing_serial_indexes: &[usize],
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        for &idx in missing_serial_indexes {
+            if row_values[idx] == Value::Null {
+                row_values[idx] = self
+                    .next_serial_default_value(table_name, schema, idx, txn)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn handle_insert(
         &self,
         table_name: String,
@@ -19,6 +98,12 @@ impl Executor {
         params: &[Value],
     ) -> Result<QueryResult> {
         let table_name_str = table_name;
+        Self::insert_trace(format!(
+            "handle_insert start table={} columns={} params={}",
+            table_name_str,
+            columns.len(),
+            params.len()
+        ));
 
         let schema_key = format!("schema:{}", table_name_str);
         let schema_bytes = txn
@@ -29,6 +114,9 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
         let composite_indexes = self
             .load_composite_indexes_for_table(&table_name_str, txn)
+            .await?;
+        let composite_unique_indexes = self
+            .load_composite_unique_indexes_for_table(&table_name_str, txn)
             .await?;
         let foreign_keys = self.load_child_foreign_keys(&table_name_str, txn).await?;
         let trigram_column_indices = Self::indexed_trigram_text_columns(&schema);
@@ -59,11 +147,24 @@ impl Executor {
 
         if let Some(query) = source {
             if let SetExpr::Values(values) = &query.body.as_ref() {
+                Self::insert_trace(format!(
+                    "values insert start table={} rows={} returning={} on_conflict={}",
+                    table_name_str,
+                    values.rows.len(),
+                    returning.is_some(),
+                    on_conflict.is_some()
+                ));
                 if returning.is_some() {
                     inserted_rows.reserve(values.rows.len());
                 }
                 let mut count = 0;
                 for row in &values.rows {
+                    Self::insert_trace(format!(
+                        "row start table={} row_index={} exprs={}",
+                        table_name_str,
+                        count,
+                        row.len()
+                    ));
                     let mut raw_values = Vec::with_capacity(row.len());
                     for expr in row.iter() {
                         let val = self
@@ -73,12 +174,16 @@ impl Executor {
                     }
 
                     // If column list specified, map values to full row with defaults for missing columns
-                    let row_values = if let Some(ref mapping) = col_mapping {
+                    let (mut row_values, missing_serial_indexes) = if let Some(ref mapping) =
+                        col_mapping
+                    {
                         if raw_values.len() != mapping.len() {
                             return Err(FusionError::Execution(
                                 "Column count mismatch".to_string(),
                             ));
                         }
+                        let mut missing_serial_indexes =
+                            Self::serial_default_candidate_column_indexes(&schema);
                         let mut full_row: Vec<Value> = schema
                             .columns
                             .iter()
@@ -98,15 +203,36 @@ impl Executor {
                         for (i, &schema_idx) in mapping.iter().enumerate() {
                             full_row[schema_idx] = raw_values[i].clone();
                         }
-                        full_row
+                        missing_serial_indexes.retain(|idx| !mapping.contains(idx));
+                        (full_row, missing_serial_indexes)
                     } else {
-                        raw_values
+                        (raw_values, Vec::new())
                     };
 
                     if row_values.len() != schema.columns.len() {
                         return Err(FusionError::Execution("Column count mismatch".to_string()));
                     }
+                    Self::insert_trace(format!(
+                        "row defaults start table={} row_index={} missing_serial={:?}",
+                        table_name_str, count, missing_serial_indexes
+                    ));
+                    self.apply_missing_serial_defaults(
+                        &table_name_str,
+                        &schema,
+                        &mut row_values,
+                        &missing_serial_indexes,
+                        txn,
+                    )
+                    .await?;
+                    Self::insert_trace(format!(
+                        "row coerce start table={} row_index={}",
+                        table_name_str, count
+                    ));
                     let row_values = self.coerce_row_to_schema(row_values, &schema)?;
+                    Self::insert_trace(format!(
+                        "row constraints start table={} row_index={}",
+                        table_name_str, count
+                    ));
 
                     // Enforce NOT NULL constraints
                     for (idx, col) in schema.columns.iter().enumerate() {
@@ -119,13 +245,10 @@ impl Executor {
                     }
 
                     // Enforce CHECK constraints
-                    for (idx, col) in schema.columns.iter().enumerate() {
+                    for col in schema.columns.iter() {
                         if let Some(ref check_sql) = col.check_expr {
-                            let check_result = self.evaluate_check_constraint(
-                                check_sql,
-                                &col.name,
-                                &row_values[idx],
-                            );
+                            let check_result =
+                                self.evaluate_check_constraint(check_sql, &schema, &row_values);
                             if !check_result {
                                 return Err(FusionError::Execution(format!(
                                     "CHECK constraint violated for column '{}': {}",
@@ -173,11 +296,12 @@ impl Executor {
                         }
                     }
 
-                    let row_id = if let Some(first) = row_values.first() {
-                        encode_key(first)
-                    } else {
-                        uuid::Uuid::new_v4().to_string()
-                    };
+                    let row_id =
+                        self.row_id_for_insert(&schema, &row_values, &composite_unique_indexes);
+                    Self::insert_trace(format!(
+                        "row row_id table={} row_index={} row_id={}",
+                        table_name_str, count, row_id
+                    ));
 
                     let key = format!("data:{}:{}", table_name_str, row_id);
 
@@ -237,6 +361,15 @@ impl Executor {
                                         txn,
                                     )
                                     .await?;
+                                    self.validate_composite_unique_constraints(
+                                        &composite_unique_indexes,
+                                        &table_name_str,
+                                        &schema,
+                                        &existing_row,
+                                        Some(&row_id),
+                                        txn,
+                                    )
+                                    .await?;
                                     let value =
                                         crate::common::encoding::RowEncoder::encode(&existing_row);
                                     txn.put(key.as_bytes(), &value).await?;
@@ -291,6 +424,11 @@ impl Executor {
                             }
                         }
                     }
+                    if txn.get(key.as_bytes()).await?.is_some() {
+                        return Err(FusionError::Execution(
+                            "PRIMARY KEY constraint violated: duplicate row key".to_string(),
+                        ));
+                    }
 
                     self.validate_child_foreign_keys(
                         &table_name_str,
@@ -300,6 +438,23 @@ impl Executor {
                         txn,
                     )
                     .await?;
+                    Self::insert_trace(format!(
+                        "row composite unique start table={} row_index={}",
+                        table_name_str, count
+                    ));
+                    self.validate_composite_unique_constraints(
+                        &composite_unique_indexes,
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        Some(&row_id),
+                        txn,
+                    )
+                    .await?;
+                    Self::insert_trace(format!(
+                        "row put start table={} row_index={}",
+                        table_name_str, count
+                    ));
 
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
@@ -360,6 +515,10 @@ impl Executor {
                         txn,
                     )
                     .await?;
+                    Self::insert_trace(format!(
+                        "row done table={} row_index={}",
+                        table_name_str, count
+                    ));
 
                     if returning.is_some() {
                         inserted_rows.push(row_values.clone());
@@ -369,9 +528,18 @@ impl Executor {
 
                 // Handle RETURNING clause
                 if let Some(ret_items) = returning {
+                    Self::insert_trace(format!(
+                        "values insert returning table={} rows={}",
+                        table_name_str,
+                        inserted_rows.len()
+                    ));
                     return self.build_returning_result(ret_items, &inserted_rows, &schema);
                 }
 
+                Self::insert_trace(format!(
+                    "values insert done table={} count={}",
+                    table_name_str, count
+                ));
                 return Ok(QueryResult::Success {
                     message: format!("Inserted {} rows", count),
                 });
@@ -391,17 +559,28 @@ impl Executor {
                         ));
                     }
                     let row_values = self.coerce_row_to_schema(row_values, &schema)?;
-                    let row_id = if let Some(first) = row_values.first() {
-                        encode_key(first)
-                    } else {
-                        uuid::Uuid::new_v4().to_string()
-                    };
+                    let row_id =
+                        self.row_id_for_insert(&schema, &row_values, &composite_unique_indexes);
                     let key = format!("data:{}:{}", table_name_str, row_id);
+                    if txn.get(key.as_bytes()).await?.is_some() {
+                        return Err(FusionError::Execution(
+                            "PRIMARY KEY constraint violated: duplicate row key".to_string(),
+                        ));
+                    }
                     self.validate_child_foreign_keys(
                         &table_name_str,
                         &schema,
                         &row_values,
                         &foreign_keys,
+                        txn,
+                    )
+                    .await?;
+                    self.validate_composite_unique_constraints(
+                        &composite_unique_indexes,
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        Some(&row_id),
                         txn,
                     )
                     .await?;

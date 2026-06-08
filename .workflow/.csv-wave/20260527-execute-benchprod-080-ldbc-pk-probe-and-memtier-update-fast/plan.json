@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-080",
+  "title": "LDBC PK probe projection and memtier update fast path",
+  "created_at": "2026-05-27T17:45:00+08:00",
+  "completed_at": "2026-05-27T18:17:15+08:00",
+  "status": "completed",
+  "scope": "database core join probe and simple primary-key update execution",
+  "target_cases": [
+    "ldbc:One-hop friends",
+    "memtier:SET existing key"
+  ],
+  "baseline_source": "E:/Playground/FusionDB-bench/runs/repeat_benchprod079_production_medium_indexed_bareagg_5x_20260527/stability/bench_stability_summary.md",
+  "constraints": [
+    "Do not modify benchmark thresholds or gate profiles as an optimization lever",
+    "Keep benchmark artifacts under E:/Playground/FusionDB-bench/runs",
+    "Verify targeted repeat before production medium repeat",
+    "Use production medium gate as authoritative verifier"
+  ],
+  "result_summary": {
+    "database_changes": [
+      "restore projected right-side primary-key join columns from the probe key when the indexed probe guarantees equality",
+      "avoid decoding right row primary-key payload for LDBC one-hop PK probes",
+      "add a conservative simple primary-key UPDATE fast path for tables without returning, secondary indexes, composite indexes, checks, or foreign keys"
+    ],
+    "tests": [
+      "cargo fmt --check",
+      "cargo check --lib",
+      "cargo test --test sql_join -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo test --test sql_dml -- --nocapture",
+      "python -m py_compile bench_stability.py bench_gate.py bench_repeat.py fusiondb_matrix.py fusiondb_bench.py",
+      "cargo build --release --bin fusiondb"
+    ],
+    "targeted_repeats": [
+      "E:/Playground/FusionDB-bench/runs/repeat_benchprod080_ldbc_medium_pk_probe_projection_5x_20260527",
+      "E:/Playground/FusionDB-bench/runs/repeat_benchprod080_memtier_medium_pk_update_fast_5x_20260527"
+    ],
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod080_production_medium_pk_probe_update_fast_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod080_production_medium_pk_probe_update_fast_5x_20260527/bench_gate_summary.md"
+  }
+}

@@ -255,7 +255,52 @@ impl Executor {
                     })
                 }
                 _ => None,
+        })
+    }
+
+    fn projection_expr_name_matches(expr: &Expr, name: &str) -> bool {
+        Self::order_limit_column_name(expr)
+            .map(|expr_name| {
+                expr_name.eq_ignore_ascii_case(name)
+                    || expr_name
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(name))
             })
+            .unwrap_or(false)
+    }
+
+    fn resolve_unprojected_order_projection_source<'a>(
+        &self,
+        expr: &Expr,
+        projection: &'a [SelectItem],
+    ) -> Option<ProjectionOrderValueSource<'a>> {
+        let Expr::Identifier(ident) = expr else {
+            return None;
+        };
+
+        projection.iter().find_map(|item| match item {
+            SelectItem::UnnamedExpr(proj_expr)
+                if Self::projection_expr_name_matches(proj_expr, &ident.value) =>
+            {
+                Some(ProjectionOrderValueSource::Expr {
+                    expr: proj_expr,
+                    fallback_index: None,
+                })
+            }
+            SelectItem::ExprWithAlias {
+                expr: proj_expr,
+                alias,
+            } if alias.value.eq_ignore_ascii_case(&ident.value)
+                || Self::projection_expr_name_matches(proj_expr, &ident.value) =>
+            {
+                Some(ProjectionOrderValueSource::Expr {
+                    expr: proj_expr,
+                    fallback_index: None,
+                })
+            }
+            _ => None,
+        })
     }
 
     fn resolve_schema_order_value_index(
@@ -311,6 +356,16 @@ impl Executor {
         if rows_are_projected {
             if let Some(index) = self.resolve_order_by_projection_index(expr, projection, columns) {
                 return SortOrderValueSource::RowIndex(index);
+            }
+        }
+
+        if !rows_are_projected {
+            if let Some(source) = self.resolve_unprojected_order_projection_source(expr, projection)
+            {
+                return SortOrderValueSource::Projection {
+                    source,
+                    fallback_expr: expr,
+                };
             }
         }
 

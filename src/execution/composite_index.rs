@@ -34,6 +34,22 @@ impl CompositeIndexMeta {
 }
 
 impl Executor {
+    fn composite_index_table_marker_key(table_name: &str) -> String {
+        format!("index_meta_table:{}:__marker", table_name)
+    }
+
+    pub(crate) fn composite_index_table_prefix(table_name: &str) -> String {
+        format!("index_meta_table:{}:", table_name)
+    }
+
+    pub(crate) fn composite_index_table_meta_key(table_name: &str, index_name: &str) -> String {
+        format!(
+            "{}{}",
+            Self::composite_index_table_prefix(table_name),
+            index_name
+        )
+    }
+
     fn composite_index_component_separator() -> &'static str {
         "|"
     }
@@ -42,8 +58,15 @@ impl Executor {
         format!("v3:{}:{}", table, columns.join(","))
     }
 
+    pub(crate) fn composite_unique_meta_value(table: &str, columns: &[String]) -> String {
+        format!("u3:{}:{}", table, columns.join(","))
+    }
+
     pub(crate) fn parse_index_meta(index_name: &str, meta_str: &str) -> Option<CompositeIndexMeta> {
-        if let Some(rest) = meta_str.strip_prefix("v3:") {
+        let rest = meta_str
+            .strip_prefix("v3:")
+            .or_else(|| meta_str.strip_prefix("u3:"));
+        if let Some(rest) = rest {
             let (table, columns) = rest.split_once(':')?;
             let columns = columns
                 .split(',')
@@ -101,6 +124,69 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<CompositeIndexMeta>> {
+        let marker_key = Self::composite_index_table_marker_key(table_name);
+        if txn.get(marker_key.as_bytes()).await?.is_some() {
+            return self
+                .load_composite_indexes_for_table_directory(table_name, txn)
+                .await;
+        }
+
+        self.load_composite_indexes_for_table_legacy_scan(table_name, txn)
+            .await
+    }
+
+    pub(crate) async fn load_composite_unique_indexes_for_table(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<CompositeIndexMeta>> {
+        let indexes = self
+            .load_composite_indexes_for_table(table_name, txn)
+            .await?;
+        Ok(indexes
+            .into_iter()
+            .filter(|index| index.name.ends_with("_pkey"))
+            .collect())
+    }
+
+    async fn load_composite_indexes_for_table_directory(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<CompositeIndexMeta>> {
+        let prefix = Self::composite_index_table_prefix(table_name);
+        let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let mut indexes = Vec::new();
+
+        for (key, value) in entries {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            let Some(index_name) = key_str.strip_prefix(&prefix) else {
+                continue;
+            };
+            if index_name == "__marker" {
+                continue;
+            }
+
+            let meta_str = String::from_utf8(value).unwrap_or_default();
+            let Some(meta) = Self::parse_index_meta(index_name, &meta_str) else {
+                continue;
+            };
+
+            if meta.table == table_name && meta.columns.len() > 1 {
+                indexes.push(meta);
+            }
+        }
+
+        Ok(indexes)
+    }
+
+    async fn load_composite_indexes_for_table_legacy_scan(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<CompositeIndexMeta>> {
         let entries = txn.scan_prefix(b"index_meta:", None).await?;
         let mut indexes = Vec::new();
 
@@ -123,6 +209,51 @@ impl Executor {
         }
 
         Ok(indexes)
+    }
+
+    pub(crate) async fn ensure_composite_index_directory_marker(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let marker_key = Self::composite_index_table_marker_key(table_name);
+        txn.put(marker_key.as_bytes(), b"v1").await
+    }
+
+    pub(crate) async fn rebuild_composite_index_directory_for_table(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let prefix = Self::composite_index_table_prefix(table_name);
+        let existing_entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        for (key, _) in existing_entries {
+            txn.delete(&key).await?;
+        }
+
+        self.ensure_composite_index_directory_marker(table_name, txn)
+            .await?;
+
+        let global_entries = txn.scan_prefix(b"index_meta:", None).await?;
+        for (key, value) in global_entries {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            let Some(index_name) = key_str.strip_prefix("index_meta:") else {
+                continue;
+            };
+
+            let meta_str = String::from_utf8(value.clone()).unwrap_or_default();
+            let Some(meta) = Self::parse_index_meta(index_name, &meta_str) else {
+                continue;
+            };
+            if meta.table == table_name && meta.columns.len() > 1 {
+                let table_meta_key = Self::composite_index_table_meta_key(table_name, index_name);
+                txn.put(table_meta_key.as_bytes(), &value).await?;
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn composite_index_prefix(table_name: &str, columns: &[String]) -> String {
@@ -162,6 +293,30 @@ impl Executor {
             value_key,
             row_id
         ))
+    }
+
+    pub(crate) fn composite_index_value_key_for_columns(
+        &self,
+        columns: &[String],
+        row: &[Value],
+        schema: &TableSchema,
+    ) -> Option<String> {
+        self.composite_index_value_key(columns, row, schema, true)
+    }
+
+    pub(crate) fn composite_index_value_key_for_meta_values(
+        &self,
+        meta: &CompositeIndexMeta,
+        values: &[Value],
+    ) -> Option<String> {
+        if meta.columns.len() != values.len() {
+            return None;
+        }
+        let mut parts = Vec::with_capacity(values.len());
+        for value in values {
+            parts.push(self.index_component_for_meta(value, meta)?);
+        }
+        Some(parts.join(Self::composite_index_component_separator()))
     }
 
     fn composite_index_value_key(
@@ -264,6 +419,71 @@ impl Executor {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn validate_composite_unique_constraints(
+        &self,
+        indexes: &[CompositeIndexMeta],
+        table_name: &str,
+        schema: &TableSchema,
+        row: &[Value],
+        current_row_id: Option<&str>,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        for index in indexes {
+            let Some(value_key) =
+                self.composite_index_value_key_for_columns(&index.columns, row, schema)
+            else {
+                continue;
+            };
+            let prefix = format!(
+                "{}{}:",
+                Self::composite_index_prefix(table_name, &index.columns),
+                value_key
+            );
+            let entries = txn.scan_prefix(prefix.as_bytes(), Some(1)).await?;
+            for (key, _) in entries {
+                let Some(row_id) = Self::row_id_from_key(&key) else {
+                    continue;
+                };
+                if current_row_id.is_some_and(|current| current == row_id) {
+                    continue;
+                }
+                return Err(crate::common::FusionError::Execution(format!(
+                    "UNIQUE constraint violated for columns '{}'",
+                    index.columns.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn row_id_for_insert(
+        &self,
+        schema: &TableSchema,
+        row: &[Value],
+        composite_unique_indexes: &[CompositeIndexMeta],
+    ) -> String {
+        if let Some(primary_key) = composite_unique_indexes
+            .iter()
+            .find(|index| index.name.ends_with("_pkey"))
+        {
+            if let Some(value_key) =
+                self.composite_index_value_key_for_columns(&primary_key.columns, row, schema)
+            {
+                return value_key;
+            }
+        }
+
+        if let Some(pk_idx) = schema.get_primary_key_index() {
+            if let Some(pk_value) = row.get(pk_idx) {
+                if let Some(row_id) = Self::value_to_primary_row_id(pk_value) {
+                    return row_id;
+                }
+            }
+        }
+
+        uuid::Uuid::new_v4().to_string()
     }
 
     pub(crate) async fn delete_loaded_composite_indexes_for_row(
@@ -391,12 +611,12 @@ impl Executor {
             .map(|range| usize::from(range.lower.is_some()) + usize::from(range.upper.is_some()))
             .unwrap_or(0);
 
-        let order_matches = index.ordered_encoding
-            && range_column_orderable
-            && Self::composite_order_matches_next_column(
-                order_by,
-                range_column.map(String::as_str),
-            );
+        let order_direction = if index.ordered_encoding && range_column_orderable {
+            Self::composite_order_next_column_direction(order_by, range_column.map(String::as_str))
+        } else {
+            None
+        };
+        let order_matches = order_direction.is_some();
 
         let index_prefix = format!(
             "{}{}",
@@ -469,6 +689,16 @@ impl Executor {
                     if let Some(ordered) = &mut ordered_row_ids {
                         ordered.push(row_id);
                     }
+                }
+            }
+        }
+        if let (Some(ordered), Some(asc)) = (&mut ordered_row_ids, order_direction) {
+            if !asc {
+                ordered.reverse();
+            }
+            if can_cover_predicates {
+                if let Some(limit) = ordered_limit.or(limit) {
+                    ordered.truncate(limit);
                 }
             }
         }
@@ -635,24 +865,26 @@ impl Executor {
         }
     }
 
-    fn composite_order_matches_next_column(
+    fn composite_order_next_column_direction(
         order_by: Option<&sqlparser::ast::OrderBy>,
         next_column: Option<&str>,
-    ) -> bool {
+    ) -> Option<bool> {
         let (Some(order_by), Some(next_column)) = (order_by, next_column) else {
-            return false;
+            return None;
         };
         let OrderByKind::Expressions(exprs) = &order_by.kind else {
-            return false;
+            return None;
         };
         let [order_expr] = exprs.as_slice() else {
-            return false;
+            return None;
         };
-        if !order_expr.options.asc.unwrap_or(true) {
-            return false;
-        }
-        Self::order_limit_column_name(&order_expr.expr)
+        if Self::order_limit_column_name(&order_expr.expr)
             .is_some_and(|column| column.eq_ignore_ascii_case(next_column))
+        {
+            Some(order_expr.options.asc.unwrap_or(true))
+        } else {
+            None
+        }
     }
 
     fn composite_column_type_is_orderable(data_type: &str) -> bool {
@@ -690,6 +922,13 @@ impl Executor {
                 txn.delete(&key).await?;
             }
         }
+
+        let table_prefix = Self::composite_index_table_prefix(table_name);
+        let table_entries = txn.scan_prefix(table_prefix.as_bytes(), None).await?;
+        for (key, _) in table_entries {
+            txn.delete(&key).await?;
+        }
+
         Ok(())
     }
 

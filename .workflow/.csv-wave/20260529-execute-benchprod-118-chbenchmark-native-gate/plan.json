@@ -1,0 +1,81 @@
+{
+  "id": "BENCHPROD-118",
+  "title": "Promote CH-benCHmark native full-run evidence to independent benchmark gate coverage",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Inspect current CH-benCHmark native smoke artifacts and bench_gate integration",
+      "status": "completed"
+    },
+    {
+      "step": "Confirm latest CH-benCHmark evidence is a full create/load/execute BenchBase run",
+      "status": "completed"
+    },
+    {
+      "step": "Add CH-benCHmark native report discovery and explicit report input to bench_gate.py",
+      "status": "completed"
+    },
+    {
+      "step": "Extract CH-benCHmark native checks into a reusable evaluator independent of external_smoke_summary.json",
+      "status": "completed"
+    },
+    {
+      "step": "Verify explicit report, run-root discovery, strict profile discovery, and combined independent gate paths",
+      "status": "completed"
+    },
+    {
+      "step": "Record evidence conservatively as native full-run smoke, not long-duration HTAP production certification",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "bench_gate": "E:\\Playground\\FusionDB-bench\\bench_gate.py",
+    "profiles": [
+      "E:\\Playground\\FusionDB-bench\\gate_profiles\\production_medium.json",
+      "E:\\Playground\\FusionDB-bench\\gate_profiles\\production_medium_strict_native.json"
+    ],
+    "chbenchmark_source": "E:\\Playground\\FusionDB-bench\\runs\\chbenchmark_native_benchbase_full_after_q6_q8_fix_20260528\\chbenchmark_native_smoke_summary.json",
+    "explicit_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod118_chbenchmark_native_only_20260529\\bench_gate_summary.json",
+    "discovery_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod118_chbenchmark_native_discovery_20260529\\bench_gate_summary.json",
+    "strict_profile_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod118_strict_chbenchmark_native_discovery_20260529\\bench_gate_summary.json",
+    "combined_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod118_independent_ldbc_tsbs_ch_20260529\\bench_gate_summary.json",
+    "combined_strict_gate": "E:\\Playground\\FusionDB-bench\\runs\\gate_benchprod118_strict_independent_ldbc_tsbs_ch_20260529\\bench_gate_summary.json",
+    "verification": [
+      "python -m py_compile bench_gate.py chbenchmark_native_smoke.py tsbs_official_runner_smoke.py ldbc_snb_complex_matrix.py: passed",
+      "python -m json.tool gate_profiles/production_medium.json and production_medium_strict_native.json: passed",
+      "python bench_gate.py ... --chbenchmark-native-report ...: passed 28/28",
+      "python bench_gate.py ... without --chbenchmark-native-report: passed 28/28 via discovery",
+      "python bench_gate.py --gate-profile production_medium_strict_native.json ...: passed 28/28 via discovery",
+      "python bench_gate.py ... with independent LDBC matrix + TSBS official runner + CH-benCHmark native: passed 43/43",
+      "python bench_gate.py --gate-profile production_medium_strict_native.json ... with independent LDBC matrix + TSBS official runner + CH-benCHmark native: passed 43/43"
+    ]
+  },
+  "result": {
+    "gate_integration": true,
+    "profile_defaults_enabled": true,
+    "required_run_mode": "full",
+    "required_workload_steps": [
+      "chbenchmark_create",
+      "chbenchmark_load",
+      "chbenchmark_execute"
+    ],
+    "checks_added": [
+      "external_smoke.chbenchmark.native_evidence",
+      "external_smoke.chbenchmark.native_status",
+      "external_smoke.chbenchmark.native_run_mode",
+      "external_smoke.chbenchmark.native_steps",
+      "external_smoke.chbenchmark.native_workload_steps",
+      "external_smoke.chbenchmark.native_blockers"
+    ],
+    "long_duration_htap_certification": false
+  },
+  "remaining_blockers": [
+    "This gate integration covers CH-benCHmark native full-run smoke only, not a long-duration HTAP production certification.",
+    "The observed latest workload completed only a short duration=10 run and sampled a small transaction mix.",
+    "Broader CH-benCHmark query coverage, longer mixed workload duration, and recovery/compaction interactions remain future production-readiness work.",
+    "Native memtier remains blocked until a real memtier_benchmark binary is available.",
+    "Full official LDBC mixed workload/update coverage remains separate from the command-mode isolation matrix."
+  ],
+  "next_task": "BENCHPROD-119 candidate: move native memtier from blocked to runnable by installing/building a real memtier_benchmark, or deepen CH-benCHmark with a query-class matrix."
+}

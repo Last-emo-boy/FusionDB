@@ -1,0 +1,66 @@
+{
+  "id": "BENCHPROD-107",
+  "title": "Broaden LDBC full test-data coverage through Q13 and Short Query 6 frontiers",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-106 bounded Q1/Q14 prefix40 evidence into broader full test-data LDBC paths",
+      "status": "completed"
+    },
+    {
+      "step": "Cover the Query 13 recursive shape that uses array_append(path, p2) and p2 <> ALL(path)",
+      "status": "completed"
+    },
+    {
+      "step": "Diagnose Short Query 6 returning zero rows for JDBC prepared execution",
+      "status": "completed"
+    },
+    {
+      "step": "Resolve placeholders inside final grouped aggregate projections such as coalesce(min(parent), $2)",
+      "status": "completed"
+    },
+    {
+      "step": "Add SQ6 regressions for literal, prepared, post-to-message derivation, and COPY empty-field NULL handling",
+      "status": "completed"
+    },
+    {
+      "step": "Run Rust regressions, release PgWire integration tests, release build, JDBC probe, and disable-Q14 full test-data LDBC isolation smoke",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "ldbc_disable_q14_full_testdata_isolation": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod107_sq6fix_disable_q14_full_testdata_10ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "fmt": "cargo fmt --check: passed",
+    "sql_set_subquery": "cargo test --test sql_set_subquery -- --nocapture: 32 passed",
+    "pg_integration_release": "cargo test --release --test pg_integration -- --nocapture: 27 passed",
+    "release_binary": "cargo build --release --bin fusiondb: passed",
+    "jdbc_sq6_probe": "PreparedStatement#setLong SQ6 probe against old run WAL copy moved from ROWS=0 before the fix to ROWS=1 after the fix"
+  },
+  "result": {
+    "ldbc_full_native_pass": false,
+    "disable_q14_isolation_command_pass": true,
+    "disable_q14_isolation_status": "gap",
+    "disable_q14_isolation_reason": "--disable-read-query 14 isolation mode",
+    "operation_count": 19,
+    "queries_observed": [
+      "LdbcQuery1",
+      "LdbcQuery13",
+      "LdbcShortQuery1PersonProfile",
+      "LdbcShortQuery2PersonPosts",
+      "LdbcShortQuery3PersonFriends",
+      "LdbcShortQuery4MessageContent",
+      "LdbcShortQuery5MessageCreator",
+      "LdbcShortQuery6MessageForum",
+      "LdbcShortQuery7MessageReplies"
+    ],
+    "current_frontier": "With Q14 disabled, the full test-data isolation run completes ldbc_command successfully and exercises Q13 plus all short queries 1-7. Non-isolation full test-data remains blocked by Query 14 timeout/performance and is not a full native LDBC pass."
+  },
+  "remaining_blockers": [
+    "This is disable-Q14 full test-data isolation evidence, not a full official/native LDBC benchmark pass.",
+    "Unbounded/non-isolation full test-data LDBC still has a Query 14 timeout/performance frontier.",
+    "LDBC update query files remain absent in the configured PostgreSQL implementation command path and are not covered by this read-focused run.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-108 candidate: attack non-isolation full test-data Q14 timeout/performance or add a targeted Q14 profiling harness while preserving evidence labels."
+}

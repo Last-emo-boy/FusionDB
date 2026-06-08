@@ -1,0 +1,138 @@
+{
+  "id": "BENCHPROD-114",
+  "title": "Optimize LDBC Query4 with guarded comma-join reorder",
+  "date": "2026-05-29",
+  "status": "completed",
+  "steps": [
+    {
+      "step": "Continue from BENCHPROD-113 Q4 broad-smoke bottleneck evidence",
+      "status": "completed"
+    },
+    {
+      "step": "Inspect LDBC Query4 SQL shape and existing join/subquery execution paths",
+      "status": "completed"
+    },
+    {
+      "step": "Add a guarded comma-join reorder path for the LDBC Q4 tag/message/message_tag/knows shape",
+      "status": "completed"
+    },
+    {
+      "step": "Preserve deferred NOT EXISTS outer probe columns for Q4 projection pushdown",
+      "status": "completed"
+    },
+    {
+      "step": "Add regression coverage for the Q4 implicit join plus deferred NOT EXISTS shape",
+      "status": "completed"
+    },
+    {
+      "step": "Run Q4-only native command-mode isolation and capture runtime improvement",
+      "status": "completed"
+    },
+    {
+      "step": "Investigate and guard against Q10 self-join regression exposed by broad smoke",
+      "status": "completed"
+    },
+    {
+      "step": "Run final 80-op native command-mode smoke with Q6 and Q14 indexes",
+      "status": "completed"
+    },
+    {
+      "step": "Record evidence conservatively as native command-mode smoke, not a full official LDBC pass",
+      "status": "completed"
+    }
+  ],
+  "evidence": {
+    "starting_80op_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod113_q6_q14_indexes_80ops_20260529\\ldbc_results\\fusiondb-results.json",
+    "q4_isolation_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_isolate_q4_reorder_retry_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q4_isolation_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_isolate_q4_reorder_retry_20260529\\ldbc_results\\fusiondb-results.json",
+    "q10_regression_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_isolate_q10_ambiguous_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q10_after_guard_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_isolate_q10_after_q4_guard_20260529\\ldbc_snb_native_smoke_summary.json",
+    "q10_after_guard_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_isolate_q10_after_q4_guard_20260529\\ldbc_results\\fusiondb-results.json",
+    "final_80op_smoke_run": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_q4_guard_80ops_20260529\\ldbc_snb_native_smoke_summary.json",
+    "final_80op_metrics": "E:\\Playground\\FusionDB-bench\\runs\\ldbc_snb_native_benchprod114_q4_guard_80ops_20260529\\ldbc_results\\fusiondb-results.json",
+    "verification": [
+      "python -m py_compile ldbc_snb_native_smoke.py external_bootstrap.py: passed",
+      "cargo fmt --check: passed",
+      "cargo test --test sql_join -- --nocapture: 24/24 passed",
+      "cargo test --test sql_set_subquery -- --nocapture: 35/35 passed",
+      "cargo build --release --bin fusiondb: passed"
+    ]
+  },
+  "result": {
+    "full_official_ldbc_pass": false,
+    "updates_covered": false,
+    "native_ldbc_q4_isolation_command_pass": true,
+    "native_ldbc_q6_q14_80op_smoke_pass": true,
+    "q4_improvement": {
+      "benchprod113_80op_q4_ms": 39368,
+      "benchprod114_isolation_q4_ms": 138,
+      "benchprod114_80op_q4_ms": 118
+    },
+    "final_80op_smoke_metrics": {
+      "reported_status": "passed",
+      "reported_operation_count": 80,
+      "reported_total_duration_ms": 3302,
+      "reported_throughput_ops_per_second": 24.227740763173834,
+      "query6_sampled": false,
+      "complex_queries_exercised": {
+        "LdbcQuery1": {
+          "count": 1,
+          "ms": 100
+        },
+        "LdbcQuery2": {
+          "count": 1,
+          "ms": 35
+        },
+        "LdbcQuery3": {
+          "count": 1,
+          "ms": 128
+        },
+        "LdbcQuery4": {
+          "count": 1,
+          "ms": 118
+        },
+        "LdbcQuery5": {
+          "count": 1,
+          "ms": 172
+        },
+        "LdbcQuery8": {
+          "count": 1,
+          "ms": 22
+        },
+        "LdbcQuery9": {
+          "count": 1,
+          "ms": 47
+        },
+        "LdbcQuery10": {
+          "count": 1,
+          "ms": 51
+        },
+        "LdbcQuery11": {
+          "count": 1,
+          "ms": 21
+        },
+        "LdbcQuery14": {
+          "count": 1,
+          "ms": 1068
+        }
+      },
+      "short_queries_exercised": {
+        "LdbcShortQuery1PersonProfile": 10,
+        "LdbcShortQuery2PersonPosts": 10,
+        "LdbcShortQuery3PersonFriends": 10,
+        "LdbcShortQuery4MessageContent": 10,
+        "LdbcShortQuery5MessageCreator": 10,
+        "LdbcShortQuery6MessageForum": 10,
+        "LdbcShortQuery7MessageReplies": 10
+      }
+    }
+  },
+  "remaining_blockers": [
+    "This is not a full official LDBC benchmark pass.",
+    "Updates remain disabled in generated LDBC properties: LdbcUpdate1AddPerson_enable=false through LdbcUpdate8AddFriendship_enable=false.",
+    "The final 80-op broad smoke still did not sample LdbcQuery6; Q6 coverage remains tied to BENCHPROD-113 isolation evidence.",
+    "LdbcQuery14 remains the largest sampled complex query in the final 80-op smoke at about 1.07 seconds.",
+    "Native memtier remains blocked by missing real memtier_benchmark tooling."
+  ],
+  "next_task": "BENCHPROD-115 candidate: broaden LDBC complex-query sampling or target Q14/Q6 mixed-run coverage while preserving conservative labels."
+}

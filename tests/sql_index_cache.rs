@@ -944,6 +944,70 @@ async fn test_composite_index_range_order_limit_skips_outside_range_decode() {
 }
 
 #[tokio::test]
+async fn test_composite_index_range_order_desc_limit_skips_older_rows() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE tsbs_latest_desc (id INTEGER PRIMARY KEY, host_id INTEGER, ts INTEGER, usage_user INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO tsbs_latest_desc VALUES (1, 1, 1000, 10), (2, 1, 2000, 20), (3, 1, 3000, 30), (4, 1, 4000, 40), (5, 2, 5000, 50)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_tsbs_latest_desc_host_ts ON tsbs_latest_desc (host_id, ts)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for id in [1_i64, 2, 5] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(if id == 5 { 2 } else { 1 }),
+                Value::Integer(id * 1000),
+                Value::Integer(999),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:tsbs_latest_desc:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT ts, usage_user FROM tsbs_latest_desc WHERE host_id = 1 ORDER BY ts DESC LIMIT 2",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["ts", "usage_user"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(4000), Value::Integer(40)],
+            vec![Value::Integer(3000), Value::Integer(30)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_show_indexes_reports_composite_columns() {
     let (executor, wal) = setup().await;
     exec_ok(

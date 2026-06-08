@@ -1,0 +1,16 @@
+{
+  "id": "BENCHPROD-091",
+  "status": "completed",
+  "deliverables": [
+    "pgbench_native_smoke.py",
+    "README documentation for native pgbench smoke",
+    "external_smoke.py native pgbench evidence integration",
+    "tool_missing evidence report for the current environment"
+  ],
+  "verification_status": "passed",
+  "remaining_global_goal_work": [
+    "Provide the official pgbench binary and run native init/run against FusionDB.",
+    "Fix any concrete pgbench command gap captured after binary installation.",
+    "Proceed to BenchBase/TPC-C artifact bootstrap and official load/run gap capture."
+  ]
+}

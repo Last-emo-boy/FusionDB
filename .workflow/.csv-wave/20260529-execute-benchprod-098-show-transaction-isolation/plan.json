@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "session_id": "20260529-execute-benchprod-098-show-transaction-isolation",
+  "source": "maestro-execute",
+  "objective": "BENCHPROD-098: implement PostgreSQL-compatible SHOW TRANSACTION ISOLATION LEVEL handling and advance LDBC command-mode evidence to the next blocker",
+  "created_at": "2026-05-29T04:00:00+08:00",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-098"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "BENCHPROD-098",
+      "title": "PgWire SHOW transaction isolation compatibility",
+      "status": "completed",
+      "files": [
+        "E:/Playground/FusionDB/src/server/pg_server.rs",
+        "E:/Playground/FusionDB/tests/pg_integration.rs",
+        "E:/Playground/FusionDB-bench/ldbc_snb_native_smoke.py",
+        "E:/Playground/FusionDB-bench/README.md"
+      ],
+      "convergence": [
+        "SHOW TRANSACTION ISOLATION LEVEL returns transaction_isolation=read committed through extended and simple PgWire paths",
+        "LDBC command-mode evidence progresses beyond Hikari startup and Java 17 module access",
+        "strict native gate preserves LDBC as a workload gap, now blocked on missing SNB schema/data instead of PgWire transaction isolation metadata"
+      ]
+    }
+  ]
+}
