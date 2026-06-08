@@ -65,9 +65,11 @@ impl Executor {
             return Vec::new();
         };
         if dim <= 1 {
-            return (1..=values.len())
-                .map(|index| vec![Value::Integer(index as i64)])
-                .collect();
+            let mut rows = Vec::with_capacity(values.len());
+            for index in 1..=values.len() {
+                rows.push(vec![Value::Integer(index as i64)]);
+            }
+            return rows;
         }
 
         let max_len = values
@@ -78,19 +80,22 @@ impl Executor {
             })
             .max()
             .unwrap_or(0);
-        (1..=max_len)
-            .map(|index| vec![Value::Integer(index as i64)])
-            .collect()
+        let mut rows = Vec::with_capacity(max_len);
+        for index in 1..=max_len {
+            rows.push(vec![Value::Integer(index as i64)]);
+        }
+        rows
     }
 
     pub(crate) fn table_function_args_exprs(args: &TableFunctionArgs) -> Option<Vec<&Expr>> {
-        args.args
-            .iter()
-            .map(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
-                _ => None,
-            })
-            .collect()
+        let mut exprs = Vec::with_capacity(args.args.len());
+        for arg in &args.args {
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+                return None;
+            };
+            exprs.push(expr);
+        }
+        Some(exprs)
     }
 
     pub(crate) fn evaluate_generate_subscripts(

@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-201",
+  "title": "Preallocate generate_subscripts helpers",
+  "status": "completed",
+  "created_at": "2026-06-08T19:14:00+08:00",
+  "completed_at": "2026-06-08T19:17:13+08:00",
+  "scope": "generate_subscripts table-function row and argument vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/mod.rs"
+      ],
+      "summary": [
+        "Replaced dimension-1 generate_subscripts row collect with a vector preallocated from the array length.",
+        "Replaced nested-dimension generate_subscripts row collect with a vector preallocated from the maximum nested array length.",
+        "Replaced table-function argument expression collect with a vector preallocated from args.args.len()."
+      ]
+    },
+    "tests": {
+      "generate_subscripts_from_array_literal": "passed",
+      "generate_subscripts_depends_on_left_row_array": "passed",
+      "array_agg_over_generated_subscripts": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused table-function, scan, predicate, aggregate, or ORDER BY hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
