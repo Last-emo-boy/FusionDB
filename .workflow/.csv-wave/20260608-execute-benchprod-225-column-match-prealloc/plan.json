@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-225-column-match-prealloc",
+  "objective": "Preallocate fallback column-match buffers during expression column resolution.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:58:00+08:00",
+  "completed_at": "2026-06-08T21:04:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-225",
+      "title": "Preallocate fallback column matches",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/value.rs"
+      ],
+      "result": "Fallback column-name resolution now preallocates the match-index vector from schema column count before preserving the existing ambiguity check."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_three_table_join_with_alias_projection -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_correlated_not_exists_membership_filter_with_alias -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves exact-name lookup, case-insensitive lookup, suffix fallback matching, and ambiguous-column errors."
+  ]
+}

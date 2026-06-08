@@ -467,19 +467,17 @@ impl Executor {
         let suffix = format!(".{}", fallback_name);
         let fallback_lower = fallback_name.to_ascii_lowercase();
         let suffix_lower = suffix.to_ascii_lowercase();
-        let matches: Vec<usize> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                c.name == fallback_name
-                    || c.name.ends_with(&suffix)
-                    || c.name.eq_ignore_ascii_case(fallback_name)
-                    || c.name.to_ascii_lowercase().ends_with(&suffix_lower)
-                    || c.name.to_ascii_lowercase() == fallback_lower
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let mut matches = Vec::with_capacity(schema.columns.len());
+        for (index, column) in schema.columns.iter().enumerate() {
+            if column.name == fallback_name
+                || column.name.ends_with(&suffix)
+                || column.name.eq_ignore_ascii_case(fallback_name)
+                || column.name.to_ascii_lowercase().ends_with(&suffix_lower)
+                || column.name.to_ascii_lowercase() == fallback_lower
+            {
+                matches.push(index);
+            }
+        }
 
         if matches.len() == 1 {
             return Ok(matches[0]);

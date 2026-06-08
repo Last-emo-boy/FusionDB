@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-225",
+  "title": "Preallocate fallback column matches",
+  "status": "completed",
+  "created_at": "2026-06-08T20:58:00+08:00",
+  "completed_at": "2026-06-08T21:04:00+08:00",
+  "scope": "Expression column index resolution",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/value.rs"
+      ],
+      "summary": [
+        "Replaced fallback column-match iterator collect with Vec::with_capacity(schema.columns.len()).",
+        "Preserved exact, case-insensitive, and suffix-based matching conditions.",
+        "Preserved single-match return, ambiguous-match error, and not-found error behavior."
+      ]
+    },
+    "tests": {
+      "join_alias_projection": "passed",
+      "subquery_alias_membership_filter": "passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
