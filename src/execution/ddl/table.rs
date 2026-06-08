@@ -33,6 +33,14 @@ fn table_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+fn table_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 impl Executor {
     pub(crate) async fn handle_create_table(
         &self,
@@ -328,7 +336,7 @@ impl Executor {
 
             txn.delete(schema_key.as_bytes()).await?;
 
-            let prefix = format!("data:{}:", table_name);
+            let prefix = table_data_prefix_for_table(&table_name);
             let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
             for (k, _) in kv_pairs {
                 txn.delete(&k).await?;
@@ -369,7 +377,7 @@ impl Executor {
                 )));
             }
 
-            let prefix = format!("data:{}:", table_name);
+            let prefix = table_data_prefix_for_table(&table_name);
             let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
             for (k, _) in &kv_pairs {
                 txn.delete(k).await?;
@@ -495,7 +503,7 @@ impl Executor {
                                 schema.columns.remove(idx);
 
                                 // Rewrite existing rows: remove the column at idx
-                                let data_prefix = format!("data:{}:", table_name);
+                                let data_prefix = table_data_prefix_for_table(&table_name);
                                 let rows = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
                                 for (k, v) in rows {
                                     let key_str = std::str::from_utf8(&k).ok();
@@ -679,7 +687,7 @@ impl Executor {
             )));
         }
 
-        let data_prefix = format!("data:{}:", table_name);
+        let data_prefix = table_data_prefix_for_table(table_name);
         let rows = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
         let mut seen = HashSet::with_capacity(rows.len());
         let mut rewrites = Vec::with_capacity(rows.len());
@@ -933,7 +941,15 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::table_data_key_for_row_id;
+    use super::{table_data_key_for_row_id, table_data_prefix_for_table};
+
+    #[test]
+    fn table_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = table_data_prefix_for_table("accounts");
+
+        assert_eq!(prefix, "data:accounts:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
 
     #[test]
     fn table_data_key_for_row_id_preallocates_exact_key() {

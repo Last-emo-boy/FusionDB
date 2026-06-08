@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-314",
+  "title": "Preallocate DDL table data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/ddl/table.rs"
+  ],
+  "description": "Avoid generic format! allocation work when DDL table operations build data:<table>: prefixes from known table-name length.",
+  "implementation": [
+    "Added table_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Replaced DROP TABLE data scan prefix construction.",
+    "Replaced TRUNCATE TABLE data scan prefix construction.",
+    "Replaced ALTER TABLE DROP COLUMN row-rewrite scan prefix construction.",
+    "Replaced ALTER TABLE ADD PRIMARY KEY row-rewrite scan prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test table_data_prefix -- --nocapture",
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "DDL table data-prefix construction now reserves capacity from known table-name length while preserving table drop, truncate, row-cache invalidation, row rewrite, and SQL DDL behavior."
+}
