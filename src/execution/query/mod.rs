@@ -2443,7 +2443,10 @@ impl Executor {
             let mut is_count_star = false;
 
             if is_wildcard {
-                columns = schema.columns.iter().map(|c| c.name.clone()).collect();
+                columns = Vec::with_capacity(schema.columns.len());
+                for column in &schema.columns {
+                    columns.push(column.name.clone());
+                }
             } else {
                 if select.projection.len() == 1 {
                     let expr = match &select.projection[0] {
@@ -2482,7 +2485,10 @@ impl Executor {
                                 columns.push(alias.value.clone());
                             }
                             SelectItem::QualifiedWildcard(_, _) => {
-                                columns = schema.columns.iter().map(|c| c.name.clone()).collect();
+                                columns = Vec::with_capacity(schema.columns.len());
+                                for column in &schema.columns {
+                                    columns.push(column.name.clone());
+                                }
                                 break;
                             }
                             _ => {}

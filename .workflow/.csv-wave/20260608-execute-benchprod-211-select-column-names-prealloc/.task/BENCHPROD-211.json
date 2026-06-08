@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-211",
+  "title": "Preallocate SELECT column names",
+  "status": "completed",
+  "created_at": "2026-06-08T19:58:00+08:00",
+  "completed_at": "2026-06-08T20:00:16+08:00",
+  "scope": "SELECT wildcard result column-name construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced plain wildcard result column-name collect with an explicitly preallocated vector sized from schema.columns.len().",
+        "Applied the same preallocation to qualified wildcard projection handling.",
+        "Preserved result column order, COUNT(*) detection, and projection label behavior."
+      ]
+    },
+    "tests": {
+      "select_all": "passed",
+      "select_projection": "passed",
+      "sql_select": "27/27 passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
