@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-258",
+  "title": "Preallocate FBTree bulk-load buffers",
+  "status": "completed",
+  "created_at": "2026-06-08T23:52:00+08:00",
+  "completed_at": "2026-06-08T23:56:00+08:00",
+  "scope": "FBTree bulk-load outer buffer construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fbtree.rs"
+      ],
+      "summary": [
+        "Added node_group_count and bulk_load_node_capacity helpers.",
+        "Preallocated the leaf id list from iterator size_hint and FANOUT.",
+        "Preallocated the node arena from estimated leaf and inner node counts.",
+        "Preallocated next-level id lists for each inner-node build level."
+      ]
+    },
+    "tests": {
+      "fbtree_unit_tests": "3/3 passed",
+      "fusion_large_fbtree_prefix_scan": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

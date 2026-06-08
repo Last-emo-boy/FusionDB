@@ -68,6 +68,20 @@ impl FBTree {
         }
     }
 
+    fn node_group_count(item_count: usize) -> usize {
+        item_count / FANOUT + usize::from(item_count % FANOUT != 0)
+    }
+
+    fn bulk_load_node_capacity(leaf_count: usize) -> usize {
+        let mut total = leaf_count;
+        let mut level_count = leaf_count;
+        while level_count > 1 {
+            level_count = Self::node_group_count(level_count);
+            total += level_count;
+        }
+        total
+    }
+
     // Helper to calculate features for a key relative to a prefix
     fn extract_features(key: &[u8], prefix_len: usize) -> [u8; FEATURE_SIZE] {
         let mut features = [0u8; FEATURE_SIZE];
@@ -87,10 +101,14 @@ impl FBTree {
     where
         I: Iterator<Item = (Vec<u8>, Vec<u8>)>,
     {
-        let mut leaves = Vec::new();
+        let (lower_bound, upper_bound) = iter.size_hint();
+        let entry_capacity_hint = upper_bound.unwrap_or(lower_bound);
+        let leaf_capacity = Self::node_group_count(entry_capacity_hint).max(1);
+
+        let mut leaves = Vec::with_capacity(leaf_capacity);
         let mut current_leaf = Self::empty_leaf_node();
 
-        let mut nodes_arena = Vec::new();
+        let mut nodes_arena = Vec::with_capacity(Self::bulk_load_node_capacity(leaf_capacity));
 
         for (k, v) in iter {
             if current_leaf.keys.len() >= FANOUT {
@@ -127,7 +145,8 @@ impl FBTree {
         let mut current_level_ids = leaves;
 
         while current_level_ids.len() > 1 {
-            let mut next_level_ids = Vec::new();
+            let mut next_level_ids =
+                Vec::with_capacity(Self::node_group_count(current_level_ids.len()));
             let mut current_inner = Self::empty_inner_node();
 
             for (_i, &child_id) in current_level_ids.iter().enumerate() {
@@ -436,6 +455,7 @@ mod tests {
     #[test]
     fn bulk_load_preallocates_leaf_and_inner_slots() {
         let tree = FBTree::bulk_load(sorted_pairs(FANOUT * 2 + 1));
+        assert!(tree.nodes.capacity() >= 4);
 
         let root = tree.nodes[tree.root].read().unwrap();
         let Node::Inner(inner) = &*root else {
@@ -463,5 +483,16 @@ mod tests {
         let scanned: Vec<_> = tree.scan(b"key:0031").collect();
         assert_eq!(scanned.len(), 2);
         assert_eq!(scanned[0].0, b"key:0031".to_vec());
+    }
+
+    #[test]
+    fn bulk_load_capacity_helpers_count_fanout_groups() {
+        assert_eq!(FBTree::node_group_count(0), 0);
+        assert_eq!(FBTree::node_group_count(1), 1);
+        assert_eq!(FBTree::node_group_count(FANOUT), 1);
+        assert_eq!(FBTree::node_group_count(FANOUT + 1), 2);
+
+        assert_eq!(FBTree::bulk_load_node_capacity(1), 1);
+        assert_eq!(FBTree::bulk_load_node_capacity(FANOUT + 1), FANOUT + 4);
     }
 }
