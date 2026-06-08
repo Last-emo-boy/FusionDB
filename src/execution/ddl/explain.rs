@@ -751,9 +751,12 @@ impl Executor {
             }
         }
 
-        let mut members = members.into_iter().collect::<Vec<_>>();
-        members.sort_unstable();
-        Some(members)
+        let mut member_list = Vec::with_capacity(members.len());
+        for member in members {
+            member_list.push(member);
+        }
+        member_list.sort_unstable();
+        Some(member_list)
     }
 
     fn schema_contains_column_name_for_explain(

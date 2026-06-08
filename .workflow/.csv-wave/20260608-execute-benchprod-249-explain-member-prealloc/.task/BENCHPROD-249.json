@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-249",
+  "title": "Preallocate EXPLAIN predicate members",
+  "status": "completed",
+  "created_at": "2026-06-08T23:00:38+08:00",
+  "completed_at": "2026-06-08T23:00:38+08:00",
+  "scope": "EXPLAIN join-order predicate schema member vector construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/ddl/explain.rs"
+      ],
+      "summary": [
+        "Replaced members.into_iter().collect::<Vec<_>>() with Vec::with_capacity(members.len()).",
+        "Pushed schema member indices into the preallocated vector before sort_unstable().",
+        "Preserved sorted member output and join-order predicate classification behavior."
+      ]
+    },
+    "tests": {
+      "explain_join_order": "passed",
+      "sql_ddl": "29/29 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, storage, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
