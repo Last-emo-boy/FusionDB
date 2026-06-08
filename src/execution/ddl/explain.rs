@@ -31,6 +31,14 @@ impl ExplainAccessPath {
     }
 }
 
+fn explain_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +70,14 @@ mod tests {
 
     fn compound(name: &str, column: &str) -> Expr {
         Expr::CompoundIdentifier(vec![Ident::new(name), Ident::new(column)])
+    }
+
+    #[test]
+    fn explain_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = explain_data_prefix_for_table("lineitem");
+
+        assert_eq!(prefix, "data:lineitem:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 
     #[test]
@@ -609,7 +625,7 @@ impl Executor {
             let base_rows = if let Some(stats) = &stats {
                 stats.row_count
             } else {
-                let data_prefix = format!("data:{}:", table_name);
+                let data_prefix = explain_data_prefix_for_table(&table_name);
                 txn.count_prefix(data_prefix.as_bytes())
                     .await
                     .unwrap_or(usize::MAX)
