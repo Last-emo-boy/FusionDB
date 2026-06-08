@@ -26,6 +26,14 @@ fn insert_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+fn insert_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 impl Executor {
     fn insert_trace_enabled() -> bool {
         std::env::var("FUSIONDB_INSERT_TRACE")
@@ -60,7 +68,7 @@ impl Executor {
         column_idx: usize,
         txn: &mut dyn Transaction,
     ) -> Result<Value> {
-        let prefix = format!("data:{}:", table_name);
+        let prefix = insert_data_prefix_for_table(table_name);
         let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let mut max_seen = 0_i64;
         for (key, value) in existing {
@@ -329,7 +337,7 @@ impl Executor {
 
         for (idx, col) in context.schema.columns.iter().enumerate() {
             if col.is_unique && !col.is_primary && row_values[idx] != Value::Null {
-                let prefix = format!("data:{}:", context.table_name);
+                let prefix = insert_data_prefix_for_table(&context.table_name);
                 let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
                 for (k, v) in &existing {
                     let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
@@ -737,7 +745,7 @@ impl Executor {
                     for (idx, col) in schema.columns.iter().enumerate() {
                         if col.is_unique && !col.is_primary && row_values[idx] != Value::Null {
                             // Scan existing rows for duplicate value
-                            let prefix = format!("data:{}:", table_name_str);
+                            let prefix = insert_data_prefix_for_table(&table_name_str);
                             let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
                             for (k, v) in &existing {
                                 let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
@@ -1134,7 +1142,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::insert_data_key_for_row_id;
+    use super::{insert_data_key_for_row_id, insert_data_prefix_for_table};
 
     #[test]
     fn insert_data_key_for_row_id_preallocates_exact_key() {
@@ -1142,5 +1150,13 @@ mod tests {
 
         assert_eq!(key, "data:orders:00042");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn insert_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = insert_data_prefix_for_table("orders");
+
+        assert_eq!(prefix, "data:orders:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }
