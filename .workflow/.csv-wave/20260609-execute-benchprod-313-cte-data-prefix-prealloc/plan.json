@@ -1,0 +1,46 @@
+{
+  "id": "benchprod-313-cte-data-prefix-prealloc",
+  "objective": "Preallocate materialized CTE cleanup data prefixes from CTE-name length.",
+  "status": "completed",
+  "created_at": "2026-06-09T04:12:00+08:00",
+  "completed_at": "2026-06-09T04:15:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-313",
+      "title": "Preallocate CTE data prefixes",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Materialized CTE cleanup now uses an explicit-capacity helper instead of format! for data:<cte>: prefixes."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test materialized_cte_data_prefix -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_set_subquery test_cte_basic -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_set_subquery test_recursive_cte_alias_can_rename_prefix_columns -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for data:<cte>: before pushing known components.",
+    "The optimization replaces format! in clear_materialized_cte data-prefix scan construction.",
+    "Generated prefix bytes, scan_prefix inputs, delete keys, and CTE query results are unchanged."
+  ]
+}

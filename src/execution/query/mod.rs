@@ -23,6 +23,14 @@ fn join_group_left_bucket() -> Vec<Vec<Value>> {
     Vec::with_capacity(1)
 }
 
+fn materialized_cte_data_prefix_for_name(cte_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + cte_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(cte_name);
+    prefix.push(':');
+    prefix
+}
+
 fn materialized_cte_data_key_for_row_id(cte_name: &str, row_id: &str) -> String {
     let mut key = String::with_capacity("data:".len() + cte_name.len() + 1 + row_id.len());
     key.push_str("data:");
@@ -899,7 +907,7 @@ impl Executor {
     async fn clear_materialized_cte(txn: &mut dyn Transaction, cte_name: &str) -> Result<()> {
         txn.delete(format!("schema:{}", cte_name).as_bytes())
             .await?;
-        let prefix = format!("data:{}:", cte_name);
+        let prefix = materialized_cte_data_prefix_for_name(cte_name);
         let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
         for (key, _) in entries {
             txn.delete(&key).await?;
@@ -3376,6 +3384,14 @@ mod tests {
     fn join_group_left_bucket_preallocates_first_row() {
         let bucket = join_group_left_bucket();
         assert!(bucket.capacity() >= 1);
+    }
+
+    #[test]
+    fn materialized_cte_data_prefix_for_name_preallocates_exact_prefix() {
+        let prefix = materialized_cte_data_prefix_for_name("recent_orders");
+
+        assert_eq!(prefix, "data:recent_orders:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 
     #[test]

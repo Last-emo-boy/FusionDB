@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-313",
+  "title": "Preallocate CTE data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Avoid generic format! allocation work when materialized CTE cleanup scans build data:<cte>: prefixes from known CTE-name length.",
+  "implementation": [
+    "Added materialized_cte_data_prefix_for_name() with explicit capacity for data:<cte>:.",
+    "Replaced clear_materialized_cte data scan prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test materialized_cte_data_prefix -- --nocapture",
+    "cargo test --test sql_set_subquery test_cte_basic -- --nocapture",
+    "cargo test --test sql_set_subquery test_recursive_cte_alias_can_rename_prefix_columns -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Materialized CTE cleanup data-prefix construction now reserves capacity from known CTE-name length while preserving scan_prefix cleanup, recursive replacement, and CTE SQL results."
+}
