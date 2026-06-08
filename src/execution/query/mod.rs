@@ -3096,7 +3096,9 @@ impl Executor {
         }
 
         let partitions: Vec<Vec<usize>> = if spec.partition_by.is_empty() {
-            vec![(0..rows.len()).collect()]
+            let mut indices = Vec::with_capacity(rows.len());
+            indices.extend(0..rows.len());
+            vec![indices]
         } else {
             let mut partitions: HashMap<Vec<Value>, Vec<usize>> =
                 HashMap::with_capacity(rows.len());
@@ -3110,7 +3112,11 @@ impl Executor {
                 }
                 partitions.entry(partition_key).or_default().push(i);
             }
-            partitions.into_values().collect()
+            let mut partition_values = Vec::with_capacity(partitions.len());
+            for (_, indices) in partitions {
+                partition_values.push(indices);
+            }
+            partition_values
         };
 
         let mut result = vec![Value::Null; rows.len()];

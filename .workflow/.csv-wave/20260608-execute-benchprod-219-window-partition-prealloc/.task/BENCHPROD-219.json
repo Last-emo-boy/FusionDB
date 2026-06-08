@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-219",
+  "title": "Preallocate window partitions",
+  "status": "completed",
+  "created_at": "2026-06-08T20:26:00+08:00",
+  "completed_at": "2026-06-08T20:28:33+08:00",
+  "scope": "Window function partition vector construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced the no-PARTITION-BY row index collect with an explicitly preallocated vector sized from rows.len().",
+        "Replaced HashMap partition values collect with an explicitly preallocated vector sized from partitions.len().",
+        "Preserved window partition membership, row indexes, partition key evaluation, and per-partition ordering."
+      ]
+    },
+    "tests": {
+      "sql_window": "4/4 passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
