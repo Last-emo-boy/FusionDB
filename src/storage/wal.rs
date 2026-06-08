@@ -64,9 +64,13 @@ fn segment_path(base: &str, id: u64) -> String {
     }
 }
 
+fn wal_segment_list() -> Vec<(u64, String)> {
+    Vec::with_capacity(1)
+}
+
 /// Find all existing WAL segment files for a base path, sorted by segment ID.
 fn find_segments(base: &str) -> Vec<(u64, String)> {
-    let mut segments = Vec::new();
+    let mut segments = wal_segment_list();
 
     // Check base file (segment 0)
     if std::path::Path::new(base).exists() {
@@ -581,6 +585,12 @@ mod tests {
     fn test_find_segments_empty() {
         let segments = find_segments("nonexistent_test_path_xyz.wal");
         assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_wal_segment_list_preallocates_base_segment() {
+        let segments = wal_segment_list();
+        assert!(segments.capacity() >= 1);
     }
 
     #[test]

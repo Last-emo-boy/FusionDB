@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-280-wal-segment-list-prealloc",
+  "objective": "Preallocate WAL segment discovery lists for the common base segment.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:56:00+08:00",
+  "completed_at": "2026-06-09T01:59:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-280",
+      "title": "Preallocate WAL segment list",
+      "status": "completed",
+      "evidence": [
+        "src/storage/wal.rs"
+      ],
+      "result": "WAL segment discovery now creates its segment vector with capacity for the common base WAL segment."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test test_wal_segment_list_preallocates_base_segment -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::wal::tests -- --nocapture",
+      "status": "passed: 8/8"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::memory::tests -- --nocapture",
+      "status": "passed: 7/7"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid the recurring MSVC PDB pressure.",
+    "The segment list capacity is 1 because the common existing WAL path pushes segment 0 before scanning rotated segment files.",
+    "The optimization only changes the initial Vec allocation for WAL segment discovery; file existence checks, rotated segment parsing, sorting, replay, and truncate semantics are unchanged."
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-280",
+  "title": "Preallocate WAL segment list",
+  "status": "completed",
+  "created_at": "2026-06-09T01:56:00+08:00",
+  "completed_at": "2026-06-09T01:59:00+08:00",
+  "scope": "WAL segment discovery vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/wal.rs"
+      ],
+      "summary": [
+        "Added wal_segment_list to create WAL segment vectors with capacity 1.",
+        "Changed find_segments to use the preallocated helper before checking the base segment and rotated segment files.",
+        "Added unit coverage proving the helper preallocates for the base WAL segment.",
+        "Preserved segment path discovery, segment ID parsing, sorted order, replay, and truncate semantics."
+      ]
+    },
+    "tests": {
+      "wal_segment_list_unit": "passed",
+      "storage_wal_tests": "8/8 passed",
+      "storage_memory_tests": "7/7 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}
