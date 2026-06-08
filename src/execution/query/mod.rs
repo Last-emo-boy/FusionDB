@@ -813,11 +813,10 @@ impl Executor {
         columns: &[String],
         rows: &[Vec<Value>],
     ) -> Result<()> {
-        let cols = columns
-            .iter()
-            .enumerate()
-            .map(|(index, c)| Column {
-                name: c.clone(),
+        let mut cols = Vec::with_capacity(columns.len());
+        for (index, column) in columns.iter().enumerate() {
+            cols.push(Column {
+                name: column.clone(),
                 data_type: Self::materialized_column_type(rows, index),
                 is_primary: false,
                 is_indexed: false,
@@ -826,8 +825,8 @@ impl Executor {
                 is_nullable: true,
                 is_unique: false,
                 check_expr: None,
-            })
-            .collect();
+            });
+        }
         let schema = TableSchema::new(cte_name.to_string(), cols);
         let schema_key = format!("schema:{}", cte_name);
         let schema_bytes = bincode::serialize(&schema)

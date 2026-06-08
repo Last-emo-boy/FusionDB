@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-237",
+  "title": "Preallocate materialized CTE schema columns",
+  "status": "completed",
+  "created_at": "2026-06-08T21:56:23+08:00",
+  "completed_at": "2026-06-08T21:56:23+08:00",
+  "scope": "Materialized CTE temporary schema construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced materialized CTE column metadata collect with Vec::with_capacity(columns.len()).",
+        "Kept per-column materialized type inference and metadata fields unchanged.",
+        "Preserved temporary schema serialization and temporary row storage behavior."
+      ]
+    },
+    "tests": {
+      "cte_basic": "passed",
+      "recursive_cte_alias_columns": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, projection, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
