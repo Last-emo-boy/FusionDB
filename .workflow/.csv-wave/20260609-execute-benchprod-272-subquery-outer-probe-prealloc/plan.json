@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-272-subquery-outer-probe-prealloc",
+  "objective": "Preallocate the correlated EXISTS join outer-probe column set from known join schema width.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:06:00+08:00",
+  "completed_at": "2026-06-09T01:09:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-272",
+      "title": "Preallocate subquery outer-probe column set",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "result": "Correlated EXISTS join probe classification now preallocates its extracted-column set from the combined local join schema width."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_correlated_exists_two_table_membership_matches_ldbc_q6_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_correlated_not_exists_with_join_alias_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery -- --nocapture",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The capacity hint is bounded by left_schema.columns.len() + right_schema.columns.len(), using saturating_add.",
+    "The optimization only changes the initial HashSet allocation for extracted columns; EXISTS and NOT EXISTS semantics are unchanged."
+  ]
+}

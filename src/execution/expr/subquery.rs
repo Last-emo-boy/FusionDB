@@ -894,7 +894,12 @@ impl Executor {
         left_schema: &TableSchema,
         right_schema: &TableSchema,
     ) -> bool {
-        let mut columns = HashSet::new();
+        let mut columns = HashSet::with_capacity(
+            left_schema
+                .columns
+                .len()
+                .saturating_add(right_schema.columns.len()),
+        );
         self.extract_columns_from_expr(expr, &mut columns);
         if columns.is_empty() {
             return false;
