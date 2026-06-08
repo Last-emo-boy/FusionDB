@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-205",
+  "title": "Preallocate primary-key lookup projection indices",
+  "status": "completed",
+  "created_at": "2026-06-08T19:32:00+08:00",
+  "completed_at": "2026-06-08T19:34:46+08:00",
+  "scope": "Primary-key point lookup projection index vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/mod.rs"
+      ],
+      "summary": [
+        "Replaced primary-key exclusion filter collect with an explicitly preallocated lookup index vector.",
+        "Kept the direct clone path unchanged when no primary-key index needs to be excluded.",
+        "Preserved projection decode behavior and primary-key value restoration."
+      ]
+    },
+    "tests": {
+      "primary_key_lookup_projection_skips_where_key_decode": "passed",
+      "primary_key_only_equality_projection": "passed",
+      "primary_key_projection_reuses_full_row_cache": "passed",
+      "sql_index_cache": "37/37 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

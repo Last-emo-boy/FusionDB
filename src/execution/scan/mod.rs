@@ -819,11 +819,14 @@ impl Executor {
                                     let lookup_projection_indices =
                                         projection_indices.as_ref().map(|indices| {
                                             if let Some(pk_idx) = pk_index {
-                                                indices
-                                                    .iter()
-                                                    .copied()
-                                                    .filter(|idx| *idx != pk_idx)
-                                                    .collect::<Vec<_>>()
+                                                let mut lookup_indices =
+                                                    Vec::with_capacity(indices.len());
+                                                for &idx in indices {
+                                                    if idx != pk_idx {
+                                                        lookup_indices.push(idx);
+                                                    }
+                                                }
+                                                lookup_indices
                                             } else {
                                                 indices.clone()
                                             }
