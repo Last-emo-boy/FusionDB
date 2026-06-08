@@ -666,6 +666,41 @@ async fn test_intersect_except_with_empty_right_side() {
 }
 
 #[tokio::test]
+async fn test_intersect_except_with_empty_left_side() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE set_left_empty (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE set_right_nonempty (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO set_right_nonempty VALUES (1, 'a'), (2, 'b')",
+    )
+    .await;
+
+    let (_, intersect_rows) = query(
+        &executor,
+        "SELECT name FROM set_left_empty INTERSECT SELECT name FROM set_right_nonempty",
+    )
+    .await;
+    assert!(intersect_rows.is_empty());
+
+    let (_, except_rows) = query(
+        &executor,
+        "SELECT name FROM set_left_empty EXCEPT SELECT name FROM set_right_nonempty",
+    )
+    .await;
+    assert!(except_rows.is_empty());
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_subquery_in() {
     let (executor, wal) = setup().await;
     exec_ok(

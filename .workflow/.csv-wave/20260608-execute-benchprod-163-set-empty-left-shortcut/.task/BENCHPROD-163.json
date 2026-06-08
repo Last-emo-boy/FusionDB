@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-163",
+  "title": "Short-circuit empty-left INTERSECT/EXCEPT",
+  "status": "completed",
+  "created_at": "2026-06-08T16:26:00+08:00",
+  "completed_at": "2026-06-08T16:29:39+08:00",
+  "scope": "INTERSECT and EXCEPT handling when the left input is empty",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Expanded the INTERSECT empty-input shortcut to cover an empty left side.",
+        "Added an empty-left EXCEPT branch that returns an empty Vec directly.",
+        "Added coverage for empty-left INTERSECT and EXCEPT with a non-empty right side."
+      ]
+    },
+    "tests": {
+      "intersect_except_with_empty_left_side": "passed",
+      "sql_set_subquery": "47/47 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, set-operation, recursive CTE, or scan hot path."
+  ]
+}

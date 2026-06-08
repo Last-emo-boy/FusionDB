@@ -2956,11 +2956,14 @@ impl Executor {
                     all_rows.extend(right_rows);
                     all_rows
                 }
-                SetOperator::Intersect if right_rows.is_empty() => Vec::new(),
+                SetOperator::Intersect if left_rows.is_empty() || right_rows.is_empty() => {
+                    Vec::new()
+                }
                 SetOperator::Intersect => {
                     let right_set = Self::row_hash_set(right_rows);
                     Self::filter_rows_by_membership(left_rows, &right_set, true)
                 }
+                SetOperator::Except if left_rows.is_empty() => Vec::new(),
                 SetOperator::Except if right_rows.is_empty() => left_rows,
                 SetOperator::Except => {
                     let right_set = Self::row_hash_set(right_rows);
