@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-281-obsolete-sstable-path-buffer-prealloc",
+  "objective": "Preallocate obsolete SSTable deletion path buffers from the current obsolete list length.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:00:00+08:00",
+  "completed_at": "2026-06-09T02:03:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-281",
+      "title": "Preallocate obsolete SSTable path buffer",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "Obsolete SSTable cleanup now creates the deletion path buffer with capacity for the current obsolete SSTable list."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test obsolete_sstable_path_buffer_reserves_current_obsolete_len -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests::fusion_compaction_defers_obsolete_sstable_delete_until_readers_drop -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests -- --nocapture",
+      "status": "passed: 14/14"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The path buffer capacity comes from obsolete.len() while holding the obsolete_sstables write lock.",
+    "The optimization only changes initial Vec allocation for paths ready to delete; Arc strong-count checks, retained obsolete SSTables, deletion order, and file removal semantics are unchanged."
+  ]
+}

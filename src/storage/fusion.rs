@@ -20,6 +20,10 @@ const TS_SIZE: usize = 8;
 const COMPACTION_FANIN: usize = 4;
 const SSTABLE_BLOCK_BUFFER_CAPACITY: usize = 4096;
 
+fn obsolete_sstable_path_buffer(capacity: usize) -> Vec<PathBuf> {
+    Vec::with_capacity(capacity)
+}
+
 // --- Data Structures ---
 
 use super::fbtree::FBTree;
@@ -716,10 +720,9 @@ impl FusionStorage {
     }
 
     async fn collect_obsolete_sstables(&self) {
-        let mut ready_to_delete = Vec::new();
-        {
+        let ready_to_delete = {
             let mut obsolete = self.obsolete_sstables.write().unwrap();
-            ready_to_delete.reserve(obsolete.len());
+            let mut ready_to_delete = obsolete_sstable_path_buffer(obsolete.len());
             let mut index = 0;
             while index < obsolete.len() {
                 if Arc::strong_count(&obsolete[index]) == 1 {
@@ -729,7 +732,8 @@ impl FusionStorage {
                     index += 1;
                 }
             }
-        }
+            ready_to_delete
+        };
 
         for path in ready_to_delete {
             let _ = tokio::fs::remove_file(path).await;
@@ -2312,5 +2316,11 @@ mod tests {
         );
 
         cleanup_storage_dir(&data_dir);
+    }
+
+    #[test]
+    fn obsolete_sstable_path_buffer_reserves_current_obsolete_len() {
+        let paths = obsolete_sstable_path_buffer(4);
+        assert!(paths.capacity() >= 4);
     }
 }

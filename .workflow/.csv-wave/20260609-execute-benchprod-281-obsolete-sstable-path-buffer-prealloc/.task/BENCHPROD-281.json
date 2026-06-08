@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-281",
+  "title": "Preallocate obsolete SSTable path buffer",
+  "status": "completed",
+  "created_at": "2026-06-09T02:00:00+08:00",
+  "completed_at": "2026-06-09T02:03:00+08:00",
+  "scope": "Fusion storage obsolete SSTable cleanup path allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs"
+      ],
+      "summary": [
+        "Added obsolete_sstable_path_buffer to create deletion path buffers with caller-provided capacity.",
+        "Changed collect_obsolete_sstables to allocate the deletion path buffer with obsolete.len() while holding the obsolete list lock.",
+        "Added unit coverage proving the helper reserves the requested obsolete path capacity.",
+        "Preserved Arc strong-count checks, retained obsolete SSTables, deletion ordering, and async file removal behavior."
+      ]
+    },
+    "tests": {
+      "obsolete_sstable_path_buffer_unit": "passed",
+      "fusion_compaction_defers_obsolete_sstable_delete_until_readers_drop": "passed",
+      "storage_fusion_tests": "14/14 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}
