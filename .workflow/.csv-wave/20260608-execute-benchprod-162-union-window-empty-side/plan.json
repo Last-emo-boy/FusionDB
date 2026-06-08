@@ -1,0 +1,37 @@
+{
+  "id": "benchprod-162-union-window-empty-side",
+  "objective": "Short-circuit empty-side UNION ALL window concatenation.",
+  "status": "completed",
+  "created_at": "2026-06-08T16:22:00+08:00",
+  "completed_at": "2026-06-08T16:25:16+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-162",
+      "title": "Short-circuit empty-side UNION ALL windows",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "result": "UNION ALL LIMIT/OFFSET window concatenation now trims and returns the non-empty side directly when the other side is empty."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_union_all_window_with_empty_left_side -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 46/46"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

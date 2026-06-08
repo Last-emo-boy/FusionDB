@@ -153,6 +153,15 @@ impl Executor {
             return Vec::new();
         }
 
+        if left_rows.is_empty() {
+            Self::trim_set_rows_in_place(&mut right_rows, offset, limit);
+            return right_rows;
+        }
+        if right_rows.is_empty() {
+            Self::trim_set_rows_in_place(&mut left_rows, offset, limit);
+            return left_rows;
+        }
+
         let available = total_len - offset;
         let take = limit.map_or(available, |limit| limit.min(available));
         let mut rows = Vec::with_capacity(take);

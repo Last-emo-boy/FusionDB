@@ -77,6 +77,42 @@ async fn test_union_all_with_empty_left_side() {
 }
 
 #[tokio::test]
+async fn test_union_all_window_with_empty_left_side() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_window_empty_left (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_window_empty_left_right (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO union_window_empty_left_right VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT name FROM union_window_empty_left UNION ALL SELECT name FROM union_window_empty_left_right LIMIT 2 OFFSET 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["name"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("b".to_string())],
+            vec![Value::String("c".to_string())],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_union_all_limit_offset_without_order_by() {
     let (executor, wal) = setup().await;
     exec_ok(
