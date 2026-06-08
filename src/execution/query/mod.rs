@@ -2778,25 +2778,23 @@ impl Executor {
                 if !bare_aggs.is_empty() {
                     let aggregate_plans =
                         self.compile_group_aggregate_plans(&bare_aggs, &schema, params);
-                    let mut accs: Vec<AggregateAccumulator> = bare_aggs
-                        .iter()
-                        .map(|(_, name)| AggregateAccumulator::new(name))
-                        .collect();
+                    let mut accs = Vec::with_capacity(bare_aggs.len());
+                    for (_, name) in &bare_aggs {
+                        accs.push(AggregateAccumulator::new(name));
+                    }
                     for row in &rows {
                         for (i, plan) in aggregate_plans.iter().enumerate() {
                             let arg_val = plan.arg_source.evaluate(self, row, &schema, params);
                             accs[i].update(&arg_val);
                         }
                     }
-                    let agg_map: HashMap<Expr, Value> = aggregate_plans
-                        .iter()
-                        .zip(accs.iter())
-                        .map(|(plan, acc)| (plan.expr.clone(), acc.finalize()))
-                        .collect();
-                    let result_row = select
-                        .projection
-                        .iter()
-                        .map(|item| match item {
+                    let mut agg_map = HashMap::with_capacity(aggregate_plans.len());
+                    for (plan, acc) in aggregate_plans.iter().zip(accs.iter()) {
+                        agg_map.insert(plan.expr.clone(), acc.finalize());
+                    }
+                    let mut result_row = Vec::with_capacity(select.projection.len());
+                    for item in &select.projection {
+                        let value = match item {
                             SelectItem::UnnamedExpr(expr) => self.evaluate_final_group_expr(
                                 expr,
                                 &[],
@@ -2804,7 +2802,7 @@ impl Executor {
                                 &agg_map,
                                 &schema,
                                 params,
-                            ),
+                            )?,
                             SelectItem::ExprWithAlias { expr, .. } => self
                                 .evaluate_final_group_expr(
                                     expr,
@@ -2813,10 +2811,11 @@ impl Executor {
                                     &agg_map,
                                     &schema,
                                     params,
-                                ),
-                            _ => Ok(Value::Null),
-                        })
-                        .collect::<Result<Vec<_>>>()?;
+                                )?,
+                            _ => Value::Null,
+                        };
+                        result_row.push(value);
+                    }
                     return Ok(QueryResult::Select {
                         columns,
                         rows: vec![result_row],

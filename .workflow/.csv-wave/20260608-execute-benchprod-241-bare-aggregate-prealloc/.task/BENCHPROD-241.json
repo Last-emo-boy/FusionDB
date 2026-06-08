@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-241",
+  "title": "Preallocate bare aggregate fallback buffers",
+  "status": "completed",
+  "created_at": "2026-06-08T22:13:52+08:00",
+  "completed_at": "2026-06-08T22:13:52+08:00",
+  "scope": "Bare aggregate fallback result construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced bare aggregate accumulator collect with Vec::with_capacity(bare_aggs.len()).",
+        "Replaced aggregate final-value HashMap collect with HashMap::with_capacity(aggregate_plans.len()).",
+        "Replaced final projection result-row collect with Vec::with_capacity(select.projection.len())."
+      ]
+    },
+    "tests": {
+      "bare_sum_multiply": "passed",
+      "bare_sum_avg": "2/2 passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, projection, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
