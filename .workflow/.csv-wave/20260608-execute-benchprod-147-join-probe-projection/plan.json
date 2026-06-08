@@ -1,0 +1,37 @@
+{
+  "id": "benchprod-147-join-probe-projection",
+  "objective": "Harden join index probe projection pruning so qualified right-side columns stay aligned and cached full rows remain reusable.",
+  "status": "completed",
+  "created_at": "2026-06-08T14:45:00+08:00",
+  "completed_at": "2026-06-08T15:01:55+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-147",
+      "title": "Join probe projection alignment and cache reuse",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs",
+        "tests/sql_join.rs"
+      ],
+      "result": "Join probe projection pruning now resolves qualified stage columns against the right table base schema, reuses row_cache hits on projected primary-key and BTree probe paths, and preserves sparse full-width partial decode rows for final join projection."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_primary_key_join_probe_aligns_projected_right_column_after_key -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_primary_key_join_probe_projection_reuses_right_row_cache -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 30/30"
+    }
+  ]
+}

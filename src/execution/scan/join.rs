@@ -109,8 +109,7 @@ impl Executor {
         let base_projection: Vec<String> = stage_projection
             .iter()
             .filter_map(|column| {
-                self.resolve_column_index(column, &schema)
-                    .ok()
+                Self::resolve_base_projection_column_index(column, &schema)
                     .map(|index| schema.columns[index].name.clone())
             })
             .collect();
@@ -593,8 +592,7 @@ impl Executor {
         let base_projection: Vec<String> = stage_projection
             .iter()
             .filter_map(|column| {
-                self.resolve_column_index(column, schema)
-                    .ok()
+                Self::resolve_base_projection_column_index(column, schema)
                     .map(|index| schema.columns[index].name.clone())
             })
             .collect();
@@ -646,6 +644,11 @@ impl Executor {
                 return Ok(Vec::new());
             };
             let data_key = format!("data:{}:{}", table_name, row_id);
+            if let Some(row) = self.row_cache.get(&data_key) {
+                monitor::inc_row_cache_hit();
+                return Ok(vec![row]);
+            }
+
             let Some(data_bytes) = txn.get(data_key.as_bytes()).await? else {
                 return Ok(Vec::new());
             };
@@ -683,6 +686,12 @@ impl Executor {
                 }
             } else {
                 let data_key = format!("data:{}:{}", table_name, row_id);
+                if let Some(row) = self.row_cache.get(&data_key) {
+                    monitor::inc_row_cache_hit();
+                    rows.push(row);
+                    continue;
+                }
+
                 let Some(data_bytes) = txn.get(data_key.as_bytes()).await? else {
                     continue;
                 };
@@ -706,7 +715,7 @@ impl Executor {
         let columns = projection.as_ref()?;
         let mut indices = Vec::with_capacity(columns.len());
         for column in columns {
-            if let Ok(index) = self.resolve_column_index(column, schema) {
+            if let Some(index) = Self::resolve_base_projection_column_index(column, schema) {
                 indices.push(index);
             }
         }
@@ -736,8 +745,8 @@ impl Executor {
         let filtered = columns
             .iter()
             .filter(|column| {
-                self.resolve_column_index(column, schema)
-                    .map_or(true, |index| index != column_idx)
+                Self::resolve_base_projection_column_index(column, schema)
+                    .is_none_or(|index| index != column_idx)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -747,6 +756,26 @@ impl Executor {
         } else {
             Some(filtered)
         }
+    }
+
+    fn resolve_base_projection_column_index(column: &str, schema: &TableSchema) -> Option<usize> {
+        if let Some(index) = schema
+            .columns
+            .iter()
+            .position(|schema_column| schema_column.name.eq_ignore_ascii_case(column))
+        {
+            return Some(index);
+        }
+
+        let suffix = column.rsplit('.').next().unwrap_or(column);
+        schema.columns.iter().position(|schema_column| {
+            schema_column.name.eq_ignore_ascii_case(suffix)
+                || schema_column
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|schema_suffix| schema_suffix.eq_ignore_ascii_case(suffix))
+        })
     }
 
     fn restore_probe_key_column(rows: &mut [Vec<Value>], column_idx: usize, key_value: &Value) {

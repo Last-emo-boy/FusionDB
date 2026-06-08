@@ -380,6 +380,120 @@ async fn test_join_base_scan_populates_row_cache() {
 }
 
 #[tokio::test]
+async fn test_primary_key_join_probe_aligns_projected_right_column_after_key() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE probe_left_align (id INTEGER PRIMARY KEY, right_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE probe_right_align (id INTEGER PRIMARY KEY, name TEXT, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO probe_left_align VALUES (1, 10), (2, 20)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO probe_right_align VALUES (10, 'Alice', 'unused-a'), (20, 'Bob', 'unused-b')",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT l.id, r.name
+         FROM probe_left_align l JOIN probe_right_align r ON l.right_id = r.id
+         ORDER BY l.id",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["l.id", "r.name"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::String("Alice".to_string())],
+            vec![Value::Integer(2), Value::String("Bob".to_string())],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_primary_key_join_probe_projection_reuses_right_row_cache() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE probe_left_cache (id INTEGER PRIMARY KEY, right_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE probe_right_cache (id INTEGER PRIMARY KEY, name TEXT, payload TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO probe_left_cache VALUES (1, 10)").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO probe_right_cache VALUES (10, 'Cached', 'unused')",
+    )
+    .await;
+
+    let (_, rows) = query(&executor, "SELECT * FROM probe_right_cache WHERE id = 10").await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(10),
+            Value::String("Cached".to_string()),
+            Value::String("unused".to_string())
+        ]]
+    );
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(10),
+            Value::String("Cached".to_string()),
+            Value::String("unused".to_string()),
+        ]);
+        let corrupt_col_idx = 1usize;
+        let off_pos = 2 + corrupt_col_idx * 4;
+        let start =
+            u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        for byte in &mut corrupt_row[start..] {
+            *byte = 0xff;
+        }
+
+        let key = format!(
+            "data:probe_right_cache:{}",
+            fusiondb::common::encoding::encode_i64_comparable(10)
+        );
+        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT l.id, r.name
+         FROM probe_left_cache l JOIN probe_right_cache r ON l.right_id = r.id",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["l.id", "r.name"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("Cached".to_string())]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_three_table_join_with_alias_projection() {
     let (executor, wal) = setup().await;
     exec_ok(

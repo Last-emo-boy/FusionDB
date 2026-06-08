@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-147",
+  "title": "Join probe projection alignment and cache reuse",
+  "status": "completed",
+  "created_at": "2026-06-08T14:45:00+08:00",
+  "completed_at": "2026-06-08T15:01:55+08:00",
+  "scope": "join index probe projection pruning, primary-key probe cache reuse, and join projection regression coverage",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs",
+        "tests/sql_join.rs"
+      ],
+      "summary": [
+        "Mapped stage join projection columns back to base table columns with a helper that accepts qualified aliases when building right-side probe projections.",
+        "Allowed projected primary-key and BTree join probe paths to reuse full rows already present in row_cache before reading and decoding storage bytes.",
+        "Kept join probe partial decode rows in the existing RowDecoder full-width sparse layout so later schema-based projection reads the correct right-side column slots.",
+        "Added regressions for projected right columns after the join key and for projected join probes reusing a cached full right row."
+      ]
+    },
+    "tests": {
+      "join_probe_aligns_projected_right_column_after_key": "passed",
+      "join_probe_projection_reuses_right_row_cache": "passed",
+      "fmt_check": "passed",
+      "sql_join": "30/30 passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue scanning database-core performance tasks for the next unclosed BENCHPROD item."
+  ]
+}
