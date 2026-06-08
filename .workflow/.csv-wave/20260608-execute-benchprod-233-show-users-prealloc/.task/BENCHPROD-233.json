@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-233",
+  "title": "Preallocate SHOW USERS output buffers",
+  "status": "completed",
+  "created_at": "2026-06-08T21:58:00+08:00",
+  "completed_at": "2026-06-08T22:04:00+08:00",
+  "scope": "SHOW USERS result construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/mod.rs"
+      ],
+      "summary": [
+        "Replaced SHOW USERS row collect with Vec::with_capacity(users.len()).",
+        "Preallocated per-user permission strings from record.permissions.len().",
+        "Preallocated per-table privilege names from privileges.len()."
+      ]
+    },
+    "tests": {
+      "rbac_grant_revoke": "passed",
+      "rbac_create_drop_user": "passed",
+      "sql_returning_upsert_vector_rbac": "14/14 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

@@ -987,27 +987,26 @@ impl Executor {
 
     async fn handle_show_users(&self, txn: &mut dyn Transaction) -> Result<QueryResult> {
         let users = crate::auth::list_users(txn).await?;
-        let rows: Vec<Vec<Value>> = users
-            .iter()
-            .map(|(name, record)| {
-                let perms: Vec<String> = record
-                    .permissions
-                    .iter()
-                    .map(|(t, p)| {
-                        format!("{}: {}", t, p.iter().cloned().collect::<Vec<_>>().join(","))
-                    })
-                    .collect();
-                vec![
-                    Value::String(name.clone()),
-                    Value::Boolean(record.is_superuser),
-                    Value::String(if perms.is_empty() {
-                        "none".to_string()
-                    } else {
-                        perms.join("; ")
-                    }),
-                ]
-            })
-            .collect();
+        let mut rows = Vec::with_capacity(users.len());
+        for (name, record) in &users {
+            let mut perms = Vec::with_capacity(record.permissions.len());
+            for (table, privileges) in &record.permissions {
+                let mut privilege_names = Vec::with_capacity(privileges.len());
+                for privilege in privileges {
+                    privilege_names.push(privilege.clone());
+                }
+                perms.push(format!("{}: {}", table, privilege_names.join(",")));
+            }
+            rows.push(vec![
+                Value::String(name.clone()),
+                Value::Boolean(record.is_superuser),
+                Value::String(if perms.is_empty() {
+                    "none".to_string()
+                } else {
+                    perms.join("; ")
+                }),
+            ]);
+        }
         Ok(QueryResult::Select {
             columns: vec![
                 "User".to_string(),
