@@ -1,0 +1,40 @@
+{
+  "id": "benchprod-244-wal-batch-prealloc",
+  "objective": "Preallocate synchronous WAL batch clone buffers from the known input slice length.",
+  "status": "completed",
+  "created_at": "2026-06-08T22:35:02+08:00",
+  "completed_at": "2026-06-08T22:35:02+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-244",
+      "title": "Preallocate WAL append batch clone buffer",
+      "status": "completed",
+      "evidence": [
+        "src/storage/wal.rs"
+      ],
+      "result": "WalManager::append_batch now preallocates the owned WAL entry vector from entries.len() before cloning the input slice."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::wal::tests::test_wal_append_batch_replay_preserves_order -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::wal::tests -- --nocapture",
+      "status": "passed: 5/5 target module tests"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves WAL entry order and Put/Delete clone semantics while avoiding implicit vector growth in the sync append_batch wrapper."
+  ]
+}

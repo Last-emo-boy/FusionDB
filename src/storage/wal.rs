@@ -308,13 +308,13 @@ impl WalManager {
         // Clone entries because we need to send ownership
         // This is a cost, but WalEntry owns data.
         // Ideally we change signature to take Vec<WalEntry>
-        let entries_vec: Vec<WalEntry> = entries
-            .iter()
-            .map(|e| match e {
-                WalEntry::Put(k, v) => WalEntry::Put(k.clone(), v.clone()),
-                WalEntry::Delete(k) => WalEntry::Delete(k.clone()),
-            })
-            .collect();
+        let mut entries_vec = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                WalEntry::Put(k, v) => entries_vec.push(WalEntry::Put(k.clone(), v.clone())),
+                WalEntry::Delete(k) => entries_vec.push(WalEntry::Delete(k.clone())),
+            }
+        }
 
         self.tx
             .send(WalJob::Append {
@@ -591,6 +591,34 @@ mod tests {
         assert_eq!(entries.len(), 3);
 
         // Cleanup
+        wal2.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_append_batch_replay_preserves_order() {
+        let path = format!("test_wal_batch_{}.wal", std::process::id());
+        let wal = WalManager::new(&path).unwrap();
+        wal.append_batch(&[
+            WalEntry::Put(b"key1".to_vec(), b"val1".to_vec()),
+            WalEntry::Delete(b"key1".to_vec()),
+            WalEntry::Put(b"key2".to_vec(), b"val2".to_vec()),
+        ])
+        .unwrap();
+
+        let wal2 = WalManager::new(&path).unwrap();
+        let entries = wal2.replay().unwrap();
+        match entries.as_slice() {
+            [WalEntry::Put(k1, v1), WalEntry::Delete(k2), WalEntry::Put(k3, v3)] => {
+                assert_eq!(k1, b"key1");
+                assert_eq!(v1, b"val1");
+                assert_eq!(k2, b"key1");
+                assert_eq!(k3, b"key2");
+                assert_eq!(v3, b"val2");
+            }
+            other => panic!("unexpected WAL entries: {:?}", other),
+        }
+
         wal2.truncate().unwrap();
         let _ = std::fs::remove_file(&path);
     }

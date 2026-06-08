@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-244",
+  "title": "Preallocate WAL append batch clone buffer",
+  "status": "completed",
+  "created_at": "2026-06-08T22:35:02+08:00",
+  "completed_at": "2026-06-08T22:35:02+08:00",
+  "scope": "Synchronous WAL append batch cloning",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/wal.rs"
+      ],
+      "summary": [
+        "Replaced append_batch slice map collect with Vec::with_capacity(entries.len()).",
+        "Cloned Put and Delete entries into the owned send buffer with explicit pushes.",
+        "Added a WAL append_batch replay test that checks Put/Delete order and payload preservation."
+      ]
+    },
+    "tests": {
+      "wal_append_batch_replay_order": "passed",
+      "wal_module_tests": "5/5 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
