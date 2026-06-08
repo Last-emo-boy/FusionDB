@@ -527,7 +527,12 @@ impl Executor {
             return None;
         };
 
-        let mut required_indices = HashSet::new();
+        let required_capacity = projected_columns
+            .len()
+            .saturating_add(pending_predicates.len())
+            .saturating_add(join_column_refs.len())
+            .min(schema.columns.len());
+        let mut required_indices = HashSet::with_capacity(required_capacity);
 
         for column in projected_columns {
             if let Ok(index) = self.resolve_column_index(column, schema) {

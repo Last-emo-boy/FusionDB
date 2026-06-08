@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-186",
+  "title": "Preallocate join required indices",
+  "status": "completed",
+  "created_at": "2026-06-08T18:13:00+08:00",
+  "completed_at": "2026-06-08T18:16:03+08:00",
+  "scope": "Join stage projection required-index allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Computed required_indices capacity from projected column count, pending predicate count, and join column reference count.",
+        "Capped the capacity by schema width before constructing the HashSet.",
+        "Kept index resolution, required column collection, and projection decision behavior unchanged."
+      ]
+    },
+    "tests": {
+      "join_projection_pushdown_with_group_by": "passed",
+      "join_left_filter_projection_skips_unused_left_column_decode": "passed",
+      "comma_join_projection_keeps_right_columns_without_join_pushdown": "passed",
+      "join_index_probe_projection_skips_unused_right_column_decode": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused join, scan, expression, or predicate hot path."
+  ]
+}
