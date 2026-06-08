@@ -1581,7 +1581,15 @@ impl Executor {
         let new_schema = TableSchema::new("join_result".to_string(), new_columns);
 
         let row_width = left_schema.columns.len() + right_schema.columns.len();
-        let mut new_rows = Vec::new();
+        let expected_rows = if is_left_outer {
+            left_rows.len()
+        } else {
+            left_rows.len().min(right_rows.len())
+        };
+        let output_capacity = limit
+            .map_or(expected_rows, |limit| expected_rows.min(limit))
+            .min(4096);
+        let mut new_rows = Vec::with_capacity(output_capacity);
         let mut hash_join_executed = false;
 
         if !matches!(

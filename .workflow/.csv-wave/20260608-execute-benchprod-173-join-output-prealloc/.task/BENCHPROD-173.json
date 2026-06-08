@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-173",
+  "title": "Preallocate join output rows",
+  "status": "completed",
+  "created_at": "2026-06-08T17:21:00+08:00",
+  "completed_at": "2026-06-08T17:24:01+08:00",
+  "scope": "Regular join output row buffer allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Changed the regular scan_join output rows buffer from Vec::new to Vec::with_capacity.",
+        "Sized the capacity from left/right input row counts and the pushed join limit.",
+        "Preserved left outer join expectations and capped preallocation at 4096 rows.",
+        "Kept hash join, nested loop join, projection, and limit stop conditions unchanged."
+      ]
+    },
+    "tests": {
+      "inner_join_focused": "3 matched passed",
+      "left_join_focused": "2 matched passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}
