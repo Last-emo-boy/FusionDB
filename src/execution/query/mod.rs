@@ -862,6 +862,11 @@ impl Executor {
         } else {
             Self::deduplicate_rows(anchor_rows)
         };
+        let mut seen_rows = if union_all {
+            None
+        } else {
+            Some(Self::row_hash_set(all_rows.clone()))
+        };
         let mut delta_rows = all_rows.clone();
         let recursive_query = Self::query_from_set_expr(recursive_body);
 
@@ -894,7 +899,15 @@ impl Executor {
                         row.len()
                     )));
                 }
-                if union_all || !all_rows.contains(&row) {
+                let should_add = if union_all {
+                    true
+                } else {
+                    seen_rows
+                        .as_mut()
+                        .expect("recursive UNION should track seen rows")
+                        .insert(row.clone())
+                };
+                if should_add {
                     if all_rows.len() >= Self::MAX_RECURSIVE_CTE_ROWS {
                         return Err(FusionError::Execution(format!(
                             "WITH RECURSIVE CTE {} row limit exceeded: max {} rows",

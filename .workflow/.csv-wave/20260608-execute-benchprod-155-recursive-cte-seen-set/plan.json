@@ -1,0 +1,37 @@
+{
+  "id": "benchprod-155-recursive-cte-seen-set",
+  "objective": "Avoid linear scans when recursive UNION checks whether candidate rows were already produced.",
+  "status": "completed",
+  "created_at": "2026-06-08T15:38:00+08:00",
+  "completed_at": "2026-06-08T15:41:04+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-155",
+      "title": "Track recursive UNION rows with a HashSet",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "result": "Recursive UNION now checks produced rows through a HashSet instead of scanning all accumulated rows."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_with_recursive_union_skips_seen_recursive_rows -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 40/40"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
