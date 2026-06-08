@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-285-obsolete-sstable-buffer-prealloc",
+  "objective": "Preallocate Fusion storage obsolete SSTable buffers for the first compaction output.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:13:00+08:00",
+  "completed_at": "2026-06-09T02:15:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-285",
+      "title": "Preallocate obsolete SSTable buffer",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "Fusion storage now creates the obsolete SSTable queue with capacity for the first compaction candidate retained for deferred deletion."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test obsolete_sstable_buffer_preallocates_first_compaction_output -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests::fusion_compaction_defers_obsolete_sstable_delete_until_readers_drop -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests -- --nocapture",
+      "status": "passed: 18/18"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The obsolete SSTable buffer capacity is 1 because the first successful compaction pushes its first old SSTable into this queue.",
+    "The optimization only changes initial Vec allocation for obsolete SSTable handles; compaction replacement, Arc strong-count checks, deferred deletion, and file removal semantics are unchanged."
+  ]
+}

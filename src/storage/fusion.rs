@@ -32,6 +32,10 @@ fn sstable_handle_buffer() -> Vec<Arc<SsTable>> {
     Vec::with_capacity(1)
 }
 
+fn obsolete_sstable_buffer() -> Vec<Arc<SsTable>> {
+    Vec::with_capacity(1)
+}
+
 // --- Data Structures ---
 
 use super::fbtree::FBTree;
@@ -260,7 +264,7 @@ impl FusionStorage {
             active_memtable: Arc::new(RwLock::new(active)),
             immutable_memtables: Arc::new(RwLock::new(immutable_memtable_buffer())),
             sstables: Arc::new(RwLock::new(sstables_vec)),
-            obsolete_sstables: Arc::new(RwLock::new(Vec::new())),
+            obsolete_sstables: Arc::new(RwLock::new(obsolete_sstable_buffer())),
             wal: Arc::new(wal),
             current_ts: Arc::new(AtomicU64::new(0)), // Will be updated by replay
             next_memtable_id: Arc::new(AtomicU64::new(next_id)),
@@ -2352,5 +2356,11 @@ mod tests {
     fn immutable_memtable_buffer_preallocates_first_flush() {
         let memtables = immutable_memtable_buffer();
         assert!(memtables.capacity() >= 1);
+    }
+
+    #[test]
+    fn obsolete_sstable_buffer_preallocates_first_compaction_output() {
+        let sstables = obsolete_sstable_buffer();
+        assert!(sstables.capacity() >= 1);
     }
 }
