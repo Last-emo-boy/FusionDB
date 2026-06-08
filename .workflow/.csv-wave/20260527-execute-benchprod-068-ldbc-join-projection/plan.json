@@ -20,7 +20,7 @@
     {
       "id": "BENCHPROD-068",
       "title": "LDBC join projection pushdown",
-      "status": "in_progress",
+      "status": "completed",
       "expected_changes": [
         "Use join projection hints when the first relation has a local WHERE predicate.",
         "Use join projection hints for right-side relation scans inside join steps.",

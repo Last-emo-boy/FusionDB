@@ -23,7 +23,7 @@
     {
       "id": "BENCHPROD-061",
       "title": "Stream multi-column GROUP BY rollups for CH-benCHmark",
-      "status": "in_progress",
+      "status": "completed",
       "expected_changes": [
         "Support streaming column-scan aggregation for simple projections with multiple GROUP BY columns.",
         "Target `GROUP BY w_id, status` with `SUM(total)` and `COUNT(*)`.",

@@ -22,7 +22,7 @@
     {
       "id": "BENCHPROD-064",
       "title": "Top-N grouped aggregate ORDER BY LIMIT",
-      "status": "in_progress",
+      "status": "completed",
       "expected_changes": [
         "Optimize fast-path grouped aggregate ordering when ORDER BY is supported and LIMIT/OFFSET is present.",
         "Avoid fully sorting every group for LDBC `ORDER BY COUNT(*) DESC LIMIT 10` and CH `ORDER BY SUM(total) DESC LIMIT 20` shapes.",

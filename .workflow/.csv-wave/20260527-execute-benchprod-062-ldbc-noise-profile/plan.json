@@ -19,7 +19,7 @@
     {
       "id": "BENCHPROD-062",
       "title": "Add observed LDBC one-hop noise to production gate profile",
-      "status": "in_progress",
+      "status": "completed",
       "expected_changes": [
         "Record the observed `ldbc:One-hop friends` instability from BENCHPROD-060 as known low-latency benchmark noise.",
         "Update the versioned production_medium gate profile without changing suite thresholds.",

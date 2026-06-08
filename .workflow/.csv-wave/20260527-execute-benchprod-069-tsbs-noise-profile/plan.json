@@ -18,7 +18,7 @@
     {
       "id": "BENCHPROD-069",
       "title": "Add TSBS tag-filtered noise to production gate profile",
-      "status": "in_progress",
+      "status": "completed",
       "expected_changes": [
         "Add tsbs:Tag-filtered time range to the production medium unstable case allowlist.",
         "Keep suite thresholds unchanged.",

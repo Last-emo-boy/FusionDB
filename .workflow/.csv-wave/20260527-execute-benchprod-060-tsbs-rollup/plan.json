@@ -23,7 +23,7 @@
     {
       "id": "BENCHPROD-060",
       "title": "Optimize TSBS Fleet rollup by region",
-      "status": "in_progress",
+      "status": "completed",
       "expected_changes": [
         "Inspect the TSBS rollup query and current GROUP BY aggregate fast path.",
         "Reduce per-row work for `WHERE ts >= 1000 AND ts < 50000 GROUP BY region` without changing SQL semantics.",

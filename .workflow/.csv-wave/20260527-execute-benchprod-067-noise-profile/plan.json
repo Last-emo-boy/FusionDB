@@ -20,7 +20,7 @@
     {
       "id": "BENCHPROD-067",
       "title": "Add current LDBC and memtier noise to production gate profile",
-      "status": "in_progress",
+      "status": "completed",
       "expected_changes": [
         "Add the newly observed low-latency unstable cases to the versioned production_medium allowlist.",
         "Do not change suite thresholds or maximum unstable counts.",
