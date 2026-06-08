@@ -1039,8 +1039,10 @@ impl Executor {
                             {
                                 ordered
                             } else {
-                                let mut row_ids_vec: Vec<String> =
-                                    index_plan.row_ids.into_iter().collect();
+                                let mut row_ids_vec = Vec::with_capacity(index_plan.row_ids.len());
+                                for row_id in index_plan.row_ids {
+                                    row_ids_vec.push(row_id);
+                                }
                                 row_ids_vec.sort_unstable();
                                 row_ids_vec
                             };

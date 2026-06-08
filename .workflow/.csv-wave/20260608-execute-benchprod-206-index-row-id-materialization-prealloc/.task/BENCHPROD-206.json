@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-206",
+  "title": "Preallocate index scan row id materialization",
+  "status": "completed",
+  "created_at": "2026-06-08T19:39:00+08:00",
+  "completed_at": "2026-06-08T19:41:39+08:00",
+  "scope": "Index scan row id materialization before sorting unordered row id sets",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/mod.rs"
+      ],
+      "summary": [
+        "Replaced unordered index row id collect with an explicitly preallocated vector sized from index_plan.row_ids.len().",
+        "Preserved sort_unstable ordering for unordered row id sets.",
+        "Kept ordered row id reuse, limit truncation, exact filtering, and row fetch behavior unchanged."
+      ]
+    },
+    "tests": {
+      "sql_index_cache": "37/37 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
