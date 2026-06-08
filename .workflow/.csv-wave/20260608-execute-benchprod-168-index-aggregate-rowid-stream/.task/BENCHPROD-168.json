@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-168",
+  "title": "Stream indexed aggregate row ids",
+  "status": "completed",
+  "created_at": "2026-06-08T16:55:30+08:00",
+  "completed_at": "2026-06-08T16:58:51+08:00",
+  "scope": "Indexed column aggregate scan row id handling",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "summary": [
+        "Removed the intermediate row_ids vector from simple_column_aggregate_index_scan.",
+        "Primary-key probes now fetch and visit the single candidate row directly.",
+        "BTree index probes now parse each index entry row id and immediately fetch and visit the data row.",
+        "Kept aggregate state finalization and predicate evaluation behavior unchanged."
+      ]
+    },
+    "tests": {
+      "filtered_count_uses_index_candidates_and_required_columns_only": "passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}

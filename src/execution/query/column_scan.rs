@@ -811,27 +811,6 @@ impl Executor {
             return Ok(None);
         };
 
-        let mut row_ids = Vec::new();
-        let column = &schema.columns[column_index];
-        if column.is_primary {
-            if let Some(row_id) = Self::value_to_primary_row_id(&value) {
-                row_ids.push(row_id);
-            } else {
-                return Ok(None);
-            }
-        } else if let Some(value_key) = self.value_to_index_string(&value) {
-            let index_prefix = format!("index:{}:{}:{}:", table_name, column_name, value_key);
-            let entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
-            row_ids.reserve(entries.len());
-            for (key, _) in entries {
-                if let Some(row_id) = Self::row_id_from_key(&key) {
-                    row_ids.push(row_id.to_string());
-                }
-            }
-        } else {
-            return Ok(None);
-        }
-
         let mut states: Vec<ColumnAggregateState> = plans
             .iter()
             .map(|plan| ColumnAggregateState::new(plan.kind))
@@ -844,11 +823,29 @@ impl Executor {
             error: None,
         };
 
-        for row_id in row_ids {
+        let column = &schema.columns[column_index];
+        if column.is_primary {
+            let Some(row_id) = Self::value_to_primary_row_id(&value) else {
+                return Ok(None);
+            };
             let data_key = format!("data:{}:{}", table_name, row_id);
             if let Some(data) = txn.get(data_key.as_bytes()).await? {
                 visitor.visit_row(&data)?;
             }
+        } else if let Some(value_key) = self.value_to_index_string(&value) {
+            let index_prefix = format!("index:{}:{}:{}:", table_name, column_name, value_key);
+            let entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
+            for (key, _) in entries {
+                let Some(row_id) = Self::row_id_from_key(&key) else {
+                    continue;
+                };
+                let data_key = format!("data:{}:{}", table_name, row_id);
+                if let Some(data) = txn.get(data_key.as_bytes()).await? {
+                    visitor.visit_row(&data)?;
+                }
+            }
+        } else {
+            return Ok(None);
         }
 
         Ok(Some(
