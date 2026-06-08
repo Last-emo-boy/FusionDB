@@ -2298,7 +2298,11 @@ impl Executor {
                 if cols.is_empty() {
                     Some(vec![])
                 } else {
-                    Some(cols.into_iter().collect())
+                    let mut projection_columns = Vec::with_capacity(cols.len());
+                    for column in cols {
+                        projection_columns.push(column);
+                    }
+                    Some(projection_columns)
                 }
             };
 
@@ -2350,7 +2354,11 @@ impl Executor {
                 if cols.is_empty() {
                     Some(vec![])
                 } else {
-                    Some(cols.into_iter().collect())
+                    let mut projection_columns = Vec::with_capacity(cols.len());
+                    for column in cols {
+                        projection_columns.push(column);
+                    }
+                    Some(projection_columns)
                 }
             } else {
                 projection_hint
