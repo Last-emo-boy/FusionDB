@@ -1414,6 +1414,31 @@ async fn test_group_by_aggregate_order_by_limit_offset_topn_window() {
 }
 
 #[tokio::test]
+async fn test_group_by_order_by_limit_offset_beyond_groups() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE topn_sales_empty (id INTEGER PRIMARY KEY, category TEXT, amount INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO topn_sales_empty VALUES (1, 'A', 10), (2, 'B', 90), (3, 'C', 50)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT category, SUM(amount) FROM topn_sales_empty GROUP BY category ORDER BY SUM(amount) DESC LIMIT 2 OFFSET 10",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["category", "SUM(amount)"]);
+    assert!(rows.is_empty());
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_group_by_sum_multiply_expr() {
     let (executor, wal) = setup().await;
     exec_ok(

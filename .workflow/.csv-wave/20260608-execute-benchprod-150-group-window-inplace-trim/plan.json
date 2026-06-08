@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-150-group-window-inplace-trim",
+  "objective": "Reduce allocation in simple GROUP BY ORDER BY LIMIT/OFFSET result trimming by slicing the result window in place.",
+  "status": "completed",
+  "created_at": "2026-06-08T15:15:00+08:00",
+  "completed_at": "2026-06-08T15:18:22+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-150",
+      "title": "Group-by order-limit in-place trim",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/column_scan.rs",
+        "tests/sql_group_aggregate.rs"
+      ],
+      "result": "Simple GROUP BY ORDER BY LIMIT/OFFSET now trims the final result window in place instead of draining into a newly allocated Vec."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_group_aggregate test_group_by_aggregate_order_by_limit_offset_topn_window -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate test_group_by_order_by_limit_offset_beyond_groups -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 30/30"
+    }
+  ]
+}

@@ -1489,12 +1489,23 @@ impl Executor {
         }
 
         if offset > 0 || limit.is_some() {
-            let take = limit.unwrap_or(usize::MAX);
-            let limited = rows.drain(..).skip(offset).take(take).collect::<Vec<_>>();
-            *rows = limited;
+            Self::trim_rows_in_place(rows, offset, limit);
         }
 
         Ok(())
+    }
+
+    fn trim_rows_in_place(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<usize>) {
+        if offset >= rows.len() {
+            rows.clear();
+            return;
+        }
+        if offset > 0 {
+            drop(rows.drain(..offset));
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
     }
 
     pub(super) fn simple_order_limit_supported(

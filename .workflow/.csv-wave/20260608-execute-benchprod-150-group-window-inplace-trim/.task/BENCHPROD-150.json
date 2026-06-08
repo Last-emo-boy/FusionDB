@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-150",
+  "title": "Group-by order-limit in-place trim",
+  "status": "completed",
+  "created_at": "2026-06-08T15:15:00+08:00",
+  "completed_at": "2026-06-08T15:18:22+08:00",
+  "scope": "simple GROUP BY ORDER BY LIMIT/OFFSET result-window trimming",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs",
+        "tests/sql_group_aggregate.rs"
+      ],
+      "summary": [
+        "Added trim_rows_in_place for simple group-by fast-path result windowing.",
+        "Replaced drain/skip/take/collect with prefix drain plus truncate, avoiding a new Vec allocation for LIMIT/OFFSET trimming.",
+        "Added an offset-beyond-groups regression to cover the clear branch."
+      ]
+    },
+    "tests": {
+      "group_by_aggregate_order_by_limit_offset_topn_window": "passed",
+      "group_by_order_by_limit_offset_beyond_groups": "passed",
+      "fmt_check": "passed",
+      "sql_group_aggregate": "50/50 passed",
+      "sql_select": "27/27 passed",
+      "sql_join": "30/30 passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query or scan hot path."
+  ]
+}
