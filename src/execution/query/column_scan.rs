@@ -117,7 +117,10 @@ impl ColumnAggregateState {
             is_int: true,
             min: None,
             max: None,
-            strings: Vec::new(),
+            strings: match kind {
+                ColumnAggregateKind::StringAgg => Vec::with_capacity(1),
+                _ => Vec::new(),
+            },
         }
     }
 
@@ -489,8 +492,14 @@ impl GroupColumnAggregateState {
             is_int: true,
             min: None,
             max: None,
-            distinct: HashSet::new(),
-            strings: Vec::new(),
+            distinct: match kind {
+                GroupColumnAggregateKind::CountDistinct => HashSet::with_capacity(1),
+                _ => HashSet::new(),
+            },
+            strings: match kind {
+                GroupColumnAggregateKind::StringAgg => Vec::with_capacity(1),
+                _ => Vec::new(),
+            },
         }
     }
 
@@ -1590,5 +1599,25 @@ impl Executor {
             }
         }
         Ordering::Equal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_aggregate_state_preallocates_string_agg_first_value() {
+        let state = ColumnAggregateState::new(ColumnAggregateKind::StringAgg);
+        assert!(state.strings.capacity() >= 1);
+    }
+
+    #[test]
+    fn group_column_aggregate_state_preallocates_collecting_first_value() {
+        let distinct = GroupColumnAggregateState::new(GroupColumnAggregateKind::CountDistinct);
+        assert!(distinct.distinct.capacity() >= 1);
+
+        let strings = GroupColumnAggregateState::new(GroupColumnAggregateKind::StringAgg);
+        assert!(strings.strings.capacity() >= 1);
     }
 }

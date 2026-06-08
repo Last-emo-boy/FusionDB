@@ -1,0 +1,50 @@
+{
+  "id": "benchprod-288-column-scan-aggregate-first-input-prealloc",
+  "objective": "Preallocate column-scan aggregate states for their first collected input value.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:23:00+08:00",
+  "completed_at": "2026-06-09T02:25:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-288",
+      "title": "Preallocate column-scan aggregate first input",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "result": "Column-scan aggregate states now reserve capacity for the first collected string or distinct value."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test execution::query::column_scan::tests -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_group_aggregate test_bare_string_agg_column_scan_uses_only_aggregate_columns -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_group_aggregate test_string_agg_group_by_fast_path_uses_only_group_and_value_columns -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_group_aggregate -- --nocapture",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "An initial cargo test invocation passed two test filters and failed before running tests; verification was rerun with the correct module filter.",
+    "The initial capacity is 1 because column-scan aggregate states are created before receiving their first matching row value.",
+    "The optimization only changes initial HashSet/Vec allocation for collecting column-scan states; decoding, NULL handling, grouping, finalization, and SQL results are unchanged."
+  ]
+}
