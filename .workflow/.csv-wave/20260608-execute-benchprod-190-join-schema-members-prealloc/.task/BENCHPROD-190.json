@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-190",
+  "title": "Preallocate join schema members",
+  "status": "completed",
+  "created_at": "2026-06-08T18:28:00+08:00",
+  "completed_at": "2026-06-08T18:30:41+08:00",
+  "scope": "Join predicate schema membership allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Initialized predicate_schema_members member HashSet with schemas.len().",
+        "Replaced collect-based Vec construction with Vec::with_capacity(members.len()) followed by extend.",
+        "Kept unmatched-column handling, member deduplication, and sorted output behavior unchanged."
+      ]
+    },
+    "tests": {
+      "implicit_join_where_equi_predicate_matches_chbenchmark_q16_shape": "passed",
+      "implicit_join_common_or_equi_predicate_matches_chbenchmark_q19_shape": "passed",
+      "three_table_join_with_alias_projection": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused join, scan, expression, or predicate hot path."
+  ]
+}

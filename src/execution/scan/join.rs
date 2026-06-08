@@ -987,7 +987,7 @@ impl Executor {
             return None;
         }
 
-        let mut members = HashSet::new();
+        let mut members = HashSet::with_capacity(schemas.len());
         for column in columns {
             let mut matched = false;
             for (index, schema) in schemas.iter().enumerate() {
@@ -1001,9 +1001,10 @@ impl Executor {
             }
         }
 
-        let mut members = members.into_iter().collect::<Vec<_>>();
-        members.sort_unstable();
-        Some(members)
+        let mut sorted_members = Vec::with_capacity(members.len());
+        sorted_members.extend(members);
+        sorted_members.sort_unstable();
+        Some(sorted_members)
     }
 
     fn schema_contains_column_name_strict(&self, col_name: &str, schema: &TableSchema) -> bool {

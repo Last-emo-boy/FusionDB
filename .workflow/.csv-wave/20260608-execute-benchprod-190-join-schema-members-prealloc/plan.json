@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-190-join-schema-members-prealloc",
+  "objective": "Preallocate join predicate schema member collections from schema count.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:28:00+08:00",
+  "completed_at": "2026-06-08T18:30:41+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-190",
+      "title": "Preallocate join schema members",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "Join predicate schema membership now sizes the member set from schema count and the sorted output vector from matched member count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_implicit_join_where_equi_predicate_matches_chbenchmark_q16_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_implicit_join_common_or_equi_predicate_matches_chbenchmark_q19_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_three_table_join_with_alias_projection -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
