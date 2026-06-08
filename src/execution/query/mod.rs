@@ -892,7 +892,7 @@ impl Executor {
                 }
             };
 
-            let mut new_delta = Vec::new();
+            let mut new_delta = Vec::with_capacity(next_rows.len());
             for row in next_rows {
                 if row.len() != columns.len() {
                     return Err(FusionError::Execution(format!(

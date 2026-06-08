@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-157",
+  "title": "Preallocate recursive CTE delta rows",
+  "status": "completed",
+  "created_at": "2026-06-08T16:00:00+08:00",
+  "completed_at": "2026-06-08T16:04:08+08:00",
+  "scope": "Recursive CTE iteration delta row allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Changed recursive CTE new_delta allocation from Vec::new() to Vec::with_capacity(next_rows.len()).",
+        "Used the recursive term output size as a safe upper bound for rows that may enter the next delta.",
+        "Kept recursive UNION and UNION ALL semantics unchanged."
+      ]
+    },
+    "tests": {
+      "recursive_union_filter": "4/4 passed",
+      "sql_set_subquery": "41/41 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, recursive CTE, set-operation, or scan hot path."
+  ]
+}
