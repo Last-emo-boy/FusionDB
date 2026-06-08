@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-255",
+  "title": "Preallocate subquery local scope",
+  "status": "completed",
+  "created_at": "2026-06-08T23:30:00+08:00",
+  "completed_at": "2026-06-08T23:34:00+08:00",
+  "scope": "Correlated subquery local scope construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "summary": [
+        "Computed relation_capacity from each FROM relation plus its JOIN relations.",
+        "Initialized relation_names with HashSet::with_capacity(relation_capacity).",
+        "Initialized the local columns buffer with Vec::with_capacity(relation_capacity)."
+      ]
+    },
+    "tests": {
+      "correlated_not_exists_join_alias_shape": "passed",
+      "correlated_exists_two_table_membership": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

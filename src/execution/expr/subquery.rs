@@ -1011,8 +1011,12 @@ impl Executor {
         txn: &mut dyn Transaction,
         params: &[Value],
     ) -> Result<SubqueryLocalScope> {
-        let mut relation_names = HashSet::new();
-        let mut columns = Vec::new();
+        let relation_capacity = from
+            .iter()
+            .map(|table| 1usize.saturating_add(table.joins.len()))
+            .sum();
+        let mut relation_names = HashSet::with_capacity(relation_capacity);
+        let mut columns = Vec::with_capacity(relation_capacity);
 
         for table in from {
             self.append_local_scope_for_factor(
