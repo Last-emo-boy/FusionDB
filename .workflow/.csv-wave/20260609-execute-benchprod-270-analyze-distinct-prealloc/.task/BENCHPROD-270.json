@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-270",
+  "title": "Preallocate ANALYZE distinct collectors",
+  "status": "completed",
+  "created_at": "2026-06-09T00:56:00+08:00",
+  "completed_at": "2026-06-09T01:00:00+08:00",
+  "scope": "ANALYZE table statistics collection",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/analyze.rs"
+      ],
+      "summary": [
+        "Added ANALYZE_DISTINCT_PREALLOC_LIMIT and analyze_distinct_capacity.",
+        "Changed ColumnStatsCollector to initialize distinct with HashSet::with_capacity.",
+        "Passed a bounded row-count-derived capacity hint to each per-column collector.",
+        "Added unit coverage for the bounded capacity helper."
+      ]
+    },
+    "tests": {
+      "analyze_distinct_capacity_unit": "passed",
+      "analyze_table_collects_statistics": "passed",
+      "explain_includes_analyze_statistics": "passed",
+      "sql_ddl": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

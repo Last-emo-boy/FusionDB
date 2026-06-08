@@ -6,6 +6,12 @@ use std::collections::HashSet;
 
 use super::{Executor, QueryResult};
 
+const ANALYZE_DISTINCT_PREALLOC_LIMIT: usize = 1024;
+
+fn analyze_distinct_capacity(row_count: usize) -> usize {
+    row_count.min(ANALYZE_DISTINCT_PREALLOC_LIMIT)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct TableStats {
     pub table_name: String,
@@ -73,9 +79,13 @@ impl Executor {
     ) -> Result<TableStats> {
         let prefix = format!("data:{}:", table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let distinct_capacity = analyze_distinct_capacity(kv_pairs.len());
         let mut collectors = Vec::with_capacity(schema.columns.len());
         for column in &schema.columns {
-            collectors.push(ColumnStatsCollector::new(column.name.clone()));
+            collectors.push(ColumnStatsCollector::new(
+                column.name.clone(),
+                distinct_capacity,
+            ));
         }
 
         let mut row_count = 0usize;
@@ -139,11 +149,11 @@ struct ColumnStatsCollector {
 }
 
 impl ColumnStatsCollector {
-    fn new(name: String) -> Self {
+    fn new(name: String, distinct_capacity: usize) -> Self {
         Self {
             name,
             null_count: 0,
-            distinct: HashSet::new(),
+            distinct: HashSet::with_capacity(distinct_capacity),
             min: None,
             max: None,
         }
@@ -185,5 +195,20 @@ impl ColumnStatsCollector {
             min: self.min,
             max: self.max,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_distinct_capacity_is_bounded() {
+        assert_eq!(analyze_distinct_capacity(0), 0);
+        assert_eq!(analyze_distinct_capacity(3), 3);
+        assert_eq!(
+            analyze_distinct_capacity(ANALYZE_DISTINCT_PREALLOC_LIMIT + 1),
+            ANALYZE_DISTINCT_PREALLOC_LIMIT
+        );
     }
 }

@@ -1,0 +1,49 @@
+{
+  "id": "benchprod-270-analyze-distinct-prealloc",
+  "objective": "Preallocate ANALYZE column distinct collectors from bounded table row count.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:56:00+08:00",
+  "completed_at": "2026-06-09T01:00:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-270",
+      "title": "Preallocate ANALYZE distinct collectors",
+      "status": "completed",
+      "evidence": [
+        "src/execution/analyze.rs"
+      ],
+      "result": "ANALYZE now preallocates per-column distinct sets from the scanned row count with a fixed upper bound."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test analyze_distinct_capacity_is_bounded -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl test_analyze_table_collects_statistics -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl test_explain_includes_analyze_statistics -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The distinct set capacity hint uses the scanned row count capped at ANALYZE_DISTINCT_PREALLOC_LIMIT.",
+    "The cap prevents wide or very large tables from over-reserving per column."
+  ]
+}
