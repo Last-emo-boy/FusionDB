@@ -1,0 +1,43 @@
+{
+  "id": "benchprod-202-group-aggregate-plan-prealloc",
+  "objective": "Preallocate GROUP BY aggregate plan vectors from known aggregate counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T19:18:00+08:00",
+  "completed_at": "2026-06-08T19:21:14+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-202",
+      "title": "Preallocate GROUP BY aggregate plans",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "GROUP BY aggregate planning now builds aggregate plan vectors with explicit capacity from the aggregate expression count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_column_aggregates_fast_path_preserves_alias_and_nulls -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_bare_aggregate_sum_multiply_expr -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full."
+  ]
+}

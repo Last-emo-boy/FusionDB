@@ -609,9 +609,9 @@ impl Executor {
         schema: &TableSchema,
         params: &[Value],
     ) -> Vec<GroupAggregatePlan<'a>> {
-        aggregates
-            .iter()
-            .map(|(expr, func_name)| GroupAggregatePlan {
+        let mut plans = Vec::with_capacity(aggregates.len());
+        for (expr, func_name) in aggregates {
+            plans.push(GroupAggregatePlan {
                 expr: expr.clone(),
                 func_name: func_name.clone(),
                 arg_source: if let Expr::Function(func) = expr {
@@ -619,8 +619,9 @@ impl Executor {
                 } else {
                     RowValueSource::Expr(expr)
                 },
-            })
-            .collect()
+            });
+        }
+        plans
     }
 
     fn simple_projected_group_aggregate_projection(
