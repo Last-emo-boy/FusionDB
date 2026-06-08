@@ -34,6 +34,13 @@ fn insert_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn insert_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 impl Executor {
     fn insert_trace_enabled() -> bool {
         std::env::var("FUSIONDB_INSERT_TRACE")
@@ -145,7 +152,7 @@ impl Executor {
         columns: &[Ident],
         txn: &mut dyn Transaction,
     ) -> Result<InsertRowsContext> {
-        let schema_key = format!("schema:{}", table_name);
+        let schema_key = insert_schema_key_for_table(table_name);
         let schema_bytes = txn
             .get(schema_key.as_bytes())
             .await?
@@ -592,7 +599,7 @@ impl Executor {
             params.len()
         ));
 
-        let schema_key = format!("schema:{}", table_name_str);
+        let schema_key = insert_schema_key_for_table(&table_name_str);
         let schema_bytes = txn
             .get(schema_key.as_bytes())
             .await?
@@ -1142,7 +1149,9 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_data_key_for_row_id, insert_data_prefix_for_table};
+    use super::{
+        insert_data_key_for_row_id, insert_data_prefix_for_table, insert_schema_key_for_table,
+    };
 
     #[test]
     fn insert_data_key_for_row_id_preallocates_exact_key() {
@@ -1158,5 +1167,13 @@ mod tests {
 
         assert_eq!(prefix, "data:orders:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn insert_schema_key_for_table_preallocates_exact_key() {
+        let key = insert_schema_key_for_table("orders");
+
+        assert_eq!(key, "schema:orders");
+        assert!(key.capacity() >= key.len());
     }
 }

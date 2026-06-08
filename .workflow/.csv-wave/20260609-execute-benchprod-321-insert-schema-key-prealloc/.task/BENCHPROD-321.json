@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-321",
+  "title": "Preallocate INSERT schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/dml/insert.rs"
+  ],
+  "description": "Avoid generic format! allocation work when INSERT builds schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added insert_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced InsertRowsContext schema lookup key construction.",
+    "Replaced regular INSERT schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test insert_schema_key -- --nocapture",
+    "cargo test --test sql_dml test_insert_single_row -- --nocapture",
+    "cargo test --test sql_dml test_copy_from_csv_enforces_constraints_on_direct_path -- --nocapture",
+    "cargo test --test sql_dml -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "INSERT schema-key construction now reserves capacity from known table-name length while preserving schema lookup, insert planning, COPY direct-path context, constraints, indexes, and SQL DML behavior."
+}
