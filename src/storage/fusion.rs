@@ -93,6 +93,14 @@ fn transaction_write_buffer() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     Vec::with_capacity(1)
 }
 
+fn vector_rebuild_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::sstable::{SsTable, SsTableBuilder};
 use crate::storage::vector_index::VectorIndex;
@@ -569,7 +577,7 @@ impl FusionStorage {
                             continue;
                         }
 
-                        let data_prefix = format!("data:{}:", table_name);
+                        let data_prefix = vector_rebuild_data_prefix_for_table(table_name);
                         if let Ok(data_pairs) = txn.scan_prefix(data_prefix.as_bytes(), None).await
                         {
                             let mut batches: HashMap<String, Vec<(String, Vec<f32>)>> =
@@ -1790,6 +1798,14 @@ mod tests {
     #[test]
     fn fusion_transaction_write_buffer_preallocates_first_write() {
         assert!(transaction_write_buffer().capacity() >= 1);
+    }
+
+    #[test]
+    fn vector_rebuild_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = vector_rebuild_data_prefix_for_table("embeddings");
+
+        assert_eq!(prefix, "data:embeddings:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 
     #[test]

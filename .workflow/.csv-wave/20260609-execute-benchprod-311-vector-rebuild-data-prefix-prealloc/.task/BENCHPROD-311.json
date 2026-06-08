@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-311",
+  "title": "Preallocate vector rebuild data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/storage/fusion.rs"
+  ],
+  "description": "Avoid generic format! allocation work when Fusion storage vector-index rebuild scans build data:<table>: prefixes from known table-name length.",
+  "implementation": [
+    "Added vector_rebuild_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Replaced FusionStorage::rebuild_vector_index data scan prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test vector_rebuild_data_prefix -- --nocapture",
+    "cargo test fusion_rebuild_vector_index_decodes_only_hnsw_columns -- --nocapture",
+    "cargo test --test sql_returning_upsert_vector_rbac test_hnsw_order_by_projection -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Vector-index rebuild data-prefix construction now reserves capacity from known table-name length while preserving HNSW rebuild scanning, row-id extraction, batch insertion, and SQL query behavior."
+}
