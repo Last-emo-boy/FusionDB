@@ -1,0 +1,47 @@
+{
+  "id": "benchprod-197-column-group-output-prealloc",
+  "objective": "Preallocate grouped column-scan aggregate output rows from known group counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:57:00+08:00",
+  "completed_at": "2026-06-08T18:59:28+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-197",
+      "title": "Preallocate grouped aggregate output rows",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "result": "Grouped column-scan count and aggregate paths now build result row vectors with explicit capacities from HashMap group counts."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_count_with_simple_where_uses_column_scan -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_column_aggregates_fast_path_uses_only_group_and_aggregate_columns -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_multi_column_group_by_aggregates_fast_path_order_by_limit -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full."
+  ]
+}

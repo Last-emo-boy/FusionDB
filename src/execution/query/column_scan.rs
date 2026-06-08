@@ -1231,10 +1231,11 @@ impl Executor {
             return Err(err);
         }
 
-        Ok(counts
-            .into_iter()
-            .map(|(value, count)| vec![value, Value::Integer(count)])
-            .collect())
+        let mut rows = Vec::with_capacity(counts.len());
+        for (value, count) in counts {
+            rows.push(vec![value, Value::Integer(count)]);
+        }
+        Ok(rows)
     }
 
     pub(super) fn simple_group_by_column_aggregate_projection(
@@ -1425,15 +1426,14 @@ impl Executor {
             return Err(err);
         }
 
-        Ok(groups
-            .into_iter()
-            .map(|(group_values, states)| {
-                let mut row = Vec::with_capacity(group_values.len() + states.len());
-                row.extend(group_values);
-                row.extend(states.iter().map(GroupColumnAggregateState::finalize));
-                row
-            })
-            .collect())
+        let mut rows = Vec::with_capacity(groups.len());
+        for (group_values, states) in groups {
+            let mut row = Vec::with_capacity(group_values.len() + states.len());
+            row.extend(group_values);
+            row.extend(states.iter().map(GroupColumnAggregateState::finalize));
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     async fn group_by_single_column_aggregate_scan(
@@ -1466,15 +1466,14 @@ impl Executor {
             return Err(err);
         }
 
-        Ok(groups
-            .into_iter()
-            .map(|(group_value, states)| {
-                let mut row = Vec::with_capacity(1 + states.len());
-                row.push(group_value);
-                row.extend(states.iter().map(GroupColumnAggregateState::finalize));
-                row
-            })
-            .collect())
+        let mut rows = Vec::with_capacity(groups.len());
+        for (group_value, states) in groups {
+            let mut row = Vec::with_capacity(1 + states.len());
+            row.push(group_value);
+            row.extend(states.iter().map(GroupColumnAggregateState::finalize));
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     pub(super) fn apply_simple_group_by_order_limit(
