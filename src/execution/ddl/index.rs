@@ -14,6 +14,13 @@ fn create_index_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn index_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 fn drop_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
     let mut prefix =
         String::with_capacity("index:".len() + table_name.len() + 1 + column_name.len() + 1);
@@ -48,7 +55,7 @@ impl Executor {
             )));
         }
 
-        let schema_key = format!("schema:{}", table_name_str);
+        let schema_key = index_schema_key_for_table(&table_name_str);
         let schema_bytes = txn
             .get(schema_key.as_bytes())
             .await?
@@ -251,7 +258,7 @@ impl Executor {
 
                     // Update schema: mark column as not indexed
                     if meta.columns.len() == 1 {
-                        let schema_key = format!("schema:{}", table_name);
+                        let schema_key = index_schema_key_for_table(&table_name);
                         if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
                             if let Ok(mut schema) =
                                 bincode::deserialize::<TableSchema>(&schema_bytes)
@@ -292,7 +299,18 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_index_data_prefix_for_table, drop_index_prefix_for_column};
+    use super::{
+        create_index_data_prefix_for_table, drop_index_prefix_for_column,
+        index_schema_key_for_table,
+    };
+
+    #[test]
+    fn index_schema_key_for_table_preallocates_exact_key() {
+        let key = index_schema_key_for_table("orders");
+
+        assert_eq!(key, "schema:orders");
+        assert!(key.capacity() >= key.len());
+    }
 
     #[test]
     fn create_index_data_prefix_for_table_preallocates_exact_prefix() {

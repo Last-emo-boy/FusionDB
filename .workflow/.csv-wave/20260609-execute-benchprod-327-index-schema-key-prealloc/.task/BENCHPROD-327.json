@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-327",
+  "title": "Preallocate INDEX schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/ddl/index.rs"
+  ],
+  "description": "Avoid generic format! allocation work when CREATE INDEX and DROP INDEX build schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added index_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced CREATE INDEX schema lookup key construction.",
+    "Replaced DROP INDEX single-column schema update key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test index_schema_key -- --nocapture",
+    "cargo test --test sql_index_cache test_create_btree_index -- --nocapture",
+    "cargo test --test sql_index_cache test_drop_index -- --nocapture",
+    "cargo test --test sql_index_cache -- --nocapture",
+    "cargo fmt",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "INDEX schema-key construction now reserves capacity from known table-name length while preserving index creation, index backfill, DROP INDEX schema updates, and index-cache behavior."
+}
