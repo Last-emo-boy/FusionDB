@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-282",
+  "title": "Preallocate SSTable file candidate list",
+  "status": "completed",
+  "created_at": "2026-06-09T02:04:00+08:00",
+  "completed_at": "2026-06-09T02:06:00+08:00",
+  "scope": "Fusion storage startup SSTable file discovery allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs"
+      ],
+      "summary": [
+        "Added sstable_file_candidate_buffer to create SSTable file candidate vectors with capacity 1.",
+        "Changed FusionStorage startup SSTable discovery to use the preallocated candidate buffer before scanning .sst files.",
+        "Added unit coverage proving the helper preallocates for the first file candidate.",
+        "Preserved directory scanning, SSTable ID parsing, sorting, opening, and timestamp restore behavior."
+      ]
+    },
+    "tests": {
+      "sstable_file_candidate_buffer_unit": "passed",
+      "fusion_reopen_uses_fresh_memtable_id_after_existing_sstables": "passed",
+      "storage_fusion_tests": "15/15 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}

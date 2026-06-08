@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-282-sstable-file-candidate-prealloc",
+  "objective": "Preallocate Fusion storage SSTable file candidate lists for the first discovered SSTable file.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:04:00+08:00",
+  "completed_at": "2026-06-09T02:06:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-282",
+      "title": "Preallocate SSTable file candidate list",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "Fusion storage startup now creates its SSTable file candidate list with capacity for the first discovered SSTable file."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test sstable_file_candidate_buffer_preallocates_first_file -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests::fusion_reopen_uses_fresh_memtable_id_after_existing_sstables -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests -- --nocapture",
+      "status": "passed: 15/15"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The candidate list capacity is 1 because the first discovered .sst file is immediately pushed into the list.",
+    "The optimization only changes initial Vec allocation for SSTable file candidates; directory scanning, SSTable ID parsing, sorting, opening, and timestamp restore semantics are unchanged."
+  ]
+}

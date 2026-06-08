@@ -24,6 +24,10 @@ fn obsolete_sstable_path_buffer(capacity: usize) -> Vec<PathBuf> {
     Vec::with_capacity(capacity)
 }
 
+fn sstable_file_candidate_buffer() -> Vec<(u64, PathBuf)> {
+    Vec::with_capacity(1)
+}
+
 // --- Data Structures ---
 
 use super::fbtree::FBTree;
@@ -184,7 +188,7 @@ impl FusionStorage {
         let sst_dir = sstable_dir.as_path();
         if sst_dir.exists() {
             if let Ok(mut entries) = std::fs::read_dir(sst_dir) {
-                let mut files = Vec::new();
+                let mut files = sstable_file_candidate_buffer();
                 while let Some(Ok(entry)) = entries.next() {
                     let path = entry.path();
                     if let Some(ext) = path.extension() {
@@ -2322,5 +2326,11 @@ mod tests {
     fn obsolete_sstable_path_buffer_reserves_current_obsolete_len() {
         let paths = obsolete_sstable_path_buffer(4);
         assert!(paths.capacity() >= 4);
+    }
+
+    #[test]
+    fn sstable_file_candidate_buffer_preallocates_first_file() {
+        let files = sstable_file_candidate_buffer();
+        assert!(files.capacity() >= 1);
     }
 }
