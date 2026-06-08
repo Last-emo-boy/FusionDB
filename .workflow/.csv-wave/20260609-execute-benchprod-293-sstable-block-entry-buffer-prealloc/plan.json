@@ -1,0 +1,47 @@
+{
+  "id": "benchprod-293-sstable-block-entry-buffer-prealloc",
+  "objective": "Preallocate SSTable iterator block entry buffers from known block entry counts.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:45:00+08:00",
+  "completed_at": "2026-06-09T02:49:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-293",
+      "title": "Preallocate SSTable block entry buffer",
+      "status": "completed",
+      "evidence": [
+        "src/storage/sstable.rs"
+      ],
+      "result": "SsTableIterator now reserves entry-buffer capacity for the first entry and for parsed block counts bounded by block length."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::sstable::tests -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests -- --nocapture",
+      "status": "passed: 20/20"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The iterator entry queue now starts with capacity for the first decoded block entry.",
+    "After reading a block count, the iterator reserves at most the number of entries that can fit in the block by minimum encoded entry size.",
+    "The optimization only changes VecDeque allocation; SSTable block IO, CRC handling, lower-bound filtering, entry order, Fusion scans, compaction, and DML behavior are unchanged.",
+    "The full sql_dml regression emitted existing SSTable retry warnings after passing; the command exited successfully."
+  ]
+}

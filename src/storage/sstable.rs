@@ -1,6 +1,6 @@
 use crate::common::Result;
 use moka::sync::Cache;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -18,6 +18,14 @@ use fastbloom::BloomFilter;
 // Footer: [IndexOffset: 8b] [FilterOffset: 8b] [Magic: 4b]
 
 const SST_MAGIC: u32 = 0xCAFEBABE;
+
+fn block_entry_buffer() -> VecDeque<(Vec<u8>, Vec<u8>)> {
+    VecDeque::with_capacity(1)
+}
+
+fn block_entry_reserve_count(count: u32, block_len: usize) -> usize {
+    (count as usize).min(block_len / 8)
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct SsTableMeta {
@@ -275,7 +283,7 @@ impl SsTable {
             index_offsets: self.index_offsets.clone(),
             file_len: self.file_len,
             current_block_idx: start_idx,
-            current_block_entries: std::collections::VecDeque::new(),
+            current_block_entries: block_entry_buffer(),
             lower_bound: start_key.map(|key| key.to_vec()),
         })
     }
@@ -292,7 +300,7 @@ pub struct SsTableIterator {
     index_offsets: Arc<Vec<u64>>,
     file_len: u64,
     current_block_idx: usize,
-    current_block_entries: std::collections::VecDeque<(Vec<u8>, Vec<u8>)>,
+    current_block_entries: VecDeque<(Vec<u8>, Vec<u8>)>,
     lower_bound: Option<Vec<u8>>,
 }
 
@@ -341,6 +349,8 @@ impl SsTableIterator {
                 continue;
             }
             let count = u32::from_le_bytes(count_buf);
+            self.current_block_entries
+                .reserve(block_entry_reserve_count(count, block_len));
 
             for _ in 0..count {
                 let mut len_buf = [0u8; 4];
@@ -370,6 +380,22 @@ impl SsTableIterator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{block_entry_buffer, block_entry_reserve_count};
+
+    #[test]
+    fn block_entry_buffer_preallocates_first_entry() {
+        assert!(block_entry_buffer().capacity() >= 1);
+    }
+
+    #[test]
+    fn block_entry_reserve_count_is_bounded_by_block_length() {
+        assert_eq!(block_entry_reserve_count(3, 24), 3);
+        assert_eq!(block_entry_reserve_count(100, 16), 2);
     }
 }
 

@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-293",
+  "title": "Preallocate SSTable block entry buffer",
+  "status": "completed",
+  "created_at": "2026-06-09T02:45:00+08:00",
+  "completed_at": "2026-06-09T02:49:00+08:00",
+  "scope": "SSTable iterator block entry allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/sstable.rs"
+      ],
+      "summary": [
+        "Added a block_entry_buffer helper that reserves one SSTable iterator entry slot.",
+        "Changed SsTable::new_iterator() to initialize current_block_entries with the preallocated buffer.",
+        "Added a bounded block_entry_reserve_count helper for parsed block entry counts.",
+        "Changed block parsing to reserve entry-buffer capacity from the parsed count, capped by the block length."
+      ]
+    },
+    "tests": {
+      "sstable_units": "2/2 passed",
+      "fusion_units": "20/20 passed",
+      "sql_dml": "44/44 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}
