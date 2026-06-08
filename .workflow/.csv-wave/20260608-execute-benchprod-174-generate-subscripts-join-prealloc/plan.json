@@ -1,0 +1,40 @@
+{
+  "id": "benchprod-174-generate-subscripts-join-prealloc",
+  "objective": "Preallocate generate_subscripts join output rows.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:24:30+08:00",
+  "completed_at": "2026-06-08T17:27:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-174",
+      "title": "Preallocate generate_subscripts join output",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "The generate_subscripts join specialization now initializes joined_rows with a conservative left-row-count capacity capped at 4096."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_generate_subscripts_depends_on_left_row_array -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_array_agg_over_generated_subscripts -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

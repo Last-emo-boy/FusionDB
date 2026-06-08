@@ -46,7 +46,7 @@ impl Executor {
         let mut columns = left_schema.columns.clone();
         columns.extend(prefixed_right_schema.columns.clone());
         let joined_schema = TableSchema::new("join_result".to_string(), columns);
-        let mut joined_rows = Vec::new();
+        let mut joined_rows = Vec::with_capacity(left_rows.len().min(4096));
 
         for left_row in left_rows {
             let Some(result) =

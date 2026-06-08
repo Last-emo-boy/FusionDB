@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-174",
+  "title": "Preallocate generate_subscripts join output",
+  "status": "completed",
+  "created_at": "2026-06-08T17:24:30+08:00",
+  "completed_at": "2026-06-08T17:27:00+08:00",
+  "scope": "generate_subscripts join specialization output allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Changed apply_generate_subscripts_join joined_rows from Vec::new to Vec::with_capacity.",
+        "Sized the initial capacity from the left input row count capped at 4096.",
+        "Kept per-row generate_subscripts evaluation, projection, and row assembly behavior unchanged."
+      ]
+    },
+    "tests": {
+      "generate_subscripts_depends_on_left_row_array": "passed",
+      "array_agg_over_generated_subscripts": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}
