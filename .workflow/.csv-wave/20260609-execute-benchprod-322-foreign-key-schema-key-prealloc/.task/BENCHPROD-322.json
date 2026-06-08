@@ -1,0 +1,24 @@
+{
+  "id": "BENCHPROD-322",
+  "title": "Preallocate foreign-key schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/foreign_key.rs"
+  ],
+  "description": "Avoid generic format! allocation work when foreign-key validation builds schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added foreign_key_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced foreign-key load_table_schema() key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test foreign_key_schema_key -- --nocapture",
+    "cargo test --test sql_view_show_constraints test_foreign_key_insert_update_and_parent_delete_checks -- --nocapture",
+    "cargo test --test sql_view_show_constraints test_composite_foreign_key_insert_update_and_parent_checks -- --nocapture",
+    "cargo test --test sql_view_show_constraints -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Foreign-key schema-key construction now reserves capacity from known table-name length while preserving referenced-table schema lookup and SQL constraint behavior."
+}

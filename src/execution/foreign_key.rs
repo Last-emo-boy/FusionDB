@@ -23,6 +23,13 @@ fn foreign_key_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn foreign_key_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ForeignKeyMeta {
     pub name: String,
@@ -519,7 +526,7 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<TableSchema> {
-        let schema_key = format!("schema:{}", table_name);
+        let schema_key = foreign_key_schema_key_for_table(table_name);
         let schema_bytes = txn.get(schema_key.as_bytes()).await?.ok_or_else(|| {
             FusionError::Execution(format!("Referenced table {} not found", table_name))
         })?;
@@ -530,7 +537,10 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{foreign_key_data_key_for_row_id, foreign_key_data_prefix_for_table};
+    use super::{
+        foreign_key_data_key_for_row_id, foreign_key_data_prefix_for_table,
+        foreign_key_schema_key_for_table,
+    };
 
     #[test]
     fn foreign_key_data_key_for_row_id_preallocates_exact_key() {
@@ -546,5 +556,13 @@ mod tests {
 
         assert_eq!(prefix, "data:warehouse:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn foreign_key_schema_key_for_table_preallocates_exact_key() {
+        let key = foreign_key_schema_key_for_table("warehouse");
+
+        assert_eq!(key, "schema:warehouse");
+        assert!(key.capacity() >= key.len());
     }
 }
