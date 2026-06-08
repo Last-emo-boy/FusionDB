@@ -2578,10 +2578,11 @@ impl Executor {
                             }
 
                             let accs = groups.entry(group_key).or_insert_with(|| {
-                                aggregate_plans
-                                    .iter()
-                                    .map(|plan| AggregateAccumulator::new(&plan.func_name))
-                                    .collect()
+                                let mut accs = Vec::with_capacity(aggregate_plans.len());
+                                for plan in &aggregate_plans {
+                                    accs.push(AggregateAccumulator::new(&plan.func_name));
+                                }
+                                accs
                             });
 
                             for (i, plan) in aggregate_plans.iter().enumerate() {

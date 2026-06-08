@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-218",
+  "title": "Preallocate group aggregate accumulators",
+  "status": "completed",
+  "created_at": "2026-06-08T20:22:00+08:00",
+  "completed_at": "2026-06-08T20:24:19+08:00",
+  "scope": "Generic group aggregate fallback per-group accumulator initialization",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced per-group aggregate accumulator collect with an explicitly preallocated vector sized from aggregate_plans.len().",
+        "Preserved aggregate plan order and accumulator type selection.",
+        "Preserved aggregate argument evaluation and accumulator update behavior."
+      ]
+    },
+    "tests": {
+      "group_by_sum_matching_tests": "3/3 passed",
+      "group_by_aggregates_with_multi_predicate_partial_decode": "passed",
+      "group_by_aggregate_order_by_limit_offset_topn_window": "passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

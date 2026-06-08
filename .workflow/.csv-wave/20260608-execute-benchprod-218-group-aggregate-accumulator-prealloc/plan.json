@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-218-group-aggregate-accumulator-prealloc",
+  "objective": "Preallocate group aggregate accumulator vectors from known aggregate plan counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:22:00+08:00",
+  "completed_at": "2026-06-08T20:24:19+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-218",
+      "title": "Preallocate group aggregate accumulators",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Generic group aggregate fallback now preallocates per-group accumulator vectors from the known aggregate plan count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_sum -- --nocapture",
+      "status": "passed: 3 matching tests"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_aggregates_with_multi_predicate_partial_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_aggregate_order_by_limit_offset_topn_window -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "Accumulator order, accumulator type selection, and aggregate update behavior were kept unchanged."
+  ]
+}
