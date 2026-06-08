@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-231-composite-meta-prealloc",
+  "objective": "Preallocate composite-index metadata column vectors from encoded column counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T21:43:00+08:00",
+  "completed_at": "2026-06-08T21:50:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-231",
+      "title": "Preallocate composite-index metadata columns",
+      "status": "completed",
+      "evidence": [
+        "src/execution/composite_index.rs"
+      ],
+      "result": "Composite-index metadata parsing now preallocates parsed column vectors from the encoded comma count for both current and v2 metadata formats."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_create_composite_btree_index_and_lookup -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache test_show_indexes_reports_composite_columns -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_composite_index_dml_uses_table_metadata_directory -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache",
+      "status": "passed: 37/37"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves trimming, empty-column filtering, empty metadata rejection, and ordered_encoding differences between metadata versions."
+  ]
+}

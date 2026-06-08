@@ -68,40 +68,42 @@ impl Executor {
             .or_else(|| meta_str.strip_prefix("u3:"));
         if let Some(rest) = rest {
             let (table, columns) = rest.split_once(':')?;
-            let columns = columns
-                .split(',')
-                .map(str::trim)
-                .filter(|column| !column.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>();
+            let mut parsed_columns = Vec::with_capacity(columns.matches(',').count() + 1);
+            for column in columns.split(',') {
+                let column = column.trim();
+                if !column.is_empty() {
+                    parsed_columns.push(column.to_owned());
+                }
+            }
 
-            if table.is_empty() || columns.is_empty() {
+            if table.is_empty() || parsed_columns.is_empty() {
                 return None;
             }
 
             Some(CompositeIndexMeta {
                 name: index_name.to_string(),
                 table: table.to_string(),
-                columns,
+                columns: parsed_columns,
                 ordered_encoding: true,
             })
         } else if let Some(rest) = meta_str.strip_prefix("v2:") {
             let (table, columns) = rest.split_once(':')?;
-            let columns = columns
-                .split(',')
-                .map(str::trim)
-                .filter(|column| !column.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>();
+            let mut parsed_columns = Vec::with_capacity(columns.matches(',').count() + 1);
+            for column in columns.split(',') {
+                let column = column.trim();
+                if !column.is_empty() {
+                    parsed_columns.push(column.to_owned());
+                }
+            }
 
-            if table.is_empty() || columns.is_empty() {
+            if table.is_empty() || parsed_columns.is_empty() {
                 return None;
             }
 
             Some(CompositeIndexMeta {
                 name: index_name.to_string(),
                 table: table.to_string(),
-                columns,
+                columns: parsed_columns,
                 ordered_encoding: false,
             })
         } else {

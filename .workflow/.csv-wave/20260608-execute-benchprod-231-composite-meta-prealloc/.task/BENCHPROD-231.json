@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-231",
+  "title": "Preallocate composite-index metadata columns",
+  "status": "completed",
+  "created_at": "2026-06-08T21:43:00+08:00",
+  "completed_at": "2026-06-08T21:50:00+08:00",
+  "scope": "Composite-index metadata parsing",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/composite_index.rs"
+      ],
+      "summary": [
+        "Replaced current v3/u3 metadata column collect with Vec::with_capacity(columns.matches(',').count() + 1).",
+        "Replaced v2 metadata column collect with the same preallocated parsing loop.",
+        "Preserved trimming, empty-column filtering, metadata rejection, and ordered_encoding behavior."
+      ]
+    },
+    "tests": {
+      "composite_btree_index_lookup": "passed",
+      "show_indexes_composite_columns": "passed",
+      "composite_index_metadata_directory": "passed",
+      "sql_index_cache": "37/37 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
