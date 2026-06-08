@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-273",
+  "title": "Reserve WAL replay aggregate entries",
+  "status": "completed",
+  "created_at": "2026-06-09T01:12:00+08:00",
+  "completed_at": "2026-06-09T01:16:00+08:00",
+  "scope": "WAL replay aggregate entry allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/wal.rs"
+      ],
+      "summary": [
+        "Changed WalManager::replay to reserve the aggregate all_entries Vec from each non-empty segment's bounded file-size capacity hint.",
+        "Reused replay_entry_capacity_hint(file_len), preserving the existing per-segment preallocation bound.",
+        "Added unit coverage proving replay returns an entry Vec whose capacity reflects the segment hint while preserving batch replay order."
+      ]
+    },
+    "tests": {
+      "wal_replay_reserves_total_entries_from_segment_hint": "passed",
+      "storage_wal_tests": "7/7 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

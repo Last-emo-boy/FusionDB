@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-273-wal-replay-reserve",
+  "objective": "Reserve WAL replay's aggregate entry buffer from each non-empty segment's bounded file-size hint.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:12:00+08:00",
+  "completed_at": "2026-06-09T01:16:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-273",
+      "title": "Reserve WAL replay aggregate entries",
+      "status": "completed",
+      "evidence": [
+        "src/storage/wal.rs"
+      ],
+      "result": "WAL replay now reserves the aggregate entry vector from each segment's bounded replay-entry capacity hint before extending it."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test test_wal_replay_reserves_total_entries_from_segment_hint -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::wal::tests -- --nocapture",
+      "status": "passed: 7/7"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The reserve amount reuses the existing bounded replay_entry_capacity_hint(file_len).",
+    "The optimization only changes aggregate Vec capacity during replay; WAL record decoding, ordering, truncation, and persistence semantics are unchanged."
+  ]
+}

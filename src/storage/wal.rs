@@ -352,6 +352,7 @@ impl WalManager {
             if file_len == 0 {
                 continue;
             }
+            all_entries.reserve(Self::replay_entry_capacity_hint(file_len));
             let entries = Self::replay_single_file(seg_path, file_len)?;
             if !entries.is_empty() {
                 println!(
@@ -645,6 +646,29 @@ mod tests {
             WalManager::replay_entry_capacity_hint(MAX_SEGMENT_SIZE),
             MAX_WAL_REPLAY_PREALLOC_ENTRIES
         );
+    }
+
+    #[test]
+    fn test_wal_replay_reserves_total_entries_from_segment_hint() {
+        let path = format!("test_wal_replay_capacity_{}.wal", std::process::id());
+        let wal = WalManager::new(&path).unwrap();
+        wal.append_batch(&[
+            WalEntry::Put(b"key1".to_vec(), b"val1".to_vec()),
+            WalEntry::Delete(b"key1".to_vec()),
+            WalEntry::Put(b"key2".to_vec(), b"val2".to_vec()),
+        ])
+        .unwrap();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        let expected_capacity = WalManager::replay_entry_capacity_hint(file_len);
+
+        let wal2 = WalManager::new(&path).unwrap();
+        let entries = wal2.replay().unwrap();
+
+        assert_eq!(entries.len(), 3);
+        assert!(entries.capacity() >= expected_capacity);
+
+        wal2.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
