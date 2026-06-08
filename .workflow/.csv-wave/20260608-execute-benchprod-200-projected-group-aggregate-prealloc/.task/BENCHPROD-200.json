@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-200",
+  "title": "Preallocate projected GROUP BY aggregates",
+  "status": "completed",
+  "created_at": "2026-06-08T19:10:00+08:00",
+  "completed_at": "2026-06-08T19:13:38+08:00",
+  "scope": "Projected GROUP BY aggregate accumulator and output allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced per-group accumulator collect with a vector preallocated from aggregate_plans.len().",
+        "Replaced final projected group result collect with a result vector preallocated from groups.len().",
+        "Preserved accumulator update order and output row shape."
+      ]
+    },
+    "tests": {
+      "group_by_sum_filtered": "3/3 filtered tests passed",
+      "array_agg_over_generated_subscripts": "passed",
+      "sql_group_aggregate": "50/50 passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused GROUP BY, aggregate, scan, predicate, or ORDER BY hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
