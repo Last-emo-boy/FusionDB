@@ -1142,6 +1142,60 @@ async fn test_composite_index_dml_uses_table_metadata_directory() {
 }
 
 #[tokio::test]
+async fn test_composite_index_dml_falls_back_to_legacy_metadata_scan() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE stock_legacy (id INTEGER PRIMARY KEY, warehouse_id INTEGER, item_id INTEGER, qty INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_stock_legacy_warehouse_item ON stock_legacy (warehouse_id, item_id)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        assert!(txn
+            .get(b"index_meta:idx_stock_legacy_warehouse_item")
+            .await
+            .unwrap()
+            .is_some());
+        txn.delete(b"index_meta_table:stock_legacy:__marker")
+            .await
+            .unwrap();
+        txn.delete(b"index_meta_table:stock_legacy:idx_stock_legacy_warehouse_item")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    exec_ok(&executor, "INSERT INTO stock_legacy VALUES (1, 1, 100, 50)").await;
+
+    {
+        let txn = storage.begin_transaction().await.unwrap();
+        let entries = txn
+            .scan_prefix(b"index:stock_legacy:warehouse_id,item_id:", None)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        txn.rollback().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT qty FROM stock_legacy WHERE warehouse_id = 1 AND item_id = 100",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(50)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_delete_primary_key_reuses_row_cache_for_secondary_index() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

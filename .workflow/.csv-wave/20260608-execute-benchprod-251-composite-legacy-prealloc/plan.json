@@ -1,0 +1,46 @@
+{
+  "id": "benchprod-251-composite-legacy-prealloc",
+  "objective": "Preallocate composite-index legacy metadata scan result buffers from known scan entry counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T23:10:22+08:00",
+  "completed_at": "2026-06-08T23:10:22+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-251",
+      "title": "Preallocate composite index legacy metadata results",
+      "status": "completed",
+      "evidence": [
+        "src/execution/composite_index.rs",
+        "tests/sql_dml.rs"
+      ],
+      "result": "Composite index legacy metadata loading now preallocates result capacity from the scan entry count and has direct fallback coverage."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_composite_index_dml_falls_back_to_legacy_metadata_scan -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_composite_index_dml_uses_table_metadata_directory -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The full sql_dml run printed transient SSTable retry warnings, but all tests passed.",
+    "The change preserves legacy metadata filtering, parse behavior, table filtering, and composite index lookup semantics."
+  ]
+}

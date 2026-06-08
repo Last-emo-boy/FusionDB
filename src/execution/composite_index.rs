@@ -194,7 +194,7 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<Vec<CompositeIndexMeta>> {
         let entries = txn.scan_prefix(b"index_meta:", None).await?;
-        let mut indexes = Vec::new();
+        let mut indexes = Vec::with_capacity(entries.len());
 
         for (key, value) in entries {
             let Ok(key_str) = std::str::from_utf8(&key) else {

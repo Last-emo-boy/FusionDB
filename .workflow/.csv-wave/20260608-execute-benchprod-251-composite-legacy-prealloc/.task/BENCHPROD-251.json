@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-251",
+  "title": "Preallocate composite index legacy metadata results",
+  "status": "completed",
+  "created_at": "2026-06-08T23:10:22+08:00",
+  "completed_at": "2026-06-08T23:10:22+08:00",
+  "scope": "Composite index legacy metadata scan result construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/composite_index.rs",
+        "tests/sql_dml.rs"
+      ],
+      "summary": [
+        "Changed legacy composite-index metadata result buffer from Vec::new() to Vec::with_capacity(entries.len()).",
+        "Added a direct fallback test that removes the table metadata directory marker and relies on legacy index_meta entries.",
+        "Preserved metadata parsing, table-name filtering, and composite index DML/query behavior."
+      ]
+    },
+    "tests": {
+      "legacy_metadata_fallback": "passed",
+      "table_metadata_directory": "passed",
+      "sql_dml": "44/44 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
