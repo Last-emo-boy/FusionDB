@@ -39,6 +39,15 @@ pub(super) struct ColumnPredicateScanPlan {
     column_indices: Vec<usize>,
 }
 
+fn column_scan_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
+    key.push_str("data:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 impl ColumnPredicateTerm {
     fn matches(&self, value: &Value) -> bool {
         if matches!(value, Value::Null) || matches!(self.value, Value::Null) {
@@ -853,7 +862,7 @@ impl Executor {
             let Some(row_id) = Self::value_to_primary_row_id(&value) else {
                 return Ok(None);
             };
-            let data_key = format!("data:{}:{}", table_name, row_id);
+            let data_key = column_scan_data_key_for_row_id(table_name, &row_id);
             if let Some(data) = txn.get(data_key.as_bytes()).await? {
                 visitor.visit_row(&data)?;
             }
@@ -864,7 +873,7 @@ impl Executor {
                 let Some(row_id) = Self::row_id_from_key(&key) else {
                     continue;
                 };
-                let data_key = format!("data:{}:{}", table_name, row_id);
+                let data_key = column_scan_data_key_for_row_id(table_name, row_id);
                 if let Some(data) = txn.get(data_key.as_bytes()).await? {
                     visitor.visit_row(&data)?;
                 }
@@ -1619,5 +1628,13 @@ mod tests {
 
         let strings = GroupColumnAggregateState::new(GroupColumnAggregateKind::StringAgg);
         assert!(strings.strings.capacity() >= 1);
+    }
+
+    #[test]
+    fn column_scan_data_key_for_row_id_preallocates_exact_key() {
+        let key = column_scan_data_key_for_row_id("metrics", "00042");
+
+        assert_eq!(key, "data:metrics:00042");
+        assert!(key.capacity() >= key.len());
     }
 }
