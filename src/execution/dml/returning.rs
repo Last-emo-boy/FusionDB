@@ -19,7 +19,10 @@ impl Executor {
             .iter()
             .any(|item| matches!(item, SelectItem::Wildcard(_)));
         if is_wildcard {
-            col_names = schema.columns.iter().map(|c| c.name.clone()).collect();
+            col_names = Vec::with_capacity(schema.columns.len());
+            for column in &schema.columns {
+                col_names.push(column.name.clone());
+            }
             result_rows = rows.to_vec();
         } else {
             for item in ret_items {

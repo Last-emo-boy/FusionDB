@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-212",
+  "title": "Preallocate RETURNING column names",
+  "status": "completed",
+  "created_at": "2026-06-08T20:01:00+08:00",
+  "completed_at": "2026-06-08T20:03:09+08:00",
+  "scope": "DML RETURNING wildcard result column-name construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/dml/returning.rs"
+      ],
+      "summary": [
+        "Replaced RETURNING wildcard column-name collect with an explicitly preallocated vector sized from schema.columns.len().",
+        "Preserved result row cloning for RETURNING *.",
+        "Preserved expression-specific RETURNING column labels and evaluation behavior."
+      ]
+    },
+    "tests": {
+      "insert_returning": "passed",
+      "update_returning": "passed",
+      "delete_returning": "passed",
+      "sql_returning_upsert_vector_rbac": "13/13 passed",
+      "insert_omitted_serial_primary_key_generates_ids": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
