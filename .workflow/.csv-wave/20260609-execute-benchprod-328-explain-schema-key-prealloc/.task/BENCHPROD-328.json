@@ -1,0 +1,24 @@
+{
+  "id": "BENCHPROD-328",
+  "title": "Preallocate EXPLAIN schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/ddl/explain.rs"
+  ],
+  "description": "Avoid generic format! allocation work when EXPLAIN builds schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added explain_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced explain_table_access() schema lookup key construction.",
+    "Replaced load_explain_schema() schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test explain_schema_key -- --nocapture",
+    "cargo test --test sql_ddl test_explain -- --nocapture",
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "EXPLAIN schema-key construction now reserves capacity from known table-name length while preserving access path reporting, ANALYZE statistics estimates, join order estimates, and DDL behavior."
+}

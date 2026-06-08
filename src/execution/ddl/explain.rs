@@ -39,6 +39,13 @@ fn explain_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn explain_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +85,14 @@ mod tests {
 
         assert_eq!(prefix, "data:lineitem:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn explain_schema_key_for_table_preallocates_exact_key() {
+        let key = explain_schema_key_for_table("lineitem");
+
+        assert_eq!(key, "schema:lineitem");
+        assert!(key.capacity() >= key.len());
     }
 
     #[test]
@@ -273,7 +288,7 @@ impl Executor {
     ) -> Result<ExplainAccessPath> {
         if let TableFactor::Table { name, .. } = table {
             let table_name = name.to_string();
-            let schema_key = format!("schema:{}", table_name);
+            let schema_key = explain_schema_key_for_table(&table_name);
             if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
                 let schema: TableSchema = bincode::deserialize(&schema_bytes)
                     .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
@@ -371,7 +386,7 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<Option<TableSchema>> {
-        let schema_key = format!("schema:{}", table_name);
+        let schema_key = explain_schema_key_for_table(table_name);
         let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
             return Ok(None);
         };

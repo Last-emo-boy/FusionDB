@@ -1,0 +1,47 @@
+{
+  "id": "benchprod-328-explain-schema-key-prealloc",
+  "objective": "Preallocate EXPLAIN schema lookup keys from table-name length.",
+  "status": "completed",
+  "created_at": "2026-06-09T07:36:00+08:00",
+  "completed_at": "2026-06-09T07:36:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-328",
+      "title": "Preallocate EXPLAIN schema keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/explain.rs"
+      ],
+      "result": "EXPLAIN access-path and estimate schema lookups now use an explicit-capacity helper instead of format! for schema:<table> keys."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test explain_schema_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_explain -- --nocapture",
+      "status": "passed: 8/8"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 33/33"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for schema:<table> before pushing known components.",
+    "The optimization replaces format! in explain_table_access() and load_explain_schema().",
+    "Generated schema key bytes, EXPLAIN access path reporting, ANALYZE statistics estimates, join order estimates, and DDL behavior are unchanged.",
+    "git diff --check printed the existing CRLF normalization warning for src/execution/ddl/explain.rs while exiting successfully."
+  ]
+}
