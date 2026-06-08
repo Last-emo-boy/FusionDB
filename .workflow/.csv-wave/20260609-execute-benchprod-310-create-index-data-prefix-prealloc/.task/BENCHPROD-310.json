@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-310",
+  "title": "Preallocate CREATE INDEX data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/ddl/index.rs"
+  ],
+  "description": "Avoid generic format! allocation work when CREATE INDEX backfill scans build data:<table>: prefixes from known table-name length.",
+  "implementation": [
+    "Added create_index_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Replaced CREATE INDEX existing-row backfill scan prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test create_index_data_prefix -- --nocapture",
+    "cargo test --test sql_index_cache -- --nocapture",
+    "cargo test --test sql_returning_upsert_vector_rbac test_hnsw_order_by_projection -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "CREATE INDEX data-prefix construction now reserves capacity from known table-name length while preserving BTree, composite, FTS, trigram, HNSW, and row-cache backfill behavior."
+}

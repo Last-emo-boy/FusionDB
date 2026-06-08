@@ -6,6 +6,14 @@ use sqlparser::ast::Expr;
 
 use super::super::{Executor, QueryResult};
 
+fn create_index_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 impl Executor {
     pub(crate) async fn handle_create_index(
         &self,
@@ -100,7 +108,7 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema serialization error: {}", e)))?;
         txn.put(schema_key.as_bytes(), &new_schema_value).await?;
 
-        let prefix = format!("data:{}:", table_name_str);
+        let prefix = create_index_data_prefix_for_table(&table_name_str);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
 
         let mut count = 0;
@@ -268,5 +276,18 @@ impl Executor {
         Ok(QueryResult::Success {
             message: format!("Dropped {} index(es)", dropped),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_index_data_prefix_for_table;
+
+    #[test]
+    fn create_index_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = create_index_data_prefix_for_table("orders");
+
+        assert_eq!(prefix, "data:orders:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }
