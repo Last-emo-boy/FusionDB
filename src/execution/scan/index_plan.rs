@@ -19,6 +19,26 @@ pub(crate) struct IndexScanPlan {
 }
 
 impl Executor {
+    fn data_key_for_row_id(table_name: &str, row_id: &str) -> String {
+        let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
+        key.push_str("data:");
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(row_id);
+        key
+    }
+
+    fn data_key_upper_bound_for_row_id(table_name: &str, row_id: &str) -> String {
+        let mut key =
+            String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len() + 1);
+        key.push_str("data:");
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(row_id);
+        key.push('\0');
+        key
+    }
+
     fn order_by_primary_key_direction(
         &self,
         order_by: Option<&sqlparser::ast::OrderBy>,
@@ -305,7 +325,7 @@ impl Executor {
         row_id: &str,
         txn: &mut dyn Transaction,
     ) -> Result<Option<Vec<Value>>> {
-        let data_key = format!("data:{}:{}", table_name, row_id);
+        let data_key = Self::data_key_for_row_id(table_name, row_id);
         if let Some(row) = self.row_cache.get(&data_key) {
             monitor::inc_row_cache_hit();
             return Ok(Some(row));
@@ -545,7 +565,7 @@ impl Executor {
                                 if col.is_primary {
                                     let val_str = Self::value_to_primary_row_id(&val);
                                     if let Some(s) = val_str {
-                                        let key = format!("data:{}:{}", table_name, s);
+                                        let key = Self::data_key_for_row_id(table_name, &s);
                                         if txn.get(key.as_bytes()).await?.is_some() {
                                             all_row_ids.insert(s);
                                         }
@@ -592,7 +612,8 @@ impl Executor {
                                 let col = &schema.columns[col_idx];
                                 if col.is_indexed {
                                     let all_row_ids = if col.is_primary {
-                                        let key_prefix = format!("data:{}:{}", table_name, prefix);
+                                        let key_prefix =
+                                            Self::data_key_for_row_id(table_name, &prefix);
                                         let kv =
                                             txn.scan_prefix(key_prefix.as_bytes(), limit).await?;
                                         let mut row_ids = HashSet::with_capacity(kv.len());
@@ -688,8 +709,9 @@ impl Executor {
                             let high_encoded = Self::value_to_primary_row_id(&high_val);
 
                             if let (Some(low_key), Some(high_key)) = (low_encoded, high_encoded) {
-                                let start = format!("data:{}:{}", table_name, low_key);
-                                let end = format!("data:{}:{}\u{0}", table_name, high_key);
+                                let start = Self::data_key_for_row_id(table_name, &low_key);
+                                let end =
+                                    Self::data_key_upper_bound_for_row_id(table_name, &high_key);
                                 let kv = txn
                                     .scan_range(start.as_bytes(), end.as_bytes(), limit)
                                     .await?;
@@ -787,5 +809,26 @@ impl Executor {
             }
             Ok(None)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    #[test]
+    fn data_key_for_row_id_preallocates_exact_key() {
+        let key = Executor::data_key_for_row_id("orders", "00042");
+
+        assert_eq!(key, "data:orders:00042");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn data_key_upper_bound_appends_nul_with_capacity() {
+        let key = Executor::data_key_upper_bound_for_row_id("orders", "00042");
+
+        assert_eq!(key, "data:orders:00042\0");
+        assert!(key.capacity() >= key.len());
     }
 }
