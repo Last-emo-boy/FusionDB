@@ -2828,33 +2828,32 @@ impl Executor {
             let window_results: Vec<Option<Vec<Value>>> = if !is_wildcard
                 && matches!(select.group_by, sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty())
             {
-                select
-                    .projection
-                    .iter()
-                    .map(|item| {
-                        let expr = match item {
-                            SelectItem::UnnamedExpr(e) => Some(e),
-                            SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
-                            _ => None,
-                        };
-                        if let Some(Expr::Function(func)) = expr {
-                            let fname = func.name.to_string().to_uppercase();
-                            if matches!(
-                                fname.as_str(),
-                                "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "LEAD"
-                            ) {
-                                if let Some(ref over) = func.over {
-                                    if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
-                                        return Some(self.compute_window_function(
-                                            &fname, spec, func, &rows, &schema, params,
-                                        ));
-                                    }
+                let mut results = Vec::with_capacity(select.projection.len());
+                for item in &select.projection {
+                    let expr = match item {
+                        SelectItem::UnnamedExpr(e) => Some(e),
+                        SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+                        _ => None,
+                    };
+                    if let Some(Expr::Function(func)) = expr {
+                        let fname = func.name.to_string().to_uppercase();
+                        if matches!(
+                            fname.as_str(),
+                            "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "LEAD"
+                        ) {
+                            if let Some(ref over) = func.over {
+                                if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
+                                    results.push(Some(self.compute_window_function(
+                                        &fname, spec, func, &rows, &schema, params,
+                                    )));
+                                    continue;
                                 }
                             }
                         }
-                        None
-                    })
-                    .collect()
+                    }
+                    results.push(None);
+                }
+                results
             } else {
                 vec![]
             };

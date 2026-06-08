@@ -1,0 +1,40 @@
+{
+  "id": "benchprod-220-window-result-prealloc",
+  "objective": "Preallocate window projection result vectors from projection counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:29:00+08:00",
+  "completed_at": "2026-06-08T20:31:44+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-220",
+      "title": "Preallocate window projection results",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "SELECT window projection precomputation now preallocates the per-projection result vector from the known projection count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_window",
+      "status": "passed: 4/4"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "Projection-column alignment, window function detection, and non-window projection behavior were kept unchanged."
+  ]
+}

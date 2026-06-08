@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-220",
+  "title": "Preallocate window projection results",
+  "status": "completed",
+  "created_at": "2026-06-08T20:29:00+08:00",
+  "completed_at": "2026-06-08T20:31:44+08:00",
+  "scope": "SELECT window function projection precomputation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced window_results map collect with an explicitly preallocated vector sized from select.projection.len().",
+        "Preserved one result slot per projection column.",
+        "Preserved window function detection and non-window projection behavior."
+      ]
+    },
+    "tests": {
+      "sql_window": "4/4 passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
