@@ -1128,10 +1128,10 @@ impl Executor {
             let table = sql[on_pos + 4..to_pos].trim();
             let username = sql[to_pos + 4..].trim().to_lowercase();
 
-            let privileges: Vec<String> = privs_str
-                .split(',')
-                .map(|s| s.trim().to_uppercase())
-                .collect();
+            let mut privileges = Vec::with_capacity(privs_str.matches(',').count() + 1);
+            for privilege in privs_str.split(',') {
+                privileges.push(privilege.trim().to_uppercase());
+            }
 
             let mut record = crate::auth::get_user(txn, &username)
                 .await?
@@ -1166,10 +1166,10 @@ impl Executor {
             let table = sql[on_pos + 4..from_pos].trim();
             let username = sql[from_pos + 6..].trim().to_lowercase();
 
-            let privileges: Vec<String> = privs_str
-                .split(',')
-                .map(|s| s.trim().to_uppercase())
-                .collect();
+            let mut privileges = Vec::with_capacity(privs_str.matches(',').count() + 1);
+            for privilege in privs_str.split(',') {
+                privileges.push(privilege.trim().to_uppercase());
+            }
 
             let mut record = crate::auth::get_user(txn, &username)
                 .await?

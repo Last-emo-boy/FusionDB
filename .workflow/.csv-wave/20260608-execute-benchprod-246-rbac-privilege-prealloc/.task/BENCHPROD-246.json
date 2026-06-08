@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-246",
+  "title": "Preallocate RBAC privilege lists",
+  "status": "completed",
+  "created_at": "2026-06-08T22:47:15+08:00",
+  "completed_at": "2026-06-08T22:47:15+08:00",
+  "scope": "RBAC GRANT and REVOKE privilege parsing",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/mod.rs"
+      ],
+      "summary": [
+        "Replaced GRANT privilege split collect with Vec::with_capacity(privs_str.matches(',').count() + 1).",
+        "Applied the same preallocation to REVOKE privilege parsing.",
+        "Preserved privilege trim and uppercase normalization semantics."
+      ]
+    },
+    "tests": {
+      "rbac_grant_revoke": "passed",
+      "sql_returning_upsert_vector_rbac": "14/14 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, storage, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
