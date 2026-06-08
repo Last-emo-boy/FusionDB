@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-193-join-first-local-predicate-prealloc",
+  "objective": "Preallocate first-relation local predicate vector from optional selection and pending predicate counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:39:00+08:00",
+  "completed_at": "2026-06-08T18:42:40+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-193",
+      "title": "Preallocate first-relation local predicates",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "First-relation join projection planning now builds local predicate vectors with explicit capacity from pending predicates plus optional first selection."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_join_left_filter_projection_skips_unused_left_column_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_join_projection_pushdown_with_group_by -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_implicit_join_where_equi_predicate_matches_chbenchmark_q16_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

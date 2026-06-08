@@ -1842,12 +1842,13 @@ impl Executor {
                     })
                     .transpose()?
                     .and_then(|schema| {
-                        let local_predicates = first_selection
-                            .as_ref()
-                            .into_iter()
-                            .chain(pending_predicates.iter())
-                            .cloned()
-                            .collect::<Vec<_>>();
+                        let mut local_predicates = Vec::with_capacity(
+                            pending_predicates.len() + usize::from(first_selection.is_some()),
+                        );
+                        if let Some(predicate) = &first_selection {
+                            local_predicates.push(predicate.clone());
+                        }
+                        local_predicates.extend(pending_predicates.iter().cloned());
                         self.build_stage_join_base_projection(
                             &first.relation,
                             &schema,
