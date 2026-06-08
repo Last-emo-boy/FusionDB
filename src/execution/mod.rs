@@ -774,7 +774,10 @@ impl Executor {
                         })
                     }
                 };
-                table.into_iter().map(|name| (name, "DELETE")).collect()
+                match table {
+                    Some(name) => vec![(name, "DELETE")],
+                    None => Vec::new(),
+                }
             }
             Statement::Update(update) => {
                 let sqlparser::ast::TableWithJoins { relation, .. } = &update.table;
@@ -1230,6 +1233,11 @@ mod tests {
                 ("users".to_string(), "SELECT"),
                 ("orders".to_string(), "SELECT")
             ]
+        );
+
+        assert_eq!(
+            statement_permissions("DELETE FROM users WHERE id = 1"),
+            vec![("users".to_string(), "DELETE")]
         );
 
         assert_eq!(

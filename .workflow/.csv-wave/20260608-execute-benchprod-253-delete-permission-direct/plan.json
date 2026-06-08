@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-253-delete-permission-direct",
+  "objective": "Avoid iterator collection overhead when resolving single-table DELETE permissions.",
+  "status": "completed",
+  "created_at": "2026-06-08T23:18:00+08:00",
+  "completed_at": "2026-06-08T23:20:03+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-253",
+      "title": "Build DELETE permission entries directly",
+      "status": "completed",
+      "evidence": [
+        "src/execution/mod.rs"
+      ],
+      "result": "DELETE permission resolution now directly constructs the zero-or-one entry result instead of routing through Option iterator collection."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test statement_permissions_preserve_preallocated_entries -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_delete_with_where -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The change preserves the existing first-table DELETE permission behavior.",
+    "A DELETE statement_permissions assertion was added beside existing permission-resolution cases."
+  ]
+}

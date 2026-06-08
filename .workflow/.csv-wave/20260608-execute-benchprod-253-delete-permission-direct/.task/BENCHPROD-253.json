@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-253",
+  "title": "Build DELETE permission entries directly",
+  "status": "completed",
+  "created_at": "2026-06-08T23:18:00+08:00",
+  "completed_at": "2026-06-08T23:20:03+08:00",
+  "scope": "Executor statement permission resolution for DELETE",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/mod.rs"
+      ],
+      "summary": [
+        "Replaced Option::into_iter().map().collect() in the DELETE permission branch with a direct match.",
+        "Preserved the zero-or-one result shape and the existing first-table extraction behavior.",
+        "Added direct unit coverage for DELETE permission extraction."
+      ]
+    },
+    "tests": {
+      "statement_permissions": "passed",
+      "delete_with_where": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
