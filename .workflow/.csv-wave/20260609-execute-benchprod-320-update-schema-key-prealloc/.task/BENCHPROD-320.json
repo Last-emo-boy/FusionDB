@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-320",
+  "title": "Preallocate UPDATE schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/dml/update.rs"
+  ],
+  "description": "Avoid generic format! allocation work when UPDATE builds schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added update_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced UPDATE schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test update_schema_key -- --nocapture",
+    "cargo test --test sql_dml test_update_primary_key_simple_table_fast_path -- --nocapture",
+    "cargo test --test sql_dml -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "UPDATE schema-key construction now reserves capacity from known table-name length while preserving schema lookup, update planning, index maintenance, and SQL DML behavior."
+}
