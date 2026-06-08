@@ -41,6 +41,13 @@ fn table_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn table_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 fn table_index_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("index:".len() + table_name.len() + 1);
     prefix.push_str("index:");
@@ -72,7 +79,7 @@ impl Executor {
         let table_name = name.to_string();
 
         // IF NOT EXISTS check
-        let schema_key_check = format!("schema:{}", table_name);
+        let schema_key_check = table_schema_key_for_table(&table_name);
         if txn.get(schema_key_check.as_bytes()).await?.is_some() {
             if if_not_exists {
                 return Ok(QueryResult::Success {
@@ -153,7 +160,7 @@ impl Executor {
                 }
             }
 
-            let parent_key = format!("schema:{}", fk.parent_table);
+            let parent_key = table_schema_key_for_table(&fk.parent_table);
             let parent_schema_bytes = txn.get(parent_key.as_bytes()).await?.ok_or_else(|| {
                 FusionError::Execution(format!("Referenced table {} not found", fk.parent_table))
             })?;
@@ -174,7 +181,7 @@ impl Executor {
         }
 
         let schema = TableSchema::new(table_name.clone(), cols);
-        let key = format!("schema:{}", table_name);
+        let key = table_schema_key_for_table(&table_name);
         let value = bincode::serialize(&schema)
             .map_err(|e| FusionError::Execution(format!("Schema serialization error: {}", e)))?;
 
@@ -331,7 +338,7 @@ impl Executor {
         for name in names {
             let table_name = name.to_string();
 
-            let schema_key = format!("schema:{}", table_name);
+            let schema_key = table_schema_key_for_table(&table_name);
             if txn.get(schema_key.as_bytes()).await?.is_none() {
                 if if_exists {
                     continue;
@@ -388,7 +395,7 @@ impl Executor {
         let mut count = 0;
         for target in table_names {
             let table_name = target.name.to_string();
-            let schema_key = format!("schema:{}", table_name);
+            let schema_key = table_schema_key_for_table(&table_name);
             if txn.get(schema_key.as_bytes()).await?.is_none() {
                 return Err(FusionError::Execution(format!(
                     "Table {} does not exist",
@@ -425,7 +432,7 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<QueryResult> {
         let table_name = name.to_string();
-        let schema_key = format!("schema:{}", table_name);
+        let schema_key = table_schema_key_for_table(&table_name);
 
         let schema_bytes = txn.get(schema_key.as_bytes()).await?.ok_or_else(|| {
             FusionError::Execution(format!("Table {} does not exist", table_name))
@@ -962,8 +969,16 @@ impl Executor {
 mod tests {
     use super::{
         table_data_key_for_row_id, table_data_prefix_for_table, table_index_prefix_for_column,
-        table_index_prefix_for_table,
+        table_index_prefix_for_table, table_schema_key_for_table,
     };
+
+    #[test]
+    fn table_schema_key_for_table_preallocates_exact_key() {
+        let key = table_schema_key_for_table("accounts");
+
+        assert_eq!(key, "schema:accounts");
+        assert!(key.capacity() >= key.len());
+    }
 
     #[test]
     fn table_data_prefix_for_table_preallocates_exact_prefix() {
