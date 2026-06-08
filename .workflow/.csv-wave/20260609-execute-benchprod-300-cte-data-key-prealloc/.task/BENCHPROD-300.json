@@ -1,0 +1,24 @@
+{
+  "id": "BENCHPROD-300",
+  "title": "Preallocate materialized CTE data keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Avoid generic format! allocation work when materialized CTE row writes build data:<cte>:<row_id> keys from known component lengths.",
+  "implementation": [
+    "Added materialized_cte_data_key_for_row_id() with explicit capacity for data:<cte>:<row_id>.",
+    "Replaced materialized CTE temporary row-write data-key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test materialized_cte_data_key -- --nocapture",
+    "cargo test --test sql_set_subquery test_cte_basic -- --nocapture",
+    "cargo test --test sql_set_subquery test_recursive_cte_alias_can_rename_prefix_columns -- --nocapture",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Materialized CTE data-key construction now reserves capacity from known CTE name and row-id lengths while preserving CTE and recursive CTE behavior."
+}

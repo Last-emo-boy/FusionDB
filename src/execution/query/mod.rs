@@ -23,6 +23,15 @@ fn join_group_left_bucket() -> Vec<Vec<Value>> {
     Vec::with_capacity(1)
 }
 
+fn materialized_cte_data_key_for_row_id(cte_name: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity("data:".len() + cte_name.len() + 1 + row_id.len());
+    key.push_str("data:");
+    key.push_str(cte_name);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 enum RowValueSource<'a> {
     One,
     Column(usize),
@@ -870,7 +879,7 @@ impl Executor {
 
         for (i, row) in rows.iter().enumerate() {
             let pk_str = crate::common::encoding::encode_i64_comparable(i as i64);
-            let key = format!("data:{}:{}", cte_name, pk_str);
+            let key = materialized_cte_data_key_for_row_id(cte_name, &pk_str);
             let val = crate::common::encoding::RowEncoder::encode(row);
             txn.put(key.as_bytes(), &val).await?;
             self.row_cache.invalidate(&key);
@@ -3356,5 +3365,13 @@ mod tests {
     fn join_group_left_bucket_preallocates_first_row() {
         let bucket = join_group_left_bucket();
         assert!(bucket.capacity() >= 1);
+    }
+
+    #[test]
+    fn materialized_cte_data_key_for_row_id_preallocates_exact_key() {
+        let key = materialized_cte_data_key_for_row_id("recent_orders", "0007");
+
+        assert_eq!(key, "data:recent_orders:0007");
+        assert!(key.capacity() >= key.len());
     }
 }

@@ -1,0 +1,51 @@
+{
+  "id": "benchprod-300-cte-data-key-prealloc",
+  "objective": "Preallocate materialized CTE data keys from CTE name and row-id lengths.",
+  "status": "completed",
+  "created_at": "2026-06-09T03:55:00+08:00",
+  "completed_at": "2026-06-09T04:02:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-300",
+      "title": "Preallocate materialized CTE data keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Materialized CTE row writes now use an explicit-capacity helper instead of format! for temporary data keys."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test materialized_cte_data_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_set_subquery test_cte_basic -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_set_subquery test_recursive_cte_alias_can_rename_prefix_columns -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_set_subquery -- --nocapture",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for data:<cte>:<row_id> before pushing known components.",
+    "The optimization replaces format! in materialized CTE temporary row writes.",
+    "Generated key bytes, row-cache invalidation keys, CTE cleanup prefixes, recursive CTE replacement, and SQL results are unchanged.",
+    "Focused CTE tests were launched in parallel and printed Cargo file-lock wait messages before passing."
+  ]
+}
