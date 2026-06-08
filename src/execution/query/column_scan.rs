@@ -56,6 +56,24 @@ fn column_scan_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn column_scan_index_prefix_for_value(
+    table_name: &str,
+    column_name: &str,
+    value_key: &str,
+) -> String {
+    let mut prefix = String::with_capacity(
+        "index:".len() + table_name.len() + 1 + column_name.len() + 1 + value_key.len() + 1,
+    );
+    prefix.push_str("index:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix.push_str(column_name);
+    prefix.push(':');
+    prefix.push_str(value_key);
+    prefix.push(':');
+    prefix
+}
+
 impl ColumnPredicateTerm {
     fn matches(&self, value: &Value) -> bool {
         if matches!(value, Value::Null) || matches!(self.value, Value::Null) {
@@ -875,7 +893,8 @@ impl Executor {
                 visitor.visit_row(&data)?;
             }
         } else if let Some(value_key) = self.value_to_index_string(&value) {
-            let index_prefix = format!("index:{}:{}:{}:", table_name, column_name, value_key);
+            let index_prefix =
+                column_scan_index_prefix_for_value(table_name, &column_name, &value_key);
             let entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
             for (key, _) in entries {
                 let Some(row_id) = Self::row_id_from_key(&key) else {
@@ -1651,6 +1670,14 @@ mod tests {
         let prefix = column_scan_data_prefix_for_table("metrics");
 
         assert_eq!(prefix, "data:metrics:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn column_scan_index_prefix_for_value_preallocates_exact_prefix() {
+        let prefix = column_scan_index_prefix_for_value("metrics", "host_id", "00042");
+
+        assert_eq!(prefix, "index:metrics:host_id:00042:");
         assert!(prefix.capacity() >= prefix.len());
     }
 }

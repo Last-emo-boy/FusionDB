@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-305",
+  "title": "Preallocate column-scan index-probe prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "description": "Avoid generic format! allocation work when column-scan aggregate index probes build index:<table>:<column>:<value>: prefixes from known component lengths.",
+  "implementation": [
+    "Added column_scan_index_prefix_for_value() with explicit capacity for index:<table>:<column>:<value>:.",
+    "Replaced column-scan aggregate indexed predicate probe prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test execution::query::column_scan::tests -- --nocapture",
+    "cargo test --test sql_group_aggregate test_filtered_count_uses_index_candidates_and_required_columns_only -- --nocapture",
+    "cargo test --test sql_group_aggregate -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Column-scan aggregate index-probe prefix construction now reserves capacity from known component lengths while preserving indexed aggregate query behavior."
+}
