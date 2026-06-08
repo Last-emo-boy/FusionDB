@@ -73,11 +73,10 @@ impl Executor {
     ) -> Result<TableStats> {
         let prefix = format!("data:{}:", table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
-        let mut collectors = schema
-            .columns
-            .iter()
-            .map(|column| ColumnStatsCollector::new(column.name.clone()))
-            .collect::<Vec<_>>();
+        let mut collectors = Vec::with_capacity(schema.columns.len());
+        for column in &schema.columns {
+            collectors.push(ColumnStatsCollector::new(column.name.clone()));
+        }
 
         let mut row_count = 0usize;
         for (key, bytes) in kv_pairs {
@@ -103,13 +102,15 @@ impl Executor {
             }
         }
 
+        let mut columns = Vec::with_capacity(collectors.len());
+        for collector in collectors {
+            columns.push(collector.finish());
+        }
+
         Ok(TableStats {
             table_name: table_name.to_string(),
             row_count,
-            columns: collectors
-                .into_iter()
-                .map(ColumnStatsCollector::finish)
-                .collect(),
+            columns,
             updated_at_epoch_ms: Self::current_epoch_ms(),
         })
     }

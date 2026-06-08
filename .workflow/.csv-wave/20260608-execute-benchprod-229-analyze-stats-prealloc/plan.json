@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-229-analyze-stats-prealloc",
+  "objective": "Preallocate ANALYZE statistics vectors from schema column counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T21:28:00+08:00",
+  "completed_at": "2026-06-08T21:35:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-229",
+      "title": "Preallocate ANALYZE statistics vectors",
+      "status": "completed",
+      "evidence": [
+        "src/execution/analyze.rs"
+      ],
+      "result": "ANALYZE TABLE now preallocates column statistics collectors and finalized column stats from known schema and collector counts."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl test_analyze_table_collects_statistics -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl test_explain_includes_analyze_statistics -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl test_explain_join_order_includes_analyze_estimates -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl",
+      "status": "passed: 28/28"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves row scanning, row-cache reuse, per-column observation, finalized stats content, and EXPLAIN stats consumption."
+  ]
+}
