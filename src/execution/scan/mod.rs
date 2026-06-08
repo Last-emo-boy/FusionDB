@@ -156,6 +156,15 @@ impl Executor {
         TableSchema::new(table_name, schema_columns)
     }
 
+    fn scan_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
+        let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
+        key.push_str("data:");
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(row_id);
+        key
+    }
+
     fn projection_indices_for_scan(
         projection: &Option<Vec<String>>,
         schema: &TableSchema,
@@ -727,8 +736,10 @@ impl Executor {
                                                         .search(&idx_name, &query_vec, l)?;
 
                                                     for (id, _dist) in search_results {
-                                                        let key =
-                                                            format!("data:{}:{}", table_name, id);
+                                                        let key = Self::scan_data_key_for_row_id(
+                                                            &table_name,
+                                                            &id,
+                                                        );
                                                         if let Some(row) = self.row_cache.get(&key)
                                                         {
                                                             rows.push(row);
@@ -798,7 +809,7 @@ impl Executor {
                             };
 
                             if let Some(id) = row_id {
-                                let key = format!("data:{}:{}", table_name, id);
+                                let key = Self::scan_data_key_for_row_id(&table_name, &id);
 
                                 if key_only_scan {
                                     if txn.get(key.as_bytes()).await?.is_some() {
@@ -1081,7 +1092,8 @@ impl Executor {
                                     || row_ids_vec.len() <= SMALL_INDEX_FETCH_THRESHOLD
                                 {
                                     for row_id in row_ids_vec {
-                                        let data_key = format!("data:{}:{}", table_name, row_id);
+                                        let data_key =
+                                            Self::scan_data_key_for_row_id(&table_name, &row_id);
 
                                         let row = if let Some(row) = self.row_cache.get(&data_key) {
                                             monitor::inc_row_cache_hit();
@@ -1158,10 +1170,9 @@ impl Executor {
                                             let executor = executor_for_stream;
 
                                             async move {
-                                                let data_key = format!(
-                                                    "data:{}:{}",
+                                                let data_key = Self::scan_data_key_for_row_id(
                                                     table_name.as_ref(),
-                                                    row_id
+                                                    &row_id,
                                                 );
 
                                                 if let Some(row) = executor.row_cache.get(&data_key)
@@ -1219,8 +1230,10 @@ impl Executor {
                                             if read_storage {
                                                 monitor::inc_row_read();
                                                 if cacheable {
-                                                    let data_key =
-                                                        format!("data:{}:{}", table_name, row_id);
+                                                    let data_key = Self::scan_data_key_for_row_id(
+                                                        &table_name,
+                                                        &row_id,
+                                                    );
                                                     self.row_cache.insert(data_key, row.clone());
                                                 }
                                             } else if from_cache {
@@ -1351,5 +1364,18 @@ impl Executor {
                 "Unsupported table factor".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    #[test]
+    fn scan_data_key_for_row_id_preallocates_exact_key() {
+        let key = Executor::scan_data_key_for_row_id("lineitem", "00000042");
+
+        assert_eq!(key, "data:lineitem:00000042");
+        assert!(key.capacity() >= key.len());
     }
 }

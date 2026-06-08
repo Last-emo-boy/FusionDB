@@ -1,0 +1,47 @@
+{
+  "id": "benchprod-295-scan-data-key-prealloc",
+  "objective": "Preallocate scan data keys from table and row-id lengths.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:58:00+08:00",
+  "completed_at": "2026-06-09T03:03:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-295",
+      "title": "Preallocate scan data keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/mod.rs"
+      ],
+      "result": "Single-table scan hot paths now build data keys through an explicit-capacity helper instead of format!."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test scan_data_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+      "status": "passed: 14/14"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The scan data-key helper reserves exactly enough capacity for data:<table>:<row_id>.",
+    "The optimization replaces format! in vector-search row fetch, primary-key point lookup, small index result fetch, concurrent index result fetch, and row-cache insertion after stream fetch.",
+    "Generated key bytes, row-cache keys, storage lookups, key-only projection, vector result fetch, index fetch ordering, row decoding, and SQL results are unchanged.",
+    "An initial cargo fmt --check reported one formatting diff; cargo fmt was applied and the check passed afterward."
+  ]
+}
