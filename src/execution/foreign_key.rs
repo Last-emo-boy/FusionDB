@@ -65,7 +65,7 @@ impl Executor {
         columns: &[sqlparser::ast::ColumnDef],
         constraints: &[TableConstraint],
     ) -> Result<Vec<ForeignKeyMeta>> {
-        let mut metas = Vec::new();
+        let mut metas = Vec::with_capacity(columns.len().saturating_add(constraints.len()));
 
         for column in columns {
             for option in &column.options {
@@ -131,18 +131,18 @@ impl Executor {
                 "FOREIGN KEY requires at least one child column".to_string(),
             ));
         }
-        let child_columns = fk
-            .columns
-            .iter()
-            .map(|ident| ident.value.clone())
-            .collect::<Vec<_>>();
+        let mut child_columns = Vec::with_capacity(fk.columns.len());
+        for ident in &fk.columns {
+            child_columns.push(ident.value.clone());
+        }
         let parent_columns = if fk.referred_columns.is_empty() {
             vec!["id".to_string()]
         } else {
-            fk.referred_columns
-                .iter()
-                .map(|ident| ident.value.clone())
-                .collect::<Vec<_>>()
+            let mut parent_columns = Vec::with_capacity(fk.referred_columns.len());
+            for ident in &fk.referred_columns {
+                parent_columns.push(ident.value.clone());
+            }
+            parent_columns
         };
         if child_columns.len() != parent_columns.len() {
             return Err(FusionError::Execution(format!(

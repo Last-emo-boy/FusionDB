@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-227",
+  "title": "Preallocate foreign-key metadata vectors",
+  "status": "completed",
+  "created_at": "2026-06-08T21:12:00+08:00",
+  "completed_at": "2026-06-08T21:19:00+08:00",
+  "scope": "Foreign-key metadata collection",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/foreign_key.rs"
+      ],
+      "summary": [
+        "Replaced foreign-key metadata Vec::new with Vec::with_capacity(columns.len() + constraints.len()).",
+        "Replaced table-level child column collect with Vec::with_capacity(fk.columns.len()).",
+        "Replaced table-level parent column collect with Vec::with_capacity(fk.referred_columns.len())."
+      ]
+    },
+    "tests": {
+      "column_foreign_key": "passed",
+      "table_level_foreign_key": "passed",
+      "composite_foreign_key": "passed",
+      "sql_view_show_constraints": "16/16 passed",
+      "copy_constraints_direct_path": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
