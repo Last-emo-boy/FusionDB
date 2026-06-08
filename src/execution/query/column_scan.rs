@@ -48,6 +48,14 @@ fn column_scan_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+fn column_scan_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 impl ColumnPredicateTerm {
     fn matches(&self, value: &Value) -> bool {
         if matches!(value, Value::Null) || matches!(self.value, Value::Null) {
@@ -786,7 +794,7 @@ impl Executor {
             }
         }
 
-        let prefix = format!("data:{}:", table_name);
+        let prefix = column_scan_data_prefix_for_table(table_name);
         let mut states = column_aggregate_states(plans);
 
         let scan_error = {
@@ -1042,7 +1050,7 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<i64> {
-        let prefix = format!("data:{}:", table_name);
+        let prefix = column_scan_data_prefix_for_table(table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
         let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
@@ -1127,7 +1135,7 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
-        let prefix = format!("data:{}:", table_name);
+        let prefix = column_scan_data_prefix_for_table(table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let distinct_capacity = kv_pairs.len().min(4096);
         let mut seen = HashSet::with_capacity(distinct_capacity);
@@ -1229,7 +1237,7 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
-        let prefix = format!("data:{}:", table_name);
+        let prefix = column_scan_data_prefix_for_table(table_name);
         let mut counts: HashMap<Value, i64> = HashMap::with_capacity(4096);
 
         let scan_error = {
@@ -1422,7 +1430,7 @@ impl Executor {
                 .await;
         }
 
-        let prefix = format!("data:{}:", table_name);
+        let prefix = column_scan_data_prefix_for_table(table_name);
         let mut groups: HashMap<Vec<Value>, Vec<GroupColumnAggregateState>> =
             HashMap::with_capacity(4096);
 
@@ -1462,7 +1470,7 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
-        let prefix = format!("data:{}:", table_name);
+        let prefix = column_scan_data_prefix_for_table(table_name);
         let mut groups: HashMap<Value, Vec<GroupColumnAggregateState>> =
             HashMap::with_capacity(4096);
 
@@ -1636,5 +1644,13 @@ mod tests {
 
         assert_eq!(key, "data:metrics:00042");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn column_scan_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = column_scan_data_prefix_for_table("metrics");
+
+        assert_eq!(prefix, "data:metrics:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }

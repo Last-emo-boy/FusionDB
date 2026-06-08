@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-302",
+  "title": "Preallocate column-scan data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "description": "Avoid generic format! allocation work when column-scan fast paths build data:<table>: scan prefixes from known table-name length.",
+  "implementation": [
+    "Added column_scan_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Replaced bare aggregate data-prefix construction.",
+    "Replaced COUNT DISTINCT and SELECT DISTINCT data-prefix construction.",
+    "Replaced grouped aggregate data-prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test execution::query::column_scan::tests -- --nocapture",
+    "cargo test --test sql_select test_select_distinct_with_simple_where_uses_column_scan -- --nocapture",
+    "cargo test --test sql_select test_select_distinct_order_limit_uses_column_scan -- --nocapture",
+    "cargo test --test sql_group_aggregate -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Column-scan data-prefix construction now reserves capacity from known table-name length while preserving aggregate and distinct query behavior."
+}
