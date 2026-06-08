@@ -1,0 +1,45 @@
+{
+  "id": "benchprod-286-vector-index-map-prealloc",
+  "objective": "Preallocate VectorIndex top-level index maps for the default index slot.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:16:00+08:00",
+  "completed_at": "2026-06-09T02:18:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-286",
+      "title": "Preallocate vector index map",
+      "status": "completed",
+      "evidence": [
+        "src/storage/vector_index.rs"
+      ],
+      "result": "VectorIndex now creates its top-level index map with capacity for the default index slot created during Fusion storage initialization."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test vector_index_map_preallocates_default_index_slot -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::vector_index::tests -- --nocapture",
+      "status": "passed: 7/7"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests::fusion_rebuild_vector_index_decodes_only_hnsw_columns -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The top-level VectorIndex map capacity is 1 because Fusion storage initialization creates the default vector index immediately after VectorIndex::new().",
+    "The optimization only changes initial HashMap allocation for index wrappers; lazy wrapper creation, vector insertion, HNSW rebuild, delete, and search semantics are unchanged."
+  ]
+}

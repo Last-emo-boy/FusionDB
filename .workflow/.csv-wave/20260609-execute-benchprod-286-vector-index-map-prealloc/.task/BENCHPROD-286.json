@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-286",
+  "title": "Preallocate vector index map",
+  "status": "completed",
+  "created_at": "2026-06-09T02:16:00+08:00",
+  "completed_at": "2026-06-09T02:18:00+08:00",
+  "scope": "VectorIndex top-level wrapper map allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/vector_index.rs"
+      ],
+      "summary": [
+        "Added vector_index_map to create VectorIndex wrapper maps with capacity 1.",
+        "Changed VectorIndex::new to use the preallocated wrapper map.",
+        "Added unit coverage proving the helper preallocates for the default index slot.",
+        "Preserved lazy wrapper creation, vector insertion, HNSW rebuild, delete, and search behavior."
+      ]
+    },
+    "tests": {
+      "vector_index_map_unit": "passed",
+      "storage_vector_index_tests": "7/7 passed",
+      "fusion_rebuild_vector_index_decodes_only_hnsw_columns": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}

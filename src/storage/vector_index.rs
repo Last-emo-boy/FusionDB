@@ -100,6 +100,10 @@ pub struct VectorIndex {
     indexes: RwLock<HashMap<String, Arc<RwLock<HnswIndexWrapper>>>>,
 }
 
+fn vector_index_map() -> HashMap<String, Arc<RwLock<HnswIndexWrapper>>> {
+    HashMap::with_capacity(1)
+}
+
 impl Default for VectorIndex {
     fn default() -> Self {
         Self::new()
@@ -109,7 +113,7 @@ impl Default for VectorIndex {
 impl VectorIndex {
     pub fn new() -> Self {
         Self {
-            indexes: RwLock::new(HashMap::new()),
+            indexes: RwLock::new(vector_index_map()),
         }
     }
 
@@ -247,12 +251,18 @@ fn vector_distance_order(a: &(String, f32), b: &(String, f32)) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::{HnswIndexWrapper, VectorIndex};
+    use super::{vector_index_map, HnswIndexWrapper, VectorIndex};
 
     #[test]
     fn wrapper_with_vector_capacity_reserves_vectors() {
         let wrapper = HnswIndexWrapper::with_vector_capacity(0, 4);
         assert!(wrapper.vectors.capacity() >= 4);
+    }
+
+    #[test]
+    fn vector_index_map_preallocates_default_index_slot() {
+        let indexes = vector_index_map();
+        assert!(indexes.capacity() >= 1);
     }
 
     #[test]
