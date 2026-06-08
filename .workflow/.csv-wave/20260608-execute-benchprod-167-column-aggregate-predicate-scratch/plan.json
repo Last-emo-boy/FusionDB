@@ -1,0 +1,52 @@
+{
+  "id": "benchprod-167-column-aggregate-predicate-scratch",
+  "objective": "Preallocate predicate scratch values for column-scan aggregate and distinct fast paths.",
+  "status": "completed",
+  "created_at": "2026-06-08T16:47:00+08:00",
+  "completed_at": "2026-06-08T16:54:47+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-167",
+      "title": "Preallocate column aggregate predicate scratch values",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "result": "Column-scan aggregate and distinct paths now share predicate scratch preallocation sized from the predicate column count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_group_aggregate test_group_by_count_with_simple_where_column_scan -- --nocapture",
+      "status": "passed: 0 matched; covered by full sql_group_aggregate suite"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate test_group_by_aggregates_with_simple_where_uses_column_scan -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_select test_select_distinct_with_simple_where_uses_column_scan -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate test_count_distinct_with_simple_where_uses_column_scan -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

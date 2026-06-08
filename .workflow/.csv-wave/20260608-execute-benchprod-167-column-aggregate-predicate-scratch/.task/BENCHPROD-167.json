@@ -1,0 +1,34 @@
+{
+  "id": "BENCHPROD-167",
+  "title": "Preallocate column aggregate predicate scratch values",
+  "status": "completed",
+  "created_at": "2026-06-08T16:47:00+08:00",
+  "completed_at": "2026-06-08T16:54:47+08:00",
+  "scope": "Column-scan aggregate and distinct predicate scratch allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "summary": [
+        "Added ColumnPredicateScanPlan::scratch_values to size predicate scratch buffers from predicate column count.",
+        "Updated column-scan aggregate visitors to start with preallocated predicate_values buffers.",
+        "Updated distinct and count-distinct local predicate scratch allocation to use the shared helper.",
+        "Kept predicate decoding, matching, grouping, and distinct semantics unchanged."
+      ]
+    },
+    "tests": {
+      "group_by_count_with_simple_where_column_scan": "0 matched in focused run; covered by sql_group_aggregate full suite",
+      "group_by_aggregates_with_simple_where_uses_column_scan": "passed",
+      "select_distinct_with_simple_where_uses_column_scan": "passed",
+      "count_distinct_with_simple_where_uses_column_scan": "passed",
+      "sql_group_aggregate": "50/50 passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}

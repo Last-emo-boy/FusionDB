@@ -58,6 +58,10 @@ impl ColumnPredicateTerm {
 }
 
 impl ColumnPredicateScanPlan {
+    fn scratch_values(predicate: Option<&Self>) -> Vec<Value> {
+        Vec::with_capacity(predicate.map_or(0, |predicate| predicate.column_indices.len()))
+    }
+
     fn decode_values(&self, data: &[u8], values: &mut Vec<Value>) -> Result<()> {
         values.clear();
         values.reserve(self.column_indices.len());
@@ -753,7 +757,7 @@ impl Executor {
                 plans,
                 predicate,
                 states: &mut states,
-                predicate_values: Vec::new(),
+                predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
                 error: None,
             };
             txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
@@ -836,7 +840,7 @@ impl Executor {
             plans,
             predicate: Some(predicate),
             states: &mut states,
-            predicate_values: Vec::new(),
+            predicate_values: ColumnPredicateScanPlan::scratch_values(Some(predicate)),
             error: None,
         };
 
@@ -1012,8 +1016,7 @@ impl Executor {
         let prefix = format!("data:{}:", table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
-        let mut predicate_values =
-            Vec::with_capacity(predicate.map_or(0, |predicate| predicate.column_indices.len()));
+        let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
 
         for (_, data) in kv_pairs {
             Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
@@ -1100,8 +1103,7 @@ impl Executor {
         let distinct_capacity = kv_pairs.len().min(4096);
         let mut seen = HashSet::with_capacity(distinct_capacity);
         let mut rows = Vec::with_capacity(distinct_capacity);
-        let mut predicate_values =
-            Vec::with_capacity(predicate.map_or(0, |predicate| predicate.column_indices.len()));
+        let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
 
         for (_, data) in kv_pairs {
             Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
@@ -1206,7 +1208,7 @@ impl Executor {
                 group_column_index: column_index,
                 predicate,
                 counts: &mut counts,
-                predicate_values: Vec::new(),
+                predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
                 error: None,
             };
             txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
@@ -1400,7 +1402,7 @@ impl Executor {
                 aggregate_plans,
                 predicate,
                 groups: &mut groups,
-                predicate_values: Vec::new(),
+                predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
                 error: None,
             };
             txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
@@ -1441,7 +1443,7 @@ impl Executor {
                 aggregate_plans,
                 predicate,
                 groups: &mut groups,
-                predicate_values: Vec::new(),
+                predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
                 error: None,
             };
             txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
