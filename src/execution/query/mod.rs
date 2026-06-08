@@ -101,6 +101,19 @@ impl Executor {
         unique_rows
     }
 
+    fn trim_set_rows_in_place(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<usize>) {
+        if offset >= rows.len() {
+            rows.clear();
+            return;
+        }
+        if offset > 0 {
+            drop(rows.drain(..offset));
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+    }
+
     fn compound_identifier_prefix(idents: &[sqlparser::ast::Ident]) -> String {
         let prefix_len = idents.len().saturating_sub(1);
         let capacity = idents
@@ -2942,11 +2955,7 @@ impl Executor {
 
             // Apply LIMIT/OFFSET from the outer query
             if query.limit_clause.is_some() {
-                combined = if let Some(limit) = set_limit {
-                    combined.into_iter().skip(set_offset).take(limit).collect()
-                } else {
-                    combined.into_iter().skip(set_offset).collect()
-                };
+                Self::trim_set_rows_in_place(&mut combined, set_offset, set_limit);
             }
 
             return Ok(QueryResult::Select {

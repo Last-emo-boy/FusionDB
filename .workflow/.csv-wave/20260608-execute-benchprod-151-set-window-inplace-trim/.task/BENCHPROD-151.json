@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-151",
+  "title": "Set-operation result window in-place trim",
+  "status": "completed",
+  "created_at": "2026-06-08T15:19:00+08:00",
+  "completed_at": "2026-06-08T15:21:45+08:00",
+  "scope": "UNION/INTERSECT/EXCEPT outer LIMIT/OFFSET result trimming",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Added trim_set_rows_in_place for set-operation final LIMIT/OFFSET windowing.",
+        "Replaced skip/take/collect allocation with prefix drain plus truncate.",
+        "Added a UNION ALL ORDER BY LIMIT/OFFSET regression where offset exceeds the available rows."
+      ]
+    },
+    "tests": {
+      "union_all_order_by_limit_offset": "passed",
+      "union_all_order_by_limit_offset_beyond_rows": "passed",
+      "fmt_check": "passed",
+      "sql_set_subquery": "36/36 passed",
+      "sql_select": "27/27 passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query or scan hot path."
+  ]
+}

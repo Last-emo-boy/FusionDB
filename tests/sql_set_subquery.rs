@@ -183,6 +183,37 @@ async fn test_union_all_order_by_limit_offset() {
 }
 
 #[tokio::test]
+async fn test_union_all_order_by_limit_offset_beyond_rows() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_empty_a (id INTEGER PRIMARY KEY, score INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_empty_b (id INTEGER PRIMARY KEY, score INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO union_empty_a VALUES (1, 50), (2, 10)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO union_empty_b VALUES (3, 40)").await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT score FROM union_empty_a UNION ALL SELECT score FROM union_empty_b ORDER BY score ASC LIMIT 2 OFFSET 10",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["score"]);
+    assert!(rows.is_empty());
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_union_distinct() {
     let (executor, wal) = setup().await;
     exec_ok(
