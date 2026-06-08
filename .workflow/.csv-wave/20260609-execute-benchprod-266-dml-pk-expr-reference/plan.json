@@ -1,0 +1,66 @@
+{
+  "id": "benchprod-266-dml-pk-expr-reference",
+  "objective": "Avoid temporary column-set allocation in DML primary-key equality fast-path checks.",
+  "status": "completed",
+  "created_at": "2026-06-09T00:31:00+08:00",
+  "completed_at": "2026-06-09T00:35:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-266",
+      "title": "Avoid DML primary-key value column-set allocation",
+      "status": "completed",
+      "evidence": [
+        "src/execution/dml/mod.rs",
+        "src/execution/scan/index_plan.rs"
+      ],
+      "result": "DML primary-key equality fast-path checks now use the zero-allocation column-reference predicate instead of extracting columns into a temporary HashSet."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_update_primary_key_simple_table_fast_path -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_update_qualified_primary_key_uses_point_lookup -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_update_commuted_primary_key_uses_point_lookup -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_delete_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_delete_qualified_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_delete_commuted_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "primary_key_row_id_from_eq_selection now calls expr_has_column_reference directly.",
+    "expr_has_column_reference now covers additional expression shapes handled by extract_columns_from_expr, including EXTRACT, arrays, compound field access, substring, ANY, and ALL."
+  ]
+}

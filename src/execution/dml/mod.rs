@@ -1,7 +1,6 @@
 use crate::catalog::{IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{BinaryOperator, Expr, TableFactor};
-use std::collections::HashSet;
 
 use super::Executor;
 
@@ -226,9 +225,7 @@ impl Executor {
             return None;
         };
 
-        let mut value_columns = HashSet::new();
-        self.extract_columns_from_expr(value_expr, &mut value_columns);
-        if !value_columns.is_empty() {
+        if self.expr_has_column_reference(value_expr) {
             return None;
         }
 

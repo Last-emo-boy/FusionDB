@@ -1,0 +1,37 @@
+{
+  "id": "BENCHPROD-266",
+  "title": "Avoid DML primary-key value column-set allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:31:00+08:00",
+  "completed_at": "2026-06-09T00:35:00+08:00",
+  "scope": "DML primary-key equality fast-path value expression checks",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/dml/mod.rs",
+        "src/execution/scan/index_plan.rs"
+      ],
+      "summary": [
+        "Replaced temporary HashSet column extraction in primary_key_row_id_from_eq_selection with expr_has_column_reference.",
+        "Removed the now-unused HashSet import from the DML helper module.",
+        "Expanded expr_has_column_reference coverage to match additional expression forms already handled by extract_columns_from_expr."
+      ]
+    },
+    "tests": {
+      "update_pk_simple": "passed",
+      "update_pk_qualified": "passed",
+      "update_pk_commuted": "passed",
+      "delete_pk_simple": "passed",
+      "delete_pk_qualified": "passed",
+      "delete_pk_commuted": "passed",
+      "sql_dml": "44/44 passed",
+      "sql_index_cache": "38/38 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

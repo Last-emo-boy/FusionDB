@@ -134,8 +134,24 @@ impl Executor {
             Expr::BinaryOp { left, right, .. } => {
                 self.expr_has_column_reference(left) || self.expr_has_column_reference(right)
             }
-            Expr::Nested(expr) | Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } => {
-                self.expr_has_column_reference(expr)
+            Expr::Nested(expr)
+            | Expr::UnaryOp { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Extract { expr, .. } => self.expr_has_column_reference(expr),
+            Expr::Array(array) => array
+                .elem
+                .iter()
+                .any(|expr| self.expr_has_column_reference(expr)),
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                self.expr_has_column_reference(root)
+                    || access_chain.iter().any(|access| {
+                        matches!(
+                            access,
+                            sqlparser::ast::AccessExpr::Subscript(
+                                sqlparser::ast::Subscript::Index { index }
+                            ) if self.expr_has_column_reference(index)
+                        )
+                    })
             }
             Expr::Function(func) => {
                 if let FunctionArguments::List(args) = &func.args {
@@ -154,12 +170,29 @@ impl Executor {
                 self.expr_has_column_reference(expr)
                     || list.iter().any(|expr| self.expr_has_column_reference(expr))
             }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                self.expr_has_column_reference(expr)
+                    || substring_from
+                        .as_ref()
+                        .is_some_and(|expr| self.expr_has_column_reference(expr))
+                    || substring_for
+                        .as_ref()
+                        .is_some_and(|expr| self.expr_has_column_reference(expr))
+            }
             Expr::Between {
                 expr, low, high, ..
             } => {
                 self.expr_has_column_reference(expr)
                     || self.expr_has_column_reference(low)
                     || self.expr_has_column_reference(high)
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                self.expr_has_column_reference(left) || self.expr_has_column_reference(right)
             }
             Expr::IsNull(expr)
             | Expr::IsNotNull(expr)
