@@ -1,0 +1,50 @@
+{
+  "id": "benchprod-279-join-group-left-bucket-prealloc",
+  "objective": "Preallocate join group aggregate left-side row buckets for their first row.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:51:00+08:00",
+  "completed_at": "2026-06-09T01:55:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-279",
+      "title": "Preallocate join group left buckets",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Join group aggregate fast path now creates new left-side row buckets with capacity for the immediately inserted first row."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test join_group_left_bucket_preallocates_first_row -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_join test_join_group_by_count_sum_fast_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_join test_join_group_by_aggregate_fast_path_matches_chbench_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_join -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default temp location has previously been unreliable for this workspace.",
+    "Before rerunning verification, Cargo-generated PDB files under target/debug were removed after path verification to avoid MSVC PDB limit and disk pressure failures.",
+    "The bucket capacity is 1 because a new join group left-side bucket is immediately followed by the first matching row push.",
+    "The optimization only changes initial Vec allocation for new left-side row buckets; join key grouping, aggregate computation, and result semantics are unchanged."
+  ]
+}

@@ -19,6 +19,10 @@ fn window_partition_bucket() -> Vec<usize> {
     Vec::with_capacity(1)
 }
 
+fn join_group_left_bucket() -> Vec<Vec<Value>> {
+    Vec::with_capacity(1)
+}
+
 enum RowValueSource<'a> {
     One,
     Column(usize),
@@ -1614,7 +1618,10 @@ impl Executor {
             HashMap::with_capacity(left_rows.len());
         for row in left_rows {
             if let Some(key) = row.get(left_key_index).cloned() {
-                left_by_key.entry(key).or_default().push(row);
+                left_by_key
+                    .entry(key)
+                    .or_insert_with(join_group_left_bucket)
+                    .push(row);
             }
         }
 
@@ -3342,6 +3349,12 @@ mod tests {
     #[test]
     fn window_partition_bucket_preallocates_first_row_index() {
         let bucket = window_partition_bucket();
+        assert!(bucket.capacity() >= 1);
+    }
+
+    #[test]
+    fn join_group_left_bucket_preallocates_first_row() {
+        let bucket = join_group_left_bucket();
         assert!(bucket.capacity() >= 1);
     }
 }
