@@ -1,0 +1,47 @@
+{
+  "id": "benchprod-292-fusion-merge-heap-prealloc",
+  "objective": "Preallocate Fusion merge heaps from known iterator counts.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:41:00+08:00",
+  "completed_at": "2026-06-09T02:44:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-292",
+      "title": "Preallocate Fusion merge heaps",
+      "status": "completed",
+      "evidence": [
+        "src/storage/fusion.rs"
+      ],
+      "result": "Fusion compaction and visible-range merge heaps now reserve capacity from their candidate iterator counts."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test merge_heap_reserves_candidate_iterators -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::fusion::tests -- --nocapture",
+      "status": "passed: 20/20"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "Compaction merge heap capacity now comes from the number of SSTable iterators in the compaction fan-in.",
+    "Visible-range merge heap capacity now comes from one write-buffer iterator plus memtable and SSTable iterator counts.",
+    "The optimization only changes BinaryHeap initial allocation; merge ordering, MVCC visibility, deduplication, visitor short-circuiting, compaction output, and DML behavior are unchanged.",
+    "The full sql_dml regression emitted existing SSTable retry warnings after passing; the command exited successfully."
+  ]
+}

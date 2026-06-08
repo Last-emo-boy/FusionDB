@@ -127,6 +127,10 @@ impl Ord for MergeItem {
     }
 }
 
+fn merge_heap(capacity: usize) -> BinaryHeap<MergeItem> {
+    BinaryHeap::with_capacity(capacity)
+}
+
 #[derive(Clone)]
 struct FusionStoragePaths {
     sstable_dir: PathBuf,
@@ -782,7 +786,7 @@ impl FusionStorage {
         let mut builder = SsTableBuilder::new(out_path.clone());
 
         // Merge Logic
-        let mut heap = BinaryHeap::new();
+        let mut heap = merge_heap(iterators.len());
 
         // Init heap
         for (idx, it) in iterators.iter_mut().enumerate() {
@@ -1086,8 +1090,10 @@ impl FusionTransaction {
             (ik, iv)
         });
 
+        let sstables = self.storage.sstables.read().unwrap().clone();
+
         // 2. Initialize Heap
-        let mut heap = BinaryHeap::new();
+        let mut heap = merge_heap(1 + mem_tables.len() + sstables.len());
 
         if let Some((k, v)) = wb_iter.next() {
             heap.push(MergeItem {
@@ -1127,7 +1133,6 @@ impl FusionTransaction {
             }
         }
 
-        let sstables = self.storage.sstables.read().unwrap().clone();
         let mut sst_iters: Vec<Option<crate::storage::sstable::SsTableIterator>> =
             Vec::with_capacity(sstables.len());
         let end_ik = FusionStorage::encode_key(end, u64::MAX);
@@ -1785,6 +1790,12 @@ mod tests {
     #[test]
     fn fusion_transaction_write_buffer_preallocates_first_write() {
         assert!(transaction_write_buffer().capacity() >= 1);
+    }
+
+    #[test]
+    fn merge_heap_reserves_candidate_iterators() {
+        let capacity = 1 + COMPACTION_FANIN;
+        assert!(merge_heap(capacity).capacity() >= capacity);
     }
 
     #[tokio::test]

@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-292",
+  "title": "Preallocate Fusion merge heaps",
+  "status": "completed",
+  "created_at": "2026-06-09T02:41:00+08:00",
+  "completed_at": "2026-06-09T02:44:00+08:00",
+  "scope": "Fusion compaction and visible-range heap allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs"
+      ],
+      "summary": [
+        "Added a merge_heap helper that constructs BinaryHeap with caller-provided capacity.",
+        "Changed compaction merge heap initialization to reserve one slot per candidate SSTable iterator.",
+        "Changed visible-range merge heap initialization to reserve for the write-buffer iterator, memtable iterators, and SSTable iterators.",
+        "Moved the visible-range SSTable snapshot before heap creation so the heap capacity uses the same snapshot that later creates SSTable iterators."
+      ]
+    },
+    "tests": {
+      "merge_heap_capacity_unit": "passed",
+      "fusion_units": "20/20 passed",
+      "sql_dml": "44/44 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}
