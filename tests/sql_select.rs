@@ -223,6 +223,70 @@ async fn test_select_projection() {
 }
 
 #[tokio::test]
+async fn test_wide_select_projection_skips_unused_tail_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE wide_projection (
+            id INTEGER PRIMARY KEY,
+            c01 TEXT, c02 TEXT, c03 TEXT, c04 TEXT,
+            c05 TEXT, c06 TEXT, c07 TEXT, c08 TEXT,
+            c09 TEXT, c10 TEXT, c11 TEXT, c12 TEXT
+        )",
+    )
+    .await;
+
+    let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::String("v01".to_string()),
+        Value::String("v02".to_string()),
+        Value::String("v03".to_string()),
+        Value::String("v04".to_string()),
+        Value::String("v05".to_string()),
+        Value::String("v06".to_string()),
+        Value::String("v07".to_string()),
+        Value::String("v08".to_string()),
+        Value::String("v09".to_string()),
+        Value::String("v10".to_string()),
+        Value::String("v11".to_string()),
+        Value::String("unused-tail".to_string()),
+    ]);
+    let corrupt_col_idx = 12usize;
+    let off_pos = 2 + corrupt_col_idx * 4;
+    let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut row[start..] {
+        *byte = 0xff;
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let key = format!(
+            "data:wide_projection:{}",
+            fusiondb::common::encoding::encode_i64_comparable(1)
+        );
+        txn.put(key.as_bytes(), &row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(&executor, "SELECT c11, c03, c07, c01 FROM wide_projection").await;
+
+    assert_eq!(cols, vec!["c11", "c03", "c07", "c01"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::String("v11".to_string()),
+            Value::String("v03".to_string()),
+            Value::String("v07".to_string()),
+            Value::String("v01".to_string()),
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_select_constant_projection_from_table() {
     let (executor, wal) = setup().await;
     exec_ok(

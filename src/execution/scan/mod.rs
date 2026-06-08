@@ -15,7 +15,7 @@ use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, TableFactor,
     TableFunctionArgs,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::analyze::{ColumnStats, TableStats};
 use super::Executor;
@@ -150,6 +150,55 @@ impl Executor {
                 })
                 .collect(),
         )
+    }
+
+    fn projection_indices_for_scan(
+        projection: &Option<Vec<String>>,
+        schema: &TableSchema,
+    ) -> Option<Vec<usize>> {
+        let cols = projection.as_ref()?;
+        if cols.is_empty() {
+            return Some(Vec::new());
+        }
+
+        if cols.len().saturating_mul(schema.columns.len()) <= 32 {
+            let mut indices = Vec::with_capacity(cols.len());
+            for name in cols {
+                if let Some((idx, _)) = schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, col)| col.name.eq_ignore_ascii_case(name))
+                {
+                    indices.push(idx);
+                }
+            }
+            return if indices.is_empty() {
+                None
+            } else {
+                Some(indices)
+            };
+        }
+
+        let mut column_indices = HashMap::with_capacity(schema.columns.len());
+        for (idx, column) in schema.columns.iter().enumerate() {
+            column_indices
+                .entry(column.name.to_ascii_lowercase())
+                .or_insert(idx);
+        }
+
+        let mut indices = Vec::with_capacity(cols.len());
+        for name in cols {
+            if let Some(idx) = column_indices.get(&name.to_ascii_lowercase()) {
+                indices.push(*idx);
+            }
+        }
+
+        if indices.is_empty() {
+            None
+        } else {
+            Some(indices)
+        }
     }
 
     async fn scan_derived_table(
@@ -496,29 +545,7 @@ impl Executor {
                     FusionError::Execution(format!("Schema deserialization error: {}", e))
                 })?;
 
-                // Calculate Projection Indices (Case Insensitive)
-                let projection_indices = if let Some(cols) = projection {
-                    let mut indices = Vec::with_capacity(cols.len());
-                    for name in cols {
-                        let mut found = None;
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if col.name.eq_ignore_ascii_case(name) {
-                                found = Some(i);
-                                break;
-                            }
-                        }
-                        if let Some(idx) = found {
-                            indices.push(idx);
-                        }
-                    }
-                    if cols.is_empty() || !indices.is_empty() {
-                        Some(indices)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let projection_indices = Self::projection_indices_for_scan(projection, &schema);
                 let zero_column_projection = projection_indices
                     .as_ref()
                     .is_some_and(|indices| indices.is_empty());

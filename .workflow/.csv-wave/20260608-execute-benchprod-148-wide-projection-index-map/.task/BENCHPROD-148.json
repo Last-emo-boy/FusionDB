@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-148",
+  "title": "Wide scan projection index map",
+  "status": "completed",
+  "created_at": "2026-06-08T15:03:00+08:00",
+  "completed_at": "2026-06-08T15:08:41+08:00",
+  "scope": "table scan projection index planning for wide schemas",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/mod.rs",
+        "tests/sql_select.rs"
+      ],
+      "summary": [
+        "Added projection_indices_for_scan to centralize case-insensitive projection index resolution.",
+        "Kept the existing linear lookup path for small projection/schema combinations.",
+        "Added a HashMap-backed schema index path for wider scans to avoid repeated schema-column walks.",
+        "Added a wide-table projection regression that corrupts an unused tail column and proves the scan still performs partial decode of only projected columns."
+      ]
+    },
+    "tests": {
+      "wide_select_projection_skips_unused_tail_decode": "passed",
+      "fmt_check": "passed",
+      "sql_select": "27/27 passed",
+      "sql_index_cache": "36/36 passed",
+      "sql_join": "30/30 passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue scanning database-core execution hot paths for narrow, testable performance iterations."
+  ]
+}
