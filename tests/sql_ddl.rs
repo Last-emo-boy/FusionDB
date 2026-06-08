@@ -310,9 +310,87 @@ async fn test_explain_includes_analyze_statistics() {
     assert_eq!(cols, vec!["EXPLAIN"]);
     assert_eq!(rows.len(), 1);
     if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Estimate: rows=2, cost="));
         assert!(plan.contains("Stats: rows=3"));
         assert!(plan.contains("category(distinct=2"));
         assert!(plan.contains("qty(distinct=2, nulls=1"));
+    } else {
+        panic!("expected explain text");
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_join_order_includes_analyze_estimates() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_join_big (id INTEGER PRIMARY KEY, join_key INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_join_mid (id INTEGER PRIMARY KEY, join_key INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_join_small (id INTEGER PRIMARY KEY, join_key INTEGER)",
+    )
+    .await;
+
+    exec_ok(
+        &executor,
+        "INSERT INTO explain_join_big VALUES (1, 1), (2, 1), (3, 1), (4, 1)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO explain_join_mid VALUES (1, 1), (2, 1)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO explain_join_small VALUES (1, 1)").await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE explain_join_big COMPUTE STATISTICS",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE explain_join_mid COMPUTE STATISTICS",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE explain_join_small COMPUTE STATISTICS",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT *
+           FROM explain_join_big, explain_join_mid, explain_join_small
+          WHERE explain_join_big.join_key = explain_join_mid.join_key
+            AND explain_join_mid.join_key = explain_join_small.join_key
+            AND explain_join_big.join_key = explain_join_small.join_key",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Join Order:"));
+        assert!(plan.contains("Join Estimate: rows="));
+        let small = plan
+            .find("explain_join_small(rows=1)")
+            .expect("small table estimate missing");
+        let mid = plan
+            .find("explain_join_mid(rows=2)")
+            .expect("mid table estimate missing");
+        let big = plan
+            .find("explain_join_big(rows=4)")
+            .expect("big table estimate missing");
+        assert!(small < mid && mid < big, "unexpected join order: {plan}");
     } else {
         panic!("expected explain text");
     }

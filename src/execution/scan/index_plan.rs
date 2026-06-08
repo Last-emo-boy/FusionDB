@@ -280,12 +280,8 @@ impl Executor {
         base.saturating_mul(multiplier).clamp(128, 4096)
     }
 
-    pub(super) fn should_use_index_plan(
-        candidate_count: usize,
-        limit: Option<usize>,
-        order_by: Option<&sqlparser::ast::OrderBy>,
-    ) -> bool {
-        candidate_count > 0 && candidate_count <= Self::index_candidate_cap(limit, order_by)
+    pub(super) fn should_use_index_plan(candidate_count: usize, candidate_cap: usize) -> bool {
+        candidate_count > 0 && candidate_count <= candidate_cap
     }
 
     #[allow(clippy::type_complexity)]

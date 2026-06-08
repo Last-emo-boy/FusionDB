@@ -824,11 +824,14 @@ impl Executor {
                 FusionError::Execution(format!("Schema deserialization error: {}", e))
             })?;
             self.prefix_schema_columns(&mut schema, &table.relation)?;
-            let data_prefix = format!("data:{}:", table_name);
-            let row_count = txn
-                .count_prefix(data_prefix.as_bytes())
-                .await
-                .unwrap_or(usize::MAX);
+            let row_count = if let Some(stats) = self.load_table_stats(&table_name, txn).await? {
+                stats.row_count
+            } else {
+                let data_prefix = format!("data:{}:", table_name);
+                txn.count_prefix(data_prefix.as_bytes())
+                    .await
+                    .unwrap_or(usize::MAX)
+            };
             relations.push(CommaJoinRelationPlan {
                 table: table.clone(),
                 schema,

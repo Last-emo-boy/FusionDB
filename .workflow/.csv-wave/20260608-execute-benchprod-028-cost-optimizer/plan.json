@@ -1,0 +1,56 @@
+{
+  "id": "benchprod-028-cost-optimizer",
+  "objective": "Feed ANALYZE stats into index choice and join order planning, and expose cardinality/cost in EXPLAIN.",
+  "status": "completed",
+  "created_at": "2026-06-08T10:18:00+08:00",
+  "completed_at": "2026-06-08T10:32:06+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-028",
+      "title": "Cost-based optimizer and join ordering",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/explain.rs",
+        "src/execution/scan/mod.rs",
+        "src/execution/scan/index_plan.rs",
+        "src/execution/scan/join.rs",
+        "tests/sql_ddl.rs"
+      ],
+      "result": "EXPLAIN now reports cardinality/cost estimates from ANALYZE stats; stats guide index probe caps and comma join row-count planning; LDBC/CH join regression suites pass."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_ddl analyze",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_ddl explain",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join comma_join_reorder",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache index",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_ddl",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    }
+  ]
+}

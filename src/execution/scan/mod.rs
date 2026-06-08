@@ -17,7 +17,10 @@ use sqlparser::ast::{
 };
 use std::collections::HashSet;
 
+use super::analyze::{ColumnStats, TableStats};
 use super::Executor;
+
+const STATS_INDEX_PROBE_LIMIT_MAX: usize = 65_536;
 
 impl Executor {
     pub(crate) fn generate_subscripts_schema(relation: &TableFactor) -> Option<TableSchema> {
@@ -264,6 +267,152 @@ impl Executor {
                 "Unsupported table factor".to_string(),
             )),
         }
+    }
+
+    async fn stats_guided_index_probe_limit(
+        &self,
+        table_name: &str,
+        selection: &Expr,
+        schema: &TableSchema,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+    ) -> Result<Option<usize>> {
+        let baseline_cap = Self::index_candidate_cap(limit, order_by);
+        let Some(stats) = self.load_table_stats(table_name, txn).await? else {
+            return Ok(None);
+        };
+        let Some(estimated_rows) =
+            self.scan_estimate_indexable_predicate_rows(selection, schema, &stats)
+        else {
+            return Ok(None);
+        };
+
+        if estimated_rows <= baseline_cap {
+            return Ok(None);
+        }
+
+        let table_rows = stats.row_count.max(1);
+        let index_cost = (table_rows as f64).log2().max(1.0) + estimated_rows as f64;
+        if index_cost < table_rows as f64 {
+            Ok(Some(
+                estimated_rows
+                    .min(STATS_INDEX_PROBE_LIMIT_MAX)
+                    .max(baseline_cap),
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn scan_estimate_indexable_predicate_rows(
+        &self,
+        selection: &Expr,
+        schema: &TableSchema,
+        stats: &TableStats,
+    ) -> Option<usize> {
+        Self::collect_conjunctive_predicates(selection)
+            .iter()
+            .filter_map(|predicate| self.scan_estimate_single_index_rows(predicate, schema, stats))
+            .min()
+    }
+
+    fn scan_estimate_single_index_rows(
+        &self,
+        expr: &Expr,
+        schema: &TableSchema,
+        stats: &TableStats,
+    ) -> Option<usize> {
+        match expr {
+            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
+                let column_idx = self.scan_column_constant_index(left, right, schema)?;
+                let column = schema.columns.get(column_idx)?;
+                if !Self::scan_column_can_use_btree_index(column) {
+                    return None;
+                }
+                if column.is_primary || column.is_unique {
+                    return Some(usize::from(stats.row_count > 0));
+                }
+                let column_stats =
+                    Self::scan_column_stats_for_schema_index(stats, schema, column_idx)?;
+                if column_stats.distinct_count == 0 {
+                    return None;
+                }
+                Some(Self::scan_selectivity_to_rows(
+                    stats.row_count,
+                    1.0 / column_stats.distinct_count as f64,
+                ))
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } if !*negated => {
+                let column_idx = self.resolve_schema_column_index(expr, schema)?;
+                let column = schema.columns.get(column_idx)?;
+                if !Self::scan_column_can_use_btree_index(column) {
+                    return None;
+                }
+                if column.is_primary || column.is_unique {
+                    return Some(list.len().min(stats.row_count));
+                }
+                let column_stats =
+                    Self::scan_column_stats_for_schema_index(stats, schema, column_idx)?;
+                if column_stats.distinct_count == 0 {
+                    return None;
+                }
+                Some(Self::scan_selectivity_to_rows(
+                    stats.row_count,
+                    (list.len() as f64 / column_stats.distinct_count as f64).clamp(0.0, 1.0),
+                ))
+            }
+            Expr::Nested(inner) => self.scan_estimate_single_index_rows(inner, schema, stats),
+            _ => None,
+        }
+    }
+
+    fn scan_column_constant_index(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        schema: &TableSchema,
+    ) -> Option<usize> {
+        let left_idx = self.resolve_schema_column_index(left, schema);
+        let right_idx = self.resolve_schema_column_index(right, schema);
+
+        if left_idx.is_some() && right_idx.is_none() && !self.expr_has_column_reference(right) {
+            left_idx
+        } else if right_idx.is_some() && left_idx.is_none() && !self.expr_has_column_reference(left)
+        {
+            right_idx
+        } else {
+            None
+        }
+    }
+
+    fn scan_column_can_use_btree_index(column: &Column) -> bool {
+        column.is_primary || (column.is_indexed && column.index_type == IndexType::BTree)
+    }
+
+    fn scan_column_stats_for_schema_index<'a>(
+        stats: &'a TableStats,
+        schema: &TableSchema,
+        index: usize,
+    ) -> Option<&'a ColumnStats> {
+        let column_name = schema.columns.get(index)?.name.as_str();
+        let unqualified = column_name.rsplit('.').next().unwrap_or(column_name);
+        stats.columns.iter().find(|column| {
+            column.name.eq_ignore_ascii_case(column_name)
+                || column.name.eq_ignore_ascii_case(unqualified)
+        })
+    }
+
+    fn scan_selectivity_to_rows(row_count: usize, selectivity: f64) -> usize {
+        if row_count == 0 {
+            return 0;
+        }
+        let rows = (row_count as f64 * selectivity.clamp(0.0, 1.0)).ceil() as usize;
+        rows.clamp(1, row_count)
     }
 
     pub(crate) async fn scan_single_table(
@@ -825,8 +974,18 @@ impl Executor {
                 // Try Index Scan
                 if !index_used {
                     if let Some(sel) = selection {
-                        let index_probe_limit =
-                            Self::index_candidate_cap(limit, order_by).saturating_add(1);
+                        let index_candidate_cap = self
+                            .stats_guided_index_probe_limit(
+                                &table_name,
+                                sel,
+                                &schema,
+                                txn,
+                                limit,
+                                order_by,
+                            )
+                            .await?
+                            .unwrap_or_else(|| Self::index_candidate_cap(limit, order_by));
+                        let index_probe_limit = index_candidate_cap.saturating_add(1);
                         if let Some(index_plan) = self
                             .try_index_scan(
                                 sel,
@@ -870,8 +1029,7 @@ impl Executor {
                                 selection_fully_applied = true;
                             } else if Self::should_use_index_plan(
                                 row_ids_vec.len(),
-                                limit,
-                                order_by,
+                                index_candidate_cap,
                             ) {
                                 index_used = true;
                                 selection_fully_applied = index_plan.exact;
