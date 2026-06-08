@@ -56,6 +56,13 @@ enum ExistsCache {
     Join(ExistsJoinMembershipCache),
 }
 
+fn subquery_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 impl Executor {
     pub(crate) async fn materialize_subqueries(
         &self,
@@ -919,7 +926,8 @@ impl Executor {
         let TableFactor::Table { name, .. } = factor else {
             return Ok(None);
         };
-        let schema_key = format!("schema:{}", name);
+        let table_name = name.to_string();
+        let schema_key = subquery_schema_key_for_table(&table_name);
         let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
             return Ok(None);
         };
@@ -1076,7 +1084,7 @@ impl Executor {
         let schema = match factor {
             TableFactor::Table { name, .. } => {
                 let table_name = name.to_string();
-                let schema_key = format!("schema:{}", table_name);
+                let schema_key = subquery_schema_key_for_table(&table_name);
                 let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
                     return Ok(());
                 };
@@ -1276,5 +1284,18 @@ impl Executor {
         }
 
         prefix
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subquery_schema_key_for_table;
+
+    #[test]
+    fn subquery_schema_key_for_table_preallocates_exact_key() {
+        let key = subquery_schema_key_for_table("orders");
+
+        assert_eq!(key, "schema:orders");
+        assert!(key.capacity() >= key.len());
     }
 }

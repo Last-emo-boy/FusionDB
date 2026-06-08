@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-331",
+  "title": "Preallocate SUBQUERY schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/expr/subquery.rs"
+  ],
+  "description": "Avoid generic format! allocation work when subquery local-scope paths build schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added subquery_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced table_factor_schema_if_simple_table() schema lookup key construction.",
+    "Replaced append_local_scope_for_factor() schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test subquery_schema_key -- --nocapture",
+    "cargo test --test sql_set_subquery subquery -- --nocapture",
+    "cargo test --test sql_set_subquery exists -- --nocapture",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "SUBQUERY schema-key construction now reserves capacity from known table-name length while preserving subquery materialization, correlated EXISTS membership, CTE behavior, recursive query behavior, and join-side query behavior."
+}
