@@ -1,23 +1,24 @@
 {
   "id": "benchprod-029-storage-soak",
   "objective": "Add compaction/VACUUM/crash-recovery soak benchmark loops and fix storage recovery defects exposed by the soak.",
-  "status": "partial",
+  "status": "completed",
   "created_at": "2026-06-08T10:35:00+08:00",
-  "updated_at": "2026-06-08T12:40:00+08:00",
+  "updated_at": "2026-06-08T14:43:20+08:00",
   "tasks": [
     {
       "id": "BENCHPROD-029",
       "title": "Production storage soak and VACUUM",
-      "status": "open",
+      "status": "completed",
       "evidence": [
         "E:\\Playground\\FusionDB-bench\\storage_soak.py",
         "E:\\Playground\\FusionDB-bench\\README.md",
         "src/storage/fusion.rs",
         "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_tiny_20260608_fix\\storage_soak_summary.json",
         "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_small_20260608_fix\\storage_soak_summary.json",
-        "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_medium_700cycles_20260608_121332_deferreddelete\\storage_soak_summary.json"
+        "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_medium_700cycles_20260608_121332_deferreddelete\\storage_soak_summary.json",
+        "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_medium_7200s_20260608_124142_deferreddelete\\storage_soak_summary.json"
       ],
-      "result": "Storage soak harness added; tiny, small, and targeted medium 700-cycle checkpoint/compact/restart/forced-kill loops pass after FusionStorage recovery, scan, and compaction reader-safety fixes. Medium multi-hour run remains pending."
+      "result": "Storage soak harness added; tiny, small, targeted medium 700-cycle, and final medium 7200s checkpoint/compact/restart/forced-kill loops pass after FusionStorage recovery, scan, and compaction reader-safety fixes. Final medium 7200s run passed with 1522 cycles, 334840 live rows, 7201.438 elapsed seconds, final SSTable count 4/64, 761 checkpoints, 380 compact/VACUUM loops, 34 graceful restarts, 16 forced kills, and 1573 visibility checks."
     }
   ],
   "verification": [
@@ -64,10 +65,13 @@
     {
       "command": "python storage_soak.py --scale medium --cycles 700 --checkpoint-every 2 --compact-every 4 --restart-every 30 --kill-every 90 --max-sstable-count 64 --fail-on-gap --run-name storage_soak_benchprod029_medium_700cycles_20260608_121332_deferreddelete",
       "status": "passed"
+    },
+    {
+      "command": "python storage_soak.py --scale medium --duration-seconds 7200 --checkpoint-every 2 --compact-every 4 --restart-every 30 --kill-every 90 --max-sstable-count 64 --fail-on-gap --run-name storage_soak_benchprod029_medium_7200s_20260608_124142_deferreddelete",
+      "status": "passed: 1522 cycles, 334840 live rows, 7201.438s, final SSTable count 4/64, 761 checkpoints, 380 compact/VACUUM loops, 34 graceful restarts, 16 forced kills, 1573 visibility checks"
     }
   ],
   "next_steps": [
-    "Run the medium multi-hour storage soak command with --duration-seconds 7200.",
-    "If the medium run passes, update BENCHPROD-029 to completed."
+    "BENCHPROD-029 completed after the medium 7200s storage soak passed."
   ]
 }

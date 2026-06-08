@@ -1,9 +1,9 @@
 {
   "id": "BENCHPROD-029",
   "title": "Production storage soak and VACUUM",
-  "status": "open",
+  "status": "completed",
   "created_at": "2026-06-08T10:35:00+08:00",
-  "updated_at": "2026-06-08T12:40:00+08:00",
+  "updated_at": "2026-06-08T14:43:20+08:00",
   "scope": "storage checkpoint, compaction/VACUUM-equivalent, crash recovery, and benchmark soak coverage",
   "results": {
     "implementation": {
@@ -34,11 +34,10 @@
       "release_build": "passed",
       "storage_soak_tiny": "passed: 4 cycles, 25/25 steps, live_rows=80, sstable_count=3",
       "storage_soak_small": "passed: 30 cycles, 168/168 steps, live_rows=2640, sstable_count=3",
-      "storage_soak_medium_700cycles": "passed: 700 cycles, live_rows=154000, sstable_count=3, checkpoints=350, compact_loops=175, graceful_restarts=16, forced_kills=7, visibility_checks=724"
+      "storage_soak_medium_700cycles": "passed: 700 cycles, live_rows=154000, sstable_count=3, checkpoints=350, compact_loops=175, graceful_restarts=16, forced_kills=7, visibility_checks=724",
+      "storage_soak_medium_7200s": "passed: 1522 cycles, live_rows=334840, elapsed_seconds=7201.438, final_sstable_count=4/64, checkpoints=761, compact_loops=380, compact_completed=7, graceful_restarts=34, forced_kills=16, visibility_checks=1573, failed_steps=0"
     }
   },
-  "remaining_success_criteria": [
-    "medium multi-hour run survives restart and controls SSTable/version growth"
-  ],
-  "next_action": "Run storage_soak.py at medium scale for --duration-seconds 7200 and update the task to completed if it passes."
+  "remaining_success_criteria": [],
+  "next_action": "Completed after medium 7200s storage soak passed and satisfied restart, forced-kill recovery, compaction/VACUUM, visibility, and SSTable growth guards."
 }

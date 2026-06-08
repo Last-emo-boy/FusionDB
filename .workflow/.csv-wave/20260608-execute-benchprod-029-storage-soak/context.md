@@ -74,11 +74,9 @@ Both failed runs returned the correct row count after reopening the same data di
   - Passed: 30 cycles, 168/168 steps, final live rows 2640, final SSTable count 3, 30 checkpoint loops, 15 compact loops, 14 completed compactions, 8 graceful restarts, 7 forced kills.
 - `python storage_soak.py --scale medium --cycles 700 --checkpoint-every 2 --compact-every 4 --restart-every 30 --kill-every 90 --max-sstable-count 64 --fail-on-gap --run-name storage_soak_benchprod029_medium_700cycles_20260608_121332_deferreddelete`
   - Passed: 700 cycles, final live rows 154000, final SSTable count 3, 350 checkpoint loops, 175 compact loops, 7 completed compactions, 16 graceful restarts, 7 forced kills, 724 visibility checks.
+- `python storage_soak.py --scale medium --duration-seconds 7200 --checkpoint-every 2 --compact-every 4 --restart-every 30 --kill-every 90 --max-sstable-count 64 --fail-on-gap --run-name storage_soak_benchprod029_medium_7200s_20260608_124142_deferreddelete`
+  - Passed: 1522 cycles, final live rows 334840, elapsed 7201.438 seconds, final summary SSTable count 4/64, 761 checkpoint loops, 380 compact/VACUUM loops, 7 completed compactions, 34 graceful restarts, 16 forced kills, 1573 visibility checks, 0 failed steps.
 
 ## Result
 
-This iteration adds the storage soak harness and fixes the recovery/compaction correctness issues exposed by tiny, small, and targeted medium soak runs. `BENCHPROD-029` remains open because the stated success criteria require a medium multi-hour run. The next step is to run:
-
-```powershell
-python storage_soak.py --scale medium --duration-seconds 7200 --checkpoint-every 2 --compact-every 4 --restart-every 30 --kill-every 90 --max-sstable-count 64 --fail-on-gap
-```
+This iteration adds the storage soak harness and fixes the recovery/compaction correctness issues exposed by tiny, small, targeted medium, and final medium multi-hour soak runs. `BENCHPROD-029` is complete: the medium 7200s run passed with checkpoint, compact/VACUUM, graceful restart, forced-kill recovery, visibility checks, secondary-index checks, and SSTable growth guard coverage.
