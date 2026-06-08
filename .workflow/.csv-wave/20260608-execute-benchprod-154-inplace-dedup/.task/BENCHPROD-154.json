@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-154",
+  "title": "Deduplicate query rows in place",
+  "status": "completed",
+  "created_at": "2026-06-08T15:34:00+08:00",
+  "completed_at": "2026-06-08T15:36:45+08:00",
+  "scope": "Shared DISTINCT and set-operation row deduplication",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Changed deduplicate_rows to retain unique rows inside the input Vec.",
+        "Removed the extra unique_rows Vec allocation from the shared deduplication helper.",
+        "Added UNION duplicate-input coverage to protect normal distinct set semantics."
+      ]
+    },
+    "tests": {
+      "union_distinct_with_duplicate_inputs": "passed",
+      "sql_set_subquery": "39/39 passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query or scan hot path."
+  ]
+}

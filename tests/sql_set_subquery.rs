@@ -276,6 +276,48 @@ async fn test_union_distinct() {
 }
 
 #[tokio::test]
+async fn test_union_distinct_with_duplicate_inputs() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_dup_left (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_dup_right (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO union_dup_left VALUES (1, 'a'), (2, 'b'), (3, 'a')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO union_dup_right VALUES (1, 'b'), (2, 'c'), (3, 'c')",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT name FROM union_dup_left UNION SELECT name FROM union_dup_right ORDER BY name",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["name"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("a".to_string())],
+            vec![Value::String("b".to_string())],
+            vec![Value::String("c".to_string())],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_except() {
     let (executor, wal) = setup().await;
     exec_ok(

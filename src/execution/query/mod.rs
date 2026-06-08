@@ -88,17 +88,10 @@ impl Executor {
     const MAX_RECURSIVE_CTE_ITERATIONS: usize = 128;
     const MAX_RECURSIVE_CTE_ROWS: usize = 4096;
 
-    fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    fn deduplicate_rows(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         let mut seen = HashSet::with_capacity(rows.len());
-        let mut unique_rows = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            if seen.insert(row.clone()) {
-                unique_rows.push(row);
-            }
-        }
-
-        unique_rows
+        rows.retain(|row| seen.insert(row.clone()));
+        rows
     }
 
     fn row_hash_set(rows: Vec<Vec<Value>>) -> HashSet<Vec<Value>> {

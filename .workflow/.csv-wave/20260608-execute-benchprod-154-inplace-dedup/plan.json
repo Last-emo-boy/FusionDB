@@ -1,0 +1,37 @@
+{
+  "id": "benchprod-154-inplace-dedup",
+  "objective": "Reduce allocation overhead in shared DISTINCT and set-operation row deduplication.",
+  "status": "completed",
+  "created_at": "2026-06-08T15:34:00+08:00",
+  "completed_at": "2026-06-08T15:36:45+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-154",
+      "title": "Deduplicate query rows in place",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "result": "Shared row deduplication now retains unique rows in the existing Vec instead of allocating a second output Vec."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_union_distinct_with_duplicate_inputs -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 39/39"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    }
+  ]
+}
