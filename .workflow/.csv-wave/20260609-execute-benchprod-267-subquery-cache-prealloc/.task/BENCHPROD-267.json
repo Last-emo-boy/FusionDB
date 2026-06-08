@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-267",
+  "title": "Preallocate deferred subquery membership cache",
+  "status": "completed",
+  "created_at": "2026-06-09T00:38:00+08:00",
+  "completed_at": "2026-06-09T00:40:00+08:00",
+  "scope": "Deferred EXISTS membership cache allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "summary": [
+        "Added deferred_subquery_cache_capacity to count EXISTS nodes in deferred subquery predicates.",
+        "Changed filter_rows_with_subqueries to initialize membership_caches with HashMap::with_capacity.",
+        "Preserved deferred subquery evaluation and cache key behavior."
+      ]
+    },
+    "tests": {
+      "correlated_exists_membership": "passed",
+      "correlated_not_exists_join_alias": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

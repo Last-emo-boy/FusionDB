@@ -309,6 +309,18 @@ impl Executor {
         }
     }
 
+    fn deferred_subquery_cache_capacity(expr: &Expr) -> usize {
+        match expr {
+            Expr::Exists { .. } => 1,
+            Expr::BinaryOp { left, right, .. } => Self::deferred_subquery_cache_capacity(left)
+                .saturating_add(Self::deferred_subquery_cache_capacity(right)),
+            Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+                Self::deferred_subquery_cache_capacity(inner)
+            }
+            _ => 0,
+        }
+    }
+
     fn combine_subquery_predicates(predicates: Vec<Expr>) -> Option<Expr> {
         let mut iter = predicates.into_iter();
         let first = iter.next()?;
@@ -327,7 +339,8 @@ impl Executor {
         txn: &mut dyn Transaction,
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>> {
-        let mut membership_caches = HashMap::new();
+        let mut membership_caches =
+            HashMap::with_capacity(Self::deferred_subquery_cache_capacity(expr));
         let mut filtered = Vec::with_capacity(rows.len());
         for row in rows {
             if Box::pin(self.evaluate_expr_with_subqueries(
