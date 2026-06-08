@@ -466,6 +466,23 @@ async fn test_alter_table_add_column() {
 }
 
 #[tokio::test]
+async fn test_alter_table_add_multiple_columns() {
+    let (executor, wal) = setup().await;
+    exec_ok(&executor, "CREATE TABLE multi_add (id INTEGER PRIMARY KEY)").await;
+    let msg = exec_ok(
+        &executor,
+        "ALTER TABLE multi_add ADD COLUMN name TEXT, ADD COLUMN age INTEGER",
+    )
+    .await;
+    assert!(msg.contains("Added column name"));
+    assert!(msg.contains("Added column age"));
+
+    let (cols, _) = query(&executor, "SELECT * FROM multi_add").await;
+    assert_eq!(cols, vec!["id", "name", "age"]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_alter_table_drop_column() {
     let (executor, wal) = setup().await;
     exec_ok(

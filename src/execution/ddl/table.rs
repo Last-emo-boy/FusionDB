@@ -397,7 +397,7 @@ impl Executor {
         let mut schema: TableSchema = bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
 
-        let mut messages = Vec::new();
+        let mut messages = Vec::with_capacity(operations.len());
 
         for op in operations {
             match op {

@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-254",
+  "title": "Preallocate ALTER TABLE messages",
+  "status": "completed",
+  "created_at": "2026-06-08T23:23:00+08:00",
+  "completed_at": "2026-06-08T23:27:00+08:00",
+  "scope": "DDL ALTER TABLE operation result construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/ddl/table.rs",
+        "tests/sql_ddl.rs"
+      ],
+      "summary": [
+        "Changed ALTER TABLE message collection from Vec::new() to Vec::with_capacity(operations.len()).",
+        "Added coverage for a single ALTER TABLE statement containing two ADD COLUMN operations.",
+        "Preserved schema mutation, operation ordering, and semicolon-joined success messages."
+      ]
+    },
+    "tests": {
+      "alter_table_add_multiple_columns": "passed",
+      "alter_table_add_column": "passed",
+      "sql_ddl": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
