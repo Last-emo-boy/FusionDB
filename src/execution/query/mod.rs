@@ -191,6 +191,37 @@ impl Executor {
         rows
     }
 
+    fn sort_indexed_rows_with_window<F>(
+        rows: Vec<Vec<Value>>,
+        limit_window: Option<usize>,
+        compare: F,
+    ) -> Vec<Vec<Value>>
+    where
+        F: Fn(&(usize, Vec<Value>), &(usize, Vec<Value>)) -> Ordering,
+    {
+        if limit_window == Some(0) {
+            return Vec::new();
+        }
+
+        let mut indexed_rows = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            indexed_rows.push((index, row));
+        }
+
+        if let Some(window) = limit_window.filter(|window| *window < indexed_rows.len()) {
+            let _ = indexed_rows.select_nth_unstable_by(window, &compare);
+            indexed_rows.truncate(window);
+        }
+
+        indexed_rows.sort_by(&compare);
+
+        let mut sorted_rows = Vec::with_capacity(indexed_rows.len());
+        for (_, row) in indexed_rows {
+            sorted_rows.push(row);
+        }
+        sorted_rows
+    }
+
     fn compound_identifier_prefix(idents: &[sqlparser::ast::Ident]) -> String {
         let prefix_len = idents.len().saturating_sub(1);
         let capacity = idents
@@ -3010,26 +3041,14 @@ impl Executor {
                         } else {
                             set_offset.saturating_add(limit)
                         };
-                        if window == 0 {
-                            combined.clear();
-                        } else if window < combined.len() {
-                            let mut indexed_rows: Vec<(usize, Vec<Value>)> =
-                                combined.into_iter().enumerate().collect();
-                            let _ = indexed_rows.select_nth_unstable_by(window, compare_combined);
-                            indexed_rows.truncate(window);
-                            indexed_rows.sort_by(compare_combined);
-                            combined = indexed_rows.into_iter().map(|(_, row)| row).collect();
-                        } else {
-                            let mut indexed_rows: Vec<(usize, Vec<Value>)> =
-                                combined.into_iter().enumerate().collect();
-                            indexed_rows.sort_by(compare_combined);
-                            combined = indexed_rows.into_iter().map(|(_, row)| row).collect();
-                        }
+                        combined = Self::sort_indexed_rows_with_window(
+                            combined,
+                            Some(window),
+                            compare_combined,
+                        );
                     } else {
-                        let mut indexed_rows: Vec<(usize, Vec<Value>)> =
-                            combined.into_iter().enumerate().collect();
-                        indexed_rows.sort_by(compare_combined);
-                        combined = indexed_rows.into_iter().map(|(_, row)| row).collect();
+                        combined =
+                            Self::sort_indexed_rows_with_window(combined, None, compare_combined);
                     }
                 }
             }

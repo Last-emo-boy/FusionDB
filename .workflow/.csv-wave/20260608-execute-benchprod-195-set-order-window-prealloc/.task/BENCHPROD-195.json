@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-195",
+  "title": "Preallocate set-query ORDER BY rows",
+  "status": "completed",
+  "created_at": "2026-06-08T18:49:00+08:00",
+  "completed_at": "2026-06-08T18:51:22+08:00",
+  "scope": "Set-query ORDER BY limit/offset indexed row allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Added a private helper for indexed row sorting with optional limit/offset window truncation.",
+        "Replaced set-query ORDER BY iterator collect and restore collect paths with explicit preallocation.",
+        "Preserved original index tie ordering, full-sort behavior, and Top-N selection behavior."
+      ]
+    },
+    "tests": {
+      "union_all_order_by_limit_offset_filtered": "2/2 passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused set-query, ORDER BY, projection, scan, or predicate hot path."
+  ]
+}
