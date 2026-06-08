@@ -1148,6 +1148,48 @@ async fn test_join_group_by_count_sum_fast_shape() {
 }
 
 #[tokio::test]
+async fn test_join_group_by_aggregate_fast_path_order_limit_offset() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE trim_customers (id INTEGER PRIMARY KEY, city TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE trim_orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO trim_customers VALUES (1, 'Paris'), (2, 'Berlin'), (3, 'Tokyo'), (4, 'Paris')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO trim_orders VALUES (1, 1, 10), (2, 2, 20), (3, 3, 5), (4, 4, 25)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT c.city, COUNT(*), SUM(o.total) FROM trim_customers c INNER JOIN trim_orders o ON c.id = o.customer_id GROUP BY c.city ORDER BY SUM(o.total) DESC LIMIT 1 OFFSET 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["c.city", "COUNT(*)", "SUM(o.total)"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::String("Berlin".to_string()),
+            Value::Integer(1),
+            Value::Integer(20),
+        ]]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_join_group_by_aggregate_fast_path_matches_chbench_shape() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());

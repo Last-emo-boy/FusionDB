@@ -129,7 +129,7 @@ impl Executor {
         filtered
     }
 
-    fn trim_set_rows_in_place(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<usize>) {
+    fn trim_query_rows_in_place(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<usize>) {
         if offset >= rows.len() {
             rows.clear();
             return;
@@ -154,11 +154,11 @@ impl Executor {
         }
 
         if left_rows.is_empty() {
-            Self::trim_set_rows_in_place(&mut right_rows, offset, limit);
+            Self::trim_query_rows_in_place(&mut right_rows, offset, limit);
             return right_rows;
         }
         if right_rows.is_empty() {
-            Self::trim_set_rows_in_place(&mut left_rows, offset, limit);
+            Self::trim_query_rows_in_place(&mut left_rows, offset, limit);
             return left_rows;
         }
 
@@ -170,11 +170,11 @@ impl Executor {
 
         let left_len = left_rows.len();
         if offset < left_len && offset + take <= left_len {
-            Self::trim_set_rows_in_place(&mut left_rows, offset, Some(take));
+            Self::trim_query_rows_in_place(&mut left_rows, offset, Some(take));
             return left_rows;
         }
         if offset >= left_len {
-            Self::trim_set_rows_in_place(&mut right_rows, offset - left_len, Some(take));
+            Self::trim_query_rows_in_place(&mut right_rows, offset - left_len, Some(take));
             return right_rows;
         }
 
@@ -1655,12 +1655,7 @@ impl Executor {
             }
         }
 
-        let rows = rows.into_iter().skip(offset);
-        let rows: Vec<Vec<Value>> = if let Some(limit) = limit {
-            rows.take(limit).collect()
-        } else {
-            rows.collect()
-        };
+        Self::trim_query_rows_in_place(&mut rows, offset, limit);
 
         Ok(Some(QueryResult::Select { columns, rows }))
     }
@@ -3051,7 +3046,7 @@ impl Executor {
 
             // Apply LIMIT/OFFSET from the outer query
             if query.limit_clause.is_some() && !union_all_window_pushed {
-                Self::trim_set_rows_in_place(&mut combined, set_offset, set_limit);
+                Self::trim_query_rows_in_place(&mut combined, set_offset, set_limit);
             }
 
             return Ok(QueryResult::Select {

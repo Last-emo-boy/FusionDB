@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-170-join-aggregate-inplace-trim",
+  "objective": "Trim join group aggregate result windows in place.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:08:00+08:00",
+  "completed_at": "2026-06-08T17:11:33+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-170",
+      "title": "In-place trim join aggregate result windows",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_join.rs"
+      ],
+      "result": "Join group aggregate fast-path results now reuse the query in-place trim helper instead of rebuilding rows with skip/take/collect."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_join_group_by_aggregate_fast_path_order_limit_offset -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-170",
+  "title": "In-place trim join aggregate result windows",
+  "status": "completed",
+  "created_at": "2026-06-08T17:08:00+08:00",
+  "completed_at": "2026-06-08T17:11:33+08:00",
+  "scope": "Join group aggregate ORDER BY/LIMIT/OFFSET result trimming",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_join.rs"
+      ],
+      "summary": [
+        "Renamed the query-level set trim helper to trim_query_rows_in_place to avoid collision with the column-scan helper.",
+        "Updated set-operation callers to use the renamed helper.",
+        "Changed join group aggregate fast-path result trimming from skip/take/collect to in-place trimming.",
+        "Added a join group aggregate ORDER BY/LIMIT/OFFSET test to cover the trimmed window behavior."
+      ]
+    },
+    "tests": {
+      "join_group_by_aggregate_fast_path_order_limit_offset": "passed",
+      "sql_join": "31/31 passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}
