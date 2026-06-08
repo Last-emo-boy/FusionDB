@@ -1,0 +1,40 @@
+{
+  "id": "benchprod-215-tsbs-lastpoint-output-prealloc",
+  "objective": "Preallocate TSBS lastpoint output metadata and sort key vectors from known counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:11:00+08:00",
+  "completed_at": "2026-06-08T20:13:20+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-215",
+      "title": "Preallocate TSBS lastpoint output vectors",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "TSBS DISTINCT ON lateral lastpoint fast path now preallocates output column-name and sort-key vectors from schema and ORDER BY lengths."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_tsbs_lastpoint_distinct_on_lateral_join -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "DISTINCT ON row selection, ORDER BY resolution, sort direction, and final result column order were kept unchanged."
+  ]
+}

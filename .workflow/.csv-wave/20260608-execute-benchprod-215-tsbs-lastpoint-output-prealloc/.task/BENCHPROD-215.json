@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-215",
+  "title": "Preallocate TSBS lastpoint output vectors",
+  "status": "completed",
+  "created_at": "2026-06-08T20:11:00+08:00",
+  "completed_at": "2026-06-08T20:13:20+08:00",
+  "scope": "TSBS DISTINCT ON lateral lastpoint fast path output metadata and sort keys",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced output schema column-name collects with explicitly preallocated vectors sized from output_schema.columns.len().",
+        "Replaced ORDER BY sort key collect with an explicitly preallocated vector sized from order_exprs.len().",
+        "Preserved DISTINCT ON row selection, ORDER BY source resolution, sort direction, trimming, and final column order."
+      ]
+    },
+    "tests": {
+      "tsbs_lastpoint_distinct_on_lateral_join": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

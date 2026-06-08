@@ -1243,14 +1243,13 @@ impl Executor {
             let OrderByKind::Expressions(order_exprs) = &order_by.kind else {
                 return Ok(None);
             };
-            let output_column_names: Vec<String> = output_schema
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect();
-            let sort_keys: Vec<SortOrderKey<'_>> = order_exprs
-                .iter()
-                .map(|order_expr| SortOrderKey {
+            let mut output_column_names = Vec::with_capacity(output_schema.columns.len());
+            for column in &output_schema.columns {
+                output_column_names.push(column.name.clone());
+            }
+            let mut sort_keys = Vec::with_capacity(order_exprs.len());
+            for order_expr in order_exprs {
+                sort_keys.push(SortOrderKey {
                     source: self.resolve_order_value_source(
                         &order_expr.expr,
                         &select.projection,
@@ -1260,8 +1259,8 @@ impl Executor {
                         true,
                     ),
                     asc: order_expr.options.asc.unwrap_or(true),
-                })
-                .collect();
+                });
+            }
             self.sort_rows_by_order_keys(&mut rows, &sort_keys, &output_schema, params, None);
         }
 
@@ -1276,12 +1275,13 @@ impl Executor {
 
         Self::trim_query_rows_in_place(&mut distinct_rows, offset, limit);
 
+        let mut columns = Vec::with_capacity(output_schema.columns.len());
+        for column in &output_schema.columns {
+            columns.push(column.name.clone());
+        }
+
         Ok(Some(QueryResult::Select {
-            columns: output_schema
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect(),
+            columns,
             rows: distinct_rows,
         }))
     }
