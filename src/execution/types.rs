@@ -15,10 +15,11 @@ impl Executor {
             return Err(FusionError::Execution("Column count mismatch".to_string()));
         }
 
-        row.into_iter()
-            .zip(schema.columns.iter())
-            .map(|(value, column)| Self::coerce_value_to_column_type(value, &column.data_type))
-            .collect()
+        let mut coerced = Vec::with_capacity(row.len());
+        for (value, column) in row.into_iter().zip(schema.columns.iter()) {
+            coerced.push(Self::coerce_value_to_column_type(value, &column.data_type)?);
+        }
+        Ok(coerced)
     }
 
     pub(crate) fn coerce_value_to_column_type(value: Value, data_type: &str) -> Result<Value> {

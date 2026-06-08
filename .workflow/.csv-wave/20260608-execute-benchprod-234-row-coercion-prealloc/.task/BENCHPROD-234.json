@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-234",
+  "title": "Preallocate row coercion output",
+  "status": "completed",
+  "created_at": "2026-06-08T21:42:41+08:00",
+  "completed_at": "2026-06-08T21:42:41+08:00",
+  "scope": "INSERT row schema type coercion",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/types.rs"
+      ],
+      "summary": [
+        "Replaced row coercion iterator collect with an explicit Vec::with_capacity(row.len()) loop.",
+        "Kept column count validation before allocation and conversion.",
+        "Preserved the existing per-column coerce_value_to_column_type behavior and error propagation."
+      ]
+    },
+    "tests": {
+      "insert_select": "passed",
+      "cast_expressions": "passed",
+      "sql_dml": "43/43 passed",
+      "sql_expr_functions": "22/22 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, DDL, metadata, or execution hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
