@@ -88,10 +88,17 @@ impl Executor {
     const MAX_RECURSIVE_CTE_ITERATIONS: usize = 128;
     const MAX_RECURSIVE_CTE_ROWS: usize = 4096;
 
-    fn deduplicate_rows(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+        let (rows, _) = Self::deduplicate_rows_with_seen(rows);
+        rows
+    }
+
+    fn deduplicate_rows_with_seen(
+        mut rows: Vec<Vec<Value>>,
+    ) -> (Vec<Vec<Value>>, HashSet<Vec<Value>>) {
         let mut seen = HashSet::with_capacity(rows.len());
         rows.retain(|row| seen.insert(row.clone()));
-        rows
+        (rows, seen)
     }
 
     fn row_hash_set(rows: Vec<Vec<Value>>) -> HashSet<Vec<Value>> {
@@ -857,15 +864,11 @@ impl Executor {
             set_quantifier,
             SetQuantifier::All | SetQuantifier::AllByName
         );
-        let mut all_rows = if union_all {
-            anchor_rows
+        let (mut all_rows, mut seen_rows) = if union_all {
+            (anchor_rows, None)
         } else {
-            Self::deduplicate_rows(anchor_rows)
-        };
-        let mut seen_rows = if union_all {
-            None
-        } else {
-            Some(Self::row_hash_set(all_rows.clone()))
+            let (rows, seen) = Self::deduplicate_rows_with_seen(anchor_rows);
+            (rows, Some(seen))
         };
         let mut delta_rows = all_rows.clone();
         let recursive_query = Self::query_from_set_expr(recursive_body);

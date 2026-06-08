@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-156-recursive-anchor-seen-reuse",
+  "objective": "Reuse the anchor deduplication HashSet for recursive UNION seen-row tracking.",
+  "status": "completed",
+  "created_at": "2026-06-08T15:42:00+08:00",
+  "completed_at": "2026-06-08T15:44:35+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-156",
+      "title": "Reuse recursive UNION anchor seen set",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "result": "Recursive UNION now reuses the HashSet built during anchor deduplication instead of cloning all anchor rows to rebuild it."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_with_recursive_union_deduplicates_anchor_seen_rows -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 41/41"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

@@ -176,6 +176,32 @@ async fn test_with_recursive_union_skips_seen_recursive_rows() {
 }
 
 #[tokio::test]
+async fn test_with_recursive_union_deduplicates_anchor_seen_rows() {
+    let (executor, wal) = setup().await;
+    let (_, rows) = query(
+        &executor,
+        "WITH RECURSIVE r(n) AS (
+            SELECT 1
+            UNION ALL
+            SELECT 1
+            UNION
+            SELECT n + 1 FROM r WHERE n < 3
+         )
+         SELECT n FROM r ORDER BY n",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)]
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_recursive_cte_alias_can_rename_prefix_columns() {
     let (executor, wal) = setup().await;
     let (_, rows) = query(
