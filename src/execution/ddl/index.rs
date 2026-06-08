@@ -14,6 +14,17 @@ fn create_index_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn drop_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
+    let mut prefix =
+        String::with_capacity("index:".len() + table_name.len() + 1 + column_name.len() + 1);
+    prefix.push_str("index:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix.push_str(column_name);
+    prefix.push(':');
+    prefix
+}
+
 impl Executor {
     pub(crate) async fn handle_create_index(
         &self,
@@ -229,7 +240,7 @@ impl Executor {
 
                     // Delete index entries
                     let index_prefix = if meta.columns.len() == 1 {
-                        format!("index:{}:{}:", table_name, meta.columns[0])
+                        drop_index_prefix_for_column(&table_name, &meta.columns[0])
                     } else {
                         Self::composite_index_prefix(&table_name, &meta.columns)
                     };
@@ -281,13 +292,21 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::create_index_data_prefix_for_table;
+    use super::{create_index_data_prefix_for_table, drop_index_prefix_for_column};
 
     #[test]
     fn create_index_data_prefix_for_table_preallocates_exact_prefix() {
         let prefix = create_index_data_prefix_for_table("orders");
 
         assert_eq!(prefix, "data:orders:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn drop_index_prefix_for_column_preallocates_exact_prefix() {
+        let prefix = drop_index_prefix_for_column("orders", "status");
+
+        assert_eq!(prefix, "index:orders:status:");
         assert!(prefix.capacity() >= prefix.len());
     }
 }

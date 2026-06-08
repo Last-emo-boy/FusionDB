@@ -1,0 +1,46 @@
+{
+  "id": "benchprod-318-drop-index-prefix-prealloc",
+  "objective": "Preallocate DROP INDEX single-column cleanup prefixes from table and column name lengths.",
+  "status": "completed",
+  "created_at": "2026-06-09T04:55:00+08:00",
+  "completed_at": "2026-06-09T04:58:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-318",
+      "title": "Preallocate DROP INDEX prefixes",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/index.rs"
+      ],
+      "result": "DROP INDEX single-column cleanup now uses an explicit-capacity helper instead of format! for index:<table>:<column>: prefixes."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test drop_index_prefix -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_drop_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for index:<table>:<column>: before pushing known components.",
+    "The optimization replaces format! in DROP INDEX single-column index-entry cleanup prefix construction.",
+    "Generated prefix bytes, scan_prefix inputs, deleted index entries, schema index flags, and SQL index behavior are unchanged."
+  ]
+}

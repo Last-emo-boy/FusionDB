@@ -1,0 +1,23 @@
+{
+  "id": "BENCHPROD-318",
+  "title": "Preallocate DROP INDEX prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/ddl/index.rs"
+  ],
+  "description": "Avoid generic format! allocation work when DROP INDEX single-column cleanup builds index:<table>:<column>: prefixes from known table and column name lengths.",
+  "implementation": [
+    "Added drop_index_prefix_for_column() with explicit capacity for index:<table>:<column>:.",
+    "Replaced DROP INDEX single-column index-entry cleanup prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test drop_index_prefix -- --nocapture",
+    "cargo test --test sql_index_cache test_drop_index -- --nocapture",
+    "cargo test --test sql_index_cache -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "DROP INDEX single-column prefix construction now reserves capacity from known table and column name lengths while preserving index-entry cleanup and SQL index behavior."
+}
