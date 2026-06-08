@@ -1,0 +1,22 @@
+{
+  "id": "BENCHPROD-308",
+  "title": "Preallocate ANALYZE data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/analyze.rs"
+  ],
+  "description": "Avoid generic format! allocation work when ANALYZE builds data:<table>: scan prefixes from known table-name length.",
+  "implementation": [
+    "Added analyze_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Replaced ANALYZE table-stat scan prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test analyze_ -- --nocapture",
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "ANALYZE data-prefix construction now reserves capacity from known table-name length while preserving table statistics and EXPLAIN behavior."
+}

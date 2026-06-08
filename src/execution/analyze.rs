@@ -12,6 +12,14 @@ fn analyze_distinct_capacity(row_count: usize) -> usize {
     row_count.min(ANALYZE_DISTINCT_PREALLOC_LIMIT)
 }
 
+fn analyze_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct TableStats {
     pub table_name: String,
@@ -77,7 +85,7 @@ impl Executor {
         schema: &TableSchema,
         txn: &mut dyn Transaction,
     ) -> Result<TableStats> {
-        let prefix = format!("data:{}:", table_name);
+        let prefix = analyze_data_prefix_for_table(table_name);
         let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
         let distinct_capacity = analyze_distinct_capacity(kv_pairs.len());
         let mut collectors = Vec::with_capacity(schema.columns.len());
@@ -210,5 +218,13 @@ mod tests {
             analyze_distinct_capacity(ANALYZE_DISTINCT_PREALLOC_LIMIT + 1),
             ANALYZE_DISTINCT_PREALLOC_LIMIT
         );
+    }
+
+    #[test]
+    fn analyze_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = analyze_data_prefix_for_table("items");
+
+        assert_eq!(prefix, "data:items:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }

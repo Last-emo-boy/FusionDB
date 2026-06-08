@@ -1,0 +1,42 @@
+{
+  "id": "benchprod-308-analyze-data-prefix-prealloc",
+  "objective": "Preallocate ANALYZE data prefixes from table-name length.",
+  "status": "completed",
+  "created_at": "2026-06-09T05:29:00+08:00",
+  "completed_at": "2026-06-09T05:36:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-308",
+      "title": "Preallocate ANALYZE data prefixes",
+      "status": "completed",
+      "evidence": [
+        "src/execution/analyze.rs"
+      ],
+      "result": "ANALYZE table-stat collection now uses an explicit-capacity helper instead of format! for data:<table>: prefixes."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test analyze_ -- --nocapture",
+      "status": "passed: helper and matching analyze tests"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for data:<table>: before pushing known components.",
+    "The optimization replaces format! in ANALYZE table-stat scan prefix construction.",
+    "Generated prefix bytes, transaction scan prefixes, row-cache lookups, row decoding, distinct stats, min/max stats, EXPLAIN statistics, and SQL results are unchanged."
+  ]
+}
