@@ -1,0 +1,56 @@
+{
+  "id": "benchprod-330-order-schema-key-prealloc",
+  "objective": "Preallocate ORDER BY pushdown schema lookup keys from table-name length.",
+  "status": "completed",
+  "created_at": "2026-06-09T07:47:00+08:00",
+  "completed_at": "2026-06-09T07:47:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-330",
+      "title": "Preallocate ORDER schema keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/order.rs"
+      ],
+      "result": "ORDER BY primary-key LIMIT pushdown schema lookup now uses an explicit-capacity helper instead of format! for schema:<table> keys."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test order_schema_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_select_order_by_primary_key_limit_offset -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_primary_key_range_order_limit_offset_pushdown -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_select -- --nocapture",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for schema:<table> before pushing known components.",
+    "The optimization replaces format! in primary_key_order_scan_limit() schema lookup key construction.",
+    "Generated schema key bytes, ORDER BY primary-key LIMIT pushdown, range pushdown, index-cache behavior, and general SELECT ORDER BY behavior are unchanged.",
+    "The first focused helper test rebuilt dependencies and took longer than later test runs.",
+    "git diff --check printed the existing CRLF normalization warning for src/execution/query/order.rs while exiting successfully."
+  ]
+}

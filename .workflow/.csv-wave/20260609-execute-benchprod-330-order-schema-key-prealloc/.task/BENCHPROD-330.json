@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-330",
+  "title": "Preallocate ORDER schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/query/order.rs"
+  ],
+  "description": "Avoid generic format! allocation work when ORDER BY primary-key LIMIT pushdown builds schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added order_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced primary_key_order_scan_limit() schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test order_schema_key -- --nocapture",
+    "cargo test --test sql_index_cache test_select_order_by_primary_key_limit_offset -- --nocapture",
+    "cargo test --test sql_index_cache test_primary_key_range_order_limit_offset_pushdown -- --nocapture",
+    "cargo test --test sql_index_cache -- --nocapture",
+    "cargo test --test sql_select -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "ORDER schema-key construction now reserves capacity from known table-name length while preserving ORDER BY primary-key LIMIT pushdown, range pushdown, index-cache behavior, and general SELECT ORDER BY behavior."
+}

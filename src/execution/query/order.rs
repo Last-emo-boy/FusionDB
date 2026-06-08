@@ -28,6 +28,13 @@ pub(super) struct SortOrderKey<'a> {
     pub(super) asc: bool,
 }
 
+fn order_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 impl Executor {
     pub(crate) fn order_limit_column_name(expr: &Expr) -> Option<String> {
         match expr {
@@ -106,7 +113,7 @@ impl Executor {
         }
 
         let table_name = name.to_string();
-        let schema_key = format!("schema:{}", table_name);
+        let schema_key = order_schema_key_for_table(&table_name);
         let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
             return Ok(None);
         };
@@ -501,5 +508,18 @@ impl Executor {
         rows.sort_by(|left, right| {
             self.compare_sort_order_keys(sort_keys, left, right, schema, params)
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::order_schema_key_for_table;
+
+    #[test]
+    fn order_schema_key_for_table_preallocates_exact_key() {
+        let key = order_schema_key_for_table("orders");
+
+        assert_eq!(key, "schema:orders");
+        assert!(key.capacity() >= key.len());
     }
 }
