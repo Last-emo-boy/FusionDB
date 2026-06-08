@@ -1,0 +1,49 @@
+{
+  "id": "benchprod-275-vector-batch-wrapper-prealloc",
+  "objective": "Preallocate HNSW wrapper vector storage when batch insertion creates a vector index wrapper.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:23:00+08:00",
+  "completed_at": "2026-06-09T01:27:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-275",
+      "title": "Preallocate vector batch wrapper storage",
+      "status": "completed",
+      "evidence": [
+        "src/storage/vector_index.rs"
+      ],
+      "result": "VectorIndex batch insertion now creates a new HNSW wrapper with vector-map capacity derived from the batch size."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test wrapper_with_vector_capacity_reserves_vectors -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::vector_index::tests -- --nocapture",
+      "status": "passed: 6/6"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test fusion_rebuild_vector_index_decodes_only_hnsw_columns -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_returning_upsert_vector_rbac hnsw -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "Existing wrappers still use the existing reserve(items.len()) path before applying a batch.",
+    "The optimization only changes initial HashMap capacity for newly-created HNSW wrappers; vector dimension validation, rebuild, delete, and search semantics are unchanged."
+  ]
+}

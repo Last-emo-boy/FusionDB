@@ -18,11 +18,11 @@ struct HnswIndexWrapper {
 }
 
 impl HnswIndexWrapper {
-    fn new(dimension: usize) -> Self {
+    fn with_vector_capacity(dimension: usize, vector_capacity: usize) -> Self {
         Self {
             index: None,
             dimension,
-            vectors: HashMap::new(),
+            vectors: HashMap::with_capacity(vector_capacity),
             dirty: false,
         }
     }
@@ -114,6 +114,14 @@ impl VectorIndex {
     }
 
     fn get_or_create_wrapper(&self, name: &str) -> Arc<RwLock<HnswIndexWrapper>> {
+        self.get_or_create_wrapper_with_capacity(name, 0)
+    }
+
+    fn get_or_create_wrapper_with_capacity(
+        &self,
+        name: &str,
+        vector_capacity: usize,
+    ) -> Arc<RwLock<HnswIndexWrapper>> {
         if let Some(existing) = self.indexes.read().get(name).cloned() {
             return existing;
         }
@@ -121,7 +129,12 @@ impl VectorIndex {
         let mut indexes = self.indexes.write();
         indexes
             .entry(name.to_string())
-            .or_insert_with(|| Arc::new(RwLock::new(HnswIndexWrapper::new(0))))
+            .or_insert_with(|| {
+                Arc::new(RwLock::new(HnswIndexWrapper::with_vector_capacity(
+                    0,
+                    vector_capacity,
+                )))
+            })
             .clone()
     }
 
@@ -140,7 +153,7 @@ impl VectorIndex {
             return Ok(());
         }
 
-        let wrapper_lock = self.get_or_create_wrapper(name);
+        let wrapper_lock = self.get_or_create_wrapper_with_capacity(name, items.len());
         let mut wrapper = wrapper_lock.write();
         wrapper.vectors.reserve(items.len());
 
@@ -234,7 +247,13 @@ fn vector_distance_order(a: &(String, f32), b: &(String, f32)) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::VectorIndex;
+    use super::{HnswIndexWrapper, VectorIndex};
+
+    #[test]
+    fn wrapper_with_vector_capacity_reserves_vectors() {
+        let wrapper = HnswIndexWrapper::with_vector_capacity(0, 4);
+        assert!(wrapper.vectors.capacity() >= 4);
+    }
 
     #[test]
     fn search_builds_index_lazily() {
