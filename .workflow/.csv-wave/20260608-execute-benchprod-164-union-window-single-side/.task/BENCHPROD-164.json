@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-164",
+  "title": "Short-circuit single-side UNION ALL windows",
+  "status": "completed",
+  "created_at": "2026-06-08T16:31:00+08:00",
+  "completed_at": "2026-06-08T16:34:32+08:00",
+  "scope": "UNION ALL LIMIT/OFFSET window concatenation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Detected windows fully contained within the left input and trimmed left rows in place.",
+        "Detected windows fully contained within the right input and trimmed right rows in place.",
+        "Kept mixed left/right window concatenation on the existing preallocated Vec path."
+      ]
+    },
+    "tests": {
+      "union_all_window_with_single_side_ranges": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, set-operation, recursive CTE, or scan hot path."
+  ]
+}

@@ -113,6 +113,58 @@ async fn test_union_all_window_with_empty_left_side() {
 }
 
 #[tokio::test]
+async fn test_union_all_window_with_single_side_ranges() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_window_single_left (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_window_single_right (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO union_window_single_left VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO union_window_single_right VALUES (4, 'd'), (5, 'e'), (6, 'f')",
+    )
+    .await;
+
+    let (_, left_rows) = query(
+        &executor,
+        "SELECT name FROM union_window_single_left UNION ALL SELECT name FROM union_window_single_right LIMIT 2",
+    )
+    .await;
+    assert_eq!(
+        left_rows,
+        vec![
+            vec![Value::String("a".to_string())],
+            vec![Value::String("b".to_string())],
+        ]
+    );
+
+    let (_, right_rows) = query(
+        &executor,
+        "SELECT name FROM union_window_single_left UNION ALL SELECT name FROM union_window_single_right LIMIT 2 OFFSET 3",
+    )
+    .await;
+    assert_eq!(
+        right_rows,
+        vec![
+            vec![Value::String("d".to_string())],
+            vec![Value::String("e".to_string())],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_union_all_limit_offset_without_order_by() {
     let (executor, wal) = setup().await;
     exec_ok(

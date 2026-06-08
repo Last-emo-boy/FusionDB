@@ -164,12 +164,21 @@ impl Executor {
 
         let available = total_len - offset;
         let take = limit.map_or(available, |limit| limit.min(available));
-        let mut rows = Vec::with_capacity(take);
         if take == 0 {
-            return rows;
+            return Vec::new();
         }
 
         let left_len = left_rows.len();
+        if offset < left_len && offset + take <= left_len {
+            Self::trim_set_rows_in_place(&mut left_rows, offset, Some(take));
+            return left_rows;
+        }
+        if offset >= left_len {
+            Self::trim_set_rows_in_place(&mut right_rows, offset - left_len, Some(take));
+            return right_rows;
+        }
+
+        let mut rows = Vec::with_capacity(take);
         if offset < left_len {
             let left_take = (left_len - offset).min(take);
             rows.extend(left_rows.drain(offset..offset + left_take));
@@ -177,9 +186,6 @@ impl Executor {
             if right_take > 0 {
                 rows.extend(right_rows.drain(..right_take));
             }
-        } else {
-            let right_offset = offset - left_len;
-            rows.extend(right_rows.drain(right_offset..right_offset + take));
         }
 
         rows
