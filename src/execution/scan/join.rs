@@ -818,7 +818,13 @@ impl Executor {
     }
 
     fn combine_optional_predicates(predicates: Vec<Option<Expr>>) -> Option<Expr> {
-        Self::combine_predicates(predicates.into_iter().flatten().collect())
+        let mut combined = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            if let Some(predicate) = predicate {
+                combined.push(predicate);
+            }
+        }
+        Self::combine_predicates(combined)
     }
 
     async fn reorder_comma_join_from(

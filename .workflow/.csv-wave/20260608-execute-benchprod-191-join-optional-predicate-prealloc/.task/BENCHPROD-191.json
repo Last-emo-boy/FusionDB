@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-191",
+  "title": "Preallocate optional join predicates",
+  "status": "completed",
+  "created_at": "2026-06-08T18:31:00+08:00",
+  "completed_at": "2026-06-08T18:35:06+08:00",
+  "scope": "Optional join predicate merge allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Replaced flatten().collect() in combine_optional_predicates with a Vec::with_capacity(predicates.len()) loop.",
+        "Kept optional predicate filtering, input order, and final predicate combination behavior unchanged."
+      ]
+    },
+    "tests": {
+      "inner_join_with_left_filter_and_indexed_right_probe": "passed",
+      "implicit_join_where_equi_predicate_matches_chbenchmark_q16_shape": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused join, scan, expression, or predicate hot path."
+  ]
+}
