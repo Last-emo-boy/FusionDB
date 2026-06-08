@@ -1,0 +1,24 @@
+{
+  "id": "BENCHPROD-304",
+  "title": "Preallocate join prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/scan/join.rs"
+  ],
+  "description": "Avoid generic format! allocation work when join planning and indexed join probes build data and index scan prefixes from known component lengths.",
+  "implementation": [
+    "Added join_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Added join_index_prefix_for_value() with explicit capacity for index:<table>:<column>:<value>:.",
+    "Replaced indexed join probe prefix construction.",
+    "Replaced comma-join row-count fallback data-prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test join_ -- --nocapture",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Join prefix construction now reserves capacity from known component lengths while preserving indexed join probes, row-count fallback, and join query behavior."
+}

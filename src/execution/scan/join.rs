@@ -23,6 +23,28 @@ fn join_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+fn join_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
+fn join_index_prefix_for_value(table_name: &str, column_name: &str, value_key: &str) -> String {
+    let mut prefix = String::with_capacity(
+        "index:".len() + table_name.len() + 1 + column_name.len() + 1 + value_key.len() + 1,
+    );
+    prefix.push_str("index:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix.push_str(column_name);
+    prefix.push(':');
+    prefix.push_str(value_key);
+    prefix.push(':');
+    prefix
+}
+
 struct ExprJoinProbePlan {
     left_expr: Expr,
     right_key_index: usize,
@@ -688,7 +710,7 @@ impl Executor {
             return Ok(Vec::new());
         };
 
-        let index_prefix = format!("index:{}:{}:{}:", table_name, column.name, value_str);
+        let index_prefix = join_index_prefix_for_value(table_name, &column.name, &value_str);
         let index_entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
         let mut seen_row_ids = HashSet::with_capacity(index_entries.len());
         let mut rows = Vec::with_capacity(index_entries.len());
@@ -881,7 +903,7 @@ impl Executor {
             let row_count = if let Some(stats) = self.load_table_stats(&table_name, txn).await? {
                 stats.row_count
             } else {
-                let data_prefix = format!("data:{}:", table_name);
+                let data_prefix = join_data_prefix_for_table(&table_name);
                 txn.count_prefix(data_prefix.as_bytes())
                     .await
                     .unwrap_or(usize::MAX)
@@ -2038,5 +2060,21 @@ mod tests {
 
         assert_eq!(key, "data:orders:00042");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn join_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = join_data_prefix_for_table("orders");
+
+        assert_eq!(prefix, "data:orders:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn join_index_prefix_for_value_preallocates_exact_prefix() {
+        let prefix = join_index_prefix_for_value("orders", "customer_id", "00042");
+
+        assert_eq!(prefix, "index:orders:customer_id:00042:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }
