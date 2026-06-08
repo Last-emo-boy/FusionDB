@@ -1,0 +1,68 @@
+{
+  "id": "benchprod-029-storage-soak",
+  "objective": "Add compaction/VACUUM/crash-recovery soak benchmark loops and fix storage recovery defects exposed by the soak.",
+  "status": "partial",
+  "created_at": "2026-06-08T10:35:00+08:00",
+  "updated_at": "2026-06-08T10:50:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-029",
+      "title": "Production storage soak and VACUUM",
+      "status": "open",
+      "evidence": [
+        "E:\\Playground\\FusionDB-bench\\storage_soak.py",
+        "E:\\Playground\\FusionDB-bench\\README.md",
+        "src/storage/fusion.rs",
+        "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_tiny_20260608_fix\\storage_soak_summary.json",
+        "E:\\Playground\\FusionDB-bench\\runs\\storage_soak_benchprod029_small_20260608_fix\\storage_soak_summary.json"
+      ],
+      "result": "Storage soak harness added; tiny and small checkpoint/compact/restart/forced-kill loops pass after FusionStorage recovery fixes. Medium multi-hour run remains pending."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test fusion_reopen_uses_fresh_memtable_id_after_existing_sstables",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test fusion_get_uses_latest_mvcc_timestamp_after_compaction",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test fusion_reopen_restores_current_ts_from_all_sstable_keys",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --lib storage::fusion::tests::",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_dml",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate",
+      "status": "passed"
+    },
+    {
+      "command": "cargo build --release --bin fusiondb",
+      "status": "passed"
+    },
+    {
+      "command": "python storage_soak.py --scale tiny --run-name storage_soak_benchprod029_tiny_20260608_fix --max-sstable-count 16 --fail-on-gap",
+      "status": "passed"
+    },
+    {
+      "command": "python storage_soak.py --scale small --run-name storage_soak_benchprod029_small_20260608_fix --max-sstable-count 32 --fail-on-gap",
+      "status": "passed"
+    }
+  ],
+  "next_steps": [
+    "Run the medium multi-hour storage soak command with --duration-seconds 7200.",
+    "If the medium run passes, update BENCHPROD-029 to completed."
+  ]
+}

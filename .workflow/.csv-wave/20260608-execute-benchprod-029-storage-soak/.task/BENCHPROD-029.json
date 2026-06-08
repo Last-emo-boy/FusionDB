@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-029",
+  "title": "Production storage soak and VACUUM",
+  "status": "open",
+  "created_at": "2026-06-08T10:35:00+08:00",
+  "updated_at": "2026-06-08T10:50:00+08:00",
+  "scope": "storage checkpoint, compaction/VACUUM-equivalent, crash recovery, and benchmark soak coverage",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/fusion.rs",
+        "E:\\Playground\\FusionDB-bench\\storage_soak.py",
+        "E:\\Playground\\FusionDB-bench\\README.md"
+      ],
+      "summary": [
+        "Added a storage soak runner that cycles insert/update/delete workload with checkpoint, compact, graceful restart, forced-kill recovery, visibility checks, indexed bucket checks, and SSTable guards.",
+        "Fixed reopened FusionStorage MemTable ID allocation to avoid overwriting existing SSTables after restart.",
+        "Fixed current_ts recovery by scanning loaded SSTable keys.",
+        "Fixed point reads to choose the latest visible MVCC timestamp across SSTables after compaction creates a high-ID output file."
+      ]
+    },
+    "tests": {
+      "fusion_reopen_uses_fresh_memtable_id_after_existing_sstables": "passed",
+      "fusion_get_uses_latest_mvcc_timestamp_after_compaction": "passed",
+      "fusion_reopen_restores_current_ts_from_all_sstable_keys": "passed",
+      "storage_fusion_tests": "11/11 passed",
+      "sql_dml": "43/43 passed",
+      "sql_index_cache": "36/36 passed",
+      "sql_group_aggregate": "49/49 passed",
+      "release_build": "passed",
+      "storage_soak_tiny": "passed: 4 cycles, 25/25 steps, live_rows=80, sstable_count=3",
+      "storage_soak_small": "passed: 30 cycles, 168/168 steps, live_rows=2640, sstable_count=3"
+    }
+  },
+  "remaining_success_criteria": [
+    "medium multi-hour run survives restart and controls SSTable/version growth"
+  ],
+  "next_action": "Run storage_soak.py at medium scale for a multi-hour duration and update the task to completed if it passes."
+}

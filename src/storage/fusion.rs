@@ -161,7 +161,6 @@ impl FusionStorage {
 
     pub async fn with_config(path: &str, config: &StorageConfig) -> Result<Self> {
         let wal = WalManager::new(path)?;
-        let active = MemTable::new(1);
         let sstable_dir = config.sstable_path();
         let inverted_index_path = config.inverted_index_path();
         let trigram_index_path = config.trigram_index_path();
@@ -203,14 +202,31 @@ impl FusionStorage {
             }
         }
 
-        let next_id = sstables_vec.last().map(|s| s.id + 1).unwrap_or(2);
-        let max_sstable_ts = sstables_vec
-            .iter()
-            .flat_map(|sst| [&sst.meta.first_key, &sst.meta.last_key])
-            .filter(|key| key.len() >= TS_SIZE)
-            .map(|key| Self::decode_key(key).1)
-            .max()
-            .unwrap_or(0);
+        let active_memtable_id = sstables_vec
+            .last()
+            .map(|sst| sst.id.saturating_add(1))
+            .unwrap_or(1);
+        let next_id = active_memtable_id.saturating_add(1);
+        let active = MemTable::new(active_memtable_id);
+        let mut max_sstable_ts = 0;
+        for sst in &sstables_vec {
+            match sst.new_iterator(None).await {
+                Ok(mut iter) => {
+                    while let Ok(Some((key, _))) = iter.next().await {
+                        if key.len() >= TS_SIZE {
+                            let (_, ts) = Self::decode_key(&key);
+                            max_sstable_ts = max_sstable_ts.max(ts);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to scan SSTable {} for timestamp restore: {:?}",
+                        sst.id, e
+                    );
+                }
+            }
+        }
 
         // Replay WAL
         // We need to replay committed transactions into the active memtable.
@@ -1250,22 +1266,27 @@ impl Transaction for FusionTransaction {
 
         // 2. Scan Storage (Active + Immutable) for latest version <= read_ts
         let search_key = FusionStorage::encode_key(key, self.read_ts);
+        let mut best: Option<(u64, bool, Vec<u8>)> = None;
+
+        let mut consider = |ts: u64, encoded_value: &[u8]| {
+            if ts > self.read_ts {
+                return;
+            }
+            if best.as_ref().map_or(true, |(best_ts, _, _)| ts > *best_ts) {
+                let (is_put, val) = FusionStorage::decode_value(encoded_value);
+                best = Some((ts, is_put, val.to_vec()));
+            }
+        };
 
         // Helper to check a memtable
-        let check_mem = |mem: &MemTable| -> Option<Vec<u8>> {
+        let check_mem = |mem: &MemTable| -> Option<(u64, Vec<u8>)> {
             // Range scan starting from (Key, MAX-read_ts)
             // The first entry >= search_key
             let entry = mem.map.range(search_key.clone()..).next();
             if let Some(ent) = entry {
-                let (k, _ts) = FusionStorage::decode_key(ent.key());
-                if k == key {
-                    // Found valid version
-                    let (is_put, val) = FusionStorage::decode_value(ent.value());
-                    if is_put {
-                        return Some(val.to_vec());
-                    } else {
-                        return Some(Vec::new());
-                    } // Tombstone found, stop searching
+                let (k, ts) = FusionStorage::decode_key(ent.key());
+                if k == key && ts <= self.read_ts {
+                    return Some((ts, ent.value().clone()));
                 }
             }
             None
@@ -1274,11 +1295,8 @@ impl Transaction for FusionTransaction {
         // Check Active
         {
             let active = self.storage.active_memtable.read().unwrap();
-            if let Some(val) = check_mem(&active) {
-                if val.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(val));
+            if let Some((ts, val)) = check_mem(&active) {
+                consider(ts, &val);
             }
         }
 
@@ -1286,11 +1304,8 @@ impl Transaction for FusionTransaction {
         {
             let imm = self.storage.immutable_memtables.read().unwrap();
             for mem in imm.iter().rev() {
-                if let Some(val) = check_mem(mem) {
-                    if val.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(val));
+                if let Some((ts, val)) = check_mem(mem) {
+                    consider(ts, &val);
                 }
             }
         }
@@ -1301,21 +1316,20 @@ impl Transaction for FusionTransaction {
             guard.clone()
         };
 
-        for sst in sstables.iter().rev() {
+        for sst in &sstables {
             if let Ok(Some((k_bytes, v_bytes))) = sst.find_ge(&search_key).await {
-                let (k, _ts) = FusionStorage::decode_key(&k_bytes);
-                if k == key {
-                    let (is_put, val) = FusionStorage::decode_value(&v_bytes);
-                    if is_put {
-                        return Ok(Some(val.to_vec()));
-                    } else {
-                        return Ok(None);
-                    } // Tombstone found
+                let (k, ts) = FusionStorage::decode_key(&k_bytes);
+                if k == key && ts <= self.read_ts {
+                    consider(ts, &v_bytes);
                 }
             }
         }
 
-        Ok(None)
+        match best {
+            Some((_ts, true, val)) => Ok(Some(val)),
+            Some((_ts, false, _)) => Ok(None),
+            None => Ok(None),
+        }
     }
 
     async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -2107,6 +2121,126 @@ mod tests {
                 Some((b"data:last:079".to_vec(), b"value-079".to_vec()))
             );
         }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_reopen_uses_fresh_memtable_id_after_existing_sstables() {
+        let data_dir = unique_storage_dir("reopen_memtable_id");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:reopen:001", b"before").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+        let max_existing_id = storage
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|sst| sst.id)
+            .max()
+            .expect("snapshot should create an SSTable");
+
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        let active_id = reopened.active_memtable.read().unwrap().id;
+        let next_id = reopened.next_memtable_id.load(Ordering::SeqCst);
+
+        assert!(
+            active_id > max_existing_id,
+            "reopened active memtable id {active_id} must not reuse existing SSTable id {max_existing_id}"
+        );
+        assert!(
+            next_id > active_id,
+            "next memtable id {next_id} must remain ahead of active id {active_id}"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_reopen_restores_current_ts_from_all_sstable_keys() {
+        let data_dir = unique_storage_dir("reopen_current_ts");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        for (key, value) in [
+            (b"data:restore_ts:a".as_slice(), b"one".as_slice()),
+            (b"data:restore_ts:z".as_slice(), b"two".as_slice()),
+            (b"data:restore_ts:m".as_slice(), b"three".as_slice()),
+        ] {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(key, value).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        let persisted_ts = storage.current_ts.load(Ordering::SeqCst);
+        storage.create_snapshot_now().await.unwrap();
+
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        assert_eq!(reopened.current_ts.load(Ordering::SeqCst), persisted_ts);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_get_uses_latest_mvcc_timestamp_after_compaction() {
+        let data_dir = unique_storage_dir("get_after_compaction");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:compact_get:001", b"old").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        for id in 0..3 {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            let key = format!("data:compact_get:filler:{id}");
+            txn.put(key.as_bytes(), b"filler").await.unwrap();
+            txn.commit().await.unwrap();
+            storage.create_snapshot_now().await.unwrap();
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:compact_get:001", b"new").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        assert!(storage.compact_once().await.unwrap());
+
+        let txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(
+            txn.get(b"data:compact_get:001").await.unwrap(),
+            Some(b"new".to_vec())
+        );
 
         cleanup_storage_dir(&data_dir);
     }
