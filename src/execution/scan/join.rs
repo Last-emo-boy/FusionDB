@@ -1266,13 +1266,18 @@ impl Executor {
         );
 
         let join_expr = Self::combine_predicates(join_predicates.clone());
-        let right_stage_predicates = right_selection
-            .as_ref()
-            .into_iter()
-            .chain(join_expr.iter())
-            .chain(pending_predicates.iter())
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut right_stage_predicates = Vec::with_capacity(
+            pending_predicates.len()
+                + usize::from(right_selection.is_some())
+                + usize::from(join_expr.is_some()),
+        );
+        if let Some(predicate) = &right_selection {
+            right_stage_predicates.push(predicate.clone());
+        }
+        if let Some(predicate) = &join_expr {
+            right_stage_predicates.push(predicate.clone());
+        }
+        right_stage_predicates.extend(pending_predicates.iter().cloned());
         let right_projection = schema_for_probe.as_ref().and_then(|schema| {
             self.build_stage_join_base_projection(
                 relation,

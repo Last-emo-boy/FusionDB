@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-192",
+  "title": "Preallocate right-stage join predicates",
+  "status": "completed",
+  "created_at": "2026-06-08T18:35:30+08:00",
+  "completed_at": "2026-06-08T18:38:23+08:00",
+  "scope": "Right-stage join predicate vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Replaced chained iterator collect for right_stage_predicates with an explicitly preallocated vector.",
+        "Computed capacity from pending_predicates.len(), right_selection.is_some(), and join_expr.is_some().",
+        "Kept predicate ordering and cloning behavior unchanged."
+      ]
+    },
+    "tests": {
+      "join_index_probe_projection_skips_unused_right_column_decode": "passed",
+      "inner_join_with_left_filter_and_indexed_right_probe": "passed",
+      "two_hop_join_probe_skips_guaranteed_right_key_decode": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused join, scan, expression, or predicate hot path."
+  ]
+}

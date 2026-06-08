@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-192-join-right-stage-predicate-prealloc",
+  "objective": "Preallocate right-stage join predicate vector from optional and pending predicate counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:35:30+08:00",
+  "completed_at": "2026-06-08T18:38:23+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-192",
+      "title": "Preallocate right-stage join predicates",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/join.rs"
+      ],
+      "result": "Right-stage join predicate collection now initializes its vector from the pending predicate count plus optional right-selection and join-expression inputs."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_join_index_probe_projection_skips_unused_right_column_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_inner_join_with_left_filter_and_indexed_right_probe -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_two_hop_join_probe_skips_guaranteed_right_key_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
