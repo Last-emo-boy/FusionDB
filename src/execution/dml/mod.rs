@@ -13,25 +13,24 @@ mod update;
 
 impl Executor {
     pub(crate) fn indexed_trigram_text_columns(schema: &TableSchema) -> Vec<usize> {
-        schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, col)| {
-                let upper = col.data_type.trim().to_ascii_uppercase();
-                let text_type = upper == "TEXT"
-                    || upper == "STRING"
-                    || upper == "VARCHAR"
-                    || upper == "CHAR"
-                    || upper.starts_with("VARCHAR(")
-                    || upper.starts_with("CHAR(")
-                    || upper.starts_with("CHARACTER");
-                (text_type
-                    && col.is_indexed
-                    && matches!(col.index_type, IndexType::BTree | IndexType::FTS))
-                .then_some(idx)
-            })
-            .collect()
+        let mut indices = Vec::with_capacity(schema.columns.len());
+        for (idx, col) in schema.columns.iter().enumerate() {
+            let upper = col.data_type.trim().to_ascii_uppercase();
+            let text_type = upper == "TEXT"
+                || upper == "STRING"
+                || upper == "VARCHAR"
+                || upper == "CHAR"
+                || upper.starts_with("VARCHAR(")
+                || upper.starts_with("CHAR(")
+                || upper.starts_with("CHARACTER");
+            if text_type
+                && col.is_indexed
+                && matches!(col.index_type, IndexType::BTree | IndexType::FTS)
+            {
+                indices.push(idx);
+            }
+        }
+        indices
     }
 
     pub(crate) fn update_trigram_index_for_insert(

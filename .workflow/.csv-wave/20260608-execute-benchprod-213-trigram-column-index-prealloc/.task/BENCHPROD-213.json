@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-213",
+  "title": "Preallocate trigram column indices",
+  "status": "completed",
+  "created_at": "2026-06-08T20:05:00+08:00",
+  "completed_at": "2026-06-08T20:07:10+08:00",
+  "scope": "DML trigram text column discovery",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/dml/mod.rs"
+      ],
+      "summary": [
+        "Replaced indexed trigram text column filter_map collect with an explicitly preallocated vector sized from schema.columns.len().",
+        "Preserved text type detection and BTree/FTS index-type filtering.",
+        "Preserved schema column order in the returned index list."
+      ]
+    },
+    "tests": {
+      "indexed_text_insert_updates_trigram_index_on_fusion_storage": "passed",
+      "plain_text_insert_skips_trigram_index_on_fusion_storage": "passed",
+      "update_refreshes_trigram_index_on_fusion_storage": "passed",
+      "delete_removes_trigram_index_on_fusion_storage": "passed",
+      "sql_index_cache": "37/37 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
