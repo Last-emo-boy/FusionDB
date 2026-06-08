@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-181-deferred-subquery-predicate-prealloc",
+  "objective": "Preallocate deferred subquery predicate buckets when splitting WHERE predicates.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:53:00+08:00",
+  "completed_at": "2026-06-08T17:56:50+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-181",
+      "title": "Preallocate deferred subquery predicates",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "result": "Deferred subquery predicate splitting now sizes both eager and deferred predicate buckets from the known conjunctive predicate count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_comma_join_reorder_preserves_ldbc_q4_shape_with_deferred_exists -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_not_exists_membership_filter_with_alias -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_exists_two_table_membership_matches_ldbc_q6_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

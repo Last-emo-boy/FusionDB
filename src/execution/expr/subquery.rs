@@ -271,8 +271,9 @@ impl Executor {
 
     pub(crate) fn split_deferred_subquery_selection(expr: &Expr) -> (Option<Expr>, Option<Expr>) {
         let predicates = Self::collect_conjunctive_predicates(expr);
-        let mut eager = Vec::with_capacity(predicates.len());
-        let mut deferred = Vec::new();
+        let predicate_count = predicates.len();
+        let mut eager = Vec::with_capacity(predicate_count);
+        let mut deferred = Vec::with_capacity(predicate_count);
 
         for predicate in predicates {
             if Self::contains_deferred_subquery(&predicate) {
