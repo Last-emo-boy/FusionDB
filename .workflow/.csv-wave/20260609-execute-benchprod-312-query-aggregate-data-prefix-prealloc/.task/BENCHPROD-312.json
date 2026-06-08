@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-312",
+  "title": "Preallocate query aggregate data prefixes",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Avoid generic format! allocation work when query aggregate fast paths build data:<table>: prefixes from known table-name length.",
+  "implementation": [
+    "Added aggregate_data_prefix_for_table() with explicit capacity for data:<table>:.",
+    "Replaced COUNT prefix-count data prefix construction.",
+    "Replaced primary-key MIN/MAX key-bound data prefix construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test aggregate_data_prefix -- --nocapture",
+    "cargo test --test sql_index_cache test_select_count_primary_key_uses_prefix_count -- --nocapture",
+    "cargo test --test sql_index_cache test_select_qualified_min_max_primary_key_uses_key_bounds -- --nocapture",
+    "cargo test --test sql_view_show_constraints test_select_count_not_null_column_uses_prefix_count -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Query aggregate data-prefix construction now reserves capacity from known table-name length while preserving count_prefix, primary-key MIN/MAX bounds, and SQL aggregate results."
+}

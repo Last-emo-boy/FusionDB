@@ -32,6 +32,14 @@ fn materialized_cte_data_key_for_row_id(cte_name: &str, row_id: &str) -> String 
     key
 }
 
+fn aggregate_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 enum RowValueSource<'a> {
     One,
     Column(usize),
@@ -2075,8 +2083,9 @@ impl Executor {
                                                         Some(&aggregate_qualifiers),
                                                     )
                                                 {
-                                                    let prefix =
-                                                        format!("data:{}:", table_name_str);
+                                                    let prefix = aggregate_data_prefix_for_table(
+                                                        &table_name_str,
+                                                    );
                                                     let count =
                                                         txn.count_prefix(prefix.as_bytes()).await?;
                                                     result_row.push(Value::Integer(count as i64));
@@ -2093,7 +2102,9 @@ impl Executor {
                                                         Some(&aggregate_qualifiers),
                                                     ) {
                                                         let prefix =
-                                                            format!("data:{}:", table_name_str);
+                                                            aggregate_data_prefix_for_table(
+                                                                &table_name_str,
+                                                            );
                                                         let min_key = prefix.as_bytes().to_vec();
                                                         let mut max_key =
                                                             prefix.as_bytes().to_vec();
@@ -3373,5 +3384,13 @@ mod tests {
 
         assert_eq!(key, "data:recent_orders:0007");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn aggregate_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = aggregate_data_prefix_for_table("metrics");
+
+        assert_eq!(prefix, "data:metrics:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }
