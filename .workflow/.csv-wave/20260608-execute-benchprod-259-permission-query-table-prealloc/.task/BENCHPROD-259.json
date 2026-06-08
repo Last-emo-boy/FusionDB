@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-259",
+  "title": "Preallocate permission query table buffers",
+  "status": "completed",
+  "created_at": "2026-06-08T23:58:00+08:00",
+  "completed_at": "2026-06-09T00:03:00+08:00",
+  "scope": "Executor statement permission query-source collection",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/mod.rs"
+      ],
+      "summary": [
+        "Added query_table_capacity and table_factor_table_capacity helpers.",
+        "Used the capacity hint for Statement::Query, CREATE VIEW source tables, and COPY query source tables.",
+        "Added derived-table permission coverage to the existing statement_permissions unit test."
+      ]
+    },
+    "tests": {
+      "statement_permissions": "passed",
+      "rbac_permission_check": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

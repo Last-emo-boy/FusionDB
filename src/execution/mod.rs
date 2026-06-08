@@ -752,7 +752,7 @@ impl Executor {
     fn statement_permissions(stmt: &Statement) -> Vec<(String, &'static str)> {
         match stmt {
             Statement::Query(query) => {
-                let mut tables = Vec::new();
+                let mut tables = Vec::with_capacity(Self::query_table_capacity(query));
                 Self::collect_query_tables(query, &mut tables);
                 let mut permissions = Vec::with_capacity(tables.len());
                 for table in tables {
@@ -800,7 +800,8 @@ impl Executor {
                 permissions
             }
             Statement::CreateView(create_view) => {
-                let mut source_tables = Vec::new();
+                let mut source_tables =
+                    Vec::with_capacity(Self::query_table_capacity(&create_view.query));
                 Self::collect_query_tables(&create_view.query, &mut source_tables);
                 let mut permissions = Vec::with_capacity(source_tables.len() + 1);
                 permissions.push((create_view.name.to_string(), "ALL"));
@@ -820,7 +821,7 @@ impl Executor {
                     )]
                 }
                 sqlparser::ast::CopySource::Query(query) => {
-                    let mut tables = Vec::new();
+                    let mut tables = Vec::with_capacity(Self::query_table_capacity(query));
                     Self::collect_query_tables(query, &mut tables);
                     let mut permissions = Vec::with_capacity(tables.len());
                     for table in tables {
@@ -854,6 +855,33 @@ impl Executor {
                     Self::collect_table_factor(&join.relation, tables);
                 }
             }
+        }
+    }
+
+    fn query_table_capacity(query: &sqlparser::ast::Query) -> usize {
+        if let SetExpr::Select(select) = query.body.as_ref() {
+            select
+                .from
+                .iter()
+                .map(|table_with_joins| {
+                    Self::table_factor_table_capacity(&table_with_joins.relation)
+                        + table_with_joins
+                            .joins
+                            .iter()
+                            .map(|join| Self::table_factor_table_capacity(&join.relation))
+                            .sum::<usize>()
+                })
+                .sum()
+        } else {
+            0
+        }
+    }
+
+    fn table_factor_table_capacity(table: &TableFactor) -> usize {
+        match table {
+            TableFactor::Table { .. } => 1,
+            TableFactor::Derived { subquery, .. } => Self::query_table_capacity(subquery),
+            _ => 0,
         }
     }
 
@@ -1229,6 +1257,16 @@ mod tests {
     fn statement_permissions_preserve_preallocated_entries() {
         assert_eq!(
             statement_permissions("SELECT * FROM users JOIN orders ON users.id = orders.user_id"),
+            vec![
+                ("users".to_string(), "SELECT"),
+                ("orders".to_string(), "SELECT")
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "SELECT * FROM (SELECT id FROM users) u JOIN orders ON u.id = orders.user_id"
+            ),
             vec![
                 ("users".to_string(), "SELECT"),
                 ("orders".to_string(), "SELECT")

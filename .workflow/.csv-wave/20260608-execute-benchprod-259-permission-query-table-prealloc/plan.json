@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-259-permission-query-table-prealloc",
+  "objective": "Preallocate query-source table buffers during statement permission resolution.",
+  "status": "completed",
+  "created_at": "2026-06-08T23:58:00+08:00",
+  "completed_at": "2026-06-09T00:03:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-259",
+      "title": "Preallocate permission query table buffers",
+      "status": "completed",
+      "evidence": [
+        "src/execution/mod.rs"
+      ],
+      "result": "Statement permission resolution now reserves query-source table buffers from the SELECT/COPY/CREATE VIEW AST shape."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test statement_permissions_preserve_preallocated_entries -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_returning_upsert_vector_rbac test_rbac_permission_check -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The table capacity estimate mirrors collect_query_tables for table and derived-table factors.",
+    "The change preserves collected table order and permission tuple construction."
+  ]
+}
