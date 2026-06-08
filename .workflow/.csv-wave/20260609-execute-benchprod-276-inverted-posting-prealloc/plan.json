@@ -1,0 +1,49 @@
+{
+  "id": "benchprod-276-inverted-posting-prealloc",
+  "objective": "Preallocate new inverted-index posting lists for their first posting entry.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:28:00+08:00",
+  "completed_at": "2026-06-09T01:33:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-276",
+      "title": "Preallocate inverted-index posting lists",
+      "status": "completed",
+      "evidence": [
+        "src/storage/inverted_index.rs"
+      ],
+      "result": "InvertedIndex now creates new term posting lists with capacity for the immediately inserted first posting."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test add_document_preallocates_new_posting_lists -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test storage::inverted_index::tests -- --nocapture",
+      "status": "passed: 6/6"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache fts -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The posting list capacity is 1 because add_document immediately pushes the first (doc_id, frequency) entry for a newly-created term.",
+    "The optimization only changes initial Vec allocation for new terms; tokenization, BM25 scoring, persistence, and FTS SQL behavior are unchanged."
+  ]
+}

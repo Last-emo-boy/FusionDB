@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-276",
+  "title": "Preallocate inverted-index posting lists",
+  "status": "completed",
+  "created_at": "2026-06-09T01:28:00+08:00",
+  "completed_at": "2026-06-09T01:33:00+08:00",
+  "scope": "InvertedIndex add_document posting-list allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/inverted_index.rs"
+      ],
+      "summary": [
+        "Changed InvertedIndex::add_document to create new term posting Vecs with capacity 1.",
+        "Preserved existing behavior for existing posting lists and BM25 search.",
+        "Added unit coverage proving a new posting list receives initial capacity for the first entry."
+      ]
+    },
+    "tests": {
+      "posting_prealloc_unit": "passed",
+      "storage_inverted_index_tests": "6/6 passed",
+      "sql_index_cache_fts": "passed",
+      "sql_index_cache": "38/38 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

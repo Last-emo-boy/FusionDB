@@ -57,7 +57,7 @@ impl InvertedIndex {
         for (term, freq) in term_freqs {
             self.postings
                 .entry(term)
-                .or_default()
+                .or_insert_with(|| Vec::with_capacity(1))
                 .push((doc_id.clone(), freq));
         }
 
@@ -173,6 +173,17 @@ mod tests {
         assert_eq!(index.doc_lengths.get("doc1"), Some(&3));
         assert_eq!(index.doc_lengths.get("doc2"), Some(&2));
         assert!((index.avg_doc_length - 2.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn add_document_preallocates_new_posting_lists() {
+        let mut index = InvertedIndex::new();
+
+        index.add_document("doc1".to_string(), "quick");
+
+        let postings = index.postings.get("quick").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert!(postings.capacity() >= 1);
     }
 
     #[test]
