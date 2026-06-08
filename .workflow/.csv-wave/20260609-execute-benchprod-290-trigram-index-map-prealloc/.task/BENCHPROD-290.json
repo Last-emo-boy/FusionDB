@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-290",
+  "title": "Preallocate trigram-index top-level maps",
+  "status": "completed",
+  "created_at": "2026-06-09T02:32:00+08:00",
+  "completed_at": "2026-06-09T02:35:00+08:00",
+  "scope": "Trigram-index initialization allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/trigram.rs"
+      ],
+      "summary": [
+        "Added small constructors for the top-level postings and row-id maps with first-table capacity.",
+        "Changed TrigramIndex::new() to use the preallocated map constructors.",
+        "Changed Default to call TrigramIndex::new() so both construction paths share the same allocation behavior.",
+        "Added unit coverage proving both top-level maps reserve first-table capacity."
+      ]
+    },
+    "tests": {
+      "trigram_units": "3/3 passed",
+      "sql_index_cache": "38/38 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 for Cargo verification while MSVC PDB files remain large.",
+    "Keep each optimization behavior-equivalent and commit it with its own .workflow/.csv-wave evidence."
+  ]
+}

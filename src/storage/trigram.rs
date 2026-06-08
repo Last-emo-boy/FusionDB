@@ -22,7 +22,7 @@ pub fn trigrams_bytes(s: &str) -> Vec<u32> {
     out
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TrigramIndex {
     // table_name -> column_name -> trigram -> bitmap(row_id)
     postings: HashMap<String, HashMap<String, HashMap<u32, RoaringTreemap>>>,
@@ -30,11 +30,25 @@ pub struct TrigramIndex {
     id_map: HashMap<String, HashMap<u64, String>>,
 }
 
+fn postings_map() -> HashMap<String, HashMap<String, HashMap<u32, RoaringTreemap>>> {
+    HashMap::with_capacity(1)
+}
+
+fn id_map() -> HashMap<String, HashMap<u64, String>> {
+    HashMap::with_capacity(1)
+}
+
+impl Default for TrigramIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrigramIndex {
     pub fn new() -> Self {
         Self {
-            postings: HashMap::new(),
-            id_map: HashMap::new(),
+            postings: postings_map(),
+            id_map: id_map(),
         }
     }
 
@@ -165,13 +179,19 @@ impl TrigramIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::{trigrams_bytes, TrigramIndex};
+    use super::{id_map, postings_map, trigrams_bytes, TrigramIndex};
 
     #[test]
     fn trigrams_bytes_deduplicates_sorted_keys() {
         let grams = trigrams_bytes("aaaa");
 
         assert_eq!(grams.len(), 1);
+    }
+
+    #[test]
+    fn new_preallocates_first_table_maps() {
+        assert!(postings_map().capacity() >= 1);
+        assert!(id_map().capacity() >= 1);
     }
 
     #[test]

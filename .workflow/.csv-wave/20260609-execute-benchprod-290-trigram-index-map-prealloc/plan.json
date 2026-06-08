@@ -1,0 +1,42 @@
+{
+  "id": "benchprod-290-trigram-index-map-prealloc",
+  "objective": "Preallocate trigram-index top-level maps for the first indexed table.",
+  "status": "completed",
+  "created_at": "2026-06-09T02:32:00+08:00",
+  "completed_at": "2026-06-09T02:35:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-290",
+      "title": "Preallocate trigram-index top-level maps",
+      "status": "completed",
+      "evidence": [
+        "src/storage/trigram.rs"
+      ],
+      "result": "TrigramIndex initialization now reserves capacity for the first postings table and row-id table entries."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test storage::trigram::tests -- --nocapture",
+      "status": "passed: 3/3"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "This complements BENCHPROD-271, which preallocated maps created during the first trigram insertion.",
+    "The initial top-level capacity is 1 because a newly constructed trigram index commonly receives its first indexed table immediately after initialization.",
+    "The optimization only changes initial HashMap allocation for empty top-level postings and row-id maps; trigram extraction, index updates, persistence, LIKE lookup, and row-key mapping are unchanged."
+  ]
+}
