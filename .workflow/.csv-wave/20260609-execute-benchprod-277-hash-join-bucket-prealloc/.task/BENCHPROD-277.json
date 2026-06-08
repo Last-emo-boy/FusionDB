@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-277",
+  "title": "Preallocate hash join match buckets",
+  "status": "completed",
+  "created_at": "2026-06-09T01:34:00+08:00",
+  "completed_at": "2026-06-09T01:39:00+08:00",
+  "scope": "Hash join build-side match bucket allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/join.rs"
+      ],
+      "summary": [
+        "Added join_match_bucket to create hash join match buckets with capacity 1.",
+        "Changed both build-right and build-left hash join maps to use the preallocated bucket helper.",
+        "Added unit coverage proving the helper preallocates for the first match.",
+        "Preserved hash join matching, residual predicate evaluation, and left outer row emission behavior."
+      ]
+    },
+    "tests": {
+      "join_match_bucket_unit": "passed",
+      "sql_join_inner_filter": "3/3 passed",
+      "sql_join_left_filter": "2/2 passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused storage, query execution, scan, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

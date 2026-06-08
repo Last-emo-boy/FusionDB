@@ -10,6 +10,10 @@ use super::Executor;
 const JOIN_INDEX_PROBE_THRESHOLD: usize = 128;
 const JOIN_UNIQUE_INDEX_PROBE_THRESHOLD: usize = 16_384;
 
+fn join_match_bucket<T>() -> Vec<T> {
+    Vec::with_capacity(1)
+}
+
 struct ExprJoinProbePlan {
     left_expr: Expr,
     right_key_index: usize,
@@ -1635,7 +1639,10 @@ impl Executor {
                             HashMap::with_capacity(right_rows.len());
                         for right_row in &right_rows {
                             let key = Self::row_key(right_row, &right_key_indices);
-                            hash_map.entry(key).or_default().push(right_row);
+                            hash_map
+                                .entry(key)
+                                .or_insert_with(join_match_bucket)
+                                .push(right_row);
                         }
 
                         for left_row in &left_rows {
@@ -1682,7 +1689,10 @@ impl Executor {
                             HashMap::with_capacity(left_rows.len());
                         for left_row in &left_rows {
                             let key = Self::row_key(left_row, &left_key_indices);
-                            hash_map.entry(key).or_default().push(left_row);
+                            hash_map
+                                .entry(key)
+                                .or_insert_with(join_match_bucket)
+                                .push(left_row);
                         }
 
                         for right_row in &right_rows {
@@ -2000,5 +2010,16 @@ impl Executor {
         }
 
         self.project_join_rows(schema, rows, projection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_match_bucket_preallocates_first_match() {
+        let bucket: Vec<Vec<Value>> = join_match_bucket();
+        assert!(bucket.capacity() >= 1);
     }
 }
