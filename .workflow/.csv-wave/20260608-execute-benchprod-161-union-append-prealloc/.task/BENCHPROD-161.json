@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-161",
+  "title": "Preallocate UNION append rows",
+  "status": "completed",
+  "created_at": "2026-06-08T16:17:00+08:00",
+  "completed_at": "2026-06-08T16:20:30+08:00",
+  "scope": "UNION and UNION ALL set-operation row append path",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Added empty-left and empty-right shortcuts for the non-window-pushed UNION path.",
+        "Reserved right_rows.len() before appending right rows into left rows.",
+        "Added UNION ALL coverage for an empty left side."
+      ]
+    },
+    "tests": {
+      "union_all_with_empty_left_side": "passed",
+      "sql_set_subquery": "45/45 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, set-operation, recursive CTE, or scan hot path."
+  ]
+}

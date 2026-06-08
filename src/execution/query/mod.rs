@@ -2939,8 +2939,11 @@ impl Executor {
                 SetOperator::Union if union_all_window_pushed => {
                     Self::concat_set_rows_window(left_rows, right_rows, set_offset, set_limit)
                 }
+                SetOperator::Union if left_rows.is_empty() => right_rows,
+                SetOperator::Union if right_rows.is_empty() => left_rows,
                 SetOperator::Union => {
                     let mut all_rows = left_rows;
+                    all_rows.reserve(right_rows.len());
                     all_rows.extend(right_rows);
                     all_rows
                 }
