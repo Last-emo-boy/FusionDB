@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-297",
+  "title": "Preallocate foreign-key parent data keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/foreign_key.rs"
+  ],
+  "description": "Avoid generic format! allocation work when foreign-key parent existence checks build data:<table>:<row_id> keys from known component lengths.",
+  "implementation": [
+    "Added foreign_key_data_key_for_row_id() with explicit capacity for data:<table>:<row_id>.",
+    "Replaced single-column primary-key parent existence key construction.",
+    "Replaced composite primary-key parent row existence key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test foreign_key_data_key -- --nocapture",
+    "cargo test --test sql_view_show_constraints -- --nocapture",
+    "cargo test --test sql_dml test_fusion_storage_tpcc_order_fk_chain_after_many_customers -- --nocapture",
+    "cargo test --test sql_dml test_copy_from_csv_enforces_constraints_on_direct_path -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "Foreign-key parent data-key construction now reserves capacity from known table and row-id lengths while preserving FK enforcement behavior."
+}

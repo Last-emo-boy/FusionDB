@@ -6,6 +6,15 @@ use sqlparser::ast::{ColumnOption, ColumnOptionDef, ForeignKeyConstraint, Ident,
 
 use super::Executor;
 
+fn foreign_key_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
+    key.push_str("data:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ForeignKeyMeta {
     pub name: String,
@@ -377,7 +386,7 @@ impl Executor {
             let parent_idx = schema.get_column_index(&parent_columns[0]).unwrap();
             if schema.get_primary_key_index() == Some(parent_idx) {
                 if let Some(row_id) = Self::value_to_primary_row_id(&values[0]) {
-                    let key = format!("data:{}:{}", parent_table, row_id);
+                    let key = foreign_key_data_key_for_row_id(parent_table, &row_id);
                     return Ok(txn.get(key.as_bytes()).await?.is_some());
                 }
                 return Ok(false);
@@ -397,7 +406,7 @@ impl Executor {
                 continue;
             }
             if let Some(row_id) = self.composite_index_value_key_for_meta_values(&index, values) {
-                let key = format!("data:{}:{}", parent_table, row_id);
+                let key = foreign_key_data_key_for_row_id(parent_table, &row_id);
                 if txn.get(key.as_bytes()).await?.is_some() {
                     return Ok(true);
                 }
@@ -508,5 +517,18 @@ impl Executor {
         })?;
         bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::foreign_key_data_key_for_row_id;
+
+    #[test]
+    fn foreign_key_data_key_for_row_id_preallocates_exact_key() {
+        let key = foreign_key_data_key_for_row_id("warehouse", "0007");
+
+        assert_eq!(key, "data:warehouse:0007");
+        assert!(key.capacity() >= key.len());
     }
 }
