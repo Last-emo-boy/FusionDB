@@ -1,7 +1,8 @@
 {
   "id": "BENCHPROD-078",
   "title": "Optimize grouped aggregate rollup paths for TSBS fleet rollup",
-  "status": "pending",
+  "status": "completed",
+  "completed_at": "2026-05-27T16:58:15+08:00",
   "created_at": "2026-05-27T14:10:00+08:00",
   "scope": "database core grouped aggregate and rollup query execution",
   "target_cases": [
@@ -38,5 +39,12 @@
     "python bench_repeat.py --scale medium --suite tsbs --repeats 3 --threads 4 --run-name repeat_benchprod078_tsbs_medium_rollup_3x_20260527 --suite-timeout 1800",
     "python bench_repeat.py --scale medium --suite production --repeats 3 --threads 4 --run-name repeat_benchprod078_production_medium_rollup_3x_20260527 --suite-timeout 3600",
     "python bench_gate.py --gate-profile gate_profiles/production_medium.json --repeat-report runs/repeat_benchprod078_production_medium_rollup_3x_20260527/bench_repeat_summary.json --run-name gate_benchprod078_production_medium_rollup_20260527"
-  ]
+  ],
+  "result_summary": {
+    "context": ".workflow/.csv-wave/20260527-plan-benchprod-078-tsbs-rollup-aggregate/context.md",
+    "targeted_tsbs_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod078_tsbs_medium_groupagg_result_cache_3x_20260527",
+    "production_repeat": "E:/Playground/FusionDB-bench/runs/repeat_benchprod078_production_medium_groupagg_result_cache_5x_20260527",
+    "production_gate": "E:/Playground/FusionDB-bench/runs/gate_benchprod078_production_medium_groupagg_result_cache_5x_jitter_floor_20260527/bench_gate_summary.md",
+    "gate_status": "passed 22/22"
+  }
 }

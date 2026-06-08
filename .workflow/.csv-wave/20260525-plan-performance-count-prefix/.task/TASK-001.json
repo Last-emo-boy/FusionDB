@@ -16,5 +16,18 @@
     "A focused FusionStorage count_prefix regression test passes",
     "Existing SELECT COUNT(*) integration test passes"
   ],
-  "status": "planned"
+  "status": "completed",
+  "completed_at": "2026-05-25T01:55:00+08:00",
+  "result_summary": {
+    "execution": ".workflow/.csv-wave/20260525-execute-performance-count-prefix/context.md",
+    "verification": ".workflow/.csv-wave/20260525-verify-performance-count-prefix/verification.json",
+    "status": "passed",
+    "checks": [
+      "cargo fmt --check",
+      "cargo check --lib",
+      "cargo test storage::fusion::tests --lib -- --nocapture",
+      "cargo test storage::memory::tests --lib -- --nocapture",
+      "cargo test --test sql_integration test_select_count_star -- --nocapture"
+    ]
+  }
 }
