@@ -1,0 +1,50 @@
+{
+  "id": "benchprod-278-window-partition-bucket-prealloc",
+  "objective": "Preallocate window partition index buckets for their first row index.",
+  "status": "completed",
+  "created_at": "2026-06-09T01:44:00+08:00",
+  "completed_at": "2026-06-09T01:50:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-278",
+      "title": "Preallocate window partition buckets",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "Window partition grouping now creates new row-index buckets with capacity for the immediately inserted first index."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test window_partition_bucket_preallocates_first_row_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_window test_window_row_number -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_window -- --nocapture",
+      "status": "passed: 4/4"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery window -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was previously full.",
+    "The first cargo test attempt failed before running tests because target debug symbol files filled the E: drive; Cargo-generated PDB files under target/debug were removed after path verification.",
+    "The bucket capacity is 1 because a new window partition is immediately followed by the first row index push.",
+    "The optimization only changes initial Vec allocation for new window partition buckets; partition key evaluation, ordering, and window function semantics are unchanged."
+  ]
+}

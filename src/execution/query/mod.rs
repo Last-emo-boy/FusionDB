@@ -15,6 +15,10 @@ use super::{AggregateAccumulator, Executor, QueryResult};
 use order::SortOrderKey;
 use sqlparser::ast::{Distinct, JoinConstraint, JoinOperator};
 
+fn window_partition_bucket() -> Vec<usize> {
+    Vec::with_capacity(1)
+}
+
 enum RowValueSource<'a> {
     One,
     Column(usize),
@@ -3144,7 +3148,10 @@ impl Executor {
                             .unwrap_or(Value::Null),
                     );
                 }
-                partitions.entry(partition_key).or_default().push(i);
+                partitions
+                    .entry(partition_key)
+                    .or_insert_with(window_partition_bucket)
+                    .push(i);
             }
             let mut partition_values = Vec::with_capacity(partitions.len());
             for (_, indices) in partitions {
@@ -3325,5 +3332,16 @@ impl Executor {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_partition_bucket_preallocates_first_row_index() {
+        let bucket = window_partition_bucket();
+        assert!(bucket.capacity() >= 1);
     }
 }
