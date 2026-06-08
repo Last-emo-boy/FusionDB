@@ -1,0 +1,55 @@
+{
+  "id": "benchprod-199-or-branch-predicate-prealloc",
+  "objective": "Preallocate OR-branch predicate vectors from known branch counts during predicate planning.",
+  "status": "completed",
+  "created_at": "2026-06-08T19:06:00+08:00",
+  "completed_at": "2026-06-08T19:09:29+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-199",
+      "title": "Preallocate OR branch predicate vectors",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/predicate.rs"
+      ],
+      "result": "Predicate planning now builds OR branch predicate lists with explicit capacity from the split branch count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test collect_conjunctive_predicates_lifts_common_or_join_key -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_select test_where_or -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_or_branch_common_join_key_matches_chbenchmark_q19_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join test_implicit_join_common_or_equi_predicate_matches_chbenchmark_q19_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full."
+  ]
+}

@@ -98,14 +98,12 @@ impl Executor {
             return None;
         }
 
-        let branch_predicates = branches
-            .iter()
-            .map(|branch| {
-                let mut predicates = Vec::with_capacity(Self::conjunctive_predicate_count(branch));
-                Self::split_conjunctive_predicates(branch, &mut predicates);
-                predicates
-            })
-            .collect::<Vec<_>>();
+        let mut branch_predicates = Vec::with_capacity(branches.len());
+        for branch in &branches {
+            let mut predicates = Vec::with_capacity(Self::conjunctive_predicate_count(branch));
+            Self::split_conjunctive_predicates(branch, &mut predicates);
+            branch_predicates.push(predicates);
+        }
 
         let first_branch = branch_predicates.first()?;
         let mut common = Vec::with_capacity(first_branch.len());
