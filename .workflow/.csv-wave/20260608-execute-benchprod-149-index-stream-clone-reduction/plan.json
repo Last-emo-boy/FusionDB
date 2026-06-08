@@ -1,0 +1,42 @@
+{
+  "id": "benchprod-149-index-stream-clone-reduction",
+  "objective": "Reduce per-row allocation and clone overhead in the large index-fetch stream path.",
+  "status": "completed",
+  "created_at": "2026-06-08T15:10:00+08:00",
+  "completed_at": "2026-06-08T15:14:14+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-149",
+      "title": "Large index stream fetch clone reduction",
+      "status": "completed",
+      "evidence": [
+        "src/execution/scan/index_plan.rs",
+        "src/execution/scan/mod.rs",
+        "tests/sql_index_cache.rs"
+      ],
+      "result": "Large index fetch streams now share table names and projection index slices through Arc and build key-only primary-key rows from precomputed schema width/type metadata instead of cloning schema columns per row."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_index_cache test_primary_key_in_projection_stream_skips_payload_decode -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_index_cache",
+      "status": "passed: 37/37"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 30/30"
+    }
+  ]
+}

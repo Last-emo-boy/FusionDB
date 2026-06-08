@@ -16,6 +16,7 @@ use sqlparser::ast::{
     TableFunctionArgs,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::analyze::{ColumnStats, TableStats};
 use super::Executor;
@@ -1118,22 +1119,41 @@ impl Executor {
                                 } else {
                                     let txn_ref = &*txn;
 
-                                    let table_name_for_stream = table_name.clone();
-                                    let schema_cols = schema.columns.clone();
-                                    let projection_indices_for_stream = projection_indices.clone();
+                                    let table_name_for_stream =
+                                        Arc::<str>::from(table_name.as_str());
+                                    let projection_indices_for_stream =
+                                        projection_indices.clone().map(Arc::<[usize]>::from);
+                                    let schema_width = schema.columns.len();
+                                    let pk_type_upper_for_stream = if key_only_scan {
+                                        pk_index.and_then(|idx| {
+                                            schema.columns.get(idx).map(|column| {
+                                                Arc::<str>::from(
+                                                    column
+                                                        .data_type
+                                                        .to_ascii_uppercase()
+                                                        .into_boxed_str(),
+                                                )
+                                            })
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     let executor_for_stream = self;
 
                                     let fetch_stream = futures::stream::iter(row_ids_vec)
                                         .map(|row_id| {
                                             let table_name = table_name_for_stream.clone();
-                                            let schema_cols = schema_cols.clone();
                                             let projection_indices =
                                                 projection_indices_for_stream.clone();
+                                            let pk_type_upper = pk_type_upper_for_stream.clone();
                                             let executor = executor_for_stream;
 
                                             async move {
-                                                let data_key =
-                                                    format!("data:{}:{}", table_name, row_id);
+                                                let data_key = format!(
+                                                    "data:{}:{}",
+                                                    table_name.as_ref(),
+                                                    row_id
+                                                );
 
                                                 if let Some(row) = executor.row_cache.get(&data_key)
                                                 {
@@ -1143,12 +1163,11 @@ impl Executor {
                                                 }
 
                                                 if key_only_scan {
-                                                    let schema = TableSchema::new(
-                                                        table_name.clone(),
-                                                        schema_cols,
-                                                    );
-                                                    let r = Self::primary_key_row_from_id(
-                                                        &schema, pk_index, &row_id,
+                                                    let r = Self::primary_key_row_from_parts(
+                                                        schema_width,
+                                                        pk_index,
+                                                        pk_type_upper.as_deref(),
+                                                        &row_id,
                                                     );
                                                     return Ok(Some((
                                                         row_id, r, false, false, false,

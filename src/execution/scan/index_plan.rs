@@ -212,27 +212,46 @@ impl Executor {
         pk_index: Option<usize>,
         row_id: &str,
     ) -> Vec<Value> {
-        let mut row = vec![Value::Null; schema.columns.len()];
-        if let Some(pk_idx) = pk_index {
-            if pk_idx < schema.columns.len() {
-                let upper = schema.columns[pk_idx].data_type.to_ascii_uppercase();
-                row[pk_idx] = if crate::execution::Executor::is_integer_type_name(&upper) {
-                    crate::common::encoding::decode_i64_comparable(row_id)
-                        .map(Value::Integer)
-                        .unwrap_or_else(|| Value::String(row_id.to_string()))
-                } else if upper == "DATE" {
-                    crate::common::encoding::decode_i64_comparable(row_id)
-                        .map(|days| Value::Date(days as i32))
-                        .unwrap_or_else(|| Value::String(row_id.to_string()))
-                } else if upper.starts_with("TIMESTAMP") || upper == "DATETIME" {
-                    crate::common::encoding::decode_i64_comparable(row_id)
-                        .map(Value::Timestamp)
-                        .unwrap_or_else(|| Value::String(row_id.to_string()))
-                } else {
-                    Value::String(row_id.to_string())
-                };
-            }
+        let pk_type_upper = pk_index
+            .and_then(|pk_idx| schema.columns.get(pk_idx))
+            .map(|column| column.data_type.to_ascii_uppercase());
+        Self::primary_key_row_from_parts(
+            schema.columns.len(),
+            pk_index,
+            pk_type_upper.as_deref(),
+            row_id,
+        )
+    }
+
+    pub(super) fn primary_key_row_from_parts(
+        schema_width: usize,
+        pk_index: Option<usize>,
+        pk_type_upper: Option<&str>,
+        row_id: &str,
+    ) -> Vec<Value> {
+        let mut row = vec![Value::Null; schema_width];
+        let (Some(pk_idx), Some(upper)) = (pk_index, pk_type_upper) else {
+            return row;
+        };
+        if pk_idx >= schema_width {
+            return row;
         }
+
+        row[pk_idx] = if crate::execution::Executor::is_integer_type_name(upper) {
+            crate::common::encoding::decode_i64_comparable(row_id)
+                .map(Value::Integer)
+                .unwrap_or_else(|| Value::String(row_id.to_string()))
+        } else if upper == "DATE" {
+            crate::common::encoding::decode_i64_comparable(row_id)
+                .map(|days| Value::Date(days as i32))
+                .unwrap_or_else(|| Value::String(row_id.to_string()))
+        } else if upper.starts_with("TIMESTAMP") || upper == "DATETIME" {
+            crate::common::encoding::decode_i64_comparable(row_id)
+                .map(Value::Timestamp)
+                .unwrap_or_else(|| Value::String(row_id.to_string()))
+        } else {
+            Value::String(row_id.to_string())
+        };
         row
     }
 

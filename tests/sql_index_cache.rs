@@ -1410,6 +1410,68 @@ async fn test_primary_key_only_equality_projection() {
 }
 
 #[tokio::test]
+async fn test_primary_key_in_projection_stream_skips_payload_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_in_stream (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+
+    let values = (1..=80)
+        .map(|id| format!("({}, 'payload-{}')", id, id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    exec_ok(
+        &executor,
+        &format!("INSERT INTO pk_in_stream VALUES {}", values),
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for id in 1..=80 {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 1usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:pk_in_stream:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let in_list = (1..=80)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (cols, rows) = query(
+        &executor,
+        &format!("SELECT id FROM pk_in_stream WHERE id IN ({})", in_list),
+    )
+    .await;
+
+    let expected = (1..=80)
+        .map(|id| vec![Value::Integer(id)])
+        .collect::<Vec<_>>();
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, expected);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_primary_key_point_lookup_reuses_row_cache() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
