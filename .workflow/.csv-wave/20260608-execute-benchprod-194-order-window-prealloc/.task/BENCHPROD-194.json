@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-194",
+  "title": "Preallocate ORDER BY window rows",
+  "status": "completed",
+  "created_at": "2026-06-08T18:44:00+08:00",
+  "completed_at": "2026-06-08T18:48:01+08:00",
+  "scope": "ORDER BY limit/offset Top-N window row vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/order.rs"
+      ],
+      "summary": [
+        "Replaced iterator collect for indexed Top-N input rows with an explicitly preallocated vector.",
+        "Restored sorted rows into a preallocated vector after window truncation.",
+        "Preserved original-index tie ordering and existing Top-N selection behavior."
+      ]
+    },
+    "tests": {
+      "select_order_by_limit_offset": "passed",
+      "select_order_by_primary_key_limit_offset": "passed",
+      "group_by_aggregate_order_by_limit_offset_topn_window": "passed",
+      "sql_select": "27/27 passed",
+      "sql_group_aggregate": "50/50 passed",
+      "sql_index_cache": "37/37 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused ORDER BY, projection, expression, scan, or predicate hot path."
+  ]
+}

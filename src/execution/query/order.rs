@@ -470,8 +470,11 @@ impl Executor {
             }
 
             if window < rows.len() {
-                let mut indexed_rows: Vec<(usize, Vec<Value>)> =
-                    std::mem::take(rows).into_iter().enumerate().collect();
+                let taken_rows = std::mem::take(rows);
+                let mut indexed_rows = Vec::with_capacity(taken_rows.len());
+                for (index, row) in taken_rows.into_iter().enumerate() {
+                    indexed_rows.push((index, row));
+                }
 
                 let compare_indexed = |left: &(usize, Vec<Value>), right: &(usize, Vec<Value>)| {
                     let ordering =
@@ -486,7 +489,11 @@ impl Executor {
                 let _ = indexed_rows.select_nth_unstable_by(window, compare_indexed);
                 indexed_rows.truncate(window);
                 indexed_rows.sort_by(compare_indexed);
-                *rows = indexed_rows.into_iter().map(|(_, row)| row).collect();
+                let mut sorted_rows = Vec::with_capacity(indexed_rows.len());
+                for (_, row) in indexed_rows {
+                    sorted_rows.push(row);
+                }
+                *rows = sorted_rows;
                 return;
             }
         }
