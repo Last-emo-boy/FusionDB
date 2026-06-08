@@ -15,6 +15,14 @@ fn foreign_key_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+fn foreign_key_data_prefix_for_table(table_name: &str) -> String {
+    let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+    prefix.push_str("data:");
+    prefix.push_str(table_name);
+    prefix.push(':');
+    prefix
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ForeignKeyMeta {
     pub name: String,
@@ -472,7 +480,7 @@ impl Executor {
             };
             column_indexes.push(column_idx);
         }
-        let prefix = format!("data:{}:", table_name);
+        let prefix = foreign_key_data_prefix_for_table(table_name);
         let rows = txn.scan_prefix(prefix.as_bytes(), None).await?;
         for (key, bytes) in rows {
             let row = if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -522,7 +530,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::foreign_key_data_key_for_row_id;
+    use super::{foreign_key_data_key_for_row_id, foreign_key_data_prefix_for_table};
 
     #[test]
     fn foreign_key_data_key_for_row_id_preallocates_exact_key() {
@@ -530,5 +538,13 @@ mod tests {
 
         assert_eq!(key, "data:warehouse:0007");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn foreign_key_data_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = foreign_key_data_prefix_for_table("warehouse");
+
+        assert_eq!(prefix, "data:warehouse:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }
