@@ -21,6 +21,34 @@ async fn test_create_table() {
 }
 
 #[tokio::test]
+async fn test_show_all_returns_settings_rows() {
+    let (executor, wal) = setup().await;
+    let results = executor.execute_sql("SHOW ALL").await.unwrap();
+
+    if let Some(QueryResult::Select { columns, rows }) = results.first() {
+        assert_eq!(
+            columns,
+            &vec![
+                "name".to_string(),
+                "setting".to_string(),
+                "description".to_string()
+            ]
+        );
+        assert!(rows.iter().any(|row| {
+            row[0] == Value::String("server_version".to_string())
+                && row[1] == Value::String("15.0".to_string())
+        }));
+        assert!(rows
+            .iter()
+            .any(|row| row[0] == Value::String("max_index_keys".to_string())));
+    } else {
+        panic!("Expected Select result from SHOW ALL");
+    }
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_create_table_table_level_single_primary_key() {
     let (executor, wal) = setup().await;
     exec_ok(

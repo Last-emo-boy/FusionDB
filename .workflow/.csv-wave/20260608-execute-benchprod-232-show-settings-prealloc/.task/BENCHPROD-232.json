@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-232",
+  "title": "Preallocate SHOW ALL settings rows",
+  "status": "completed",
+  "created_at": "2026-06-08T21:51:00+08:00",
+  "completed_at": "2026-06-08T21:57:00+08:00",
+  "scope": "SHOW ALL settings result construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/ddl/show.rs",
+        "tests/sql_ddl.rs"
+      ],
+      "summary": [
+        "Replaced fixed settings iterator collect with Vec::with_capacity(settings.len()).",
+        "Preserved each SHOW ALL row's name, setting, and description values.",
+        "Added an executor-level SHOW ALL regression test."
+      ]
+    },
+    "tests": {
+      "show_all_settings_rows": "passed",
+      "sql_ddl": "29/29 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

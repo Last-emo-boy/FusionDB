@@ -6,7 +6,7 @@ use super::super::{Executor, QueryResult};
 
 impl Executor {
     pub(crate) fn show_all_settings_result() -> QueryResult {
-        let rows = [
+        let settings = [
             (
                 "application_name",
                 "",
@@ -49,16 +49,15 @@ impl Executor {
                 "UTC",
                 "Sets the time zone for displaying and interpreting time stamps.",
             ),
-        ]
-        .into_iter()
-        .map(|(name, setting, description)| {
-            vec![
+        ];
+        let mut rows = Vec::with_capacity(settings.len());
+        for (name, setting, description) in settings {
+            rows.push(vec![
                 Value::String(name.to_string()),
                 Value::String(setting.to_string()),
                 Value::String(description.to_string()),
-            ]
-        })
-        .collect();
+            ]);
+        }
 
         QueryResult::Select {
             columns: vec![
