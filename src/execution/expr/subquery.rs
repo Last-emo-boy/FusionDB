@@ -94,11 +94,15 @@ impl Executor {
                 }
                 let result = Box::pin(self.handle_query(&bound_subquery, txn, params)).await?;
                 let values = match result {
-                    QueryResult::Select { rows, .. } => rows
-                        .into_iter()
-                        .filter_map(|row| row.into_iter().next())
-                        .map(|v| self.fusion_value_to_sql_expr(&v))
-                        .collect(),
+                    QueryResult::Select { rows, .. } => {
+                        let mut values = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            if let Some(value) = row.into_iter().next() {
+                                values.push(self.fusion_value_to_sql_expr(&value));
+                            }
+                        }
+                        values
+                    }
                     _ => vec![],
                 };
                 Ok(Expr::InList {

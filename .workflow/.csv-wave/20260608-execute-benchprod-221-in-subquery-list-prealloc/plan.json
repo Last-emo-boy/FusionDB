@@ -1,0 +1,44 @@
+{
+  "id": "benchprod-221-in-subquery-list-prealloc",
+  "objective": "Preallocate IN-subquery materialized expression lists from result row counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T20:34:00+08:00",
+  "completed_at": "2026-06-08T20:36:40+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-221",
+      "title": "Preallocate IN-subquery lists",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "result": "IN-subquery materialization now preallocates the SQL expression list from the known result row count before taking each row's first value."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_subquery_in -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery test_subquery_not_in -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The materialization still skips empty rows and converts only each result row's first value."
+  ]
+}

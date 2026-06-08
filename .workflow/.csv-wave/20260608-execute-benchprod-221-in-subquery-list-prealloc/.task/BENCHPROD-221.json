@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-221",
+  "title": "Preallocate IN-subquery lists",
+  "status": "completed",
+  "created_at": "2026-06-08T20:34:00+08:00",
+  "completed_at": "2026-06-08T20:36:40+08:00",
+  "scope": "IN-subquery materialized expression list construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "summary": [
+        "Replaced IN-subquery filter_map/map collect with an explicitly preallocated vector sized from rows.len().",
+        "Preserved the behavior of skipping empty result rows.",
+        "Preserved conversion of only each result row's first value into a SQL expression."
+      ]
+    },
+    "tests": {
+      "subquery_in": "passed",
+      "subquery_not_in": "passed",
+      "sql_set_subquery": "48/48 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
