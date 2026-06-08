@@ -14,7 +14,7 @@
     {
       "id": "TASK-138",
       "title": "GROUP BY COUNT(DISTINCT column) column-scan fast path",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Add per-group distinct accumulator state to the column aggregate fast path.",
         "Accept COUNT(DISTINCT column) in simple GROUP BY aggregate projection detection.",

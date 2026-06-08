@@ -14,7 +14,7 @@
     {
       "id": "TASK-149",
       "title": "Reuse decoded predicate values in column scans",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Decode the simple predicate column once per row.",
         "Reuse the decoded predicate value when it is also the aggregate, distinct, or group column.",

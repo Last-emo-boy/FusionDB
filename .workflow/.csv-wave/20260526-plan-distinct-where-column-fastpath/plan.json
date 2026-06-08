@@ -14,7 +14,7 @@
     {
       "id": "TASK-143",
       "title": "Single-column DISTINCT with simple WHERE column scan",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Allow SELECT DISTINCT column FROM table WHERE simple_column_predicate to use column-level decoding.",
         "Reuse existing simple predicate scan planning.",

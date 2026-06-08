@@ -14,7 +14,7 @@
     {
       "id": "TASK-140",
       "title": "Bare MIN/MAX ordinary-column scan fast path",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Add MIN/MAX state to the bare column aggregate fast path.",
         "Accept MIN(column) and MAX(column) in simple bare aggregate projection detection.",

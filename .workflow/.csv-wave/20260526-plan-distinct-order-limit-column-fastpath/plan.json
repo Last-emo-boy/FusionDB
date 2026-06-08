@@ -14,7 +14,7 @@
     {
       "id": "TASK-147",
       "title": "Single-column DISTINCT ORDER/LIMIT column scan",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Allow single-column DISTINCT fast path to run when ORDER BY references the output column or ordinal.",
         "Apply existing simple order/limit handling after column-level DISTINCT scan.",

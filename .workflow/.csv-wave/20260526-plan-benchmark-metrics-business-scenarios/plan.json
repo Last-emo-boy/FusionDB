@@ -14,7 +14,7 @@
     {
       "id": "TASK-137",
       "title": "Extend benchmark metrics and business scenarios",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Add latency stability metrics to BenchResult and JSON report output.",
         "Track success/error counts and concurrent workload throughput metadata.",

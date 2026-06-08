@@ -14,7 +14,7 @@
     {
       "id": "TASK-141",
       "title": "Bare STRING_AGG/GROUP_CONCAT ordinary-column scan fast path",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Add STRING_AGG state to the bare column aggregate fast path.",
         "Accept STRING_AGG(column) and GROUP_CONCAT(column) in simple bare aggregate projection detection.",

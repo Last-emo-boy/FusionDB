@@ -14,7 +14,7 @@
     {
       "id": "TASK-148",
       "title": "Benchmark DISTINCT ORDER and GROUP BY WHERE fast paths",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Add benchmark metrics for DISTINCT ORDER BY LIMIT.",
         "Add benchmark metrics for filtered GROUP BY COUNT and SUM workloads.",

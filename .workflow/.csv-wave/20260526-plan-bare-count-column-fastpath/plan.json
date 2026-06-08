@@ -14,7 +14,7 @@
     {
       "id": "TASK-142",
       "title": "Bare COUNT(nullable column) ordinary-column scan fast path",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Add COUNT(column) state to the bare column aggregate fast path.",
         "Preserve prefix-count fast paths for COUNT(*), COUNT(literal), COUNT(primary key), and COUNT(NOT NULL column).",

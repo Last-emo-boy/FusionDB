@@ -14,7 +14,7 @@
     {
       "id": "TASK-139",
       "title": "GROUP BY STRING_AGG/GROUP_CONCAT column-scan fast path",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Add per-group string aggregation state to the column aggregate fast path.",
         "Accept STRING_AGG(column) and GROUP_CONCAT(column) in simple GROUP BY aggregate projection detection.",

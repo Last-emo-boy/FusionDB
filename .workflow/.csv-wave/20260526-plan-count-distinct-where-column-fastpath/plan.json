@@ -14,7 +14,7 @@
     {
       "id": "TASK-144",
       "title": "COUNT(DISTINCT column) with simple WHERE column scan",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Allow COUNT(DISTINCT column) FROM table WHERE simple_column_predicate to use column-level decoding.",
         "Reuse existing simple predicate scan planning.",

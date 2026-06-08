@@ -14,7 +14,7 @@
     {
       "id": "TASK-146",
       "title": "GROUP BY aggregates with simple WHERE column scan",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Allow GROUP BY COUNT(*) and grouped aggregate column scans to accept a simple predicate.",
         "Reuse existing ColumnPredicateScanPlan and skip rows before group/aggregate decoding.",

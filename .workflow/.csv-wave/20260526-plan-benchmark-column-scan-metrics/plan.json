@@ -14,7 +14,7 @@
     {
       "id": "TASK-145",
       "title": "Benchmark column-scan fast path metrics",
-      "status": "planned",
+      "status": "completed",
       "expected_changes": [
         "Add a benchmark section for narrow column-scan aggregate and DISTINCT workloads.",
         "Cover COUNT(column), COUNT(DISTINCT ... WHERE ...), DISTINCT ... WHERE ..., MIN/MAX, STRING_AGG, and GROUP_CONCAT.",
