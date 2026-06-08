@@ -37,8 +37,8 @@ impl Executor {
         let mut schema: TableSchema = bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
-        let mut target_col_indices = Vec::new();
-        let mut target_col_names = Vec::new();
+        let mut target_col_indices = Vec::with_capacity(columns.len());
+        let mut target_col_names = Vec::with_capacity(columns.len());
         for index_col in columns {
             let col_expr = &index_col.column;
             if let Expr::Identifier(ident) = &col_expr.expr {
