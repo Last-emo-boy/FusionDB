@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-183-exists-join-cache-prealloc",
+  "objective": "Preallocate EXISTS join membership cache values from the probe-side row count.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:01:15+08:00",
+  "completed_at": "2026-06-08T18:04:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-183",
+      "title": "Preallocate EXISTS join cache values",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/subquery.rs"
+      ],
+      "result": "EXISTS join membership now builds cached probe values in a HashSet sized from the probe-side scanned row count."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_exists_two_table_membership_matches_ldbc_q6_shape -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery test_correlated_not_exists_membership_filter_with_alias -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join test_comma_join_reorder_preserves_ldbc_q4_shape_with_deferred_exists -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

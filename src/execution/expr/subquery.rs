@@ -566,37 +566,43 @@ impl Executor {
                 }
             }
 
-            let values = match plan.probe_side {
-                ExistsJoinSide::Left => left_rows
-                    .into_iter()
-                    .filter_map(|row| {
-                        let join_value = row.get(left_join_index)?;
+            let mut values = HashSet::with_capacity(match plan.probe_side {
+                ExistsJoinSide::Left => left_rows.len(),
+                ExistsJoinSide::Right => right_rows.len(),
+            });
+            match plan.probe_side {
+                ExistsJoinSide::Left => {
+                    for row in left_rows {
+                        let Some(join_value) = row.get(left_join_index) else {
+                            continue;
+                        };
                         let joined = match plan.filter_side {
                             ExistsJoinSide::Left => matching_left_keys.contains(join_value),
                             ExistsJoinSide::Right => matching_right_keys.contains(join_value),
                         };
                         if joined {
-                            row.get(probe_index).cloned()
-                        } else {
-                            None
+                            if let Some(value) = row.get(probe_index).cloned() {
+                                values.insert(value);
+                            }
                         }
-                    })
-                    .collect(),
-                ExistsJoinSide::Right => right_rows
-                    .into_iter()
-                    .filter_map(|row| {
-                        let join_value = row.get(right_join_index)?;
+                    }
+                }
+                ExistsJoinSide::Right => {
+                    for row in right_rows {
+                        let Some(join_value) = row.get(right_join_index) else {
+                            continue;
+                        };
                         let joined = match plan.filter_side {
                             ExistsJoinSide::Left => matching_left_keys.contains(join_value),
                             ExistsJoinSide::Right => matching_right_keys.contains(join_value),
                         };
                         if joined {
-                            row.get(probe_index).cloned()
-                        } else {
-                            None
+                            if let Some(value) = row.get(probe_index).cloned() {
+                                values.insert(value);
+                            }
                         }
-                    })
-                    .collect(),
+                    }
+                }
             };
 
             membership_caches.insert(
