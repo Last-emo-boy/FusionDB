@@ -101,6 +101,12 @@ impl Executor {
         unique_rows
     }
 
+    fn row_hash_set(rows: Vec<Vec<Value>>) -> HashSet<Vec<Value>> {
+        let mut set = HashSet::with_capacity(rows.len());
+        set.extend(rows);
+        set
+    }
+
     fn trim_set_rows_in_place(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<usize>) {
         if offset >= rows.len() {
             rows.clear();
@@ -2908,14 +2914,14 @@ impl Executor {
                     all_rows
                 }
                 SetOperator::Intersect => {
-                    let right_set: HashSet<Vec<Value>> = right_rows.into_iter().collect();
+                    let right_set = Self::row_hash_set(right_rows);
                     left_rows
                         .into_iter()
                         .filter(|row| right_set.contains(row))
                         .collect()
                 }
                 SetOperator::Except => {
-                    let right_set: HashSet<Vec<Value>> = right_rows.into_iter().collect();
+                    let right_set = Self::row_hash_set(right_rows);
                     left_rows
                         .into_iter()
                         .filter(|row| !right_set.contains(row))

@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-153",
+  "title": "Preallocate INTERSECT/EXCEPT right row sets",
+  "status": "completed",
+  "created_at": "2026-06-08T15:27:00+08:00",
+  "completed_at": "2026-06-08T15:30:15+08:00",
+  "scope": "INTERSECT and EXCEPT right-side row HashSet construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Added row_hash_set to build a right-side row HashSet with capacity equal to the right row count.",
+        "Replaced direct collect-based HashSet construction in INTERSECT and EXCEPT.",
+        "Added duplicate-right-row coverage for INTERSECT and EXCEPT."
+      ]
+    },
+    "tests": {
+      "intersect_except_with_duplicate_right_rows": "passed",
+      "fmt_check": "passed",
+      "sql_set_subquery": "38/38 passed",
+      "sql_select": "27/27 passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused set/query/scan hot path."
+  ]
+}

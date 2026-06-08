@@ -332,6 +332,58 @@ async fn test_intersect() {
 }
 
 #[tokio::test]
+async fn test_intersect_except_with_duplicate_right_rows() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE set_left_dup (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE set_right_dup (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO set_left_dup VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO set_right_dup VALUES (1, 'b'), (2, 'b'), (3, 'd')",
+    )
+    .await;
+
+    let (_, intersect_rows) = query(
+        &executor,
+        "SELECT name FROM set_left_dup INTERSECT SELECT name FROM set_right_dup ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        intersect_rows,
+        vec![
+            vec![Value::String("b".to_string())],
+            vec![Value::String("d".to_string())],
+        ]
+    );
+
+    let (_, except_rows) = query(
+        &executor,
+        "SELECT name FROM set_left_dup EXCEPT SELECT name FROM set_right_dup ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        except_rows,
+        vec![
+            vec![Value::String("a".to_string())],
+            vec![Value::String("c".to_string())],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_subquery_in() {
     let (executor, wal) = setup().await;
     exec_ok(
