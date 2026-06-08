@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-208",
+  "title": "Preallocate insert default rows",
+  "status": "completed",
+  "created_at": "2026-06-08T19:47:00+08:00",
+  "completed_at": "2026-06-08T19:50:19+08:00",
+  "scope": "Column-list INSERT full-row default construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/dml/insert.rs"
+      ],
+      "summary": [
+        "Replaced implicit collect allocation with Vec::with_capacity(schema.columns.len()) in prepared raw VALUES row mapping.",
+        "Applied the same preallocation to the inline VALUES insert path before overlaying mapped column values.",
+        "Preserved default parsing, type coercion, serial default candidate filtering, and column count validation."
+      ]
+    },
+    "tests": {
+      "insert_with_column_list": "passed",
+      "insert_omitted_serial_primary_key_generates_ids": "passed",
+      "copy_from_csv_with_column_list_and_defaults": "passed",
+      "sql_dml": "43/43 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

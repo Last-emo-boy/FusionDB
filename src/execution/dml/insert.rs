@@ -196,22 +196,17 @@ impl Executor {
             }
             let mut missing_serial_indexes =
                 Self::serial_default_candidate_column_indexes(&context.schema);
-            let mut full_row: Vec<Value> = context
-                .schema
-                .columns
-                .iter()
-                .map(|col| {
-                    if let Some(ref def_str) = col.default_value {
-                        self.parse_default_value(def_str)
-                            .and_then(|value| {
-                                Self::coerce_value_to_column_type(value, &col.data_type)
-                            })
-                            .unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    }
-                })
-                .collect();
+            let mut full_row = Vec::with_capacity(context.schema.columns.len());
+            for col in &context.schema.columns {
+                let value = if let Some(ref def_str) = col.default_value {
+                    self.parse_default_value(def_str)
+                        .and_then(|value| Self::coerce_value_to_column_type(value, &col.data_type))
+                        .unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
+                full_row.push(value);
+            }
             for (i, &schema_idx) in mapping.iter().enumerate() {
                 full_row[schema_idx] = raw_values[i].clone();
             }
@@ -650,22 +645,18 @@ impl Executor {
                     }
 
                     // If column list specified, map values to full row with defaults for missing columns
-                    let (mut row_values, missing_serial_indexes) = if let Some(ref mapping) =
-                        col_mapping
-                    {
-                        if raw_values.len() != mapping.len() {
-                            return Err(FusionError::Execution(
-                                "Column count mismatch".to_string(),
-                            ));
-                        }
-                        let mut missing_serial_indexes =
-                            Self::serial_default_candidate_column_indexes(&schema);
-                        let mut full_row: Vec<Value> = schema
-                            .columns
-                            .iter()
-                            .map(|col| {
-                                // Use DEFAULT value if specified, otherwise NULL
-                                if let Some(ref def_str) = col.default_value {
+                    let (mut row_values, missing_serial_indexes) =
+                        if let Some(ref mapping) = col_mapping {
+                            if raw_values.len() != mapping.len() {
+                                return Err(FusionError::Execution(
+                                    "Column count mismatch".to_string(),
+                                ));
+                            }
+                            let mut missing_serial_indexes =
+                                Self::serial_default_candidate_column_indexes(&schema);
+                            let mut full_row = Vec::with_capacity(schema.columns.len());
+                            for col in &schema.columns {
+                                let value = if let Some(ref def_str) = col.default_value {
                                     self.parse_default_value(def_str)
                                         .and_then(|value| {
                                             Self::coerce_value_to_column_type(value, &col.data_type)
@@ -673,17 +664,17 @@ impl Executor {
                                         .unwrap_or(Value::Null)
                                 } else {
                                     Value::Null
-                                }
-                            })
-                            .collect();
-                        for (i, &schema_idx) in mapping.iter().enumerate() {
-                            full_row[schema_idx] = raw_values[i].clone();
-                        }
-                        missing_serial_indexes.retain(|idx| !mapping.contains(idx));
-                        (full_row, missing_serial_indexes)
-                    } else {
-                        (raw_values, Vec::new())
-                    };
+                                };
+                                full_row.push(value);
+                            }
+                            for (i, &schema_idx) in mapping.iter().enumerate() {
+                                full_row[schema_idx] = raw_values[i].clone();
+                            }
+                            missing_serial_indexes.retain(|idx| !mapping.contains(idx));
+                            (full_row, missing_serial_indexes)
+                        } else {
+                            (raw_values, Vec::new())
+                        };
 
                     if row_values.len() != schema.columns.len() {
                         return Err(FusionError::Execution("Column count mismatch".to_string()));
