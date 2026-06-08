@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-243-sstable-index-prealloc",
+  "objective": "Preallocate SSTable parallel index arrays from the known deserialized index length.",
+  "status": "completed",
+  "created_at": "2026-06-08T22:29:36+08:00",
+  "completed_at": "2026-06-08T22:29:36+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-243",
+      "title": "Preallocate SSTable index arrays",
+      "status": "completed",
+      "evidence": [
+        "src/storage/sstable.rs"
+      ],
+      "result": "SSTable open now preallocates index key and offset arrays from the known BTreeMap length and fills both arrays in a single ordered pass."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_fusion_storage_sstable_seek_finds_tpcc_district_mid_block -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_fusion_storage_prefix_scan_seeks_inside_sstable_block -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test fusion_reopen_uses_fresh_memtable_id_after_existing_sstables -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test fusion_last_reads_visible_key_from_sstable -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves BTreeMap key order and keeps index_keys and index_offsets positionally aligned by pushing both values from the same iteration."
+  ]
+}

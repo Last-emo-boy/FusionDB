@@ -101,8 +101,12 @@ impl SsTable {
             crate::common::FusionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
 
-        let index_keys: Vec<Vec<u8>> = index.keys().cloned().collect();
-        let index_offsets: Vec<u64> = index.values().cloned().collect();
+        let mut index_keys = Vec::with_capacity(index.len());
+        let mut index_offsets = Vec::with_capacity(index.len());
+        for (key, offset) in &index {
+            index_keys.push(key.clone());
+            index_offsets.push(*offset);
+        }
 
         Ok(Self {
             id,

@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-243",
+  "title": "Preallocate SSTable index arrays",
+  "status": "completed",
+  "created_at": "2026-06-08T22:29:36+08:00",
+  "completed_at": "2026-06-08T22:29:36+08:00",
+  "scope": "SSTable open index array reconstruction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/storage/sstable.rs"
+      ],
+      "summary": [
+        "Replaced separate BTreeMap keys and values collects with Vec::with_capacity(index.len()).",
+        "Filled index_keys and index_offsets in one ordered pass over the deserialized BTreeMap.",
+        "Preserved BTreeMap ordering and positional alignment for seek, prefix scan, iterator, reopen, and last-key paths."
+      ]
+    },
+    "tests": {
+      "sstable_seek_mid_block": "passed",
+      "sstable_prefix_scan_inside_block": "passed",
+      "fusion_reopen_memtable_id": "passed",
+      "fusion_last_visible_sstable_key": "passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, storage, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
