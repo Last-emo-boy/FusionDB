@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-235-create-table-meta-prealloc",
+  "objective": "Preallocate CREATE TABLE schema metadata buffers from parser-provided counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T21:47:46+08:00",
+  "completed_at": "2026-06-08T21:47:46+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-235",
+      "title": "Preallocate CREATE TABLE metadata buffers",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/table.rs"
+      ],
+      "result": "CREATE TABLE now preallocates schema columns and table-level primary-key constraint buffers from known AST slice lengths."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl test_create_table_table_level_single_primary_key -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl test_create_table_table_level_composite_primary_key -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_ddl",
+      "status": "passed: 29/29"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_view_show_constraints",
+      "status": "passed: 16/16"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves CREATE TABLE column metadata, primary-key detection, constraint validation, default/check formatting, and foreign-key validation order."
+  ]
+}

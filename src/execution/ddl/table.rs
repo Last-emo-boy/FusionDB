@@ -50,60 +50,58 @@ impl Executor {
             }
         }
         let table_primary_key = Self::extract_table_primary_key(columns, constraints)?;
-        let cols: Vec<Column> = columns
-            .iter()
-            .map(|c| {
-                let col_name = c.name.to_string();
-                let column_primary = c
-                    .options
-                    .iter()
-                    .any(|opt| matches!(&opt.option, ColumnOption::PrimaryKey(_)));
-                let is_primary = column_primary
-                    || table_primary_key
-                        .as_ref()
-                        .and_then(|pk| pk.single_primary_column())
-                        .is_some_and(|pk_name| pk_name.eq_ignore_ascii_case(&col_name));
-                let is_composite_primary = table_primary_key
+        let mut cols = Vec::with_capacity(columns.len());
+        for c in columns {
+            let col_name = c.name.to_string();
+            let column_primary = c
+                .options
+                .iter()
+                .any(|opt| matches!(&opt.option, ColumnOption::PrimaryKey(_)));
+            let is_primary = column_primary
+                || table_primary_key
                     .as_ref()
-                    .is_some_and(|pk| pk.columns.len() > 1 && pk.has_column(&col_name));
-                let default_value = c.options.iter().find_map(|opt| {
-                    if let ColumnOption::Default(expr) = &opt.option {
+                    .and_then(|pk| pk.single_primary_column())
+                    .is_some_and(|pk_name| pk_name.eq_ignore_ascii_case(&col_name));
+            let is_composite_primary = table_primary_key
+                .as_ref()
+                .is_some_and(|pk| pk.columns.len() > 1 && pk.has_column(&col_name));
+            let default_value = c.options.iter().find_map(|opt| {
+                if let ColumnOption::Default(expr) = &opt.option {
+                    Some(format!("{}", expr))
+                } else {
+                    None
+                }
+            });
+            cols.push(Column {
+                name: col_name,
+                data_type: format!("{}", c.data_type),
+                is_primary,
+                is_indexed: is_primary,
+                index_type: if is_primary {
+                    IndexType::BTree
+                } else {
+                    IndexType::None
+                },
+                default_value,
+                is_nullable: !is_primary
+                    && !is_composite_primary
+                    && !c
+                        .options
+                        .iter()
+                        .any(|opt| matches!(&opt.option, ColumnOption::NotNull)),
+                is_unique: is_primary
+                    || c.options
+                        .iter()
+                        .any(|opt| matches!(&opt.option, ColumnOption::Unique(_))),
+                check_expr: c.options.iter().find_map(|opt| {
+                    if let ColumnOption::Check(expr) = &opt.option {
                         Some(format!("{}", expr))
                     } else {
                         None
                     }
-                });
-                Column {
-                    name: col_name,
-                    data_type: format!("{}", c.data_type),
-                    is_primary,
-                    is_indexed: is_primary,
-                    index_type: if is_primary {
-                        IndexType::BTree
-                    } else {
-                        IndexType::None
-                    },
-                    default_value,
-                    is_nullable: !is_primary
-                        && !is_composite_primary
-                        && !c
-                            .options
-                            .iter()
-                            .any(|opt| matches!(&opt.option, ColumnOption::NotNull)),
-                    is_unique: is_primary
-                        || c.options
-                            .iter()
-                            .any(|opt| matches!(&opt.option, ColumnOption::Unique(_))),
-                    check_expr: c.options.iter().find_map(|opt| {
-                        if let ColumnOption::Check(expr) = &opt.option {
-                            Some(format!("{}", expr))
-                        } else {
-                            None
-                        }
-                    }),
-                }
-            })
-            .collect();
+                }),
+            });
+        }
 
         let foreign_keys = Self::collect_foreign_keys(&table_name, columns, constraints)?;
         for fk in &foreign_keys {
@@ -174,16 +172,12 @@ impl Executor {
                     .any(|opt| matches!(&opt.option, ColumnOption::PrimaryKey(_)))
             })
             .count();
-        let primary_constraints: Vec<&sqlparser::ast::PrimaryKeyConstraint> = constraints
-            .iter()
-            .filter_map(|constraint| {
-                if let TableConstraint::PrimaryKey(pk) = constraint {
-                    Some(pk)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut primary_constraints = Vec::with_capacity(constraints.len());
+        for constraint in constraints {
+            if let TableConstraint::PrimaryKey(pk) = constraint {
+                primary_constraints.push(pk);
+            }
+        }
 
         if column_primary_count > 0 && !primary_constraints.is_empty() {
             return Err(FusionError::Execution(

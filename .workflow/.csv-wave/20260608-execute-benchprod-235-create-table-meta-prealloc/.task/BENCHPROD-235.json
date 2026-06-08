@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-235",
+  "title": "Preallocate CREATE TABLE metadata buffers",
+  "status": "completed",
+  "created_at": "2026-06-08T21:47:46+08:00",
+  "completed_at": "2026-06-08T21:47:46+08:00",
+  "scope": "CREATE TABLE schema and primary-key metadata construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/ddl/table.rs"
+      ],
+      "summary": [
+        "Replaced CREATE TABLE column metadata collect with Vec::with_capacity(columns.len()) and explicit pushes.",
+        "Replaced table-level primary-key constraint collect with Vec::with_capacity(constraints.len()) and explicit pushes.",
+        "Preserved existing column option parsing, primary-key validation, and constraint error handling."
+      ]
+    },
+    "tests": {
+      "table_level_single_primary_key": "passed",
+      "table_level_composite_primary_key": "passed",
+      "sql_ddl": "29/29 passed",
+      "sql_view_show_constraints": "16/16 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused DDL, metadata, scan, projection, or query execution hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
