@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-230",
+  "title": "Preallocate EXPLAIN formatting buffers",
+  "status": "completed",
+  "created_at": "2026-06-08T21:36:00+08:00",
+  "completed_at": "2026-06-08T21:42:00+08:00",
+  "scope": "EXPLAIN statistics and join-order formatting",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/ddl/explain.rs"
+      ],
+      "summary": [
+        "Replaced EXPLAIN stats column snippet collect with Vec::with_capacity(stats.columns.len().min(4)).",
+        "Replaced join relation schema collect with Vec::with_capacity(relations.len()).",
+        "Replaced join-order label collect with Vec::with_capacity(order.len())."
+      ]
+    },
+    "tests": {
+      "explain_includes_analyze_statistics": "passed",
+      "explain_join_order_includes_analyze_estimates": "passed",
+      "sql_ddl": "28/28 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused scan, projection, index, predicate, or aggregate hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}

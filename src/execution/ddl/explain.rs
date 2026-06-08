@@ -484,21 +484,18 @@ impl Executor {
             return Ok(None);
         };
 
-        let column_parts = stats
-            .columns
-            .iter()
-            .take(4)
-            .map(|column| {
-                let mut part = format!(
-                    "{}(distinct={}, nulls={})",
-                    column.name, column.distinct_count, column.null_count
-                );
-                if let (Some(min), Some(max)) = (&column.min, &column.max) {
-                    part.push_str(&format!(", min={}, max={}", min, max));
-                }
-                part
-            })
-            .collect::<Vec<_>>();
+        let column_part_count = stats.columns.len().min(4);
+        let mut column_parts = Vec::with_capacity(column_part_count);
+        for column in stats.columns.iter().take(4) {
+            let mut part = format!(
+                "{}(distinct={}, nulls={})",
+                column.name, column.distinct_count, column.null_count
+            );
+            if let (Some(min), Some(max)) = (&column.min, &column.max) {
+                part.push_str(&format!(", min={}, max={}", min, max));
+            }
+            column_parts.push(part);
+        }
 
         let suffix = if stats.columns.len() > column_parts.len() {
             format!(", +{} more", stats.columns.len() - column_parts.len())
@@ -565,10 +562,10 @@ impl Executor {
         let relation_count = relations.len();
         let mut local_counts = vec![0usize; relation_count];
         let mut edge_counts = vec![vec![0usize; relation_count]; relation_count];
-        let schemas = relations
-            .iter()
-            .map(|relation| relation.schema.clone())
-            .collect::<Vec<_>>();
+        let mut schemas = Vec::with_capacity(relations.len());
+        for relation in &relations {
+            schemas.push(relation.schema.clone());
+        }
 
         for predicate in &predicates {
             let Some(members) = self.predicate_schema_members_for_explain(predicate, &schemas)
@@ -604,23 +601,22 @@ impl Executor {
 
         let order = Self::choose_explain_join_order(&relations, &local_counts, &edge_counts);
         let (rows, cost) = Self::estimate_join_order_cost(&relations, &order, &edge_counts);
-        let labels = order
-            .iter()
-            .map(|index| {
-                let relation = &relations[*index];
-                if relation.estimated_rows == relation.base_rows {
-                    format!(
-                        "{}(rows={})",
-                        relation.table.relation, relation.estimated_rows
-                    )
-                } else {
-                    format!(
-                        "{}(rows={} of {})",
-                        relation.table.relation, relation.estimated_rows, relation.base_rows
-                    )
-                }
-            })
-            .collect();
+        let mut labels = Vec::with_capacity(order.len());
+        for index in &order {
+            let relation = &relations[*index];
+            let label = if relation.estimated_rows == relation.base_rows {
+                format!(
+                    "{}(rows={})",
+                    relation.table.relation, relation.estimated_rows
+                )
+            } else {
+                format!(
+                    "{}(rows={} of {})",
+                    relation.table.relation, relation.estimated_rows, relation.base_rows
+                )
+            };
+            labels.push(label);
+        }
 
         Ok(Some(ExplainJoinOrder {
             order: labels,
