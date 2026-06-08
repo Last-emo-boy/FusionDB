@@ -1,0 +1,51 @@
+{
+  "id": "benchprod-196-column-aggregate-state-prealloc",
+  "objective": "Preallocate column aggregate state and finalize vectors from known plan/state counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T18:52:00+08:00",
+  "completed_at": "2026-06-08T18:56:07+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-196",
+      "title": "Preallocate column aggregate states",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "result": "Column aggregate fast paths now build aggregate state and finalized value vectors with explicit capacities from plan/state counts."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_bare_aggregate_sum_avg -- --nocapture",
+      "status": "passed: 2/2 filtered tests"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_bare_sum_avg_with_simple_where_column_scan -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_column_aggregates_fast_path_uses_only_group_and_aggregate_columns -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate test_group_by_aggregates_with_simple_where_uses_column_scan -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_group_aggregate",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "C: and the default TEMP drive reported 0 GB free, so cargo/linker verification used a temporary directory on E:. Cargo still warned that global cache last-use data could not be written, but all tests and checks exited successfully."
+  ]
+}

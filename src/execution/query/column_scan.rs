@@ -217,6 +217,22 @@ impl ColumnAggregateState {
     }
 }
 
+fn column_aggregate_states(plans: &[ColumnAggregateScanPlan]) -> Vec<ColumnAggregateState> {
+    let mut states = Vec::with_capacity(plans.len());
+    for plan in plans {
+        states.push(ColumnAggregateState::new(plan.kind));
+    }
+    states
+}
+
+fn finalize_column_aggregate_states(states: &[ColumnAggregateState]) -> Vec<Value> {
+    let mut values = Vec::with_capacity(states.len());
+    for state in states {
+        values.push(state.finalize());
+    }
+    values
+}
+
 struct ColumnAggregateScanVisitor<'a> {
     plans: &'a [ColumnAggregateScanPlan],
     predicate: Option<&'a ColumnPredicateScanPlan>,
@@ -291,6 +307,16 @@ struct GroupColumnAggregateState {
     strings: Vec<String>,
 }
 
+fn group_column_aggregate_states(
+    plans: &[GroupColumnAggregateScanPlan],
+) -> Vec<GroupColumnAggregateState> {
+    let mut states = Vec::with_capacity(plans.len());
+    for plan in plans {
+        states.push(GroupColumnAggregateState::new(plan.kind));
+    }
+    states
+}
+
 struct GroupAggregateScanVisitor<'a> {
     group_column_indices: &'a [usize],
     aggregate_plans: &'a [GroupColumnAggregateScanPlan],
@@ -319,12 +345,10 @@ impl GroupAggregateScanVisitor<'_> {
             )?);
         }
 
-        let states = self.groups.entry(group_values).or_insert_with(|| {
-            self.aggregate_plans
-                .iter()
-                .map(|plan| GroupColumnAggregateState::new(plan.kind))
-                .collect()
-        });
+        let states = self
+            .groups
+            .entry(group_values)
+            .or_insert_with(|| group_column_aggregate_states(self.aggregate_plans));
 
         for (state, plan) in states.iter_mut().zip(self.aggregate_plans.iter()) {
             if let Some(column_index) = plan.column_index {
@@ -381,12 +405,10 @@ impl SingleGroupAggregateScanVisitor<'_> {
             &self.predicate_values,
         )?;
 
-        let states = self.groups.entry(group_value).or_insert_with(|| {
-            self.aggregate_plans
-                .iter()
-                .map(|plan| GroupColumnAggregateState::new(plan.kind))
-                .collect()
-        });
+        let states = self
+            .groups
+            .entry(group_value)
+            .or_insert_with(|| group_column_aggregate_states(self.aggregate_plans));
 
         for (state, plan) in states.iter_mut().zip(self.aggregate_plans.iter()) {
             if let Some(column_index) = plan.column_index {
@@ -747,10 +769,7 @@ impl Executor {
         }
 
         let prefix = format!("data:{}:", table_name);
-        let mut states: Vec<ColumnAggregateState> = plans
-            .iter()
-            .map(|plan| ColumnAggregateState::new(plan.kind))
-            .collect();
+        let mut states = column_aggregate_states(plans);
 
         let scan_error = {
             let mut visitor = ColumnAggregateScanVisitor {
@@ -769,7 +788,7 @@ impl Executor {
             return Err(err);
         }
 
-        Ok(states.iter().map(ColumnAggregateState::finalize).collect())
+        Ok(finalize_column_aggregate_states(&states))
     }
 
     async fn simple_column_aggregate_index_scan(
@@ -811,10 +830,7 @@ impl Executor {
             return Ok(None);
         };
 
-        let mut states: Vec<ColumnAggregateState> = plans
-            .iter()
-            .map(|plan| ColumnAggregateState::new(plan.kind))
-            .collect();
+        let mut states = column_aggregate_states(plans);
         let mut visitor = ColumnAggregateScanVisitor {
             plans,
             predicate: Some(predicate),
@@ -848,9 +864,7 @@ impl Executor {
             return Ok(None);
         }
 
-        Ok(Some(
-            states.iter().map(ColumnAggregateState::finalize).collect(),
-        ))
+        Ok(Some(finalize_column_aggregate_states(&states)))
     }
 
     pub(super) fn simple_column_predicate_scan_plan(

@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-196",
+  "title": "Preallocate column aggregate states",
+  "status": "completed",
+  "created_at": "2026-06-08T18:52:00+08:00",
+  "completed_at": "2026-06-08T18:56:07+08:00",
+  "scope": "Column aggregate fast-path state vector allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/column_scan.rs"
+      ],
+      "summary": [
+        "Added helpers that build column aggregate state vectors with capacity from plan counts.",
+        "Added a helper that finalizes column aggregate states into a preallocated value vector.",
+        "Reused the group aggregate state helper for single-column and multi-column group scans."
+      ]
+    },
+    "tests": {
+      "bare_aggregate_sum_avg": "2/2 filtered tests passed",
+      "bare_sum_avg_with_simple_where_column_scan": "passed",
+      "group_by_column_aggregates_fast_path_uses_only_group_and_aggregate_columns": "passed",
+      "group_by_aggregates_with_simple_where_uses_column_scan": "passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused aggregate, projection, scan, predicate, or ORDER BY hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
