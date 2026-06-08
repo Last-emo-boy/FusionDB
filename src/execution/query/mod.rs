@@ -89,6 +89,9 @@ impl Executor {
     const MAX_RECURSIVE_CTE_ROWS: usize = 4096;
 
     fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+        if rows.len() < 2 {
+            return rows;
+        }
         let (rows, _) = Self::deduplicate_rows_with_seen(rows);
         rows
     }
@@ -96,6 +99,11 @@ impl Executor {
     fn deduplicate_rows_with_seen(
         mut rows: Vec<Vec<Value>>,
     ) -> (Vec<Vec<Value>>, HashSet<Vec<Value>>) {
+        if rows.len() < 2 {
+            let mut seen = HashSet::with_capacity(rows.len());
+            seen.extend(rows.iter().cloned());
+            return (rows, seen);
+        }
         let mut seen = HashSet::with_capacity(rows.len());
         rows.retain(|row| seen.insert(row.clone()));
         (rows, seen)

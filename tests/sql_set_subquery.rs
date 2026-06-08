@@ -326,6 +326,36 @@ async fn test_union_distinct() {
 }
 
 #[tokio::test]
+async fn test_union_distinct_single_row() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_single_left (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE union_single_right (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO union_single_left VALUES (1, 'solo')",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT name FROM union_single_left UNION SELECT name FROM union_single_right",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["name"]);
+    assert_eq!(rows, vec![vec![Value::String("solo".to_string())]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_union_distinct_with_duplicate_inputs() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-158",
+  "title": "Skip shared dedup hash work for 0/1 row results",
+  "status": "completed",
+  "created_at": "2026-06-08T16:05:00+08:00",
+  "completed_at": "2026-06-08T16:08:24+08:00",
+  "scope": "Shared query row deduplication for small result sets",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "summary": [
+        "Added a 0/1 row early return to deduplicate_rows to avoid HashSet construction for ordinary callers.",
+        "Added a matching small-input branch to deduplicate_rows_with_seen while still returning the seen set needed by recursive UNION.",
+        "Added single-row UNION coverage for the small-result distinct path."
+      ]
+    },
+    "tests": {
+      "union_distinct_single_row": "passed",
+      "sql_set_subquery": "42/42 passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, set-operation, recursive CTE, or scan hot path."
+  ]
+}

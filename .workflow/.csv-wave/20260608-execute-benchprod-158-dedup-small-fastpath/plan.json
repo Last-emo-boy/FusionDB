@@ -1,0 +1,41 @@
+{
+  "id": "benchprod-158-dedup-small-fastpath",
+  "objective": "Avoid hash-set work for shared row deduplication when the result has fewer than two rows.",
+  "status": "completed",
+  "created_at": "2026-06-08T16:05:00+08:00",
+  "completed_at": "2026-06-08T16:08:24+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-158",
+      "title": "Skip shared dedup hash work for 0/1 row results",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_set_subquery.rs"
+      ],
+      "result": "Shared row deduplication now returns 0/1 row inputs directly and avoids building a HashSet for ordinary dedup callers."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_set_subquery test_union_distinct_single_row -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery",
+      "status": "passed: 42/42"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}
