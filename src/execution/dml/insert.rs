@@ -223,10 +223,11 @@ impl Executor {
         on_conflict: Option<&OnInsert>,
         txn: &mut dyn Transaction,
     ) -> Result<QueryResult> {
-        let mut inserted_rows: Vec<Vec<Value>> = Vec::new();
-        if returning.is_some() {
-            inserted_rows.reserve(raw_rows.len());
-        }
+        let mut inserted_rows: Vec<Vec<Value>> = if returning.is_some() {
+            Vec::with_capacity(raw_rows.len())
+        } else {
+            Vec::new()
+        };
 
         let mut count = 0usize;
         for raw_values in raw_rows {
@@ -612,8 +613,6 @@ impl Executor {
             None
         };
 
-        let mut inserted_rows: Vec<Vec<Value>> = Vec::new();
-
         if let Some(query) = source {
             if let SetExpr::Values(values) = &query.body.as_ref() {
                 Self::insert_trace(format!(
@@ -623,9 +622,11 @@ impl Executor {
                     returning.is_some(),
                     on_conflict.is_some()
                 ));
-                if returning.is_some() {
-                    inserted_rows.reserve(values.rows.len());
-                }
+                let mut inserted_rows: Vec<Vec<Value>> = if returning.is_some() {
+                    Vec::with_capacity(values.rows.len())
+                } else {
+                    Vec::new()
+                };
                 let mut count = 0;
                 for row in &values.rows {
                     Self::insert_trace(format!(

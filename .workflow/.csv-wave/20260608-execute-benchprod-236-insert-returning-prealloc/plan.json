@@ -1,0 +1,48 @@
+{
+  "id": "benchprod-236-insert-returning-prealloc",
+  "objective": "Preallocate INSERT RETURNING row buffers from known VALUES row counts.",
+  "status": "completed",
+  "created_at": "2026-06-08T21:52:29+08:00",
+  "completed_at": "2026-06-08T21:52:29+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-236",
+      "title": "Preallocate INSERT RETURNING rows",
+      "status": "completed",
+      "evidence": [
+        "src/execution/dml/insert.rs"
+      ],
+      "result": "INSERT VALUES RETURNING paths now allocate returned-row buffers directly from known input row counts."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_returning_upsert_vector_rbac test_insert_returning -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml test_insert_omitted_serial_primary_key_generates_ids -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_returning_upsert_vector_rbac",
+      "status": "passed: 14/14"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo test --test sql_dml",
+      "status": "passed: 43/43"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo/linker verification used an E: workspace temp directory because the default C:/TEMP drive was full.",
+    "The change preserves INSERT count reporting, RETURNING row contents, UPSERT conflict behavior, serial defaults, and non-RETURNING allocation behavior."
+  ]
+}

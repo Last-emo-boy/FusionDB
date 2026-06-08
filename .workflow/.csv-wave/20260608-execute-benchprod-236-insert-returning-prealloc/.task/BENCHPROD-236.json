@@ -1,0 +1,32 @@
+{
+  "id": "BENCHPROD-236",
+  "title": "Preallocate INSERT RETURNING rows",
+  "status": "completed",
+  "created_at": "2026-06-08T21:52:29+08:00",
+  "completed_at": "2026-06-08T21:52:29+08:00",
+  "scope": "INSERT VALUES RETURNING row buffer construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/dml/insert.rs"
+      ],
+      "summary": [
+        "Replaced Vec::new plus reserve in insert_raw_values_rows with conditional Vec::with_capacity(raw_rows.len()).",
+        "Moved VALUES-path returned-row buffer initialization to the point where values.rows.len() is available.",
+        "Kept non-RETURNING paths allocation-free and preserved RETURNING row collection semantics."
+      ]
+    },
+    "tests": {
+      "insert_returning": "passed",
+      "serial_returning": "passed",
+      "sql_returning_upsert_vector_rbac": "14/14 passed",
+      "sql_dml": "43/43 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused DML, scan, projection, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
