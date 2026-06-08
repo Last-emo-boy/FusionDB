@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-178",
+  "title": "Preallocate primary BETWEEN row ids",
+  "status": "completed",
+  "created_at": "2026-06-08T17:38:00+08:00",
+  "completed_at": "2026-06-08T17:40:46+08:00",
+  "scope": "Primary-key BETWEEN index scan row id allocation",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/scan/index_plan.rs"
+      ],
+      "summary": [
+        "Changed the primary-key BETWEEN row_ids HashSet from HashSet::new to HashSet::with_capacity(kv.len()).",
+        "Kept scan_range bounds, row id extraction, exactness, and ordering behavior unchanged."
+      ]
+    },
+    "tests": {
+      "select_between": "passed",
+      "select_with_commuted_primary_key_range": "passed",
+      "primary_key_range_reuses_row_cache": "passed",
+      "sql_index_cache": "37/37 passed",
+      "sql_select": "27/27 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}

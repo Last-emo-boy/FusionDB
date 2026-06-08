@@ -660,7 +660,7 @@ impl Executor {
                                 let kv = txn
                                     .scan_range(start.as_bytes(), end.as_bytes(), limit)
                                     .await?;
-                                let mut row_ids = HashSet::new();
+                                let mut row_ids = HashSet::with_capacity(kv.len());
                                 for (k, _) in kv {
                                     if let Some(row_id) = Self::row_id_from_key(&k) {
                                         row_ids.insert(row_id.to_string());
