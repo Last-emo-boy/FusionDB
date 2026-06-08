@@ -14,6 +14,13 @@ fn delete_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn delete_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 impl Executor {
     pub(crate) async fn handle_delete(
         &self,
@@ -54,7 +61,7 @@ impl Executor {
             }
         };
 
-        let schema_key = format!("schema:{}", table_name_str);
+        let schema_key = delete_schema_key_for_table(&table_name_str);
         let schema_bytes = txn
             .get(schema_key.as_bytes())
             .await?
@@ -247,7 +254,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::delete_data_prefix_for_table;
+    use super::{delete_data_prefix_for_table, delete_schema_key_for_table};
 
     #[test]
     fn delete_data_prefix_for_table_preallocates_exact_prefix() {
@@ -255,5 +262,13 @@ mod tests {
 
         assert_eq!(prefix, "data:accounts:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn delete_schema_key_for_table_preallocates_exact_key() {
+        let key = delete_schema_key_for_table("accounts");
+
+        assert_eq!(key, "schema:accounts");
+        assert!(key.capacity() >= key.len());
     }
 }
