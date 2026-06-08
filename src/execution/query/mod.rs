@@ -1920,8 +1920,10 @@ impl Executor {
                                     )
                                 }),
                             ) {
-                                let columns =
-                                    plans.iter().map(|plan| plan.output_name.clone()).collect();
+                                let mut columns = Vec::with_capacity(plans.len());
+                                for plan in &plans {
+                                    columns.push(plan.output_name.clone());
+                                }
                                 let result_row = self
                                     .simple_column_aggregate_scan(
                                         &table_name_str,
@@ -2099,10 +2101,10 @@ impl Executor {
                                         Some(&aggregate_qualifiers),
                                         false,
                                     ) {
-                                        let columns = plans
-                                            .iter()
-                                            .map(|plan| plan.output_name.clone())
-                                            .collect();
+                                        let mut columns = Vec::with_capacity(plans.len());
+                                        for plan in &plans {
+                                            columns.push(plan.output_name.clone());
+                                        }
                                         let result_row = self
                                             .simple_column_aggregate_scan(
                                                 &table_name_str,

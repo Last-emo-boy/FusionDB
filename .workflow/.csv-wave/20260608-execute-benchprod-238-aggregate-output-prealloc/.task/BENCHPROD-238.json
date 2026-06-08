@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-238",
+  "title": "Preallocate aggregate output columns",
+  "status": "completed",
+  "created_at": "2026-06-08T22:00:02+08:00",
+  "completed_at": "2026-06-08T22:00:02+08:00",
+  "scope": "Simple column aggregate output column construction",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs"
+      ],
+      "summary": [
+        "Replaced filtered simple aggregate output-name collect with Vec::with_capacity(plans.len()).",
+        "Replaced bare simple aggregate output-name collect with Vec::with_capacity(plans.len()).",
+        "Preserved aggregate plan order, aliases, predicate behavior, and result row construction."
+      ]
+    },
+    "tests": {
+      "filtered_bare_aggregates": "passed",
+      "bare_sum_avg": "2/2 passed",
+      "sql_group_aggregate": "50/50 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query execution, scan, projection, DML, DDL, or metadata hot path.",
+    "Use an E: temp directory for Cargo verification while C:/TEMP remains full."
+  ]
+}
