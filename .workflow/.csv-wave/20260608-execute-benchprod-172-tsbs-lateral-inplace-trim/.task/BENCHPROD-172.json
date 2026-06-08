@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-172",
+  "title": "In-place trim TSBS lateral DISTINCT results",
+  "status": "completed",
+  "created_at": "2026-06-08T17:16:00+08:00",
+  "completed_at": "2026-06-08T17:20:32+08:00",
+  "scope": "TSBS lastpoint lateral DISTINCT ON LIMIT/OFFSET result trimming",
+  "results": {
+    "implementation": {
+      "changed_files": [
+        "src/execution/query/mod.rs",
+        "tests/sql_join.rs"
+      ],
+      "summary": [
+        "Replaced TSBS lateral DISTINCT ON result skip/take/collect trimming with trim_query_rows_in_place.",
+        "Returned the trimmed distinct_rows vector directly.",
+        "Extended the TSBS lateral join test with an outer LIMIT/OFFSET assertion."
+      ]
+    },
+    "tests": {
+      "tsbs_lastpoint_distinct_on_lateral_join": "passed",
+      "sql_join": "31/31 passed",
+      "fmt_check": "passed",
+      "diff_check": "passed"
+    }
+  },
+  "next_task_signals": [
+    "Continue database-core performance iterations from another focused query, scan, join, or set-operation hot path."
+  ]
+}

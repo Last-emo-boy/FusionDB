@@ -1238,12 +1238,7 @@ impl Executor {
             }
         }
 
-        let rows = distinct_rows.into_iter().skip(offset);
-        let rows = if let Some(limit) = limit {
-            rows.take(limit).collect()
-        } else {
-            rows.collect()
-        };
+        Self::trim_query_rows_in_place(&mut distinct_rows, offset, limit);
 
         Ok(Some(QueryResult::Select {
             columns: output_schema
@@ -1251,7 +1246,7 @@ impl Executor {
                 .iter()
                 .map(|column| column.name.clone())
                 .collect(),
-            rows,
+            rows: distinct_rows,
         }))
     }
 

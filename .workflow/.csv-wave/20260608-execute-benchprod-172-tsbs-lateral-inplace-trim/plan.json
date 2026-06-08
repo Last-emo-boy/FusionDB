@@ -1,0 +1,37 @@
+{
+  "id": "benchprod-172-tsbs-lateral-inplace-trim",
+  "objective": "Trim TSBS lateral DISTINCT ON result windows in place.",
+  "status": "completed",
+  "created_at": "2026-06-08T17:16:00+08:00",
+  "completed_at": "2026-06-08T17:20:32+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-172",
+      "title": "In-place trim TSBS lateral DISTINCT results",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs",
+        "tests/sql_join.rs"
+      ],
+      "result": "TSBS lastpoint lateral DISTINCT ON results now reuse the query in-place trim helper instead of rebuilding rows with skip/take/collect."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --test sql_join test_tsbs_lastpoint_distinct_on_lateral_join -- --nocapture",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ]
+}

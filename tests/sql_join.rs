@@ -1874,6 +1874,24 @@ async fn test_tsbs_lastpoint_distinct_on_lateral_join() {
             ],
         ]
     );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT DISTINCT ON (t.hostname) * FROM tags t INNER JOIN LATERAL(SELECT * FROM cpu c WHERE c.tags_id = t.id ORDER BY time DESC LIMIT 1) AS b ON true ORDER BY t.hostname, b.time DESC LIMIT 1 OFFSET 1",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::String("host_1".to_string()),
+            Value::Integer(3),
+            Value::Integer(2),
+            Value::Timestamp(1451606460000000),
+            Value::Float(20.0),
+        ]]
+    );
     cleanup(&wal);
 }
 
