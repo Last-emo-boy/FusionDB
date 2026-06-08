@@ -17,6 +17,15 @@ struct InsertRowsContext {
     col_mapping: Option<Vec<usize>>,
 }
 
+fn insert_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
+    key.push_str("data:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 impl Executor {
     fn insert_trace_enabled() -> bool {
         std::env::var("FUSIONDB_INSERT_TRACE")
@@ -360,7 +369,7 @@ impl Executor {
             context.table_name, row_index, row_id
         ));
 
-        let key = format!("data:{}:{}", context.table_name, row_id);
+        let key = insert_data_key_for_row_id(&context.table_name, &row_id);
 
         if let Some(OnInsert::OnConflict(oc)) = on_conflict {
             if let Some(existing_bytes) = txn.get(key.as_bytes()).await? {
@@ -769,7 +778,7 @@ impl Executor {
                         table_name_str, count, row_id
                     ));
 
-                    let key = format!("data:{}:{}", table_name_str, row_id);
+                    let key = insert_data_key_for_row_id(&table_name_str, &row_id);
 
                     // Handle ON CONFLICT (UPSERT)
                     if let Some(sqlparser::ast::OnInsert::OnConflict(oc)) = on_conflict {
@@ -1027,7 +1036,7 @@ impl Executor {
                     let row_values = self.coerce_row_to_schema(row_values, &schema)?;
                     let row_id =
                         self.row_id_for_insert(&schema, &row_values, &composite_unique_indexes);
-                    let key = format!("data:{}:{}", table_name_str, row_id);
+                    let key = insert_data_key_for_row_id(&table_name_str, &row_id);
                     if txn.get(key.as_bytes()).await?.is_some() {
                         return Err(FusionError::Execution(
                             "PRIMARY KEY constraint violated: duplicate row key".to_string(),
@@ -1120,5 +1129,18 @@ impl Executor {
         }
         // For non-EXCLUDED expressions, evaluate against the existing row
         self.evaluate_value(expr, existing_row, schema, &[])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insert_data_key_for_row_id;
+
+    #[test]
+    fn insert_data_key_for_row_id_preallocates_exact_key() {
+        let key = insert_data_key_for_row_id("orders", "00042");
+
+        assert_eq!(key, "data:orders:00042");
+        assert!(key.capacity() >= key.len());
     }
 }

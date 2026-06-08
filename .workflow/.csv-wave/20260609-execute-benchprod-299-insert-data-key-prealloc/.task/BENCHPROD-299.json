@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-299",
+  "title": "Preallocate DML insert data keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/dml/insert.rs"
+  ],
+  "description": "Avoid generic format! allocation work when DML insert paths build data:<table>:<row_id> keys from known component lengths.",
+  "implementation": [
+    "Added insert_data_key_for_row_id() with explicit capacity for data:<table>:<row_id>.",
+    "Replaced single-row insert/upsert data-key construction.",
+    "Replaced values-list insert/upsert data-key construction.",
+    "Replaced INSERT ... SELECT data-key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test insert_data_key -- --nocapture",
+    "cargo test --test sql_dml -- --nocapture",
+    "cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "DML insert data-key construction now reserves capacity from known table and row-id lengths while preserving insert, upsert, insert-select, RETURNING, and index behavior."
+}
