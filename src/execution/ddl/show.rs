@@ -4,6 +4,13 @@ use crate::storage::Transaction;
 
 use super::super::{Executor, QueryResult};
 
+fn show_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 impl Executor {
     pub(crate) fn show_all_settings_result() -> QueryResult {
         let settings = [
@@ -75,7 +82,7 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<QueryResult> {
         let table_name_str = table_name.to_string();
-        let schema_key = format!("schema:{}", table_name_str);
+        let schema_key = show_schema_key_for_table(&table_name_str);
         if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
             let schema: TableSchema = bincode::deserialize(&schema_bytes)
                 .map_err(|e| FusionError::Execution(format!("Schema error: {}", e)))?;
@@ -121,7 +128,7 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<QueryResult> {
         let table_name_str = table_name.to_string();
-        let schema_key = format!("schema:{}", table_name_str);
+        let schema_key = show_schema_key_for_table(&table_name_str);
         let schema_bytes = txn
             .get(schema_key.as_bytes())
             .await?
@@ -244,5 +251,18 @@ impl Executor {
             ],
             rows: indexes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn show_schema_key_for_table_preallocates_exact_key() {
+        let key = show_schema_key_for_table("items");
+
+        assert_eq!(key, "schema:items");
+        assert!(key.capacity() >= key.len());
     }
 }

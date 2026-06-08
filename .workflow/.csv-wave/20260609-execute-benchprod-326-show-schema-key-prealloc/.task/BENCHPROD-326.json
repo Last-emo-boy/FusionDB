@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-326",
+  "title": "Preallocate SHOW schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/ddl/show.rs"
+  ],
+  "description": "Avoid generic format! allocation work when DESCRIBE and SHOW CREATE TABLE build schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added show_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced DESCRIBE TABLE schema lookup key construction.",
+    "Replaced SHOW CREATE TABLE schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test show_schema_key -- --nocapture",
+    "cargo test --test sql_ddl test_describe_table -- --nocapture",
+    "cargo test --test sql_ddl test_show_create_table -- --nocapture",
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "SHOW schema-key construction now reserves capacity from known table-name length while preserving DESCRIBE output, SHOW CREATE TABLE output, and broader DDL behavior."
+}
