@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-348",
+  "title": "Preallocate composite metadata values",
+  "status": "completed",
+  "category": "database-performance",
+  "created_at": "2026-06-09T09:34:18+08:00",
+  "completed_at": "2026-06-09T09:34:18+08:00",
+  "files_changed": [
+    "src/execution/composite_index.rs"
+  ],
+  "summary": "Replaced composite index metadata value format! construction with a shared explicit-capacity builder.",
+  "verification": {
+    "unit": "cargo test composite_index_meta_value -- --nocapture passed 1/1; cargo test composite_unique_meta_value -- --nocapture passed 1/1",
+    "focused": "Composite index creation, SHOW INDEXES, DML maintenance, metadata directory/fallback, and table-level composite primary-key focused tests passed",
+    "integration": "cargo test --test sql_index_cache -- --nocapture passed 38/38; cargo test --test sql_dml -- --nocapture passed 44/44; cargo test --test sql_ddl -- --nocapture passed 33/33",
+    "format": "cargo fmt --check passed",
+    "diff": "git diff --check passed",
+    "search": "rg 'format!\\(\"v3:\\{}:\\{}\"|format!\\(\"u3:\\{}:\\{}\"' src/execution/composite_index.rs -n returned no matches"
+  },
+  "result": "Composite index metadata still emits v3:<table>:<columns> and u3:<table>:<columns>, but avoids join-plus-format allocation."
+}

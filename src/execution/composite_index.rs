@@ -66,12 +66,34 @@ impl Executor {
         "|"
     }
 
+    fn composite_index_meta_value_for_prefix(
+        prefix: &str,
+        table: &str,
+        columns: &[String],
+    ) -> String {
+        let columns_len: usize = columns.iter().map(|column| column.len()).sum();
+        let mut value = String::with_capacity(
+            prefix.len() + 1 + table.len() + 1 + columns_len + columns.len().saturating_sub(1),
+        );
+        value.push_str(prefix);
+        value.push(':');
+        value.push_str(table);
+        value.push(':');
+        for (idx, column) in columns.iter().enumerate() {
+            if idx > 0 {
+                value.push(',');
+            }
+            value.push_str(column);
+        }
+        value
+    }
+
     pub(crate) fn composite_index_meta_value(table: &str, columns: &[String]) -> String {
-        format!("v3:{}:{}", table, columns.join(","))
+        Self::composite_index_meta_value_for_prefix("v3", table, columns)
     }
 
     pub(crate) fn composite_unique_meta_value(table: &str, columns: &[String]) -> String {
-        format!("u3:{}:{}", table, columns.join(","))
+        Self::composite_index_meta_value_for_prefix("u3", table, columns)
     }
 
     pub(crate) fn parse_index_meta(index_name: &str, meta_str: &str) -> Option<CompositeIndexMeta> {
@@ -1016,5 +1038,23 @@ mod tests {
 
         assert_eq!(prefix, "index:orders:warehouse_id,district_id,customer_id:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn composite_index_meta_value_preallocates_exact_value() {
+        let columns = vec!["warehouse_id".to_string(), "district_id".to_string()];
+        let value = Executor::composite_index_meta_value("stock", &columns);
+
+        assert_eq!(value, "v3:stock:warehouse_id,district_id");
+        assert!(value.capacity() >= value.len());
+    }
+
+    #[test]
+    fn composite_unique_meta_value_preallocates_exact_value() {
+        let columns = vec!["warehouse_id".to_string(), "district_id".to_string()];
+        let value = Executor::composite_unique_meta_value("stock", &columns);
+
+        assert_eq!(value, "u3:stock:warehouse_id,district_id");
+        assert!(value.capacity() >= value.len());
     }
 }
