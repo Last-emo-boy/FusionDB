@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-391",
+  "title": "Preallocate CONCAT result buffer",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/function.rs"
+  ],
+  "description": "Replace CONCAT evaluation's empty String result with a conservative preallocated result buffer helper.",
+  "convergence": {
+    "criteria": [
+      "CONCAT evaluation no longer starts from String::new",
+      "CONCAT argument evaluation remains single-pass and in order",
+      "CONCAT output bytes remain unchanged",
+      "Focused helper test covers the initial capacity policy",
+      "SQL expression function regressions pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "concat_result_buffer"
+    ],
+    "notes": [
+      "The helper uses the argument count as a conservative initial String capacity.",
+      "Argument evaluation still happens exactly once per argument inside the existing loop.",
+      "append_concat_value and scalar/fallback text conversion behavior are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test concat_result_buffer_preallocates_by_argument_count -- --nocapture",
+      "cargo test --test sql_expr_functions test_string_functions -- --nocapture",
+      "cargo test --test sql_expr_functions -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'concat_result_buffer|let mut result = String::new\\(\\)' src/execution/expr/function.rs -n"
+    ]
+  }
+}

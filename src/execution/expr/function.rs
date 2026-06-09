@@ -104,6 +104,10 @@ fn append_concat_value(result: &mut String, value: Value) {
     }
 }
 
+fn concat_result_buffer(arg_count: usize) -> String {
+    String::with_capacity(arg_count)
+}
+
 fn embedding_text_for_value(value: &Value) -> Cow<'_, str> {
     match value {
         Value::String(s) => Cow::Borrowed(s.as_str()),
@@ -221,7 +225,7 @@ impl Executor {
                 }
             }
             Some(EvaluatedFunction::Concat) => {
-                let mut result = String::new();
+                let mut result = concat_result_buffer(args.len());
                 for arg in args {
                     let val = self.evaluate_arg(arg, row, schema, params)?;
                     append_concat_value(&mut result, val);
@@ -558,10 +562,21 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_concat_value, embedding_text_for_value, evaluated_function_kind};
+    use super::{
+        append_concat_value, concat_result_buffer, embedding_text_for_value,
+        evaluated_function_kind,
+    };
     use crate::common::Value;
     use sqlparser::ast::{Ident, ObjectName};
     use std::borrow::Cow;
+
+    #[test]
+    fn concat_result_buffer_preallocates_by_argument_count() {
+        let result = concat_result_buffer(3);
+
+        assert_eq!(result, "");
+        assert!(result.capacity() >= 3);
+    }
 
     #[test]
     fn append_concat_value_preserves_exact_scalar_and_fallback_text() {
