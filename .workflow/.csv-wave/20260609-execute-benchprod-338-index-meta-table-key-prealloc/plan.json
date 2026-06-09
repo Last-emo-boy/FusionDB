@@ -1,0 +1,64 @@
+{
+  "id": "benchprod-338-index-meta-table-key-prealloc",
+  "objective": "Preallocate composite-index table metadata directory keys.",
+  "status": "completed",
+  "created_at": "2026-06-09T08:52:00+08:00",
+  "completed_at": "2026-06-09T08:52:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-338",
+      "title": "Preallocate index_meta_table keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/composite_index.rs"
+      ],
+      "result": "Composite-index metadata directory marker, prefix, and per-index keys now use explicit-capacity construction instead of format!."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test composite_index_table -- --nocapture",
+      "status": "passed: 3/3"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_composite_index_dml_uses_table_metadata_directory -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_composite_index_dml_falls_back_to_legacy_metadata_scan -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_create_composite_btree_index_and_lookup -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_composite_index_prefix_scan_skips_nonmatching_row_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helpers reserve capacity for index_meta_table:<table>:__marker, index_meta_table:<table>:, and index_meta_table:<table>:<index>.",
+    "The optimization replaces format! construction for composite-index table metadata directory marker and prefix keys.",
+    "Generated key bytes and composite-index directory behavior are unchanged.",
+    "cargo fmt was run after cargo fmt --check reported a line-wrap change.",
+    "git diff --check printed the existing CRLF normalization warning for src/execution/composite_index.rs while exiting successfully."
+  ]
+}

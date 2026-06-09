@@ -35,19 +35,31 @@ impl CompositeIndexMeta {
 
 impl Executor {
     fn composite_index_table_marker_key(table_name: &str) -> String {
-        format!("index_meta_table:{}:__marker", table_name)
+        let mut key =
+            String::with_capacity("index_meta_table:".len() + table_name.len() + ":__marker".len());
+        key.push_str("index_meta_table:");
+        key.push_str(table_name);
+        key.push_str(":__marker");
+        key
     }
 
     pub(crate) fn composite_index_table_prefix(table_name: &str) -> String {
-        format!("index_meta_table:{}:", table_name)
+        let mut prefix = String::with_capacity("index_meta_table:".len() + table_name.len() + 1);
+        prefix.push_str("index_meta_table:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
     }
 
     pub(crate) fn composite_index_table_meta_key(table_name: &str, index_name: &str) -> String {
-        format!(
-            "{}{}",
-            Self::composite_index_table_prefix(table_name),
-            index_name
-        )
+        let mut key = String::with_capacity(
+            "index_meta_table:".len() + table_name.len() + 1 + index_name.len(),
+        );
+        key.push_str("index_meta_table:");
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(index_name);
+        key
     }
 
     fn composite_index_component_separator() -> &'static str {
@@ -968,6 +980,30 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::Executor;
+
+    #[test]
+    fn composite_index_table_marker_key_preallocates_exact_key() {
+        let key = Executor::composite_index_table_marker_key("stock");
+
+        assert_eq!(key, "index_meta_table:stock:__marker");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn composite_index_table_prefix_preallocates_exact_prefix() {
+        let prefix = Executor::composite_index_table_prefix("stock");
+
+        assert_eq!(prefix, "index_meta_table:stock:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn composite_index_table_meta_key_preallocates_exact_key() {
+        let key = Executor::composite_index_table_meta_key("stock", "idx_stock_warehouse_item");
+
+        assert_eq!(key, "index_meta_table:stock:idx_stock_warehouse_item");
+        assert!(key.capacity() >= key.len());
+    }
 
     #[test]
     fn composite_index_prefix_preallocates_exact_prefix() {
