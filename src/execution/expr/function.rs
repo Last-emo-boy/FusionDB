@@ -1,6 +1,7 @@
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArguments};
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use super::Executor;
@@ -13,6 +14,13 @@ fn append_concat_value(result: &mut String, value: Value) {
         Value::Boolean(b) => write!(result, "{}", b).expect("writing to String cannot fail"),
         Value::Null => {}
         other => write!(result, "{:?}", other).expect("writing to String cannot fail"),
+    }
+}
+
+fn embedding_text_for_value(value: &Value) -> Cow<'_, str> {
+    match value {
+        Value::String(s) => Cow::Borrowed(s.as_str()),
+        other => Cow::Owned(format!("{:?}", other)),
     }
 }
 
@@ -55,11 +63,8 @@ impl Executor {
                     ));
                 }
                 let text_val = self.evaluate_arg(&args[0], row, schema, params)?;
-                let text = match &text_val {
-                    Value::String(s) => s.clone(),
-                    other => format!("{:?}", other),
-                };
-                match self.embedding_registry.embed(&text) {
+                let text = embedding_text_for_value(&text_val);
+                match self.embedding_registry.embed(text.as_ref()) {
                     Some(vec) => Ok(Value::Vector(vec)),
                     None => Err(FusionError::Execution(
                         "No embedding provider available".to_string(),
@@ -466,8 +471,9 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::append_concat_value;
+    use super::{append_concat_value, embedding_text_for_value};
     use crate::common::Value;
+    use std::borrow::Cow;
 
     #[test]
     fn append_concat_value_preserves_exact_scalar_and_fallback_text() {
@@ -483,5 +489,18 @@ mod tests {
 
         assert_eq!(result, "prefix:db423.5trueArray([Integer(7)])");
         assert!(result.capacity() >= result.len());
+    }
+
+    #[test]
+    fn embedding_text_for_value_borrows_strings_and_preserves_fallback_text() {
+        let string_value = Value::String("red apple".to_string());
+        let text = embedding_text_for_value(&string_value);
+
+        assert!(matches!(text, Cow::Borrowed("red apple")));
+
+        let fallback_value = Value::Integer(42);
+        let text = embedding_text_for_value(&fallback_value);
+
+        assert_eq!(text, Cow::Owned::<str>("Integer(42)".to_string()));
     }
 }

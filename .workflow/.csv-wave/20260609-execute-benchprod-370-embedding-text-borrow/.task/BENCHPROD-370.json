@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-370",
+  "title": "Borrow EMBEDDING string text",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/function.rs"
+  ],
+  "description": "Use Cow to borrow string EMBEDDING arguments and only allocate debug fallback text for non-string values.",
+  "convergence": {
+    "criteria": [
+      "String EMBEDDING arguments are borrowed instead of cloned",
+      "Non-string fallback text remains the previous Debug representation",
+      "Existing HNSW/EMBEDDING SQL regression passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "embedding_text_for_value"
+    ],
+    "notes": [
+      "Value::String returns Cow::Borrowed over the existing string bytes.",
+      "Other values return Cow::Owned with the same format!(\"{:?}\", value) fallback text.",
+      "The embedding provider still receives &str via Cow::as_ref()."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test embedding_text_for_value -- --nocapture",
+      "cargo test --test sql_returning_upsert_vector_rbac test_hnsw_order_by_projection -- --nocapture",
+      "cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'Value::String\\\\(s\\\\) => s\\\\.clone\\\\(\\\\)|embedding_registry\\\\.embed\\\\(&text\\\\)' src/execution/expr/function.rs -n"
+    ]
+  }
+}
