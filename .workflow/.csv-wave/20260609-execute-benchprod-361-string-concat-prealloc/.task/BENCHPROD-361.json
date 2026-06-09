@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-361",
+  "title": "Preallocate SQL string concat values",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/value.rs"
+  ],
+  "description": "Replace the SQL StringConcat result format! with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "String concat result remains left followed by right",
+      "String and scalar concat SQL regressions pass",
+      "Expression function regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "concat_string_values"
+    ],
+    "notes": [
+      "The helper reserves left.len() + right.len() before appending both operands.",
+      "Generated SQL string-concat values remain byte-for-byte equivalent to the prior format! output.",
+      "Array concat and null handling remain untouched."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test concat_string_values -- --nocapture",
+      "cargo test --test sql_expr_functions string_concat -- --nocapture",
+      "cargo test --test sql_expr_functions -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(\"\\{\\}\\{\\}\", l, r\\)' src/execution/expr/value.rs -n"
+    ]
+  }
+}

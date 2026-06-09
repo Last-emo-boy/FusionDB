@@ -15,6 +15,13 @@ fn decimal_index_string_for_value(decimal: &str) -> String {
     value
 }
 
+fn concat_string_values(left: &str, right: &str) -> String {
+    let mut value = String::with_capacity(left.len() + right.len());
+    value.push_str(left);
+    value.push_str(right);
+    value
+}
+
 impl Executor {
     pub(crate) fn evaluate_value(
         &self,
@@ -209,7 +216,7 @@ impl Executor {
                             Value::Null => return Ok(Value::Null),
                             other => format!("{:?}", other),
                         };
-                        Ok(Value::String(format!("{}{}", l, r)))
+                        Ok(Value::String(concat_string_values(&l, &r)))
                     }
                     BinaryOperator::Arrow => {
                         if let Value::Object(map) = left_val {
@@ -930,13 +937,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::decimal_index_string_for_value;
+    use super::{concat_string_values, decimal_index_string_for_value};
 
     #[test]
     fn decimal_index_string_for_value_preallocates_exact_value() {
         let value = decimal_index_string_for_value("123.45");
 
         assert_eq!(value, "dec:123.45");
+        assert!(value.capacity() >= value.len());
+    }
+
+    #[test]
+    fn concat_string_values_preallocates_exact_value() {
+        let value = concat_string_values("hello ", "world");
+
+        assert_eq!(value, "hello world");
         assert!(value.capacity() >= value.len());
     }
 }
