@@ -813,7 +813,7 @@ impl Executor {
                 index_name
             )));
         }
-        let meta_val = format!("{}:{}", table_name, column_name);
+        let meta_val = Self::single_column_index_meta_value(table_name, &column_name);
 
         let column = &mut schema.columns[column_idx];
         column.is_primary = true;

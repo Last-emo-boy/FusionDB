@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-352",
+  "title": "Preallocate single-column index metadata values",
+  "status": "completed",
+  "files": [
+    "src/execution/composite_index.rs",
+    "src/execution/ddl/index.rs",
+    "src/execution/ddl/table.rs"
+  ],
+  "description": "Replace legacy table:column index metadata format! construction with a shared exact-capacity Executor helper.",
+  "convergence": {
+    "criteria": [
+      "Generated metadata remains table:column",
+      "CREATE INDEX and ALTER TABLE ADD PRIMARY KEY use the shared helper",
+      "execution/storage contains no format!(\"{}:{}\") metadata construction",
+      "Index and DDL regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helper": "Executor::single_column_index_meta_value",
+    "notes": [
+      "The helper lives next to composite metadata helpers and parse_index_meta.",
+      "DDL CREATE INDEX and ALTER TABLE ADD PRIMARY KEY now share the same single-column metadata serialization path.",
+      "Generated metadata remains the legacy table:column value consumed by parse_index_meta."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test single_column_index_meta_value -- --nocapture",
+      "cargo test --test sql_index_cache test_create_btree_index -- --nocapture",
+      "cargo test --test sql_index_cache test_show_indexes_reports_composite_columns -- --nocapture",
+      "cargo test --test sql_ddl test_alter_table_add_primary_key_rewrites_secondary_btree_index_row_ids -- --nocapture",
+      "cargo test --test sql_index_cache -- --nocapture",
+      "cargo test --test sql_ddl -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!(\"\\{}:\\{}\"' src/execution src/storage -n"
+    ]
+  }
+}

@@ -96,6 +96,14 @@ impl Executor {
         Self::composite_index_meta_value_for_prefix("u3", table, columns)
     }
 
+    pub(crate) fn single_column_index_meta_value(table: &str, column: &str) -> String {
+        let mut value = String::with_capacity(table.len() + 1 + column.len());
+        value.push_str(table);
+        value.push(':');
+        value.push_str(column);
+        value
+    }
+
     pub(crate) fn parse_index_meta(index_name: &str, meta_str: &str) -> Option<CompositeIndexMeta> {
         let rest = meta_str
             .strip_prefix("v3:")
@@ -1055,6 +1063,14 @@ mod tests {
         let value = Executor::composite_unique_meta_value("stock", &columns);
 
         assert_eq!(value, "u3:stock:warehouse_id,district_id");
+        assert!(value.capacity() >= value.len());
+    }
+
+    #[test]
+    fn single_column_index_meta_value_preallocates_exact_value() {
+        let value = Executor::single_column_index_meta_value("orders", "status");
+
+        assert_eq!(value, "orders:status");
         assert!(value.capacity() >= value.len());
     }
 }

@@ -248,7 +248,7 @@ impl Executor {
 
         // Store index metadata for DROP INDEX support
         let meta_val = if target_col_names.len() == 1 {
-            format!("{}:{}", table_name_str, target_col_names[0])
+            Self::single_column_index_meta_value(&table_name_str, &target_col_names[0])
         } else {
             Self::composite_index_meta_value(&table_name_str, &target_col_names)
         };
