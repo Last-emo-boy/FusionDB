@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-371",
+  "title": "Avoid COALESCE ObjectName display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/mod.rs"
+  ],
+  "description": "Replace COALESCE detection via func.name.to_string() with a direct ObjectNamePart helper.",
+  "convergence": {
+    "criteria": [
+      "Single-part COALESCE names still match case-insensitively",
+      "Final group expression COALESCE aggregate regression passes",
+      "sql_set_subquery regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "function_name_eq_ascii"
+    ],
+    "notes": [
+      "Identifier and Function ObjectNamePart variants compare their inner identifier bytes directly.",
+      "No ObjectName display string is allocated for the COALESCE guard.",
+      "Multi-part names return false, matching the intended simple built-in function check."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test function_name_eq_ascii -- --nocapture",
+      "cargo test --test sql_set_subquery test_group_by_projection_can_coalesce_aggregate -- --nocapture",
+      "cargo test --test sql_group_aggregate test_group_by_projection_scalar_function_from_group_columns -- --nocapture",
+      "cargo test --test sql_set_subquery -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'func\\.name\\.to_string\\(\\)\\.eq_ignore_ascii_case\\(\"COALESCE\"\\)' src/execution/expr/mod.rs -n"
+    ]
+  }
+}

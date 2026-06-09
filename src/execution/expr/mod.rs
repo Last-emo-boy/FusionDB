@@ -6,7 +6,8 @@ mod value;
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value as SqlValue,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+    ObjectNamePart, Value as SqlValue,
 };
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
@@ -27,6 +28,14 @@ fn usize_decimal_len(mut value: usize) -> usize {
         len += 1;
     }
     len
+}
+
+fn function_name_eq_ascii(name: &ObjectName, expected: &str) -> bool {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.eq_ignore_ascii_case(expected),
+        [ObjectNamePart::Function(function)] => function.name.value.eq_ignore_ascii_case(expected),
+        _ => false,
+    }
 }
 
 impl Executor {
@@ -511,7 +520,7 @@ impl Executor {
             Expr::Array(_) | Expr::TypedString(_) => {
                 self.evaluate_value(expr, &[], _schema, _params)
             }
-            Expr::Function(func) if func.name.to_string().eq_ignore_ascii_case("COALESCE") => {
+            Expr::Function(func) if function_name_eq_ascii(&func.name, "COALESCE") => {
                 let FunctionArguments::List(args) = &func.args else {
                     return Ok(Value::Null);
                 };
@@ -650,7 +659,8 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_function_arg_name, usize_decimal_len, Executor};
+    use super::{function_name_eq_ascii, group_function_arg_name, usize_decimal_len, Executor};
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     #[test]
     fn placeholder_index_parses_dollar_parameters() {
@@ -672,6 +682,14 @@ mod tests {
         assert_eq!(usize_decimal_len(0), 1);
         assert_eq!(usize_decimal_len(9), 1);
         assert_eq!(usize_decimal_len(10), 2);
+    }
+
+    #[test]
+    fn function_name_eq_ascii_matches_single_part_names_without_display_string() {
+        let name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("coalesce"))]);
+
+        assert!(function_name_eq_ascii(&name, "COALESCE"));
+        assert!(!function_name_eq_ascii(&name, "COUNT"));
     }
 
     #[test]
