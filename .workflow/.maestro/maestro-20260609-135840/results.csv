@@ -1,0 +1,2 @@
+id,status,skill_call,summary,artifacts,error
+"0","completed","$manage-status 记录当前 BENCHPROD 长跑收尾状态","Recorded closeout checkpoint after BENCHPROD-404 commit 45932f7.",".workflow/.maestro/maestro-20260609-135840/context.md",""
