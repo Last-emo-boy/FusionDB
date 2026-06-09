@@ -1599,9 +1599,10 @@ impl Executor {
                 Expr::Identifier(ident) => columns
                     .iter()
                     .position(|column| column.eq_ignore_ascii_case(&ident.value)),
-                Expr::Function(func) => columns
-                    .iter()
-                    .position(|column| column.eq_ignore_ascii_case(&format!("{}", func))),
+                Expr::Function(func) => {
+                    let function_name = func.to_string();
+                    Self::simple_group_by_function_order_index(columns, &function_name)
+                }
                 _ => None,
             }
             .ok_or_else(|| {
@@ -1621,6 +1622,15 @@ impl Executor {
             order_keys.push((index, order_expr.options.asc.unwrap_or(true)));
         }
         Ok(order_keys)
+    }
+
+    fn simple_group_by_function_order_index(
+        columns: &[String],
+        function_name: &str,
+    ) -> Option<usize> {
+        columns
+            .iter()
+            .position(|column| column.eq_ignore_ascii_case(function_name))
     }
 
     fn compare_simple_group_by_rows(
@@ -1679,5 +1689,27 @@ mod tests {
 
         assert_eq!(prefix, "index:metrics:host_id:00042:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn simple_group_by_function_order_index_matches_preformatted_name_once() {
+        let columns = vec![
+            "city".to_string(),
+            "COUNT(*)".to_string(),
+            "SUM(amount)".to_string(),
+        ];
+
+        assert_eq!(
+            Executor::simple_group_by_function_order_index(&columns, "count(*)"),
+            Some(1)
+        );
+        assert_eq!(
+            Executor::simple_group_by_function_order_index(&columns, "SUM(amount)"),
+            Some(2)
+        );
+        assert_eq!(
+            Executor::simple_group_by_function_order_index(&columns, "AVG(amount)"),
+            None
+        );
     }
 }

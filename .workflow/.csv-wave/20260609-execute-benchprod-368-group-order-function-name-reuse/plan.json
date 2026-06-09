@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-368",
+  "title": "Group order function name reuse",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "objective": "Avoid repeated ORDER BY function display allocation while matching group aggregate fast-path columns.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-368"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test simple_group_by_function_order_index -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate test_group_by_column_aggregates_fast_path_order_by_limit -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate -- --nocapture",
+      "result": "passed: 50/50"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'eq_ignore_ascii_case\\(&format!\\(\"\\{\\}\", func\\)\\)|position\\(\\|column\\| column\\.eq_ignore_ascii_case\\(&format!\\(\"\\{\\}\", func\\)\\)\\)' src/execution/query/column_scan.rs -n",
+      "result": "no matches"
+    }
+  ]
+}

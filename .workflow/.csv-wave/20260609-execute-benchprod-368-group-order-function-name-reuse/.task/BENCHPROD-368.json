@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-368",
+  "title": "Reuse formatted GROUP BY ORDER BY function name",
+  "status": "completed",
+  "files": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "description": "Move ORDER BY function display construction out of the column search loop for simple group aggregate fast paths.",
+  "convergence": {
+    "criteria": [
+      "Function ORDER BY matching remains case-insensitive against output column names",
+      "ORDER BY COUNT(*) and SUM(...) fast-path regressions pass",
+      "Full sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "simple_group_by_function_order_index"
+    ],
+    "notes": [
+      "The caller still uses func.to_string(), preserving the same display text as the previous format! call.",
+      "The formatted function name is created once per ORDER BY expression instead of once per candidate column.",
+      "Column matching remains eq_ignore_ascii_case."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test simple_group_by_function_order_index -- --nocapture",
+      "cargo test --test sql_group_aggregate test_group_by_column_aggregates_fast_path_order_by_limit -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'eq_ignore_ascii_case\\(&format!\\(\"\\{\\}\", func\\)\\)|position\\(\\|column\\| column\\.eq_ignore_ascii_case\\(&format!\\(\"\\{\\}\", func\\)\\)\\)' src/execution/query/column_scan.rs -n"
+    ]
+  }
+}
