@@ -27,29 +27,29 @@ impl Executor {
             return Ok(Value::Null);
         }
 
-        let upper = data_type.trim().to_ascii_uppercase();
-        if Self::is_integer_type_name(&upper) {
+        let data_type = data_type.trim();
+        if Self::is_integer_type_name(data_type) {
             return Self::coerce_to_integer(value);
         }
-        if Self::is_float_type_name(&upper) {
+        if Self::is_float_type_name(data_type) {
             return Self::coerce_to_float(value);
         }
-        if Self::is_decimal_type_name(&upper) {
+        if Self::is_decimal_type_name(data_type) {
             return Self::coerce_to_decimal(value);
         }
-        if Self::is_boolean_type_name(&upper) {
+        if Self::is_boolean_type_name(data_type) {
             return Self::coerce_to_boolean(value);
         }
-        if Self::is_date_type_name(&upper) {
+        if Self::is_date_type_name(data_type) {
             return Self::coerce_to_date(value);
         }
-        if Self::is_timestamp_type_name(&upper) {
+        if Self::is_timestamp_type_name(data_type) {
             return Self::coerce_to_timestamp(value);
         }
-        if Self::is_interval_type_name(&upper) {
+        if Self::is_interval_type_name(data_type) {
             return Self::coerce_to_interval(value);
         }
-        if Self::is_text_type_name(&upper) {
+        if Self::is_text_type_name(data_type) {
             return Ok(match value {
                 Value::String(_) => value,
                 other => Value::String(other.to_plain_string()),
@@ -180,73 +180,95 @@ impl Executor {
         }
     }
 
-    pub(crate) fn is_integer_type_name(upper: &str) -> bool {
-        matches!(
-            upper,
-            "INT"
-                | "INT2"
-                | "INT4"
-                | "INT8"
-                | "INTEGER"
-                | "SMALLINT"
-                | "BIGINT"
-                | "TINYINT"
-                | "MEDIUMINT"
-                | "SERIAL"
-                | "SERIAL2"
-                | "SERIAL4"
-                | "SERIAL8"
-                | "SMALLSERIAL"
-                | "BIGSERIAL"
+    fn type_name_matches_any(data_type: &str, candidates: &[&str]) -> bool {
+        candidates
+            .iter()
+            .any(|candidate| data_type.eq_ignore_ascii_case(candidate))
+    }
+
+    fn type_name_starts_with_ascii_case_insensitive(data_type: &str, prefix: &str) -> bool {
+        data_type
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    }
+
+    pub(crate) fn is_integer_type_name(data_type: &str) -> bool {
+        Self::type_name_matches_any(
+            data_type,
+            &[
+                "INT",
+                "INT2",
+                "INT4",
+                "INT8",
+                "INTEGER",
+                "SMALLINT",
+                "BIGINT",
+                "TINYINT",
+                "MEDIUMINT",
+                "SERIAL",
+                "SERIAL2",
+                "SERIAL4",
+                "SERIAL8",
+                "SMALLSERIAL",
+                "BIGSERIAL",
+            ],
         )
     }
 
-    pub(crate) fn is_float_type_name(upper: &str) -> bool {
-        matches!(
-            upper,
-            "FLOAT" | "FLOAT4" | "FLOAT8" | "REAL" | "DOUBLE" | "DOUBLE PRECISION"
-        ) || upper.starts_with("FLOAT(")
+    pub(crate) fn is_float_type_name(data_type: &str) -> bool {
+        Self::type_name_matches_any(
+            data_type,
+            &[
+                "FLOAT",
+                "FLOAT4",
+                "FLOAT8",
+                "REAL",
+                "DOUBLE",
+                "DOUBLE PRECISION",
+            ],
+        ) || Self::type_name_starts_with_ascii_case_insensitive(data_type, "FLOAT(")
     }
 
-    pub(crate) fn is_decimal_type_name(upper: &str) -> bool {
-        upper == "NUMERIC"
-            || upper == "DECIMAL"
-            || upper == "DEC"
-            || upper.starts_with("NUMERIC(")
-            || upper.starts_with("DECIMAL(")
-            || upper.starts_with("DEC(")
+    pub(crate) fn is_decimal_type_name(data_type: &str) -> bool {
+        Self::type_name_matches_any(data_type, &["NUMERIC", "DECIMAL", "DEC"])
+            || Self::type_name_starts_with_ascii_case_insensitive(data_type, "NUMERIC(")
+            || Self::type_name_starts_with_ascii_case_insensitive(data_type, "DECIMAL(")
+            || Self::type_name_starts_with_ascii_case_insensitive(data_type, "DEC(")
     }
 
-    fn is_boolean_type_name(upper: &str) -> bool {
-        matches!(upper, "BOOL" | "BOOLEAN")
+    fn is_boolean_type_name(data_type: &str) -> bool {
+        Self::type_name_matches_any(data_type, &["BOOL", "BOOLEAN"])
     }
 
-    fn is_date_type_name(upper: &str) -> bool {
-        matches!(upper, "DATE" | "DATE32")
+    fn is_date_type_name(data_type: &str) -> bool {
+        Self::type_name_matches_any(data_type, &["DATE", "DATE32"])
     }
 
-    fn is_timestamp_type_name(upper: &str) -> bool {
-        upper == "TIMESTAMP"
-            || upper == "TIMESTAMP WITHOUT TIME ZONE"
-            || upper == "TIMESTAMP WITH TIME ZONE"
-            || upper == "TIMESTAMPTZ"
-            || upper == "DATETIME"
-            || upper.starts_with("TIMESTAMP(")
-            || upper.starts_with("DATETIME(")
+    fn is_timestamp_type_name(data_type: &str) -> bool {
+        Self::type_name_matches_any(
+            data_type,
+            &[
+                "TIMESTAMP",
+                "TIMESTAMP WITHOUT TIME ZONE",
+                "TIMESTAMP WITH TIME ZONE",
+                "TIMESTAMPTZ",
+                "DATETIME",
+            ],
+        ) || Self::type_name_starts_with_ascii_case_insensitive(data_type, "TIMESTAMP(")
+            || Self::type_name_starts_with_ascii_case_insensitive(data_type, "DATETIME(")
     }
 
-    fn is_interval_type_name(upper: &str) -> bool {
-        upper == "INTERVAL" || upper.starts_with("INTERVAL ")
+    fn is_interval_type_name(data_type: &str) -> bool {
+        data_type.eq_ignore_ascii_case("INTERVAL")
+            || Self::type_name_starts_with_ascii_case_insensitive(data_type, "INTERVAL ")
     }
 
-    fn is_text_type_name(upper: &str) -> bool {
-        upper == "TEXT"
-            || upper == "STRING"
-            || upper == "VARCHAR"
-            || upper == "CHAR"
-            || upper.starts_with("VARCHAR(")
-            || upper.starts_with("CHAR(")
-            || upper.starts_with("CHARACTER")
+    fn is_text_type_name(data_type: &str) -> bool {
+        Self::type_name_matches_any(data_type, &["TEXT", "STRING", "VARCHAR", "CHAR"])
+            || Self::type_name_starts_with_ascii_case_insensitive(data_type, "VARCHAR(")
+            || Self::type_name_starts_with_ascii_case_insensitive(data_type, "CHAR(")
+            || Self::type_name_starts_with_ascii_case_insensitive(data_type, "CHARACTER")
     }
 
     fn coerce_to_integer(value: Value) -> Result<Value> {
@@ -446,5 +468,43 @@ mod tests {
             error.to_string(),
             "Execution error: Cannot cast ' maybe ' to BOOLEAN"
         );
+    }
+
+    #[test]
+    fn coerce_value_to_column_type_matches_type_names_without_uppercase_allocation() {
+        assert_eq!(
+            Executor::coerce_value_to_column_type(Value::String("42".to_string()), " iNt4 ")
+                .unwrap(),
+            Value::Integer(42)
+        );
+        assert_eq!(
+            Executor::coerce_value_to_column_type(
+                Value::String("1.5".to_string()),
+                "DOUBLE precision"
+            )
+            .unwrap(),
+            Value::Float(1.5)
+        );
+        assert_eq!(
+            Executor::coerce_value_to_column_type(Value::String("YeS".to_string()), "bool")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            Executor::coerce_value_to_column_type(Value::Integer(7), "character varying(20)")
+                .unwrap(),
+            Value::String("7".to_string())
+        );
+    }
+
+    #[test]
+    fn type_name_helpers_match_prefixes_case_insensitively() {
+        assert!(Executor::is_decimal_type_name("numeric(10,2)"));
+        assert!(Executor::is_float_type_name("float(24)"));
+        assert!(Executor::is_timestamp_type_name("timestamp(6)"));
+        assert!(Executor::is_interval_type_name("interval day"));
+        assert!(Executor::is_text_type_name("Character Large Object"));
+        assert!(!Executor::is_timestamp_type_name(" timestamp"));
+        assert!(!Executor::is_text_type_name("varchar2"));
     }
 }
