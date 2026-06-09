@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-357",
+  "title": "Preallocate foreign key composite index lookup prefix",
+  "status": "completed",
+  "files": [
+    "src/execution/foreign_key.rs"
+  ],
+  "description": "Replace the foreign-key composite unique-index lookup prefix format! with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "Composite foreign-key parent lookup prefix remains <composite_index_prefix><value_key>:",
+      "Foreign-key helper test asserts exact output bytes and capacity",
+      "Foreign-key constraint regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "foreign_key_composite_index_value_prefix"
+    ],
+    "notes": [
+      "The helper appends the composite index prefix, value key, and trailing colon without format! allocation.",
+      "Generated scan prefix remains byte-for-byte equivalent to the prior format! string.",
+      "The change is scoped to parent existence checks for composite unique indexes used by foreign keys."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test foreign_key_composite_index_value_prefix -- --nocapture",
+      "cargo test --test sql_view_show_constraints foreign_key -- --nocapture",
+      "cargo test --test sql_view_show_constraints -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'let prefix = format!\\(\\s*\"\\{\\}\\{\\}:\"' src/execution/foreign_key.rs -n -U"
+    ]
+  }
+}

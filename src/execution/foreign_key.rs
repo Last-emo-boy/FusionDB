@@ -30,6 +30,14 @@ fn foreign_key_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+fn foreign_key_composite_index_value_prefix(index_prefix: &str, value_key: &str) -> String {
+    let mut prefix = String::with_capacity(index_prefix.len() + value_key.len() + 1);
+    prefix.push_str(index_prefix);
+    prefix.push_str(value_key);
+    prefix.push(':');
+    prefix
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ForeignKeyMeta {
     pub name: String,
@@ -475,11 +483,8 @@ impl Executor {
             }
             if let Some(value_key) = self.composite_index_value_key_for_meta_values(&index, values)
             {
-                let prefix = format!(
-                    "{}{}:",
-                    Self::composite_index_prefix(parent_table, &index.columns),
-                    value_key
-                );
+                let index_prefix = Self::composite_index_prefix(parent_table, &index.columns);
+                let prefix = foreign_key_composite_index_value_prefix(&index_prefix, &value_key);
                 if !txn
                     .scan_prefix(prefix.as_bytes(), Some(1))
                     .await?
@@ -576,8 +581,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        foreign_key_data_key_for_row_id, foreign_key_data_prefix_for_table,
-        foreign_key_schema_key_for_table, Executor,
+        foreign_key_composite_index_value_prefix, foreign_key_data_key_for_row_id,
+        foreign_key_data_prefix_for_table, foreign_key_schema_key_for_table, Executor,
     };
 
     #[test]
@@ -602,6 +607,17 @@ mod tests {
 
         assert_eq!(key, "schema:warehouse");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn foreign_key_composite_index_value_prefix_preallocates_exact_prefix() {
+        let prefix = foreign_key_composite_index_value_prefix(
+            "index:district:warehouse_id,district_id:",
+            "i1|i2",
+        );
+
+        assert_eq!(prefix, "index:district:warehouse_id,district_id:i1|i2:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 
     #[test]
