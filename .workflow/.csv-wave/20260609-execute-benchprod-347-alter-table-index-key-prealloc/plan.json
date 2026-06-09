@@ -1,0 +1,67 @@
+{
+  "id": "benchprod-347-alter-table-index-key-prealloc",
+  "objective": "Preallocate ALTER TABLE primary-key index rewrite keys.",
+  "status": "completed",
+  "created_at": "2026-06-09T09:25:19+08:00",
+  "completed_at": "2026-06-09T09:25:19+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-347",
+      "title": "Preallocate ALTER TABLE index keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/table.rs"
+      ],
+      "result": "ALTER TABLE ADD PRIMARY KEY index creation and secondary BTree row-id rewrite now use explicit-capacity helpers instead of format!."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test table_index_key -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_alter_table_only_add_primary_key_pgbench_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_alter_table_add_primary_key_rewrites_secondary_btree_index_row_ids -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_alter_table_add_primary_key_rejects_existing_primary_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_alter_table_add_primary_key_requires_first_column -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_alter_table_add_primary_key_rejects_existing_nulls -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 33/33"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "rg '\"index:\\{}:\\{}:\\{}:\\{}\"|index_key = format!\\(|new_index_key = format!\\(' src/execution/ddl/table.rs -n",
+      "status": "passed: no matches"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "Generated index key bytes remain index:<table>:<column>:<value>:<row_id>.",
+    "The optimization covers ALTER TABLE ADD PRIMARY KEY index creation and secondary BTree row-id rewrite after primary-key storage-key changes.",
+    "git diff --check printed the existing CRLF normalization warning for the edited Rust file while exiting successfully.",
+    "The sql_ddl suite printed slow-query logs while passing 33/33 tests."
+  ]
+}

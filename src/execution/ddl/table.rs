@@ -67,6 +67,42 @@ fn table_index_prefix_for_column(table_name: &str, column_name: &str) -> String 
     prefix
 }
 
+fn table_index_key_for_value(
+    table_name: &str,
+    column_name: &str,
+    value: &str,
+    row_id: &str,
+) -> String {
+    let mut key = String::with_capacity(
+        "index:".len()
+            + table_name.len()
+            + 1
+            + column_name.len()
+            + 1
+            + value.len()
+            + 1
+            + row_id.len(),
+    );
+    key.push_str("index:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(column_name);
+    key.push(':');
+    key.push_str(value);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
+fn table_index_key_for_prefix_value_row(prefix: &str, value: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity(prefix.len() + value.len() + 1 + row_id.len());
+    key.push_str(prefix);
+    key.push_str(value);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 fn table_index_meta_key_for_index(index_name: &str) -> String {
     let mut key = String::with_capacity("index_meta:".len() + index_name.len());
     key.push_str("index_meta:");
@@ -822,10 +858,8 @@ impl Executor {
                 .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
                 .unwrap_or(Value::Null);
             if let Some(index_value) = self.value_to_index_string(&pk_value) {
-                let index_key = format!(
-                    "index:{}:{}:{}:{}",
-                    table_name, column_name, index_value, row_id
-                );
+                let index_key =
+                    table_index_key_for_value(table_name, &column_name, &index_value, row_id);
                 txn.put(index_key.as_bytes(), &[]).await?;
             }
         }
@@ -869,7 +903,8 @@ impl Executor {
                         else {
                             continue;
                         };
-                        let new_index_key = format!("{}{}:{}", prefix, value_part, new_row_id);
+                        let new_index_key =
+                            table_index_key_for_prefix_value_row(&prefix, value_part, new_row_id);
                         txn.delete(&index_key).await?;
                         txn.put(new_index_key.as_bytes(), &index_value).await?;
                     }
@@ -980,8 +1015,10 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        table_data_key_for_row_id, table_data_prefix_for_table, table_index_meta_key_for_index,
-        table_index_prefix_for_column, table_index_prefix_for_table, table_schema_key_for_table,
+        table_data_key_for_row_id, table_data_prefix_for_table,
+        table_index_key_for_prefix_value_row, table_index_key_for_value,
+        table_index_meta_key_for_index, table_index_prefix_for_column,
+        table_index_prefix_for_table, table_schema_key_for_table,
     };
 
     #[test]
@@ -1022,6 +1059,23 @@ mod tests {
 
         assert_eq!(prefix, "index:accounts:name:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn table_index_key_for_value_preallocates_exact_key() {
+        let key = table_index_key_for_value("accounts", "name", "alice", "00042");
+
+        assert_eq!(key, "index:accounts:name:alice:00042");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn table_index_key_for_prefix_value_row_preallocates_exact_key() {
+        let prefix = table_index_prefix_for_column("accounts", "name");
+        let key = table_index_key_for_prefix_value_row(&prefix, "alice", "00042");
+
+        assert_eq!(key, "index:accounts:name:alice:00042");
+        assert!(key.capacity() >= key.len());
     }
 
     #[test]
