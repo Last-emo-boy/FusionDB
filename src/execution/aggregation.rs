@@ -20,6 +20,10 @@ fn join_string_aggregate_values(values: &[String], separator: &str) -> String {
     joined
 }
 
+fn aggregate_function_name_eq_ascii(name: &str, expected: &str) -> bool {
+    name.eq_ignore_ascii_case(expected)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum AggregateAccumulator {
     Count(i64),
@@ -34,32 +38,41 @@ pub(crate) enum AggregateAccumulator {
 
 impl AggregateAccumulator {
     pub(crate) fn new(func_name: &str) -> Self {
-        match func_name.to_uppercase().as_str() {
-            "COUNT" => AggregateAccumulator::Count(0),
-            "COUNT_DISTINCT" => AggregateAccumulator::CountDistinct(HashSet::with_capacity(1)),
-            "SUM" => AggregateAccumulator::Sum(0.0, true),
-            "AVG" => AggregateAccumulator::Avg(0.0, 0),
-            "MIN" => AggregateAccumulator::Min(None),
-            "MAX" => AggregateAccumulator::Max(None),
-            "ARRAY_AGG" => AggregateAccumulator::ArrayAgg(Vec::with_capacity(1)),
-            "STRING_AGG" | "GROUP_CONCAT" => {
-                AggregateAccumulator::StringAgg(Vec::with_capacity(1), ",".to_string())
-            }
-            _ => AggregateAccumulator::Count(0),
+        if aggregate_function_name_eq_ascii(func_name, "COUNT") {
+            AggregateAccumulator::Count(0)
+        } else if aggregate_function_name_eq_ascii(func_name, "COUNT_DISTINCT") {
+            AggregateAccumulator::CountDistinct(HashSet::with_capacity(1))
+        } else if aggregate_function_name_eq_ascii(func_name, "SUM") {
+            AggregateAccumulator::Sum(0.0, true)
+        } else if aggregate_function_name_eq_ascii(func_name, "AVG") {
+            AggregateAccumulator::Avg(0.0, 0)
+        } else if aggregate_function_name_eq_ascii(func_name, "MIN") {
+            AggregateAccumulator::Min(None)
+        } else if aggregate_function_name_eq_ascii(func_name, "MAX") {
+            AggregateAccumulator::Max(None)
+        } else if aggregate_function_name_eq_ascii(func_name, "ARRAY_AGG") {
+            AggregateAccumulator::ArrayAgg(Vec::with_capacity(1))
+        } else if aggregate_function_name_eq_ascii(func_name, "STRING_AGG")
+            || aggregate_function_name_eq_ascii(func_name, "GROUP_CONCAT")
+        {
+            AggregateAccumulator::StringAgg(Vec::with_capacity(1), ",".to_string())
+        } else {
+            AggregateAccumulator::Count(0)
         }
     }
 
     pub(crate) fn with_input_capacity(func_name: &str, input_len: usize) -> Self {
         let capacity = Self::input_capacity_hint(input_len);
-        match func_name.to_uppercase().as_str() {
-            "COUNT_DISTINCT" => {
-                AggregateAccumulator::CountDistinct(HashSet::with_capacity(capacity))
-            }
-            "ARRAY_AGG" => AggregateAccumulator::ArrayAgg(Vec::with_capacity(capacity)),
-            "STRING_AGG" | "GROUP_CONCAT" => {
-                AggregateAccumulator::StringAgg(Vec::with_capacity(capacity), ",".to_string())
-            }
-            _ => Self::new(func_name),
+        if aggregate_function_name_eq_ascii(func_name, "COUNT_DISTINCT") {
+            AggregateAccumulator::CountDistinct(HashSet::with_capacity(capacity))
+        } else if aggregate_function_name_eq_ascii(func_name, "ARRAY_AGG") {
+            AggregateAccumulator::ArrayAgg(Vec::with_capacity(capacity))
+        } else if aggregate_function_name_eq_ascii(func_name, "STRING_AGG")
+            || aggregate_function_name_eq_ascii(func_name, "GROUP_CONCAT")
+        {
+            AggregateAccumulator::StringAgg(Vec::with_capacity(capacity), ",".to_string())
+        } else {
+            Self::new(func_name)
         }
     }
 
@@ -263,6 +276,28 @@ mod tests {
 
         assert_eq!(joined, "red::green::blue");
         assert!(joined.capacity() >= joined.len());
+    }
+
+    #[test]
+    fn aggregate_function_name_matching_is_ascii_case_insensitive() {
+        assert!(aggregate_function_name_eq_ascii("String_Agg", "STRING_AGG"));
+        assert!(aggregate_function_name_eq_ascii(
+            "group_concat",
+            "GROUP_CONCAT"
+        ));
+        assert!(!aggregate_function_name_eq_ascii(
+            "STRING_AGG",
+            "GROUP_CONCAT"
+        ));
+
+        match AggregateAccumulator::new("string_agg") {
+            AggregateAccumulator::StringAgg(values, _) => assert!(values.capacity() >= 1),
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
+        match AggregateAccumulator::with_input_capacity("count_distinct", 3) {
+            AggregateAccumulator::CountDistinct(values) => assert!(values.capacity() >= 3),
+            other => panic!("unexpected accumulator: {:?}", other),
+        }
     }
 
     #[test]

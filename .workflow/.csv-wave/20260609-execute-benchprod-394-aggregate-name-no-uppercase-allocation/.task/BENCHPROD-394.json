@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-394",
+  "title": "Avoid aggregate function uppercase allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/aggregation.rs"
+  ],
+  "description": "Replace AggregateAccumulator function-name to_uppercase matching with ASCII case-insensitive comparisons.",
+  "convergence": {
+    "criteria": [
+      "AggregateAccumulator::new no longer allocates a to_uppercase string for function matching",
+      "AggregateAccumulator::with_input_capacity no longer allocates a to_uppercase string for function matching",
+      "ASCII case-insensitive matching still recognizes supported aggregate names",
+      "Accumulator preallocation tests pass",
+      "STRING_AGG SQL regression passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "aggregate_function_name_eq_ascii"
+    ],
+    "notes": [
+      "The helper uses str::eq_ignore_ascii_case, matching the codebase's existing ASCII SQL function-name style.",
+      "Accumulator variants and fallback-to-count behavior are unchanged.",
+      "Capacity behavior for collecting accumulators remains unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test aggregate_function_name_matching_is_ascii_case_insensitive -- --nocapture",
+      "cargo test test_collecting_accumulators_preallocate_from_input_len -- --nocapture",
+      "cargo test test_collecting_accumulators_preallocate_first_input -- --nocapture",
+      "cargo test --test sql_group_aggregate test_string_agg -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'to_uppercase\\(\\)|aggregate_function_name_eq_ascii' src/execution/aggregation.rs -n"
+    ]
+  }
+}
