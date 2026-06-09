@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-393",
+  "title": "Generic STRING_AGG join preallocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/aggregation.rs"
+  ],
+  "objective": "Avoid generic STRING_AGG finalize using slice join by preallocating the final result buffer.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-393"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test join_string_aggregate_values_preallocates_exact_join -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test test_collecting_accumulators_preallocate_first_input -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate test_string_agg -- --nocapture",
+      "result": "passed: 2/2"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'join_string_aggregate_values|vals\\.join\\(sep\\)' src/execution/aggregation.rs -n",
+      "result": "generic STRING_AGG finalize uses join_string_aggregate_values; old vals.join(sep) path is absent"
+    }
+  ]
+}

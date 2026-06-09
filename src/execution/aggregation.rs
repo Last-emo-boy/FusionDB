@@ -4,6 +4,22 @@ use std::collections::HashSet;
 
 const AGGREGATE_PREALLOC_LIMIT: usize = 4096;
 
+fn join_string_aggregate_values(values: &[String], separator: &str) -> String {
+    let values_len: usize = values.iter().map(String::len).sum();
+    let separators_len = separator
+        .len()
+        .saturating_mul(values.len().saturating_sub(1));
+    let mut joined = String::with_capacity(values_len.saturating_add(separators_len));
+    if let Some((first, rest)) = values.split_first() {
+        joined.push_str(first);
+        for value in rest {
+            joined.push_str(separator);
+            joined.push_str(value);
+        }
+    }
+    joined
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum AggregateAccumulator {
     Count(i64),
@@ -164,7 +180,7 @@ impl AggregateAccumulator {
                 if vals.is_empty() {
                     Value::Null
                 } else {
-                    Value::String(vals.join(sep))
+                    Value::String(join_string_aggregate_values(vals, sep))
                 }
             }
         }
@@ -238,6 +254,15 @@ mod tests {
             AggregateAccumulator::StringAgg(values, _) => assert!(values.capacity() >= 1),
             other => panic!("unexpected accumulator: {:?}", other),
         }
+    }
+
+    #[test]
+    fn join_string_aggregate_values_preallocates_exact_join() {
+        let values = vec!["red".to_string(), "green".to_string(), "blue".to_string()];
+        let joined = join_string_aggregate_values(&values, "::");
+
+        assert_eq!(joined, "red::green::blue");
+        assert!(joined.capacity() >= joined.len());
     }
 
     #[test]

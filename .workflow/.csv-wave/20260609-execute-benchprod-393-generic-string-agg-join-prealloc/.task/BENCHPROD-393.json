@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-393",
+  "title": "Preallocate generic STRING_AGG result join",
+  "status": "completed",
+  "files": [
+    "src/execution/aggregation.rs"
+  ],
+  "description": "Replace generic STRING_AGG finalize's vals.join(sep) with a result-buffer helper that preallocates the exact joined length.",
+  "convergence": {
+    "criteria": [
+      "Generic STRING_AGG finalize no longer uses vals.join(sep)",
+      "Joined output bytes remain unchanged for separator-aware aggregation",
+      "Focused helper test covers joined output and capacity",
+      "Existing aggregate accumulator preallocation test passes",
+      "STRING_AGG SQL regression passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "join_string_aggregate_values"
+    ],
+    "notes": [
+      "The helper sums value bytes and separator bytes before building the result.",
+      "Empty accumulator behavior stays in finalize and still returns Value::Null.",
+      "The visible separator and value ordering are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test join_string_aggregate_values_preallocates_exact_join -- --nocapture",
+      "cargo test test_collecting_accumulators_preallocate_first_input -- --nocapture",
+      "cargo test --test sql_group_aggregate test_string_agg -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'join_string_aggregate_values|vals\\.join\\(sep\\)' src/execution/aggregation.rs -n"
+    ]
+  }
+}
