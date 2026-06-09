@@ -1,0 +1,82 @@
+{
+  "id": "benchprod-340-fts-key-prealloc",
+  "objective": "Preallocate full-text-search index keys and prefixes.",
+  "status": "completed",
+  "created_at": "2026-06-09T09:11:00+08:00",
+  "completed_at": "2026-06-09T09:11:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-340",
+      "title": "Preallocate FTS keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/dml/mod.rs",
+        "src/execution/ddl/index.rs",
+        "src/execution/ddl/table.rs",
+        "src/execution/dml/insert.rs",
+        "src/execution/dml/update.rs",
+        "src/execution/dml/delete.rs",
+        "src/execution/scan/index_plan.rs"
+      ],
+      "result": "FTS index write, delete, token scan, and primary-key rewrite paths now use explicit-capacity helpers instead of format!."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test fts_index_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test fts_column_prefix -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test fts_token_prefix -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_fts_match_against_multi_token_intersects_index_hits -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_create_index_backfills_trigram_index_on_fusion_storage -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_update_refreshes_trigram_index_on_fusion_storage -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_delete_removes_trigram_index_on_fusion_storage -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_expr_functions test_parameter_placeholder_match_against -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helpers reserve capacity for fts:<table>:<column>:<token>:<row>, fts:<table>:<column>:, and fts:<table>:<column>:<token>:.",
+    "The optimization replaces FTS key construction in CREATE INDEX backfill, INSERT, UPDATE, DELETE, MATCH scan, and ALTER TABLE primary-key rewrite paths.",
+    "Generated key bytes and FTS/trigram behavior are unchanged.",
+    "cargo fmt was run after cargo fmt --check reported line-wrap changes.",
+    "git diff --check printed the existing CRLF normalization warnings for edited Rust files while exiting successfully."
+  ]
+}

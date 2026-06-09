@@ -490,9 +490,8 @@ impl Executor {
                                         let mut candidate_row_ids: Option<HashSet<String>> = None;
 
                                         for token in tokens {
-                                            let index_prefix = format!(
-                                                "fts:{}:{}:{}:",
-                                                table_name, col_name, token
+                                            let index_prefix = Self::fts_token_prefix_for_token(
+                                                table_name, &col_name, &token,
                                             );
                                             let index_entries = txn
                                                 .scan_prefix(index_prefix.as_bytes(), None)

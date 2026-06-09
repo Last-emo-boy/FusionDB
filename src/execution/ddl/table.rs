@@ -876,7 +876,7 @@ impl Executor {
                 }
                 IndexType::FTS => {
                     let old_suffix = format!(":{}", old_row_id);
-                    let prefix = format!("fts:{}:{}:", table_name, column.name);
+                    let prefix = Self::fts_column_prefix_for_column(table_name, &column.name);
                     let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
                     for (index_key, index_value) in entries {
                         let Ok(index_key_str) = std::str::from_utf8(&index_key) else {
@@ -891,7 +891,12 @@ impl Executor {
                         else {
                             continue;
                         };
-                        let new_index_key = format!("{}{}:{}", prefix, token, new_row_id);
+                        let new_index_key = Self::fts_index_key_for_row(
+                            table_name,
+                            &column.name,
+                            token,
+                            new_row_id,
+                        );
                         txn.delete(&index_key).await?;
                         txn.put(new_index_key.as_bytes(), &index_value).await?;
                     }

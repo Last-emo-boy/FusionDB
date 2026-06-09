@@ -11,6 +11,62 @@ mod returning;
 mod update;
 
 impl Executor {
+    pub(crate) fn fts_index_key_for_row(
+        table_name: &str,
+        column_name: &str,
+        token: &str,
+        row_id: &str,
+    ) -> String {
+        let mut key = String::with_capacity(
+            "fts:".len()
+                + table_name.len()
+                + 1
+                + column_name.len()
+                + 1
+                + token.len()
+                + 1
+                + row_id.len(),
+        );
+        key.push_str("fts:");
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(column_name);
+        key.push(':');
+        key.push_str(token);
+        key.push(':');
+        key.push_str(row_id);
+        key
+    }
+
+    pub(crate) fn fts_column_prefix_for_column(table_name: &str, column_name: &str) -> String {
+        let mut prefix =
+            String::with_capacity("fts:".len() + table_name.len() + 1 + column_name.len() + 1);
+        prefix.push_str("fts:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix
+    }
+
+    pub(crate) fn fts_token_prefix_for_token(
+        table_name: &str,
+        column_name: &str,
+        token: &str,
+    ) -> String {
+        let mut prefix = String::with_capacity(
+            "fts:".len() + table_name.len() + 1 + column_name.len() + 1 + token.len() + 1,
+        );
+        prefix.push_str("fts:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix.push_str(token);
+        prefix.push(':');
+        prefix
+    }
+
     pub(crate) fn indexed_trigram_text_columns(schema: &TableSchema) -> Vec<usize> {
         let mut indices = Vec::with_capacity(schema.columns.len());
         for (idx, col) in schema.columns.iter().enumerate() {
@@ -325,5 +381,34 @@ impl Executor {
             }
         }
         qualifiers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    #[test]
+    fn fts_index_key_for_row_preallocates_exact_key() {
+        let key = Executor::fts_index_key_for_row("docs", "body", "search", "0007");
+
+        assert_eq!(key, "fts:docs:body:search:0007");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn fts_column_prefix_for_column_preallocates_exact_prefix() {
+        let prefix = Executor::fts_column_prefix_for_column("docs", "body");
+
+        assert_eq!(prefix, "fts:docs:body:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn fts_token_prefix_for_token_preallocates_exact_prefix() {
+        let prefix = Executor::fts_token_prefix_for_token("docs", "body", "search");
+
+        assert_eq!(prefix, "fts:docs:body:search:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }

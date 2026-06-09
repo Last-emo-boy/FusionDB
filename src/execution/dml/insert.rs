@@ -541,9 +541,11 @@ impl Executor {
                 if col.index_type == IndexType::FTS {
                     if let Value::String(text) = val {
                         for token in Self::tokenize_unique(text) {
-                            let index_key = format!(
-                                "fts:{}:{}:{}:{}",
-                                context.table_name, col.name, token, row_id
+                            let index_key = Self::fts_index_key_for_row(
+                                &context.table_name,
+                                &col.name,
+                                &token,
+                                &row_id,
                             );
                             txn.put(index_key.as_bytes(), &[]).await?;
                         }
@@ -970,9 +972,11 @@ impl Executor {
                             if col.index_type == IndexType::FTS {
                                 if let Value::String(text) = val {
                                     for token in Self::tokenize_unique(text) {
-                                        let index_key = format!(
-                                            "fts:{}:{}:{}:{}",
-                                            table_name_str, col.name, token, row_id
+                                        let index_key = Self::fts_index_key_for_row(
+                                            &table_name_str,
+                                            &col.name,
+                                            &token,
+                                            &row_id,
                                         );
                                         txn.put(index_key.as_bytes(), &[]).await?;
                                     }
