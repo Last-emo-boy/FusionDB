@@ -84,6 +84,44 @@ impl ForeignKeyMeta {
 }
 
 impl Executor {
+    fn foreign_key_child_key_for_name(table_name: &str, foreign_key_name: &str) -> String {
+        let mut key = String::with_capacity(
+            "fk_meta:child:".len() + table_name.len() + 1 + foreign_key_name.len(),
+        );
+        key.push_str("fk_meta:child:");
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(foreign_key_name);
+        key
+    }
+
+    fn foreign_key_parent_key_for_name(parent_table: &str, foreign_key_name: &str) -> String {
+        let mut key = String::with_capacity(
+            "fk_meta:parent:".len() + parent_table.len() + 1 + foreign_key_name.len(),
+        );
+        key.push_str("fk_meta:parent:");
+        key.push_str(parent_table);
+        key.push(':');
+        key.push_str(foreign_key_name);
+        key
+    }
+
+    pub(crate) fn foreign_key_child_prefix_for_table(table_name: &str) -> String {
+        let mut prefix = String::with_capacity("fk_meta:child:".len() + table_name.len() + 1);
+        prefix.push_str("fk_meta:child:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    pub(crate) fn foreign_key_parent_prefix_for_table(table_name: &str) -> String {
+        let mut prefix = String::with_capacity("fk_meta:parent:".len() + table_name.len() + 1);
+        prefix.push_str("fk_meta:parent:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
     pub(crate) fn collect_foreign_keys(
         table_name: &str,
         columns: &[sqlparser::ast::ColumnDef],
@@ -215,8 +253,8 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<()> {
         for fk in foreign_keys {
-            let child_key = format!("fk_meta:child:{}:{}", table_name, fk.name);
-            let parent_key = format!("fk_meta:parent:{}:{}", fk.parent_table, fk.name);
+            let child_key = Self::foreign_key_child_key_for_name(table_name, &fk.name);
+            let parent_key = Self::foreign_key_parent_key_for_name(&fk.parent_table, &fk.name);
             let bytes = bincode::serialize(fk)
                 .map_err(|e| FusionError::Execution(format!("FK serialization error: {}", e)))?;
             txn.put(child_key.as_bytes(), &bytes).await?;
@@ -230,8 +268,8 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<ForeignKeyMeta>> {
-        self.load_foreign_keys_by_prefix(&format!("fk_meta:child:{}:", table_name), txn)
-            .await
+        let prefix = Self::foreign_key_child_prefix_for_table(table_name);
+        self.load_foreign_keys_by_prefix(&prefix, txn).await
     }
 
     pub(crate) async fn load_parent_foreign_keys(
@@ -239,8 +277,8 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<ForeignKeyMeta>> {
-        self.load_foreign_keys_by_prefix(&format!("fk_meta:parent:{}:", table_name), txn)
-            .await
+        let prefix = Self::foreign_key_parent_prefix_for_table(table_name);
+        self.load_foreign_keys_by_prefix(&prefix, txn).await
     }
 
     async fn load_foreign_keys_by_prefix(
@@ -264,8 +302,8 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<()> {
         for prefix in [
-            format!("fk_meta:child:{}:", table_name),
-            format!("fk_meta:parent:{}:", table_name),
+            Self::foreign_key_child_prefix_for_table(table_name),
+            Self::foreign_key_parent_prefix_for_table(table_name),
         ] {
             let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
             for (key, _) in entries {
@@ -539,7 +577,7 @@ impl Executor {
 mod tests {
     use super::{
         foreign_key_data_key_for_row_id, foreign_key_data_prefix_for_table,
-        foreign_key_schema_key_for_table,
+        foreign_key_schema_key_for_table, Executor,
     };
 
     #[test]
@@ -564,5 +602,37 @@ mod tests {
 
         assert_eq!(key, "schema:warehouse");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn foreign_key_child_key_for_name_preallocates_exact_key() {
+        let key = Executor::foreign_key_child_key_for_name("orders", "fk_orders_customer");
+
+        assert_eq!(key, "fk_meta:child:orders:fk_orders_customer");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn foreign_key_parent_key_for_name_preallocates_exact_key() {
+        let key = Executor::foreign_key_parent_key_for_name("customers", "fk_orders_customer");
+
+        assert_eq!(key, "fk_meta:parent:customers:fk_orders_customer");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn foreign_key_child_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = Executor::foreign_key_child_prefix_for_table("orders");
+
+        assert_eq!(prefix, "fk_meta:child:orders:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn foreign_key_parent_prefix_for_table_preallocates_exact_prefix() {
+        let prefix = Executor::foreign_key_parent_prefix_for_table("customers");
+
+        assert_eq!(prefix, "fk_meta:parent:customers:");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }

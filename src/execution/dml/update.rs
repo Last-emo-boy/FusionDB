@@ -357,16 +357,15 @@ impl Executor {
                         .ok()
                         .is_some_and(|key| !key.ends_with(":__marker"))
                 });
+            let foreign_key_child_prefix = Self::foreign_key_child_prefix_for_table(table_name);
+            let foreign_key_parent_prefix = Self::foreign_key_parent_prefix_for_table(table_name);
             let has_foreign_key = txn
-                .scan_prefix(format!("fk_meta:child:{}:", table_name).as_bytes(), Some(1))
+                .scan_prefix(foreign_key_child_prefix.as_bytes(), Some(1))
                 .await?
                 .len()
                 > 0
                 || txn
-                    .scan_prefix(
-                        format!("fk_meta:parent:{}:", table_name).as_bytes(),
-                        Some(1),
-                    )
+                    .scan_prefix(foreign_key_parent_prefix.as_bytes(), Some(1))
                     .await?
                     .len()
                     > 0;
