@@ -1,0 +1,57 @@
+{
+  "id": "benchprod-332-query-schema-key-prealloc",
+  "objective": "Preallocate query-path schema lookup keys from table-name length.",
+  "status": "completed",
+  "created_at": "2026-06-09T07:59:00+08:00",
+  "completed_at": "2026-06-09T07:59:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-332",
+      "title": "Preallocate QUERY schema keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/query/mod.rs"
+      ],
+      "result": "CTE, join aggregate, DISTINCT, aggregate, COUNT DISTINCT, and GROUP BY query schema lookups now use an explicit-capacity helper instead of format! for schema:<table> keys."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test query_schema_key -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_set_subquery -- --nocapture",
+      "status": "passed: 48/48"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_join -- --nocapture",
+      "status": "passed: 31/31"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_group_aggregate -- --nocapture",
+      "status": "passed: 50/50"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_select -- --nocapture",
+      "status": "passed: 27/27"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for schema:<table> before pushing known components.",
+    "The optimization replaces format! in materialized CTE schema storage and cleanup, join aggregate schema loading, DISTINCT fast path schema loading, simple aggregate schema loading, COUNT DISTINCT schema loading, and GROUP BY fast path schema loading.",
+    "Generated schema key bytes, CTE materialization, join aggregate behavior, DISTINCT fast paths, aggregate fast paths, GROUP BY behavior, and SELECT behavior are unchanged.",
+    "The query_schema_key filter matched both the new query helper test and the existing subquery helper test.",
+    "sql_group_aggregate printed Cargo package-cache file-lock waits before passing.",
+    "git diff --check printed the existing CRLF normalization warning for src/execution/query/mod.rs while exiting successfully."
+  ]
+}

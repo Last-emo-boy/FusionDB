@@ -40,6 +40,13 @@ fn materialized_cte_data_key_for_row_id(cte_name: &str, row_id: &str) -> String 
     key
 }
 
+fn query_schema_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("schema:".len() + table_name.len());
+    key.push_str("schema:");
+    key.push_str(table_name);
+    key
+}
+
 fn aggregate_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -888,7 +895,7 @@ impl Executor {
             });
         }
         let schema = TableSchema::new(cte_name.to_string(), cols);
-        let schema_key = format!("schema:{}", cte_name);
+        let schema_key = query_schema_key_for_table(cte_name);
         let schema_bytes = bincode::serialize(&schema)
             .map_err(|e| FusionError::Execution(format!("CTE schema error: {}", e)))?;
         txn.put(schema_key.as_bytes(), &schema_bytes).await?;
@@ -905,8 +912,8 @@ impl Executor {
     }
 
     async fn clear_materialized_cte(txn: &mut dyn Transaction, cte_name: &str) -> Result<()> {
-        txn.delete(format!("schema:{}", cte_name).as_bytes())
-            .await?;
+        let schema_key = query_schema_key_for_table(cte_name);
+        txn.delete(schema_key.as_bytes()).await?;
         let prefix = materialized_cte_data_prefix_for_name(cte_name);
         let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
         for (key, _) in entries {
@@ -1535,16 +1542,12 @@ impl Executor {
         let left_table_name = left_name.to_string();
         let right_table_name = right_name.to_string();
 
-        let Some(left_schema_bytes) = txn
-            .get(format!("schema:{}", left_table_name).as_bytes())
-            .await?
-        else {
+        let left_schema_key = query_schema_key_for_table(&left_table_name);
+        let Some(left_schema_bytes) = txn.get(left_schema_key.as_bytes()).await? else {
             return Ok(None);
         };
-        let Some(right_schema_bytes) = txn
-            .get(format!("schema:{}", right_table_name).as_bytes())
-            .await?
-        else {
+        let right_schema_key = query_schema_key_for_table(&right_table_name);
+        let Some(right_schema_bytes) = txn.get(right_schema_key.as_bytes()).await? else {
             return Ok(None);
         };
 
@@ -1900,7 +1903,7 @@ impl Executor {
             {
                 if let TableFactor::Table { name, .. } = &select.from[0].relation {
                     let table_name_str = name.to_string();
-                    let schema_key = format!("schema:{}", table_name_str);
+                    let schema_key = query_schema_key_for_table(&table_name_str);
                     if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
                         let schema: TableSchema =
                             bincode::deserialize(&schema_bytes).map_err(|e| {
@@ -1967,7 +1970,7 @@ impl Executor {
                         aggregate_qualifiers.push(alias.name.value.clone());
                     }
 
-                    let schema_key = format!("schema:{}", table_name_str);
+                    let schema_key = query_schema_key_for_table(&table_name_str);
                     if let Ok(Some(schema_bytes)) = txn.get(schema_key.as_bytes()).await {
                         if let Ok(schema) = bincode::deserialize::<TableSchema>(&schema_bytes) {
                             if let (Some(plans), Some(predicate)) = (
@@ -2045,7 +2048,7 @@ impl Executor {
                         if let Some(alias) = alias {
                             aggregate_qualifiers.push(alias.name.value.clone());
                         }
-                        let schema_key = format!("schema:{}", table_name_str);
+                        let schema_key = query_schema_key_for_table(&table_name_str);
                         if let Ok(Some(schema_bytes)) = txn.get(schema_key.as_bytes()).await {
                             if let Ok(schema) = bincode::deserialize::<TableSchema>(&schema_bytes) {
                                 if let Some((column_index, column_name)) =
@@ -2201,7 +2204,7 @@ impl Executor {
                     if !group_exprs.is_empty() {
                         if let TableFactor::Table { name, .. } = &select.from[0].relation {
                             let table_name_str = name.to_string();
-                            let schema_key = format!("schema:{}", table_name_str);
+                            let schema_key = query_schema_key_for_table(&table_name_str);
                             if let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? {
                                 let schema: TableSchema = bincode::deserialize(&schema_bytes)
                                     .map_err(|e| {
@@ -3399,6 +3402,14 @@ mod tests {
         let key = materialized_cte_data_key_for_row_id("recent_orders", "0007");
 
         assert_eq!(key, "data:recent_orders:0007");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn query_schema_key_for_table_preallocates_exact_key() {
+        let key = query_schema_key_for_table("recent_orders");
+
+        assert_eq!(key, "schema:recent_orders");
         assert!(key.capacity() >= key.len());
     }
 

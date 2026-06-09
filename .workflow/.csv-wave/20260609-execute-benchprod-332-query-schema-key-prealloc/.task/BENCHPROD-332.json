@@ -1,0 +1,29 @@
+{
+  "id": "BENCHPROD-332",
+  "title": "Preallocate QUERY schema keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Avoid generic format! allocation work when query paths build schema:<table> lookup keys from known table-name length.",
+  "implementation": [
+    "Added query_schema_key_for_table() with explicit capacity for schema:<table>.",
+    "Replaced materialized CTE schema storage and cleanup key construction.",
+    "Replaced join aggregate schema lookup key construction.",
+    "Replaced DISTINCT fast path schema lookup key construction.",
+    "Replaced simple aggregate and COUNT DISTINCT schema lookup key construction.",
+    "Replaced GROUP BY fast path schema lookup key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test query_schema_key -- --nocapture",
+    "cargo test --test sql_set_subquery -- --nocapture",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo test --test sql_group_aggregate -- --nocapture",
+    "cargo test --test sql_select -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "QUERY schema-key construction now reserves capacity from known table-name length while preserving CTE materialization, join aggregate behavior, DISTINCT fast paths, aggregate fast paths, GROUP BY behavior, and SELECT behavior."
+}
