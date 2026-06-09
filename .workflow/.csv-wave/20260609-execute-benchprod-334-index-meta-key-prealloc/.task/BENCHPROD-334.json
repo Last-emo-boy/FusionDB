@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-334",
+  "title": "Preallocate index metadata keys",
+  "status": "completed",
+  "category": "database-performance",
+  "created_at": "2026-06-09T08:20:00+08:00",
+  "completed_at": "2026-06-09T08:20:00+08:00",
+  "files_changed": [
+    "src/execution/ddl/index.rs",
+    "src/execution/ddl/table.rs"
+  ],
+  "summary": "Replaced index_meta:<index> format! construction with explicit-capacity helpers in index DDL and primary-key DDL paths.",
+  "verification": {
+    "unit": "cargo test index_meta_key -- --nocapture passed with 2 tests",
+    "focused": "CREATE INDEX, DROP INDEX, composite index, composite primary key, and ALTER TABLE ADD PRIMARY KEY focused tests passed",
+    "integration": "cargo test --test sql_index_cache -- --nocapture passed 38/38; cargo test --test sql_ddl -- --nocapture passed 33/33",
+    "format": "cargo fmt --check passed",
+    "diff": "git diff --check passed"
+  },
+  "result": "All remaining index_meta:<index> format! calls in src/execution and src/storage were removed without changing generated keys."
+}

@@ -67,6 +67,13 @@ fn table_index_prefix_for_column(table_name: &str, column_name: &str) -> String 
     prefix
 }
 
+fn table_index_meta_key_for_index(index_name: &str) -> String {
+    let mut key = String::with_capacity("index_meta:".len() + index_name.len());
+    key.push_str("index_meta:");
+    key.push_str(index_name);
+    key
+}
+
 impl Executor {
     pub(crate) async fn handle_create_table(
         &self,
@@ -308,7 +315,7 @@ impl Executor {
             .name
             .clone()
             .unwrap_or_else(|| format!("{}_pkey", table_name));
-        let meta_key = format!("index_meta:{}", index_name);
+        let meta_key = table_index_meta_key_for_index(&index_name);
         if txn.get(meta_key.as_bytes()).await?.is_some() {
             return Err(FusionError::Execution(format!(
                 "Index {} already exists",
@@ -763,7 +770,7 @@ impl Executor {
 
         let index_name =
             constraint_name.unwrap_or_else(|| format!("{}_{}_pkey", table_name, column_name));
-        let meta_key = format!("index_meta:{}", index_name);
+        let meta_key = table_index_meta_key_for_index(&index_name);
         if txn.get(meta_key.as_bytes()).await?.is_some() {
             return Err(FusionError::Execution(format!(
                 "Index {} already exists",
@@ -968,8 +975,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        table_data_key_for_row_id, table_data_prefix_for_table, table_index_prefix_for_column,
-        table_index_prefix_for_table, table_schema_key_for_table,
+        table_data_key_for_row_id, table_data_prefix_for_table, table_index_meta_key_for_index,
+        table_index_prefix_for_column, table_index_prefix_for_table, table_schema_key_for_table,
     };
 
     #[test]
@@ -1010,5 +1017,13 @@ mod tests {
 
         assert_eq!(prefix, "index:accounts:name:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn table_index_meta_key_for_index_preallocates_exact_key() {
+        let key = table_index_meta_key_for_index("accounts_pkey");
+
+        assert_eq!(key, "index_meta:accounts_pkey");
+        assert!(key.capacity() >= key.len());
     }
 }

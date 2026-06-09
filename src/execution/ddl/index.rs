@@ -21,6 +21,13 @@ fn index_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+fn index_meta_key_for_index(index_name: &str) -> String {
+    let mut key = String::with_capacity("index_meta:".len() + index_name.len());
+    key.push_str("index_meta:");
+    key.push_str(index_name);
+    key
+}
+
 fn drop_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
     let mut prefix =
         String::with_capacity("index:".len() + table_name.len() + 1 + column_name.len() + 1);
@@ -47,7 +54,7 @@ impl Executor {
             .as_ref()
             .map(|n| n.to_string())
             .unwrap_or_else(|| format!("idx_{}_{}", table_name_str, uuid::Uuid::new_v4()));
-        let meta_key = format!("index_meta:{}", index_name_str);
+        let meta_key = index_meta_key_for_index(&index_name_str);
         if txn.get(meta_key.as_bytes()).await?.is_some() {
             return Err(FusionError::Execution(format!(
                 "Index {} already exists",
@@ -239,7 +246,7 @@ impl Executor {
         for name in names {
             let index_name = name.to_string();
             // Index metadata key: index_meta:<index_name>
-            let meta_key = format!("index_meta:{}", index_name);
+            let meta_key = index_meta_key_for_index(&index_name);
             if let Some(meta_bytes) = txn.get(meta_key.as_bytes()).await? {
                 let meta_str = String::from_utf8(meta_bytes).unwrap_or_default();
                 if let Some(meta) = Self::parse_index_meta(&index_name, &meta_str) {
@@ -300,7 +307,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_index_data_prefix_for_table, drop_index_prefix_for_column,
+        create_index_data_prefix_for_table, drop_index_prefix_for_column, index_meta_key_for_index,
         index_schema_key_for_table,
     };
 
@@ -318,6 +325,14 @@ mod tests {
 
         assert_eq!(prefix, "data:orders:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn index_meta_key_for_index_preallocates_exact_key() {
+        let key = index_meta_key_for_index("idx_orders_status");
+
+        assert_eq!(key, "index_meta:idx_orders_status");
+        assert!(key.capacity() >= key.len());
     }
 
     #[test]
