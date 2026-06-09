@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-376",
+  "title": "Avoid cacheable aggregate name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/mod.rs"
+  ],
+  "description": "Classify cacheable aggregate function names with direct ObjectNamePart matching before evaluating query-result cache eligibility.",
+  "convergence": {
+    "criteria": [
+      "Cacheable aggregate checks no longer build uppercase display names",
+      "COUNT, SUM, AVG, MIN, MAX, STRING_AGG, and GROUP_CONCAT cacheability remains unchanged",
+      "Qualified names remain rejected by the simple aggregate check",
+      "Group aggregate cache invalidation regression passes",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "execution_object_name_eq_ascii",
+      "cacheable_aggregate_function_kind",
+      "CacheableAggregateFunction"
+    ],
+    "notes": [
+      "The cacheability guard now classifies function names before inspecting arguments.",
+      "COUNT keeps the wildcard-or-column rule.",
+      "Value aggregates keep the single-column and no-DISTINCT rule."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test cacheable_aggregate_function_kind -- --nocapture",
+      "cargo test --test sql_group_aggregate test_execute_sql_group_by_aggregate_cache_invalidates_after_insert -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'let func_name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/mod.rs -n"
+    ]
+  }
+}

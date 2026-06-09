@@ -22,8 +22,8 @@ use crate::storage::{vector_index::VectorIndex, FusionStorage, Storage, Transact
 use moka::sync::Cache;
 use parking_lot::RwLock;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectType, OrderByKind,
-    SelectItem, SetExpr, Statement, TableFactor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+    ObjectNamePart, ObjectType, OrderByKind, SelectItem, SetExpr, Statement, TableFactor,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
@@ -75,6 +75,36 @@ pub struct Executor {
     pub(crate) row_cache: Cache<String, Vec<Value>>,
     pub(crate) vector_index: Arc<VectorIndex>,
     pub(crate) embedding_registry: Arc<EmbeddingRegistry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheableAggregateFunction {
+    Count,
+    Value,
+}
+
+fn execution_object_name_eq_ascii(name: &ObjectName, expected: &str) -> bool {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.eq_ignore_ascii_case(expected),
+        [ObjectNamePart::Function(function)] => function.name.value.eq_ignore_ascii_case(expected),
+        _ => false,
+    }
+}
+
+fn cacheable_aggregate_function_kind(name: &ObjectName) -> Option<CacheableAggregateFunction> {
+    if execution_object_name_eq_ascii(name, "COUNT") {
+        Some(CacheableAggregateFunction::Count)
+    } else if execution_object_name_eq_ascii(name, "SUM")
+        || execution_object_name_eq_ascii(name, "AVG")
+        || execution_object_name_eq_ascii(name, "MIN")
+        || execution_object_name_eq_ascii(name, "MAX")
+        || execution_object_name_eq_ascii(name, "STRING_AGG")
+        || execution_object_name_eq_ascii(name, "GROUP_CONCAT")
+    {
+        Some(CacheableAggregateFunction::Value)
+    } else {
+        None
+    }
 }
 
 impl Executor {
@@ -393,7 +423,9 @@ impl Executor {
     }
 
     fn is_cacheable_aggregate_function(func: &sqlparser::ast::Function) -> bool {
-        let func_name = func.name.to_string().to_uppercase();
+        let Some(function) = cacheable_aggregate_function_kind(&func.name) else {
+            return false;
+        };
         let FunctionArguments::List(args) = &func.args else {
             return false;
         };
@@ -401,8 +433,8 @@ impl Executor {
             return false;
         }
 
-        match func_name.as_str() {
-            "COUNT" => {
+        match function {
+            CacheableAggregateFunction::Count => {
                 matches!(
                     args.args[0],
                     FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
@@ -412,7 +444,7 @@ impl Executor {
                         if Self::is_cacheable_column_expr(expr)
                 )
             }
-            "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "GROUP_CONCAT" => {
+            CacheableAggregateFunction::Value => {
                 args.duplicate_treatment.is_none()
                     && matches!(
                         &args.args[0],
@@ -420,7 +452,6 @@ impl Executor {
                             if Self::is_cacheable_column_expr(expr)
                     )
             }
-            _ => false,
         }
     }
 
@@ -1246,6 +1277,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     fn statement_permissions(sql: &str) -> Vec<(String, &'static str)> {
         let statements = parse_sql(sql).unwrap();
@@ -1311,5 +1343,25 @@ mod tests {
                 ("old_items".to_string(), "ALL")
             ]
         );
+    }
+
+    #[test]
+    fn cacheable_aggregate_function_kind_matches_without_display_string() {
+        let count = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("count"))]);
+        let string_agg = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("String_Agg"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("count")),
+        ]);
+
+        assert_eq!(
+            cacheable_aggregate_function_kind(&count),
+            Some(CacheableAggregateFunction::Count)
+        );
+        assert_eq!(
+            cacheable_aggregate_function_kind(&string_agg),
+            Some(CacheableAggregateFunction::Value)
+        );
+        assert_eq!(cacheable_aggregate_function_kind(&qualified), None);
     }
 }
