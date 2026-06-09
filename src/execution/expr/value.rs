@@ -22,6 +22,13 @@ fn concat_string_values(left: &str, right: &str) -> String {
     value
 }
 
+fn column_suffix_for_fallback(fallback_name: &str) -> String {
+    let mut suffix = String::with_capacity(1 + fallback_name.len());
+    suffix.push('.');
+    suffix.push_str(fallback_name);
+    suffix
+}
+
 impl Executor {
     pub(crate) fn evaluate_value(
         &self,
@@ -478,7 +485,7 @@ impl Executor {
         }
 
         let fallback_name = col_name.rsplit('.').next().unwrap_or(col_name);
-        let suffix = format!(".{}", fallback_name);
+        let suffix = column_suffix_for_fallback(fallback_name);
         let fallback_lower = fallback_name.to_ascii_lowercase();
         let suffix_lower = suffix.to_ascii_lowercase();
         let mut matches = Vec::with_capacity(schema.columns.len());
@@ -937,7 +944,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{concat_string_values, decimal_index_string_for_value};
+    use super::{column_suffix_for_fallback, concat_string_values, decimal_index_string_for_value};
 
     #[test]
     fn decimal_index_string_for_value_preallocates_exact_value() {
@@ -953,5 +960,13 @@ mod tests {
 
         assert_eq!(value, "hello world");
         assert!(value.capacity() >= value.len());
+    }
+
+    #[test]
+    fn column_suffix_for_fallback_preallocates_exact_suffix() {
+        let suffix = column_suffix_for_fallback("customer_id");
+
+        assert_eq!(suffix, ".customer_id");
+        assert!(suffix.capacity() >= suffix.len());
     }
 }

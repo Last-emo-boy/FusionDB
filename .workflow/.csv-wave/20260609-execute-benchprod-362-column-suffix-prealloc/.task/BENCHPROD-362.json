@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-362",
+  "title": "Preallocate fallback column suffixes",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/value.rs"
+  ],
+  "description": "Replace fallback qualified-column suffix format! construction with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "Fallback suffix remains .<fallback_name>",
+      "Qualified column resolution regressions pass",
+      "Ambiguous join column behavior remains unchanged",
+      "Expression function regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "column_suffix_for_fallback"
+    ],
+    "notes": [
+      "The helper reserves one dot plus fallback name length before appending.",
+      "Generated suffix bytes remain equivalent to the prior format! string.",
+      "Column resolution matching logic is otherwise unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test column_suffix_for_fallback -- --nocapture",
+      "cargo test --test sql_ddl test_explain_qualified_primary_key_lookup -- --nocapture",
+      "cargo test --test sql_index_cache test_select_qualified_min_max_primary_key_uses_key_bounds -- --nocapture",
+      "cargo test --test sql_dml qualified_primary_key -- --nocapture",
+      "cargo test --test sql_join ambiguous_join_input -- --nocapture",
+      "cargo test --test sql_expr_functions -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(\"\\.\\{}\", fallback_name\\)' src/execution/expr/value.rs -n"
+    ]
+  }
+}
