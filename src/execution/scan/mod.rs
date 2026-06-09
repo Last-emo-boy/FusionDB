@@ -187,6 +187,15 @@ impl Executor {
         key
     }
 
+    fn scan_view_wrapped_query_sql(view_sql: &str) -> String {
+        let mut sql =
+            String::with_capacity("SELECT * FROM (".len() + view_sql.len() + ") AS _v".len());
+        sql.push_str("SELECT * FROM (");
+        sql.push_str(view_sql);
+        sql.push_str(") AS _v");
+        sql
+    }
+
     fn projection_indices_for_scan(
         projection: &Option<Vec<String>>,
         schema: &TableSchema,
@@ -318,8 +327,8 @@ impl Executor {
                 if let Some(view_bytes) = txn.get(view_key.as_bytes()).await? {
                     let view_sql = String::from_utf8(view_bytes)
                         .map_err(|e| FusionError::Execution(format!("View decode error: {}", e)))?;
-                    let stmts =
-                        crate::parser::parse_sql(&format!("SELECT * FROM ({}) AS _v", view_sql))?;
+                    let wrapped_sql = Self::scan_view_wrapped_query_sql(&view_sql);
+                    let stmts = crate::parser::parse_sql(&wrapped_sql)?;
                     if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next()
                     {
                         let result = Box::pin(self.handle_query(&query, txn, params)).await?;
@@ -1425,5 +1434,17 @@ mod tests {
 
         assert_eq!(key, "view:revenue0");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn scan_view_wrapped_query_sql_preallocates_exact_sql() {
+        let sql =
+            Executor::scan_view_wrapped_query_sql("SELECT id, name FROM vt WHERE score >= 80");
+
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT id, name FROM vt WHERE score >= 80) AS _v"
+        );
+        assert!(sql.capacity() >= sql.len());
     }
 }

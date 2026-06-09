@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-366",
+  "title": "Scan view wrapper SQL preallocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/scan/mod.rs"
+  ],
+  "objective": "Preallocate the view scan wrapper SQL used before parser expansion while preserving exact query text.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-366"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test scan_view_wrapped_query_sql -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_view_show_constraints -- --nocapture",
+      "result": "passed: 16/16"
+    },
+    {
+      "command": "cargo test --test sql_join test_view_timestamp_predicate_matches_chbenchmark_q15_shape -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'format!\\\\(\\\"SELECT \\\\* FROM \\\\(\\\\{\\\\}\\\\) AS _v\\\"|SELECT \\\\* FROM \\\\(\\\\{\\\\}\\\\) AS _v' src/execution/scan/mod.rs -n",
+      "result": "no matches"
+    }
+  ]
+}

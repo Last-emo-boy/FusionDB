@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-366",
+  "title": "Preallocate scan view wrapper SQL",
+  "status": "completed",
+  "files": [
+    "src/execution/scan/mod.rs"
+  ],
+  "description": "Replace the scan-table view wrapper format! call with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "Generated wrapper SQL remains SELECT * FROM (<view_sql>) AS _v",
+      "View query behavior remains unchanged",
+      "Relevant view and join regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "scan_view_wrapped_query_sql"
+    ],
+    "notes": [
+      "The helper reserves the fixed prefix, view SQL bytes, and fixed suffix before appending.",
+      "The parser receives the same wrapped SQL bytes as the prior format! output.",
+      "The change is limited to base table scan view expansion."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test scan_view_wrapped_query_sql -- --nocapture",
+      "cargo test --test sql_view_show_constraints -- --nocapture",
+      "cargo test --test sql_join test_view_timestamp_predicate_matches_chbenchmark_q15_shape -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\\\(\\\"SELECT \\\\* FROM \\\\(\\\\{\\\\}\\\\) AS _v\\\"|SELECT \\\\* FROM \\\\(\\\\{\\\\}\\\\) AS _v' src/execution/scan/mod.rs -n"
+    ]
+  }
+}
