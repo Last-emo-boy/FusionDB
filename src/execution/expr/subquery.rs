@@ -63,6 +63,13 @@ fn subquery_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+fn subquery_derived_cache_name_for_alias(alias_name: &str) -> String {
+    let mut name = String::with_capacity("derived:".len() + alias_name.len());
+    name.push_str("derived:");
+    name.push_str(alias_name);
+    name
+}
+
 impl Executor {
     pub(crate) async fn materialize_subqueries(
         &self,
@@ -678,7 +685,7 @@ impl Executor {
                     .as_ref()
                     .map(|alias| alias.name.value.as_str())
                     .unwrap_or("");
-                format!("derived:{}", alias_name)
+                subquery_derived_cache_name_for_alias(alias_name)
             }
             _ => "unsupported".to_string(),
         }
@@ -1289,7 +1296,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::subquery_schema_key_for_table;
+    use super::{subquery_derived_cache_name_for_alias, subquery_schema_key_for_table};
 
     #[test]
     fn subquery_schema_key_for_table_preallocates_exact_key() {
@@ -1297,5 +1304,13 @@ mod tests {
 
         assert_eq!(key, "schema:orders");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn subquery_derived_cache_name_for_alias_preallocates_exact_name() {
+        let name = subquery_derived_cache_name_for_alias("candidate_orders");
+
+        assert_eq!(name, "derived:candidate_orders");
+        assert!(name.capacity() >= name.len());
     }
 }
