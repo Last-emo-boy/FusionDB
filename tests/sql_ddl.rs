@@ -746,6 +746,44 @@ async fn test_alter_table_add_primary_key_rewrites_secondary_btree_index_row_ids
 }
 
 #[tokio::test]
+async fn test_alter_table_add_primary_key_uses_default_index_name() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE alter_pk_default (id INTEGER NOT NULL, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO alter_pk_default VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+
+    let msg = exec_ok(
+        &executor,
+        "ALTER TABLE alter_pk_default ADD PRIMARY KEY (id)",
+    )
+    .await;
+    assert!(msg.contains("Added PRIMARY KEY alter_pk_default_id_pkey"));
+
+    let indexes = executor
+        .execute_sql("SHOW INDEXES FROM alter_pk_default")
+        .await
+        .unwrap();
+    if let Some(QueryResult::Select { rows, .. }) = indexes.first() {
+        assert!(rows.iter().any(|row| {
+            row[0] == Value::String("alter_pk_default_id_pkey".to_string())
+                && row[1] == Value::String("alter_pk_default".to_string())
+                && row[2] == Value::String("id".to_string())
+        }));
+    } else {
+        panic!("Expected Select result from SHOW INDEXES FROM");
+    }
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_alter_table_add_primary_key_rejects_existing_primary_key() {
     let (executor, wal) = setup().await;
     exec_ok(

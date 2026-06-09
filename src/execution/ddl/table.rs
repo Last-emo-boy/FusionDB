@@ -110,6 +110,22 @@ fn table_index_meta_key_for_index(index_name: &str) -> String {
     key
 }
 
+fn table_primary_key_index_name(table_name: &str) -> String {
+    let mut name = String::with_capacity(table_name.len() + "_pkey".len());
+    name.push_str(table_name);
+    name.push_str("_pkey");
+    name
+}
+
+fn table_column_primary_key_index_name(table_name: &str, column_name: &str) -> String {
+    let mut name = String::with_capacity(table_name.len() + 1 + column_name.len() + "_pkey".len());
+    name.push_str(table_name);
+    name.push('_');
+    name.push_str(column_name);
+    name.push_str("_pkey");
+    name
+}
+
 impl Executor {
     pub(crate) async fn handle_create_table(
         &self,
@@ -350,7 +366,7 @@ impl Executor {
         let index_name = primary_key
             .name
             .clone()
-            .unwrap_or_else(|| format!("{}_pkey", table_name));
+            .unwrap_or_else(|| table_primary_key_index_name(table_name));
         let meta_key = table_index_meta_key_for_index(&index_name);
         if txn.get(meta_key.as_bytes()).await?.is_some() {
             return Err(FusionError::Execution(format!(
@@ -804,8 +820,8 @@ impl Executor {
             rewrites.push((key, old_row_id, pk_key, value));
         }
 
-        let index_name =
-            constraint_name.unwrap_or_else(|| format!("{}_{}_pkey", table_name, column_name));
+        let index_name = constraint_name
+            .unwrap_or_else(|| table_column_primary_key_index_name(table_name, &column_name));
         let meta_key = table_index_meta_key_for_index(&index_name);
         if txn.get(meta_key.as_bytes()).await?.is_some() {
             return Err(FusionError::Execution(format!(
@@ -1016,10 +1032,10 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        table_data_key_for_row_id, table_data_prefix_for_table,
-        table_index_key_for_prefix_value_row, table_index_key_for_value,
-        table_index_meta_key_for_index, table_index_prefix_for_column,
-        table_index_prefix_for_table, table_schema_key_for_table,
+        table_column_primary_key_index_name, table_data_key_for_row_id,
+        table_data_prefix_for_table, table_index_key_for_prefix_value_row,
+        table_index_key_for_value, table_index_meta_key_for_index, table_index_prefix_for_column,
+        table_index_prefix_for_table, table_primary_key_index_name, table_schema_key_for_table,
     };
 
     #[test]
@@ -1085,5 +1101,21 @@ mod tests {
 
         assert_eq!(key, "index_meta:accounts_pkey");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn table_primary_key_index_name_preallocates_exact_name() {
+        let name = table_primary_key_index_name("accounts");
+
+        assert_eq!(name, "accounts_pkey");
+        assert!(name.capacity() >= name.len());
+    }
+
+    #[test]
+    fn table_column_primary_key_index_name_preallocates_exact_name() {
+        let name = table_column_primary_key_index_name("accounts", "id");
+
+        assert_eq!(name, "accounts_id_pkey");
+        assert!(name.capacity() >= name.len());
     }
 }

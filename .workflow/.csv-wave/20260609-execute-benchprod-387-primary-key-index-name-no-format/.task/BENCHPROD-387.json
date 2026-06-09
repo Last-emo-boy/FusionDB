@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-387",
+  "title": "Avoid primary key index name format allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/ddl/table.rs",
+    "tests/sql_ddl.rs"
+  ],
+  "description": "Replace default primary-key index name construction via format! with preallocated helper builders.",
+  "convergence": {
+    "criteria": [
+      "Composite primary-key default index names no longer use format!(\"{}_pkey\", table_name)",
+      "ALTER TABLE ADD PRIMARY KEY default index names no longer use format!(\"{}_{}_pkey\", table_name, column_name)",
+      "Generated index name bytes remain unchanged",
+      "DDL primary-key regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "table_primary_key_index_name",
+      "table_column_primary_key_index_name"
+    ],
+    "notes": [
+      "Default index names now append into a single preallocated String.",
+      "Explicit primary-key constraint/index names remain cloned unchanged.",
+      "A SQL regression covers ALTER TABLE ADD PRIMARY KEY without an explicit constraint name and verifies the SHOW INDEXES name."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test table_primary_key_index_name_preallocates_exact_name -- --nocapture",
+      "cargo test table_column_primary_key_index_name_preallocates_exact_name -- --nocapture",
+      "cargo test --test sql_ddl test_alter_table_add_primary_key_uses_default_index_name -- --nocapture",
+      "cargo test --test sql_ddl primary_key -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'table_primary_key_index_name|table_column_primary_key_index_name|format!\\(\"\\{\\}_pkey\"|format!\\(\"\\{\\}_\\{\\}_pkey\"' src/execution/ddl/table.rs -n"
+    ]
+  }
+}

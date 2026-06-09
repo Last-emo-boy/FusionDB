@@ -1,0 +1,49 @@
+{
+  "id": "BENCHPROD-387",
+  "title": "Primary key index names without format allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/ddl/table.rs",
+    "tests/sql_ddl.rs"
+  ],
+  "objective": "Avoid format! allocation while generating default primary-key index names.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-387"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test table_primary_key_index_name_preallocates_exact_name -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test table_column_primary_key_index_name_preallocates_exact_name -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_ddl test_alter_table_add_primary_key_uses_default_index_name -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_ddl primary_key -- --nocapture",
+      "result": "passed: 12/12"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'table_primary_key_index_name|table_column_primary_key_index_name|format!\\(\"\\{\\}_pkey\"|format!\\(\"\\{\\}_\\{\\}_pkey\"' src/execution/ddl/table.rs -n",
+      "result": "default primary-key index name paths use helpers; old format patterns are absent"
+    }
+  ]
+}
