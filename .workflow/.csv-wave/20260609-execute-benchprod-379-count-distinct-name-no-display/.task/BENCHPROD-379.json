@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-379",
+  "title": "Avoid COUNT DISTINCT projection name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "description": "Replace count_distinct_projection COUNT detection via func.name.to_string().eq_ignore_ascii_case with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "COUNT DISTINCT projection detection no longer builds a display string for the function name",
+      "COUNT DISTINCT behavior remains unchanged for bare and group-by fast paths",
+      "Qualified names remain rejected by the simple COUNT check",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "column_scan_function_name_eq_ascii"
+    ],
+    "notes": [
+      "count_distinct_projection now reuses the direct ObjectNamePart helper.",
+      "The helper test now explicitly covers COUNT in addition to STRING_AGG.",
+      "is_simple_count_star still has its own COUNT display allocation and remains a separate next-task candidate."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test column_scan_function_name_eq_ascii -- --nocapture",
+      "cargo test --test sql_group_aggregate count_distinct -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'func\\.name\\.to_string\\(\\)\\.eq_ignore_ascii_case\\(\"COUNT\"\\)' src/execution/query/column_scan.rs -n"
+    ]
+  }
+}

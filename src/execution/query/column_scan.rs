@@ -1088,7 +1088,7 @@ impl Executor {
         let Expr::Function(func) = expr else {
             return None;
         };
-        if !func.name.to_string().eq_ignore_ascii_case("COUNT") {
+        if !column_scan_function_name_eq_ascii(&func.name, "COUNT") {
             return None;
         }
 
@@ -1736,12 +1736,14 @@ mod tests {
 
     #[test]
     fn column_scan_function_name_eq_ascii_matches_without_display_string() {
+        let count = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("Count"))]);
         let name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("String_Agg"))]);
         let qualified = ObjectName(vec![
             ObjectNamePart::Identifier(Ident::new("pg_catalog")),
             ObjectNamePart::Identifier(Ident::new("string_agg")),
         ]);
 
+        assert!(column_scan_function_name_eq_ascii(&count, "COUNT"));
         assert!(column_scan_function_name_eq_ascii(&name, "STRING_AGG"));
         assert!(!column_scan_function_name_eq_ascii(&name, "COUNT"));
         assert!(!column_scan_function_name_eq_ascii(
