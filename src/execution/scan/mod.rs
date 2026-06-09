@@ -180,6 +180,13 @@ impl Executor {
         key
     }
 
+    fn scan_view_key_for_table(table_name: &str) -> String {
+        let mut key = String::with_capacity("view:".len() + table_name.len());
+        key.push_str("view:");
+        key.push_str(table_name);
+        key
+    }
+
     fn projection_indices_for_scan(
         projection: &Option<Vec<String>>,
         schema: &TableSchema,
@@ -307,7 +314,7 @@ impl Executor {
                 }
 
                 // No table schema found — check for a view definition
-                let view_key = format!("view:{}", table_name);
+                let view_key = Self::scan_view_key_for_table(&table_name);
                 if let Some(view_bytes) = txn.get(view_key.as_bytes()).await? {
                     let view_sql = String::from_utf8(view_bytes)
                         .map_err(|e| FusionError::Execution(format!("View decode error: {}", e)))?;
@@ -546,7 +553,7 @@ impl Executor {
                 // Check for view — if no table schema exists, try view expansion
                 let schema_bytes_opt = txn.get(schema_key.as_bytes()).await?;
                 if schema_bytes_opt.is_none() {
-                    let view_key = format!("view:{}", table_name);
+                    let view_key = Self::scan_view_key_for_table(&table_name);
                     if let Some(view_bytes) = txn.get(view_key.as_bytes()).await? {
                         let view_sql = String::from_utf8(view_bytes).map_err(|e| {
                             FusionError::Execution(format!("View decode error: {}", e))
@@ -1409,6 +1416,14 @@ mod tests {
         let key = Executor::scan_schema_key_for_table("lineitem");
 
         assert_eq!(key, "schema:lineitem");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn scan_view_key_for_table_preallocates_exact_key() {
+        let key = Executor::scan_view_key_for_table("revenue0");
+
+        assert_eq!(key, "view:revenue0");
         assert!(key.capacity() >= key.len());
     }
 }
