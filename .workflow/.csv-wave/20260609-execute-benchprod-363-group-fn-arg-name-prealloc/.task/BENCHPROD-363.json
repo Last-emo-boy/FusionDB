@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-363",
+  "title": "Preallocate temporary group function argument names",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/mod.rs"
+  ],
+  "description": "Replace repeated __group_fn_arg_<index> format! construction with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "Generated argument names remain __group_fn_arg_<index>",
+      "Both evaluated function args and schema columns use the same helper",
+      "GROUP BY scalar-function projection regression passes",
+      "Group aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "group_function_arg_name",
+      "usize_decimal_len"
+    ],
+    "notes": [
+      "The helper reserves the static prefix length plus the decimal index width.",
+      "Generated temporary group-function argument names remain byte-for-byte equivalent to the prior format! strings.",
+      "Group expression evaluation behavior is otherwise unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test group_function_arg_name -- --nocapture",
+      "cargo test expr_usize_decimal_len -- --nocapture",
+      "cargo test --test sql_group_aggregate test_group_by_projection_scalar_function_from_group_columns -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(\"__group_fn_arg_\\{}\", index\\)' src/execution/expr/mod.rs -n"
+    ]
+  }
+}

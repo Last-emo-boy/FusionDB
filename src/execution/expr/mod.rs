@@ -9,8 +9,25 @@ use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value as SqlValue,
 };
 use std::collections::HashSet;
+use std::fmt::Write as FmtWrite;
 
 use super::Executor;
+
+fn group_function_arg_name(index: usize) -> String {
+    let mut name = String::with_capacity("__group_fn_arg_".len() + usize_decimal_len(index));
+    name.push_str("__group_fn_arg_");
+    write!(&mut name, "{index}").expect("writing to String cannot fail");
+    name
+}
+
+fn usize_decimal_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 10 {
+        value /= 10;
+        len += 1;
+    }
+    len
+}
 
 impl Executor {
     pub(crate) fn placeholder_index(placeholder: &str) -> usize {
@@ -538,7 +555,7 @@ impl Executor {
                         _schema,
                         _params,
                     )?;
-                    let arg_name = format!("__group_fn_arg_{}", index);
+                    let arg_name = group_function_arg_name(index);
                     evaluated_row.push(value);
                     evaluated_args.push(FunctionArg::Unnamed(FunctionArgExpr::Expr(
                         Expr::Identifier(sqlparser::ast::Ident::new(arg_name)),
@@ -555,7 +572,7 @@ impl Executor {
                     "__group_function_args".to_string(),
                     (0..evaluated_row.len())
                         .map(|index| crate::catalog::Column {
-                            name: format!("__group_fn_arg_{}", index),
+                            name: group_function_arg_name(index),
                             data_type: "UNKNOWN".to_string(),
                             is_primary: false,
                             is_indexed: false,
@@ -633,13 +650,28 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::Executor;
+    use super::{group_function_arg_name, usize_decimal_len, Executor};
 
     #[test]
     fn placeholder_index_parses_dollar_parameters() {
         assert_eq!(Executor::placeholder_index("$1"), 1);
         assert_eq!(Executor::placeholder_index("2"), 2);
         assert_eq!(Executor::placeholder_index("$bad"), 0);
+    }
+
+    #[test]
+    fn group_function_arg_name_preallocates_exact_name() {
+        let name = group_function_arg_name(42);
+
+        assert_eq!(name, "__group_fn_arg_42");
+        assert!(name.capacity() >= name.len());
+    }
+
+    #[test]
+    fn expr_usize_decimal_len_counts_digits() {
+        assert_eq!(usize_decimal_len(0), 1);
+        assert_eq!(usize_decimal_len(9), 1);
+        assert_eq!(usize_decimal_len(10), 2);
     }
 
     #[test]
