@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-356",
+  "title": "Preallocate secondary index scan prefixes",
+  "status": "completed",
+  "files": [
+    "src/execution/scan/index_plan.rs"
+  ],
+  "description": "Replace secondary index prefix format! calls in equality, IN-list, and LIKE fixed-prefix scans with exact-capacity helpers.",
+  "convergence": {
+    "criteria": [
+      "Equality and IN-list prefixes remain index:<table>:<column>:<value>:",
+      "LIKE fixed-prefix scan prefix remains index:<table>:<column>:<prefix> without trailing colon",
+      "Index and SELECT regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "Executor::secondary_index_prefix_for_value",
+      "Executor::secondary_index_prefix_for_value_start"
+    ],
+    "notes": [
+      "The trailing-colon helper is used for exact secondary-index equality and IN-list probes.",
+      "The value-start helper intentionally omits the trailing colon for LIKE fixed-prefix scans.",
+      "Generated scan prefixes remain byte-for-byte equivalent to the prior format! strings."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test secondary_index_prefix_for_value -- --nocapture",
+      "cargo test --test sql_index_cache test_create_btree_index -- --nocapture",
+      "cargo test --test sql_index_cache test_indexed_text_insert_updates_trigram_index_on_fusion_storage -- --nocapture",
+      "cargo test --test sql_select test_select_in_list -- --nocapture",
+      "cargo test --test sql_index_cache -- --nocapture",
+      "cargo test --test sql_select -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(\\s*\"index:\\{}:\\{}:\\{}:?' src/execution/scan/index_plan.rs -n -U"
+    ]
+  }
+}

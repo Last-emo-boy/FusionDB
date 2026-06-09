@@ -39,6 +39,41 @@ impl Executor {
         key
     }
 
+    fn secondary_index_prefix_for_value(
+        table_name: &str,
+        column_name: &str,
+        value: &str,
+    ) -> String {
+        let mut prefix = String::with_capacity(
+            "index:".len() + table_name.len() + 1 + column_name.len() + 1 + value.len() + 1,
+        );
+        prefix.push_str("index:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix.push_str(value);
+        prefix.push(':');
+        prefix
+    }
+
+    fn secondary_index_prefix_for_value_start(
+        table_name: &str,
+        column_name: &str,
+        value_prefix: &str,
+    ) -> String {
+        let mut prefix = String::with_capacity(
+            "index:".len() + table_name.len() + 1 + column_name.len() + 1 + value_prefix.len(),
+        );
+        prefix.push_str("index:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix.push_str(value_prefix);
+        prefix
+    }
+
     fn order_by_primary_key_direction(
         &self,
         order_by: Option<&sqlparser::ast::OrderBy>,
@@ -417,9 +452,10 @@ impl Executor {
                                 } else {
                                     limit
                                 };
-                                let index_prefix = format!(
-                                    "index:{}:{}:{}:",
-                                    table_name, storage_col_name, val_str
+                                let index_prefix = Self::secondary_index_prefix_for_value(
+                                    table_name,
+                                    &storage_col_name,
+                                    &val_str,
                                 );
                                 let index_entries =
                                     txn.scan_prefix(index_prefix.as_bytes(), scan_limit).await?;
@@ -570,9 +606,10 @@ impl Executor {
                                         }
                                     }
                                 } else if let Some(val_str) = self.value_to_index_string(&val) {
-                                    let index_prefix = format!(
-                                        "index:{}:{}:{}:",
-                                        table_name, storage_col_name, val_str
+                                    let index_prefix = Self::secondary_index_prefix_for_value(
+                                        table_name,
+                                        &storage_col_name,
+                                        &val_str,
                                     );
                                     let kv =
                                         txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
@@ -623,10 +660,12 @@ impl Executor {
                                         }
                                         row_ids
                                     } else {
-                                        let index_prefix = format!(
-                                            "index:{}:{}:{}",
-                                            table_name, storage_col_name, prefix
-                                        );
+                                        let index_prefix =
+                                            Self::secondary_index_prefix_for_value_start(
+                                                table_name,
+                                                &storage_col_name,
+                                                &prefix,
+                                            );
                                         let kv =
                                             txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
                                         let mut row_ids = HashSet::with_capacity(kv.len());
@@ -829,5 +868,21 @@ mod tests {
 
         assert_eq!(key, "data:orders:00042\0");
         assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn secondary_index_prefix_for_value_preallocates_exact_prefix() {
+        let prefix = Executor::secondary_index_prefix_for_value("orders", "status", "open");
+
+        assert_eq!(prefix, "index:orders:status:open:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn secondary_index_prefix_for_value_start_preallocates_exact_prefix() {
+        let prefix = Executor::secondary_index_prefix_for_value_start("orders", "status", "op");
+
+        assert_eq!(prefix, "index:orders:status:op");
+        assert!(prefix.capacity() >= prefix.len());
     }
 }

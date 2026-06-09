@@ -1,0 +1,56 @@
+{
+  "id": "BENCHPROD-356",
+  "title": "Secondary index scan prefix preallocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/scan/index_plan.rs"
+  ],
+  "objective": "Preallocate secondary index scan prefixes while preserving exact index scan boundaries.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-356"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test secondary_index_prefix_for_value -- --nocapture",
+      "result": "passed: 2/2"
+    },
+    {
+      "command": "cargo test --test sql_index_cache test_create_btree_index -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_index_cache test_indexed_text_insert_updates_trigram_index_on_fusion_storage -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_select test_select_in_list -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_index_cache -- --nocapture",
+      "result": "passed: 38/38"
+    },
+    {
+      "command": "cargo test --test sql_select -- --nocapture",
+      "result": "passed: 27/27"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'format!\\(\\s*\"index:\\{}:\\{}:\\{}:?' src/execution/scan/index_plan.rs -n -U",
+      "result": "no matches"
+    }
+  ]
+}
