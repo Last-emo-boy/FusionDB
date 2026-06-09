@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-373",
+  "title": "Avoid VECTOR_DISTANCE ObjectName uppercase allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/scan/mod.rs"
+  ],
+  "description": "Replace VECTOR_DISTANCE detection via func.name.to_string().to_uppercase() with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "VECTOR_DISTANCE names still match case-insensitively",
+      "ObjectNamePart::Function helper branch is covered",
+      "HNSW ORDER BY VECTOR_DISTANCE projection regression passes",
+      "sql_returning_upsert_vector_rbac regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "scan_object_name_eq_ascii"
+    ],
+    "notes": [
+      "The HNSW ORDER BY scan optimization now reuses the direct ObjectName helper.",
+      "No ObjectName display string or uppercase String is allocated for the VECTOR_DISTANCE guard.",
+      "The helper test now covers the ObjectNamePart::Function variant used by sqlparser for dynamic object-name parts."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test scan_object_name_eq_ascii -- --nocapture",
+      "cargo test --test sql_returning_upsert_vector_rbac test_hnsw_order_by_projection -- --nocapture",
+      "cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\) == \"VECTOR_DISTANCE\"' src/execution/scan/mod.rs -n"
+    ]
+  }
+}

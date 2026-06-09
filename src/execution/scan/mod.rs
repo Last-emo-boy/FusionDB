@@ -723,7 +723,7 @@ impl Executor {
                                     }
                                     // Case 2: VECTOR_DISTANCE function
                                     else if let Expr::Function(func) = sort_expr {
-                                        if func.name.to_string().to_uppercase() == "VECTOR_DISTANCE"
+                                        if scan_object_name_eq_ascii(&func.name, "VECTOR_DISTANCE")
                                         {
                                             if let FunctionArguments::List(args) = &func.args {
                                                 if args.args.len() == 2 {
@@ -1411,7 +1411,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{scan_object_name_eq_ascii, Executor};
-    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction};
 
     #[test]
     fn scan_data_key_for_row_id_preallocates_exact_key() {
@@ -1466,8 +1466,13 @@ mod tests {
             ObjectNamePart::Identifier(Ident::new("pg_catalog")),
             ObjectNamePart::Identifier(Ident::new("generate_subscripts")),
         ]);
+        let function_part = ObjectName(vec![ObjectNamePart::Function(ObjectNamePartFunction {
+            name: Ident::new("VECTOR_DISTANCE"),
+            args: Vec::new(),
+        })]);
 
         assert!(scan_object_name_eq_ascii(&name, "generate_subscripts"));
+        assert!(scan_object_name_eq_ascii(&function_part, "vector_distance"));
         assert!(!scan_object_name_eq_ascii(&name, "generate_series"));
         assert!(!scan_object_name_eq_ascii(
             &qualified,

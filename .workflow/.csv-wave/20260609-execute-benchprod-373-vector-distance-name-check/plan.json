@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-373",
+  "title": "Vector distance name check without uppercase allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/scan/mod.rs"
+  ],
+  "objective": "Avoid ObjectName display and uppercase allocations when detecting VECTOR_DISTANCE for HNSW scan optimization.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-373"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test scan_object_name_eq_ascii -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_returning_upsert_vector_rbac test_hnsw_order_by_projection -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+      "result": "passed: 14/14"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\) == \"VECTOR_DISTANCE\"' src/execution/scan/mod.rs -n",
+      "result": "no matches"
+    }
+  ]
+}
