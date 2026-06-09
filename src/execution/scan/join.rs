@@ -52,6 +52,14 @@ fn join_index_prefix_for_value(table_name: &str, column_name: &str, value_key: &
     prefix
 }
 
+fn join_prefixed_column_name(prefix: &str, column_name: &str) -> String {
+    let mut name = String::with_capacity(prefix.len() + 1 + column_name.len());
+    name.push_str(prefix);
+    name.push('.');
+    name.push_str(column_name);
+    name
+}
+
 struct ExprJoinProbePlan {
     left_expr: Expr,
     right_key_index: usize,
@@ -1206,7 +1214,7 @@ impl Executor {
 
         for col in &mut schema.columns {
             if !col.name.contains('.') {
-                col.name = format!("{}.{}", prefix, col.name);
+                col.name = join_prefixed_column_name(&prefix, &col.name);
             }
         }
         Ok(())
@@ -2092,5 +2100,13 @@ mod tests {
 
         assert_eq!(prefix, "index:orders:customer_id:00042:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn join_prefixed_column_name_preallocates_exact_name() {
+        let name = join_prefixed_column_name("orders", "customer_id");
+
+        assert_eq!(name, "orders.customer_id");
+        assert!(name.capacity() >= name.len());
     }
 }

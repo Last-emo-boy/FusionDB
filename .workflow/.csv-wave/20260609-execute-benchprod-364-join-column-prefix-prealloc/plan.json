@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-364",
+  "title": "Join column prefix preallocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/scan/join.rs"
+  ],
+  "objective": "Preallocate JOIN schema column prefixes while preserving exact output column names.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-364"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test join_prefixed_column_name -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_join test_join_base_scan_reuses_row_cache -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_join -- --nocapture",
+      "result": "passed: 31/31"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'format!\\(\"\\{}\\.\\{}\", prefix, col\\.name\\)' src/execution/scan/join.rs -n",
+      "result": "no matches"
+    }
+  ]
+}
