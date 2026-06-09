@@ -1,0 +1,48 @@
+{
+  "id": "BENCHPROD-397",
+  "title": "Trigram text data type matching without uppercase allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/dml/mod.rs"
+  ],
+  "objective": "Avoid allocating uppercase data type strings while finding indexed text columns for trigram maintenance.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-397"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test trigram_text_data_type_matching_is_ascii_case_insensitive -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test indexed_trigram_text_columns_filters_text_indexes_without_uppercase_allocation -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_index_cache test_indexed_text_insert_updates_trigram_index_on_fusion_storage -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_index_cache trigram -- --nocapture",
+      "result": "passed: 5/5"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'is_trigram_text_data_type|to_ascii_uppercase\\(\\)' src/execution/dml/mod.rs -n",
+      "result": "trigram text data type matching uses is_trigram_text_data_type; old to_ascii_uppercase path is absent"
+    }
+  ]
+}

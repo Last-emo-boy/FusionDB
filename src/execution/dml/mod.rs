@@ -10,6 +10,24 @@ mod insert;
 mod returning;
 mod update;
 
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    match value.as_bytes().get(..prefix.len()) {
+        Some(candidate) => candidate.eq_ignore_ascii_case(prefix.as_bytes()),
+        None => false,
+    }
+}
+
+fn is_trigram_text_data_type(data_type: &str) -> bool {
+    let data_type = data_type.trim();
+    data_type.eq_ignore_ascii_case("TEXT")
+        || data_type.eq_ignore_ascii_case("STRING")
+        || data_type.eq_ignore_ascii_case("VARCHAR")
+        || data_type.eq_ignore_ascii_case("CHAR")
+        || starts_with_ascii_case_insensitive(data_type, "VARCHAR(")
+        || starts_with_ascii_case_insensitive(data_type, "CHAR(")
+        || starts_with_ascii_case_insensitive(data_type, "CHARACTER")
+}
+
 impl Executor {
     pub(crate) fn fts_index_key_for_row(
         table_name: &str,
@@ -80,15 +98,7 @@ impl Executor {
     pub(crate) fn indexed_trigram_text_columns(schema: &TableSchema) -> Vec<usize> {
         let mut indices = Vec::with_capacity(schema.columns.len());
         for (idx, col) in schema.columns.iter().enumerate() {
-            let upper = col.data_type.trim().to_ascii_uppercase();
-            let text_type = upper == "TEXT"
-                || upper == "STRING"
-                || upper == "VARCHAR"
-                || upper == "CHAR"
-                || upper.starts_with("VARCHAR(")
-                || upper.starts_with("CHAR(")
-                || upper.starts_with("CHARACTER");
-            if text_type
+            if is_trigram_text_data_type(&col.data_type)
                 && col.is_indexed
                 && matches!(col.index_type, IndexType::BTree | IndexType::FTS)
             {
@@ -396,7 +406,49 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
+    use crate::catalog::{Column, IndexType, TableSchema};
+
     use super::Executor;
+
+    fn column(name: &str, data_type: &str, is_indexed: bool, index_type: IndexType) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            is_primary: false,
+            is_indexed,
+            index_type,
+            default_value: None,
+            is_nullable: true,
+            is_unique: false,
+            check_expr: None,
+        }
+    }
+
+    #[test]
+    fn trigram_text_data_type_matching_is_ascii_case_insensitive() {
+        assert!(super::is_trigram_text_data_type("TEXT"));
+        assert!(super::is_trigram_text_data_type(" string "));
+        assert!(super::is_trigram_text_data_type("varchar(32)"));
+        assert!(super::is_trigram_text_data_type("Char(8)"));
+        assert!(super::is_trigram_text_data_type("character varying"));
+        assert!(!super::is_trigram_text_data_type("INTEGER"));
+    }
+
+    #[test]
+    fn indexed_trigram_text_columns_filters_text_indexes_without_uppercase_allocation() {
+        let schema = TableSchema::new(
+            "docs".to_string(),
+            vec![
+                column("id", "INTEGER", false, IndexType::None),
+                column("body", " varchar(255) ", true, IndexType::BTree),
+                column("title", "TEXT", true, IndexType::FTS),
+                column("score", "TEXT", false, IndexType::None),
+                column("embedding", "TEXT", true, IndexType::HNSW),
+            ],
+        );
+
+        assert_eq!(Executor::indexed_trigram_text_columns(&schema), vec![1, 2]);
+    }
 
     #[test]
     fn fts_index_key_for_row_preallocates_exact_key() {

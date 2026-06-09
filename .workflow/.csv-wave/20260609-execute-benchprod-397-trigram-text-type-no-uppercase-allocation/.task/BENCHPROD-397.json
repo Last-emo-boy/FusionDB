@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-397",
+  "title": "Avoid trigram text type uppercase allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/dml/mod.rs"
+  ],
+  "description": "Replace indexed trigram text column detection's to_ascii_uppercase allocation with ASCII case-insensitive helpers.",
+  "convergence": {
+    "criteria": [
+      "Indexed trigram text column detection no longer allocates uppercase data type strings",
+      "TEXT, STRING, VARCHAR, CHAR, VARCHAR(...), CHAR(...), and CHARACTER... remain recognized",
+      "Index-type filtering remains limited to BTree and FTS indexed text columns",
+      "Focused helper and column-filter tests pass",
+      "Trigram-index SQL regression passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "starts_with_ascii_case_insensitive",
+      "is_trigram_text_data_type"
+    ],
+    "notes": [
+      "The helper trims the data type and uses ASCII case-insensitive comparisons and prefix checks.",
+      "indexed_trigram_text_columns still preserves the existing index-type and is_indexed filters.",
+      "Trigram index update and row-id logic are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test trigram_text_data_type_matching_is_ascii_case_insensitive -- --nocapture",
+      "cargo test indexed_trigram_text_columns_filters_text_indexes_without_uppercase_allocation -- --nocapture",
+      "cargo test --test sql_index_cache test_indexed_text_insert_updates_trigram_index_on_fusion_storage -- --nocapture",
+      "cargo test --test sql_index_cache trigram -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'is_trigram_text_data_type|to_ascii_uppercase\\(\\)' src/execution/dml/mod.rs -n"
+    ]
+  }
+}
