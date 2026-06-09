@@ -21,6 +21,33 @@ fn update_data_key_for_prefix_row(prefix: &str, row_id: &str) -> String {
     key
 }
 
+fn update_index_key_for_value(
+    table_name: &str,
+    column_name: &str,
+    value: &str,
+    row_id: &str,
+) -> String {
+    let mut key = String::with_capacity(
+        "index:".len()
+            + table_name.len()
+            + 1
+            + column_name.len()
+            + 1
+            + value.len()
+            + 1
+            + row_id.len(),
+    );
+    key.push_str("index:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(column_name);
+    key.push(':');
+    key.push_str(value);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 fn update_schema_key_for_table(table_name: &str) -> String {
     let mut key = String::with_capacity("schema:".len() + table_name.len());
     key.push_str("schema:");
@@ -263,17 +290,21 @@ impl Executor {
                                 }
                             } else {
                                 if let Some(old_val_str) = self.value_to_index_string(old_val) {
-                                    let old_index_key = format!(
-                                        "index:{}:{}:{}:{}",
-                                        table_name_str, col.name, old_val_str, row_id
+                                    let old_index_key = update_index_key_for_value(
+                                        &table_name_str,
+                                        &col.name,
+                                        &old_val_str,
+                                        row_id,
                                     );
                                     txn.delete(old_index_key.as_bytes()).await?;
                                 }
 
                                 if let Some(new_val_str) = self.value_to_index_string(new_val) {
-                                    let new_index_key = format!(
-                                        "index:{}:{}:{}:{}",
-                                        table_name_str, col.name, new_val_str, row_id
+                                    let new_index_key = update_index_key_for_value(
+                                        &table_name_str,
+                                        &col.name,
+                                        &new_val_str,
+                                        row_id,
                                     );
                                     txn.put(new_index_key.as_bytes(), &[]).await?;
                                 }
@@ -438,7 +469,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        update_data_key_for_prefix_row, update_data_prefix_for_table, update_schema_key_for_table,
+        update_data_key_for_prefix_row, update_data_prefix_for_table, update_index_key_for_value,
+        update_schema_key_for_table,
     };
 
     #[test]
@@ -455,6 +487,14 @@ mod tests {
         let key = update_data_key_for_prefix_row(&prefix, "00042");
 
         assert_eq!(key, "data:accounts:00042");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn update_index_key_for_value_preallocates_exact_key() {
+        let key = update_index_key_for_value("accounts", "status", "active", "00042");
+
+        assert_eq!(key, "index:accounts:status:active:00042");
         assert!(key.capacity() >= key.len());
     }
 

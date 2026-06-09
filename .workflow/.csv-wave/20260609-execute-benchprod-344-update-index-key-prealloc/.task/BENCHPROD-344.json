@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-344",
+  "title": "Preallocate UPDATE index keys",
+  "status": "completed",
+  "category": "database-performance",
+  "created_at": "2026-06-09T09:10:45+08:00",
+  "completed_at": "2026-06-09T09:10:45+08:00",
+  "files_changed": [
+    "src/execution/dml/update.rs"
+  ],
+  "summary": "Replaced ordinary secondary index key format! construction in UPDATE paths with an explicit-capacity helper.",
+  "verification": {
+    "unit": "cargo test update_index_key_for_value -- --nocapture passed 1/1",
+    "focused": "UPDATE index lookup cache invalidation, primary-key fast path with secondary index, secondary-index row cache reuse, and single-row update focused tests passed",
+    "integration": "cargo test --test sql_dml -- --nocapture passed 44/44",
+    "format": "cargo fmt --check passed",
+    "diff": "git diff --check passed",
+    "search": "rg 'old_index_key = format!\\(|new_index_key = format!\\(|\"index:\\{}:\\{}:\\{}:\\{}\"' src/execution/dml/update.rs -n returned no matches"
+  },
+  "result": "UPDATE still writes and deletes index:<table>:<column>:<value>:<row_id> keys, but avoids the format! allocation path for ordinary secondary index entries."
+}

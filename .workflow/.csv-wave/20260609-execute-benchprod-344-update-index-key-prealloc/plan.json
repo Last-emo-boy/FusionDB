@@ -1,0 +1,63 @@
+{
+  "id": "benchprod-344-update-index-key-prealloc",
+  "objective": "Preallocate UPDATE secondary index keys.",
+  "status": "completed",
+  "created_at": "2026-06-09T09:10:45+08:00",
+  "completed_at": "2026-06-09T09:10:45+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-344",
+      "title": "Preallocate UPDATE index keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/dml/update.rs"
+      ],
+      "result": "UPDATE paths that delete old ordinary secondary index entries and write new entries now use an explicit-capacity helper instead of format!."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test update_index_key_for_value -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_invalidates_row_cache_for_index_lookup -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_primary_key_fast_path_preserves_untouched_secondary_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_primary_key_reuses_row_cache_for_secondary_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_single_row -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "rg 'old_index_key = format!\\(|new_index_key = format!\\(|\"index:\\{}:\\{}:\\{}:\\{}\"' src/execution/dml/update.rs -n",
+      "status": "passed: no matches"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The generated secondary index key bytes remain index:<table>:<column>:<value>:<row_id>.",
+    "The optimization covers UPDATE ordinary secondary index delete and put paths for changed indexed values.",
+    "git diff --check printed the existing CRLF normalization warning for the edited Rust file while exiting successfully.",
+    "The sql_dml suite printed existing SSTable retry warnings and slow-query logs while passing 44/44 tests."
+  ]
+}
