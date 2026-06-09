@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-359",
+  "title": "SSTable file name preallocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/storage/fusion.rs"
+  ],
+  "objective": "Preallocate SSTable file names while preserving exact storage paths.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-359"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test sstable_file_name_for_id -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test storage::fusion::tests -- --nocapture",
+      "result": "passed: 24/24"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'format!\\(\"\\{\\}\\.sst\", id\\)' src/storage/fusion.rs -n",
+      "result": "no matches"
+    }
+  ]
+}

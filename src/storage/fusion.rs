@@ -6,6 +6,7 @@ use crate::config::StorageConfig;
 use async_trait::async_trait;
 use crossbeam_skiplist::SkipMap;
 use moka::sync::Cache;
+use std::fmt::Write as FmtWrite;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -30,6 +31,22 @@ fn sstable_file_candidate_buffer() -> Vec<(u64, PathBuf)> {
 
 fn sstable_handle_buffer() -> Vec<Arc<SsTable>> {
     Vec::with_capacity(1)
+}
+
+fn sstable_file_name_for_id(id: u64) -> String {
+    let mut name = String::with_capacity(u64_decimal_len(id) + ".sst".len());
+    write!(&mut name, "{id}").expect("writing to String cannot fail");
+    name.push_str(".sst");
+    name
+}
+
+fn u64_decimal_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 10 {
+        value /= 10;
+        len += 1;
+    }
+    len
 }
 
 fn obsolete_sstable_buffer() -> Vec<Arc<SsTable>> {
@@ -511,7 +528,7 @@ impl FusionStorage {
     }
 
     fn sstable_path_for(&self, id: u64) -> PathBuf {
-        self.paths.sstable_dir.join(format!("{}.sst", id))
+        self.paths.sstable_dir.join(sstable_file_name_for_id(id))
     }
 
     fn persist_secondary_indexes(&self, log_prefix: &str) {
@@ -2405,6 +2422,22 @@ mod tests {
     fn sstable_handle_buffer_preallocates_first_sstable() {
         let sstables = sstable_handle_buffer();
         assert!(sstables.capacity() >= 1);
+    }
+
+    #[test]
+    fn sstable_file_name_for_id_preallocates_exact_name() {
+        let name = sstable_file_name_for_id(42);
+
+        assert_eq!(name, "42.sst");
+        assert!(name.capacity() >= name.len());
+    }
+
+    #[test]
+    fn fusion_u64_decimal_len_counts_digits() {
+        assert_eq!(u64_decimal_len(0), 1);
+        assert_eq!(u64_decimal_len(9), 1);
+        assert_eq!(u64_decimal_len(10), 2);
+        assert_eq!(u64_decimal_len(u64::MAX), 20);
     }
 
     #[test]

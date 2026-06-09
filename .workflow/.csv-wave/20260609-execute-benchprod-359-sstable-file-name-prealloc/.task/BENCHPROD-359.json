@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-359",
+  "title": "Preallocate SSTable file names",
+  "status": "completed",
+  "files": [
+    "src/storage/fusion.rs"
+  ],
+  "description": "Replace SSTable file name format! construction with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "SSTable file name remains <id>.sst",
+      "FusionStorage::sstable_path_for still joins the file name under the SSTable directory",
+      "Fusion storage regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "sstable_file_name_for_id",
+      "u64_decimal_len"
+    ],
+    "notes": [
+      "The helper reserves the decimal id width plus the .sst suffix before writing into the String.",
+      "Generated SSTable file names remain byte-for-byte equivalent to the prior format! string.",
+      "The change is scoped to FusionStorage SSTable path construction."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test sstable_file_name_for_id -- --nocapture",
+      "cargo test storage::fusion::tests -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(\"\\{\\}\\.sst\", id\\)' src/storage/fusion.rs -n"
+    ]
+  }
+}
