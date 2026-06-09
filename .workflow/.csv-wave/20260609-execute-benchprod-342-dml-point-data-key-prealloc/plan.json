@@ -1,0 +1,80 @@
+{
+  "id": "benchprod-342-dml-point-data-key-prealloc",
+  "objective": "Preallocate DML point-lookup data keys for UPDATE and DELETE.",
+  "status": "completed",
+  "created_at": "2026-06-09T09:00:16+08:00",
+  "completed_at": "2026-06-09T09:00:16+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-342",
+      "title": "Preallocate DML point data keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/dml/delete.rs",
+        "src/execution/dml/update.rs"
+      ],
+      "result": "UPDATE and DELETE primary-key point paths now build data keys with explicit capacity from the existing data prefix and row id."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test data_key_for_prefix_row -- --nocapture",
+      "status": "passed: 2/2"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_delete_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_delete_qualified_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_delete_commuted_primary_key_without_secondary_index_skips_row_decode -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_primary_key_simple_table_fast_path -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_qualified_primary_key_uses_point_lookup -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_commuted_primary_key_uses_point_lookup -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_delete_primary_key_reuses_row_cache_for_secondary_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_primary_key_reuses_row_cache_for_secondary_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "rg 'format!\\(\"\\{}\\{}\", prefix, row_id\\)' src/execution/dml/delete.rs src/execution/dml/update.rs -n",
+      "status": "passed: no matches"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The generated data key bytes remain data:<table>:<row_id>.",
+    "The optimization reuses already-built data prefixes in UPDATE and DELETE primary-key point lookup paths.",
+    "git diff --check printed existing CRLF normalization warnings for the edited Rust files while exiting successfully.",
+    "The sql_dml suite printed existing SSTable retry warnings and one slow-query log while passing 44/44 tests."
+  ]
+}

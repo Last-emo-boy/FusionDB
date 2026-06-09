@@ -14,6 +14,13 @@ fn delete_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn delete_data_key_for_prefix_row(prefix: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity(prefix.len() + row_id.len());
+    key.push_str(prefix);
+    key.push_str(row_id);
+    key
+}
+
 fn delete_schema_key_for_table(table_name: &str) -> String {
     let mut key = String::with_capacity("schema:".len() + table_name.len());
     key.push_str("schema:");
@@ -101,7 +108,7 @@ impl Executor {
                 && parent_foreign_keys.is_empty();
             if no_secondary_indexes {
                 if let Some(row_id) = &target_row_id {
-                    let key = format!("{}{}", prefix, row_id);
+                    let key = delete_data_key_for_prefix_row(&prefix, row_id);
                     if txn.get(key.as_bytes()).await?.is_some() {
                         txn.delete(key.as_bytes()).await?;
                         self.row_cache.invalidate(&key);
@@ -133,7 +140,7 @@ impl Executor {
         }
 
         let kv_pairs = if let Some(row_id) = target_row_id {
-            let key = format!("{}{}", prefix, row_id);
+            let key = delete_data_key_for_prefix_row(&prefix, &row_id);
             if let Some(v) = txn.get(key.as_bytes()).await? {
                 vec![(key.into_bytes(), v)]
             } else {
@@ -256,7 +263,9 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{delete_data_prefix_for_table, delete_schema_key_for_table};
+    use super::{
+        delete_data_key_for_prefix_row, delete_data_prefix_for_table, delete_schema_key_for_table,
+    };
 
     #[test]
     fn delete_data_prefix_for_table_preallocates_exact_prefix() {
@@ -264,6 +273,15 @@ mod tests {
 
         assert_eq!(prefix, "data:accounts:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn delete_data_key_for_prefix_row_preallocates_exact_key() {
+        let prefix = delete_data_prefix_for_table("accounts");
+        let key = delete_data_key_for_prefix_row(&prefix, "00042");
+
+        assert_eq!(key, "data:accounts:00042");
+        assert!(key.capacity() >= key.len());
     }
 
     #[test]

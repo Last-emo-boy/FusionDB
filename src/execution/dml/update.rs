@@ -14,6 +14,13 @@ fn update_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn update_data_key_for_prefix_row(prefix: &str, row_id: &str) -> String {
+    let mut key = String::with_capacity(prefix.len() + row_id.len());
+    key.push_str(prefix);
+    key.push_str(row_id);
+    key
+}
+
 fn update_schema_key_for_table(table_name: &str) -> String {
     let mut key = String::with_capacity("schema:".len() + table_name.len());
     key.push_str("schema:");
@@ -83,7 +90,7 @@ impl Executor {
 
         let kv_pairs = if let Some(row_id) = target_row_id {
             // Point Lookup
-            let key = format!("{}{}", prefix, row_id);
+            let key = update_data_key_for_prefix_row(&prefix, &row_id);
             if let Some(v) = txn.get(key.as_bytes()).await? {
                 vec![(key.into_bytes(), v)]
             } else {
@@ -382,7 +389,7 @@ impl Executor {
             return Ok(None);
         }
 
-        let key = format!("{}{}", prefix, row_id);
+        let key = update_data_key_for_prefix_row(prefix, row_id);
         let Some(value) = txn.get(key.as_bytes()).await? else {
             return Ok(Some(QueryResult::Success {
                 message: "Updated 0 rows".to_string(),
@@ -430,7 +437,9 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{update_data_prefix_for_table, update_schema_key_for_table};
+    use super::{
+        update_data_key_for_prefix_row, update_data_prefix_for_table, update_schema_key_for_table,
+    };
 
     #[test]
     fn update_data_prefix_for_table_preallocates_exact_prefix() {
@@ -438,6 +447,15 @@ mod tests {
 
         assert_eq!(prefix, "data:accounts:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn update_data_key_for_prefix_row_preallocates_exact_key() {
+        let prefix = update_data_prefix_for_table("accounts");
+        let key = update_data_key_for_prefix_row(&prefix, "00042");
+
+        assert_eq!(key, "data:accounts:00042");
+        assert!(key.capacity() >= key.len());
     }
 
     #[test]
