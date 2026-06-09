@@ -163,6 +163,18 @@ fn simple_join_group_aggregate_name(name: &ObjectName) -> Option<&'static str> {
     }
 }
 
+fn single_table_prefix_aggregate_name(name: &ObjectName) -> Option<&'static str> {
+    if query_function_name_eq_ascii(name, "COUNT") {
+        Some("COUNT")
+    } else if query_function_name_eq_ascii(name, "MIN") {
+        Some("MIN")
+    } else if query_function_name_eq_ascii(name, "MAX") {
+        Some("MAX")
+    } else {
+        None
+    }
+}
+
 impl Executor {
     const MAX_RECURSIVE_CTE_ITERATIONS: usize = 128;
     const MAX_RECURSIVE_CTE_ROWS: usize = 4096;
@@ -2127,7 +2139,12 @@ impl Executor {
 
                                     let mut item_handled = false;
                                     if let Some(Expr::Function(func)) = expr {
-                                        let func_name = func.name.to_string().to_uppercase();
+                                        let Some(func_name) =
+                                            single_table_prefix_aggregate_name(&func.name)
+                                        else {
+                                            supported = false;
+                                            break;
+                                        };
                                         if func_name == "COUNT" {
                                             if let FunctionArguments::List(args) = &func.args {
                                                 let duplicate_treatment = args.duplicate_treatment;
@@ -3505,5 +3522,21 @@ mod tests {
         assert_eq!(simple_join_group_aggregate_name(&count), Some("COUNT"));
         assert_eq!(simple_join_group_aggregate_name(&sum), Some("SUM"));
         assert_eq!(simple_join_group_aggregate_name(&qualified), None);
+    }
+
+    #[test]
+    fn single_table_prefix_aggregate_name_matches_without_display_string() {
+        let count = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("Count"))]);
+        let min = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("min"))]);
+        let max = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("MAX"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("count")),
+        ]);
+
+        assert_eq!(single_table_prefix_aggregate_name(&count), Some("COUNT"));
+        assert_eq!(single_table_prefix_aggregate_name(&min), Some("MIN"));
+        assert_eq!(single_table_prefix_aggregate_name(&max), Some("MAX"));
+        assert_eq!(single_table_prefix_aggregate_name(&qualified), None);
     }
 }

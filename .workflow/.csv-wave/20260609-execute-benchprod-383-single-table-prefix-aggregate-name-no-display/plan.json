@@ -1,0 +1,48 @@
+{
+  "id": "BENCHPROD-383",
+  "title": "Single table prefix aggregate detection without display allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/query/mod.rs"
+  ],
+  "objective": "Avoid ObjectName display and uppercase allocations while recognizing single-table COUNT/MIN/MAX prefix aggregate optimizations.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-383"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test single_table_prefix_aggregate_name -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate select_count -- --nocapture",
+      "result": "passed: 7/7"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate bare_min_max -- --nocapture",
+      "result": "passed: 2/2"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate -- --nocapture",
+      "result": "passed: 50/50"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'single_table_prefix_aggregate_name|let func_name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/mod.rs -n",
+      "result": "single-table prefix path uses helper; no let func_name uppercase matches remain"
+    }
+  ]
+}

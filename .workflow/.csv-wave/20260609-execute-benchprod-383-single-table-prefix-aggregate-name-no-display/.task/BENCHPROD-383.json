@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-383",
+  "title": "Avoid single table prefix aggregate name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Replace single-table COUNT/MIN/MAX prefix aggregate dispatch via func.name.to_string().to_uppercase() with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "Single-table prefix aggregate optimization no longer builds uppercase display names before classifying supported functions",
+      "COUNT prefix-count behavior remains unchanged",
+      "MIN/MAX primary-key prefix behavior remains unchanged",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "single_table_prefix_aggregate_name"
+    ],
+    "notes": [
+      "The single-table aggregate optimization now maps COUNT, MIN, and MAX through direct ObjectNamePart comparisons.",
+      "Output column naming still uses the existing function display formatting.",
+      "Eligibility checks for COUNT arguments and MIN/MAX primary-key arguments are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test single_table_prefix_aggregate_name -- --nocapture",
+      "cargo test --test sql_group_aggregate select_count -- --nocapture",
+      "cargo test --test sql_group_aggregate bare_min_max -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'single_table_prefix_aggregate_name|let func_name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/mod.rs -n"
+    ]
+  }
+}
