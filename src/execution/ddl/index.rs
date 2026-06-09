@@ -28,6 +28,33 @@ fn index_meta_key_for_index(index_name: &str) -> String {
     key
 }
 
+fn create_index_key_for_value(
+    table_name: &str,
+    column_name: &str,
+    value: &str,
+    row_id: &str,
+) -> String {
+    let mut key = String::with_capacity(
+        "index:".len()
+            + table_name.len()
+            + 1
+            + column_name.len()
+            + 1
+            + value.len()
+            + 1
+            + row_id.len(),
+    );
+    key.push_str("index:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(column_name);
+    key.push(':');
+    key.push_str(value);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 fn drop_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
     let mut prefix =
         String::with_capacity("index:".len() + table_name.len() + 1 + column_name.len() + 1);
@@ -199,10 +226,8 @@ impl Executor {
                 }
             } else {
                 if let Some(val_str) = self.value_to_index_string(&val) {
-                    let index_key = format!(
-                        "index:{}:{}:{}:{}",
-                        table_name_str, col_name, val_str, row_id
-                    );
+                    let index_key =
+                        create_index_key_for_value(&table_name_str, col_name, &val_str, row_id);
                     txn.put(index_key.as_bytes(), &[]).await?;
                 } else {
                     continue;
@@ -307,8 +332,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_index_data_prefix_for_table, drop_index_prefix_for_column, index_meta_key_for_index,
-        index_schema_key_for_table,
+        create_index_data_prefix_for_table, create_index_key_for_value,
+        drop_index_prefix_for_column, index_meta_key_for_index, index_schema_key_for_table,
     };
 
     #[test]
@@ -332,6 +357,14 @@ mod tests {
         let key = index_meta_key_for_index("idx_orders_status");
 
         assert_eq!(key, "index_meta:idx_orders_status");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn create_index_key_for_value_preallocates_exact_key() {
+        let key = create_index_key_for_value("orders", "status", "open", "00042");
+
+        assert_eq!(key, "index:orders:status:open:00042");
         assert!(key.capacity() >= key.len());
     }
 

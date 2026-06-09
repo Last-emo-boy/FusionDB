@@ -1,0 +1,62 @@
+{
+  "id": "benchprod-346-create-index-key-prealloc",
+  "objective": "Preallocate CREATE INDEX secondary index keys.",
+  "status": "completed",
+  "created_at": "2026-06-09T09:19:23+08:00",
+  "completed_at": "2026-06-09T09:19:23+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-346",
+      "title": "Preallocate CREATE INDEX keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/ddl/index.rs"
+      ],
+      "result": "CREATE INDEX ordinary BTree backfill now uses an explicit-capacity helper instead of format! for secondary index keys."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test create_index_key_for_value -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_create_btree_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_create_integer_btree_index_after_load_uses_comparable_keys -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_create_index_reuses_row_cache_for_backfill -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache test_empty_secondary_index_lookup_skips_full_table_scan -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_index_cache -- --nocapture",
+      "status": "passed: 38/38"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "rg 'index_key = format!\\(|\"index:\\{}:\\{}:\\{}:\\{}\"' src/execution/ddl/index.rs -n",
+      "status": "passed: no matches"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The generated secondary index key bytes remain index:<table>:<column>:<value>:<row_id>.",
+    "The optimization covers ordinary single-column BTree CREATE INDEX backfill; FTS, HNSW, and composite paths are unchanged.",
+    "git diff --check printed the existing CRLF normalization warning for the edited Rust file while exiting successfully."
+  ]
+}

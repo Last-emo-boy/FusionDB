@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-346",
+  "title": "Preallocate CREATE INDEX keys",
+  "status": "completed",
+  "category": "database-performance",
+  "created_at": "2026-06-09T09:19:23+08:00",
+  "completed_at": "2026-06-09T09:19:23+08:00",
+  "files_changed": [
+    "src/execution/ddl/index.rs"
+  ],
+  "summary": "Replaced ordinary secondary index key format! construction in CREATE INDEX backfill with an explicit-capacity helper.",
+  "verification": {
+    "unit": "cargo test create_index_key_for_value -- --nocapture passed 1/1",
+    "focused": "BTree create index, integer comparable key, backfill row-cache reuse, and empty secondary index lookup focused tests passed",
+    "integration": "cargo test --test sql_index_cache -- --nocapture passed 38/38",
+    "format": "cargo fmt --check passed",
+    "diff": "git diff --check passed",
+    "search": "rg 'index_key = format!\\(|\"index:\\{}:\\{}:\\{}:\\{}\"' src/execution/ddl/index.rs -n returned no matches"
+  },
+  "result": "CREATE INDEX still writes index:<table>:<column>:<value>:<row_id> keys for ordinary BTree backfill, but avoids the format! allocation path."
+}
