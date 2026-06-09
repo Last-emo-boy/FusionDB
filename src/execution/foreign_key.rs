@@ -245,13 +245,36 @@ impl Executor {
         explicit
             .map(|ident| ident.value.clone())
             .unwrap_or_else(|| {
-                format!(
-                    "fk_{}_{}_{}",
-                    child_table,
-                    child_columns.join("_"),
-                    parent_table
-                )
+                Self::foreign_key_default_name(child_table, child_columns, parent_table)
             })
+    }
+
+    fn foreign_key_default_name(
+        child_table: &str,
+        child_columns: &[String],
+        parent_table: &str,
+    ) -> String {
+        let child_columns_len = child_columns
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(child_columns.len().saturating_sub(1));
+        let mut name = String::with_capacity(
+            "fk_".len() + child_table.len() + 1 + child_columns_len + 1 + parent_table.len(),
+        );
+        name.push_str("fk_");
+        name.push_str(child_table);
+        name.push('_');
+        if let Some((first, rest)) = child_columns.split_first() {
+            name.push_str(first);
+            for column in rest {
+                name.push('_');
+                name.push_str(column);
+            }
+        }
+        name.push('_');
+        name.push_str(parent_table);
+        name
     }
 
     pub(crate) async fn store_foreign_keys(
@@ -650,5 +673,14 @@ mod tests {
 
         assert_eq!(prefix, "fk_meta:parent:customers:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn foreign_key_default_name_preallocates_exact_name() {
+        let child_columns = vec!["c_w_id".to_string(), "c_d_id".to_string()];
+        let name = Executor::foreign_key_name(None, "customer", &child_columns, "district");
+
+        assert_eq!(name, "fk_customer_c_w_id_c_d_id_district");
+        assert!(name.capacity() >= name.len());
     }
 }

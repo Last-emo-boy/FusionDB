@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-386",
+  "title": "Avoid foreign key default name join format allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/foreign_key.rs"
+  ],
+  "description": "Replace default foreign key name construction via child_columns.join(\"_\") and format! with a preallocated string builder.",
+  "convergence": {
+    "criteria": [
+      "Default foreign key name construction no longer allocates an intermediate joined child-column string",
+      "Generated default foreign key name bytes remain unchanged for multi-column child keys",
+      "Explicit foreign key names remain cloned unchanged",
+      "Foreign key integration tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "foreign_key_default_name"
+    ],
+    "notes": [
+      "The default name path now computes the exact required child-column component length and appends into a single String.",
+      "The generated pattern remains fk_{child_table}_{child_columns_joined_by_underscore}_{parent_table}.",
+      "Foreign key metadata storage keys and constraint validation logic are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test foreign_key_default_name_preallocates_exact_name -- --nocapture",
+      "cargo test --test sql_view_show_constraints foreign_key -- --nocapture",
+      "cargo test --test sql_dml fk -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'foreign_key_default_name|child_columns\\.join\\(\"_\"\\)|format!\\(\"fk_\\{\\}_\\{\\}_\\{\\}\"' src/execution/foreign_key.rs -n"
+    ]
+  }
+}
