@@ -1,0 +1,51 @@
+{
+  "id": "benchprod-333-table-stats-key-prealloc",
+  "objective": "Preallocate ANALYZE table statistics keys from table-name length.",
+  "status": "completed",
+  "created_at": "2026-06-09T08:07:00+08:00",
+  "completed_at": "2026-06-09T08:07:00+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-333",
+      "title": "Preallocate table stats keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/analyze.rs"
+      ],
+      "result": "ANALYZE statistics load/store paths now use an explicit-capacity helper instead of format! for stats:table:<table> keys."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test table_stats_key -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_analyze_table_collects_statistics -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl test_explain_includes_analyze_statistics -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_ddl -- --nocapture",
+      "status": "passed: 33/33"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The helper reserves capacity for stats:table:<table> before pushing known components.",
+    "The optimization replaces format! in load_table_stats() and store_table_stats().",
+    "Generated stats key bytes, ANALYZE statistics storage, EXPLAIN statistics consumption, and DDL behavior are unchanged.",
+    "git diff --check printed the existing CRLF normalization warning for src/execution/analyze.rs while exiting successfully."
+  ]
+}

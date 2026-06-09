@@ -27,6 +27,13 @@ fn analyze_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+fn table_stats_key_for_table(table_name: &str) -> String {
+    let mut key = String::with_capacity("stats:table:".len() + table_name.len());
+    key.push_str("stats:table:");
+    key.push_str(table_name);
+    key
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct TableStats {
     pub table_name: String,
@@ -70,7 +77,7 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<Option<TableStats>> {
-        let key = format!("stats:table:{}", table_name);
+        let key = table_stats_key_for_table(table_name);
         let Some(bytes) = txn.get(key.as_bytes()).await? else {
             return Ok(None);
         };
@@ -80,7 +87,7 @@ impl Executor {
     }
 
     async fn store_table_stats(&self, stats: &TableStats, txn: &mut dyn Transaction) -> Result<()> {
-        let key = format!("stats:table:{}", stats.table_name);
+        let key = table_stats_key_for_table(&stats.table_name);
         let bytes = bincode::serialize(stats)
             .map_err(|e| FusionError::Execution(format!("Stats serialization error: {}", e)))?;
         txn.put(key.as_bytes(), &bytes).await
@@ -240,6 +247,14 @@ mod tests {
         let key = analyze_schema_key_for_table("items");
 
         assert_eq!(key, "schema:items");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn table_stats_key_for_table_preallocates_exact_key() {
+        let key = table_stats_key_for_table("items");
+
+        assert_eq!(key, "stats:table:items");
         assert!(key.capacity() >= key.len());
     }
 }

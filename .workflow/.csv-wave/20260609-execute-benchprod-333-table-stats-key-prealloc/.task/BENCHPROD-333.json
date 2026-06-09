@@ -1,0 +1,25 @@
+{
+  "id": "BENCHPROD-333",
+  "title": "Preallocate table stats keys",
+  "status": "completed",
+  "area": "database-core-performance",
+  "files": [
+    "src/execution/analyze.rs"
+  ],
+  "description": "Avoid generic format! allocation work when ANALYZE statistics paths build stats:table:<table> keys from known table-name length.",
+  "implementation": [
+    "Added table_stats_key_for_table() with explicit capacity for stats:table:<table>.",
+    "Replaced load_table_stats() key construction.",
+    "Replaced store_table_stats() key construction.",
+    "Added unit coverage for helper output and capacity."
+  ],
+  "verification": [
+    "cargo test table_stats_key -- --nocapture",
+    "cargo test --test sql_ddl test_analyze_table_collects_statistics -- --nocapture",
+    "cargo test --test sql_ddl test_explain_includes_analyze_statistics -- --nocapture",
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "result": "ANALYZE stats-key construction now reserves capacity from known table-name length while preserving statistics storage, EXPLAIN statistics consumption, and DDL behavior."
+}
