@@ -2,10 +2,11 @@ use crate::catalog::TableSchema;
 use crate::common::{Result, Value};
 use crate::storage::Transaction;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Query, Select, SetExpr, TableFactor, TableWithJoins, UnaryOperator,
-    Value as SqlValue,
+    BinaryOperator, Expr, ObjectName, ObjectNamePart, Query, Select, SetExpr, TableFactor,
+    TableWithJoins, UnaryOperator, Value as SqlValue,
 };
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 use super::super::{Executor, QueryResult};
 
@@ -68,6 +69,30 @@ fn subquery_derived_cache_name_for_alias(alias_name: &str) -> String {
     name.push_str("derived:");
     name.push_str(alias_name);
     name
+}
+
+fn subquery_object_name_display_capacity(name: &ObjectName) -> usize {
+    name.0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(ident) => {
+                ident.value.len() + usize::from(ident.quote_style.is_some()) * 2
+            }
+            ObjectNamePart::Function(function) => function.name.value.len() + 2,
+        })
+        .sum::<usize>()
+        + name.0.len().saturating_sub(1)
+}
+
+fn subquery_table_cache_name_for_factor(name: &ObjectName, alias_name: &str) -> String {
+    let mut cache_name = String::with_capacity(
+        "table:".len() + subquery_object_name_display_capacity(name) + 1 + alias_name.len(),
+    );
+    cache_name.push_str("table:");
+    write!(&mut cache_name, "{name}").expect("writing to String cannot fail");
+    cache_name.push(':');
+    cache_name.push_str(alias_name);
+    cache_name
 }
 
 impl Executor {
@@ -678,7 +703,7 @@ impl Executor {
                     .as_ref()
                     .map(|alias| alias.name.value.as_str())
                     .unwrap_or("");
-                format!("table:{}:{}", name, alias_name)
+                subquery_table_cache_name_for_factor(name, alias_name)
             }
             TableFactor::Derived { alias, .. } => {
                 let alias_name = alias
@@ -1296,7 +1321,11 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{subquery_derived_cache_name_for_alias, subquery_schema_key_for_table};
+    use super::{
+        subquery_derived_cache_name_for_alias, subquery_schema_key_for_table,
+        subquery_table_cache_name_for_factor,
+    };
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     #[test]
     fn subquery_schema_key_for_table_preallocates_exact_key() {
@@ -1311,6 +1340,18 @@ mod tests {
         let name = subquery_derived_cache_name_for_alias("candidate_orders");
 
         assert_eq!(name, "derived:candidate_orders");
+        assert!(name.capacity() >= name.len());
+    }
+
+    #[test]
+    fn subquery_table_cache_name_for_factor_preallocates_exact_name() {
+        let table_name = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("public")),
+            ObjectNamePart::Identifier(Ident::new("orders")),
+        ]);
+        let name = subquery_table_cache_name_for_factor(&table_name, "o");
+
+        assert_eq!(name, "table:public.orders:o");
         assert!(name.capacity() >= name.len());
     }
 }
