@@ -6,7 +6,8 @@ use crate::common::{FusionError, Result, Value};
 use crate::storage::Transaction;
 use sqlparser::ast::{
     Cte, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause,
-    OrderByKind, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
+    ObjectName, ObjectNamePart, OrderByKind, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    TableFactor,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -130,6 +131,26 @@ struct GroupAggregatePlan<'a> {
 struct SimpleProjectedGroupAggregatePlan {
     func_name: String,
     arg_index: Option<usize>,
+}
+
+fn query_function_name_eq_ascii(name: &ObjectName, expected: &str) -> bool {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.eq_ignore_ascii_case(expected),
+        [ObjectNamePart::Function(function)] => function.name.value.eq_ignore_ascii_case(expected),
+        _ => false,
+    }
+}
+
+fn simple_projected_group_aggregate_name(name: &ObjectName) -> Option<&'static str> {
+    if query_function_name_eq_ascii(name, "COUNT") {
+        Some("COUNT")
+    } else if query_function_name_eq_ascii(name, "SUM") {
+        Some("SUM")
+    } else if query_function_name_eq_ascii(name, "ARRAY_AGG") {
+        Some("ARRAY_AGG")
+    } else {
+        None
+    }
 }
 
 impl Executor {
@@ -749,8 +770,10 @@ impl Executor {
                 return None;
             }
 
-            let func_name = func.name.to_string().to_uppercase();
-            let arg_index = match func_name.as_str() {
+            let Some(func_name) = simple_projected_group_aggregate_name(&func.name) else {
+                return None;
+            };
+            let arg_index = match func_name {
                 "COUNT"
                     if matches!(
                         args.args[0],
@@ -764,7 +787,7 @@ impl Executor {
             };
 
             plans.push(SimpleProjectedGroupAggregatePlan {
-                func_name,
+                func_name: func_name.to_string(),
                 arg_index,
             });
             output_columns.push(output_name);
@@ -3384,6 +3407,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     #[test]
     fn window_partition_bucket_preallocates_first_row_index() {
@@ -3435,5 +3459,22 @@ mod tests {
 
         assert_eq!(name, "cpu.tags_id");
         assert!(name.capacity() >= name.len());
+    }
+
+    #[test]
+    fn simple_projected_group_aggregate_name_matches_without_display_string() {
+        let count = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("Count"))]);
+        let array_agg = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("array_agg"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("count")),
+        ]);
+
+        assert_eq!(simple_projected_group_aggregate_name(&count), Some("COUNT"));
+        assert_eq!(
+            simple_projected_group_aggregate_name(&array_agg),
+            Some("ARRAY_AGG")
+        );
+        assert_eq!(simple_projected_group_aggregate_name(&qualified), None);
     }
 }

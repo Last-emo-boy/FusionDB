@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-381",
+  "title": "Avoid simple projected group aggregate name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Replace simple_projected_group_aggregate_projection dispatch via func.name.to_string().to_uppercase() with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "Simple projected group aggregate planning no longer builds uppercase display names before classifying supported functions",
+      "COUNT star, SUM column, and ARRAY_AGG column behavior remains unchanged",
+      "Qualified names remain rejected by the simple aggregate check",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "query_function_name_eq_ascii",
+      "simple_projected_group_aggregate_name"
+    ],
+    "notes": [
+      "The planner now maps supported function names to static accumulator names through direct ObjectNamePart comparisons.",
+      "The accumulator name String is allocated only after the function is recognized as supported.",
+      "The later simple join and fallback aggregate planner paths still have their own uppercase allocations and remain next-task candidates."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test simple_projected_group_aggregate_name -- --nocapture",
+      "cargo test --test sql_group_aggregate group_by_sum -- --nocapture",
+      "cargo test --test sql_group_aggregate group_by_projection -- --nocapture",
+      "cargo test --test sql_set_subquery array_agg -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'simple_projected_group_aggregate_name|let func_name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/mod.rs -n"
+    ]
+  }
+}

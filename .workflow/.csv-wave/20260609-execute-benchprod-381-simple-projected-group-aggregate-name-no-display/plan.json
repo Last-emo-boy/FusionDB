@@ -1,0 +1,52 @@
+{
+  "id": "BENCHPROD-381",
+  "title": "Simple projected group aggregate detection without display allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/query/mod.rs"
+  ],
+  "objective": "Avoid ObjectName display and uppercase allocations while building simple projected group aggregate plans.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-381"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test simple_projected_group_aggregate_name -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate group_by_sum -- --nocapture",
+      "result": "passed: 3/3"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate group_by_projection -- --nocapture",
+      "result": "passed: 2/2"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery array_agg -- --nocapture",
+      "result": "passed: 2/2"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate -- --nocapture",
+      "result": "passed: 50/50"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'simple_projected_group_aggregate_name|let func_name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/mod.rs -n",
+      "result": "simple projected path uses helper; remaining uppercase matches are later planner paths"
+    }
+  ]
+}
