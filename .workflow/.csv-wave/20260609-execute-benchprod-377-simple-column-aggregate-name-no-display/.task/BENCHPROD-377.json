@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-377",
+  "title": "Avoid simple column aggregate name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "description": "Replace simple_column_aggregate_projection dispatch via func.name.to_string().to_uppercase() with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "Simple column aggregate projection detection no longer builds uppercase display names",
+      "COUNT star and COUNT column behavior remains unchanged",
+      "SUM, AVG, MIN, MAX, STRING_AGG, and GROUP_CONCAT behavior remains unchanged",
+      "Qualified names remain rejected by the simple aggregate check",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "column_scan_function_name_eq_ascii"
+    ],
+    "notes": [
+      "The helper directly matches single-part ObjectName values case-insensitively.",
+      "simple_column_aggregate_projection now branches on direct helper checks instead of matching an allocated uppercase String.",
+      "The later group-by column aggregate path still has its own name allocation and remains a next-task candidate."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test column_scan_function_name_eq_ascii -- --nocapture",
+      "cargo test --test sql_group_aggregate bare_ -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'func_name\\.as_str\\(\\)' src/execution/query/column_scan.rs -n"
+    ]
+  }
+}

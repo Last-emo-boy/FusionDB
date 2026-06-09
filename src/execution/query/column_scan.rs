@@ -4,7 +4,7 @@ use crate::common::{FusionError, Result, Value};
 use crate::storage::{ScanVisitor, Transaction};
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    OrderByKind, SelectItem,
+    ObjectName, ObjectNamePart, OrderByKind, SelectItem,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -72,6 +72,14 @@ fn column_scan_index_prefix_for_value(
     prefix.push_str(value_key);
     prefix.push(':');
     prefix
+}
+
+fn column_scan_function_name_eq_ascii(name: &ObjectName, expected: &str) -> bool {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.eq_ignore_ascii_case(expected),
+        [ObjectNamePart::Function(function)] => function.name.value.eq_ignore_ascii_case(expected),
+        _ => false,
+    }
 }
 
 impl ColumnPredicateTerm {
@@ -721,65 +729,68 @@ impl Executor {
                 return None;
             }
 
-            let func_name = func.name.to_string().to_uppercase();
-            let (kind, column_index) = match func_name.as_str() {
-                "COUNT"
-                    if matches!(
-                        args.args[0],
-                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                    ) =>
-                {
-                    (ColumnAggregateKind::CountStar, None)
+            let (kind, column_index) = if column_scan_function_name_eq_ascii(&func.name, "COUNT")
+                && matches!(
+                    args.args[0],
+                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                ) {
+                (ColumnAggregateKind::CountStar, None)
+            } else if column_scan_function_name_eq_ascii(&func.name, "COUNT") {
+                let column_index =
+                    Self::column_arg_index(&args.args[0], schema, allowed_qualifiers)?;
+                if !allow_non_nullable_count && !schema.columns[column_index].is_nullable {
+                    return None;
                 }
-                "COUNT" => {
-                    let column_index =
-                        Self::column_arg_index(&args.args[0], schema, allowed_qualifiers)?;
-                    if !allow_non_nullable_count && !schema.columns[column_index].is_nullable {
-                        return None;
-                    }
-                    (ColumnAggregateKind::CountColumn, Some(column_index))
-                }
-                "SUM" => (
+                (ColumnAggregateKind::CountColumn, Some(column_index))
+            } else if column_scan_function_name_eq_ascii(&func.name, "SUM") {
+                (
                     ColumnAggregateKind::Sum,
                     Some(Self::column_arg_index(
                         &args.args[0],
                         schema,
                         allowed_qualifiers,
                     )?),
-                ),
-                "AVG" => (
+                )
+            } else if column_scan_function_name_eq_ascii(&func.name, "AVG") {
+                (
                     ColumnAggregateKind::Avg,
                     Some(Self::column_arg_index(
                         &args.args[0],
                         schema,
                         allowed_qualifiers,
                     )?),
-                ),
-                "MIN" => (
+                )
+            } else if column_scan_function_name_eq_ascii(&func.name, "MIN") {
+                (
                     ColumnAggregateKind::Min,
                     Some(Self::column_arg_index(
                         &args.args[0],
                         schema,
                         allowed_qualifiers,
                     )?),
-                ),
-                "MAX" => (
+                )
+            } else if column_scan_function_name_eq_ascii(&func.name, "MAX") {
+                (
                     ColumnAggregateKind::Max,
                     Some(Self::column_arg_index(
                         &args.args[0],
                         schema,
                         allowed_qualifiers,
                     )?),
-                ),
-                "STRING_AGG" | "GROUP_CONCAT" => (
+                )
+            } else if column_scan_function_name_eq_ascii(&func.name, "STRING_AGG")
+                || column_scan_function_name_eq_ascii(&func.name, "GROUP_CONCAT")
+            {
+                (
                     ColumnAggregateKind::StringAgg,
                     Some(Self::column_arg_index(
                         &args.args[0],
                         schema,
                         allowed_qualifiers,
                     )?),
-                ),
-                _ => return None,
+                )
+            } else {
+                return None;
             };
             plans.push(ColumnAggregateScanPlan {
                 kind,
@@ -1651,6 +1662,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     #[test]
     fn column_aggregate_state_preallocates_string_agg_first_value() {
@@ -1689,6 +1701,22 @@ mod tests {
 
         assert_eq!(prefix, "index:metrics:host_id:00042:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn column_scan_function_name_eq_ascii_matches_without_display_string() {
+        let name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("String_Agg"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("string_agg")),
+        ]);
+
+        assert!(column_scan_function_name_eq_ascii(&name, "STRING_AGG"));
+        assert!(!column_scan_function_name_eq_ascii(&name, "COUNT"));
+        assert!(!column_scan_function_name_eq_ascii(
+            &qualified,
+            "STRING_AGG"
+        ));
     }
 
     #[test]
