@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-365",
+  "title": "Preallocate TSBS lateral qualified column names",
+  "status": "completed",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Replace TSBS lastpoint lateral alias.column format! calls with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "Generated qualified names remain <alias>.<column>",
+      "TSBS lastpoint lateral output columns remain unchanged",
+      "Full JOIN regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "query_qualified_column_name"
+    ],
+    "notes": [
+      "The helper reserves alias length, separator dot, and column length before appending.",
+      "Generated qualified column names remain byte-for-byte equivalent to prior format! output.",
+      "The inner order-by check still avoids constructing alias.time when unqualified time matches."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test query_qualified_column_name -- --nocapture",
+      "cargo test --test sql_join test_tsbs_lastpoint_distinct_on_lateral_join -- --nocapture",
+      "cargo test --test sql_join -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(\"\\{}\\.(tags_id|id|time|hostname)\"|format!\\(\"\\{}\\.\\{}\", derived_alias, column\\.name\\)' src/execution/query/mod.rs -n"
+    ]
+  }
+}

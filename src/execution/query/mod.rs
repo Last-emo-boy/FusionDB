@@ -55,6 +55,14 @@ fn aggregate_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn query_qualified_column_name(alias: &str, column: &str) -> String {
+    let mut name = String::with_capacity(alias.len() + 1 + column.len());
+    name.push_str(alias);
+    name.push('.');
+    name.push_str(column);
+    name
+}
+
 enum RowValueSource<'a> {
     One,
     Column(usize),
@@ -1112,8 +1120,8 @@ impl Executor {
             return false;
         };
 
-        let inner_tags_id = format!("{}.tags_id", inner_alias);
-        let outer_id = format!("{}.id", outer_alias);
+        let inner_tags_id = query_qualified_column_name(inner_alias, "tags_id");
+        let outer_id = query_qualified_column_name(outer_alias, "id");
         (Self::expr_column_name_matches(left, &inner_tags_id)
             && Self::expr_column_name_matches(right, &outer_id))
             || (Self::expr_column_name_matches(left, &outer_id)
@@ -1163,8 +1171,8 @@ impl Executor {
         let Some(outer_alias) = Self::relation_alias_or_name(outer_relation) else {
             return Ok(None);
         };
-        if !Self::expr_column_name_matches(&distinct_exprs[0], &format!("{}.hostname", outer_alias))
-        {
+        let outer_hostname = query_qualified_column_name(&outer_alias, "hostname");
+        if !Self::expr_column_name_matches(&distinct_exprs[0], &outer_hostname) {
             return Ok(None);
         }
 
@@ -1235,14 +1243,14 @@ impl Executor {
         let [inner_order_expr] = inner_order_exprs.as_slice() else {
             return Ok(None);
         };
-        if inner_order_expr.options.asc.unwrap_or(true)
-            || !Self::expr_column_name_matches(&inner_order_expr.expr, "time")
-                && !Self::expr_column_name_matches(
-                    &inner_order_expr.expr,
-                    &format!("{}.time", inner_alias),
-                )
-        {
+        if inner_order_expr.options.asc.unwrap_or(true) {
             return Ok(None);
+        }
+        if !Self::expr_column_name_matches(&inner_order_expr.expr, "time") {
+            let inner_time = query_qualified_column_name(&inner_alias, "time");
+            if !Self::expr_column_name_matches(&inner_order_expr.expr, &inner_time) {
+                return Ok(None);
+            }
         }
 
         let (outer_schema, outer_rows) = self.scan_table_base(outer_relation, txn, params).await?;
@@ -1263,7 +1271,7 @@ impl Executor {
         }
 
         output_columns.extend(inner_schema.columns.iter().cloned().map(|mut column| {
-            column.name = format!("{}.{}", derived_alias, column.name);
+            column.name = query_qualified_column_name(&derived_alias, &column.name);
             column
         }));
         let output_schema = TableSchema::new("tsbs_lastpoint_lateral".to_string(), output_columns);
@@ -3419,5 +3427,13 @@ mod tests {
 
         assert_eq!(prefix, "data:metrics:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn query_qualified_column_name_preallocates_exact_name() {
+        let name = query_qualified_column_name("cpu", "tags_id");
+
+        assert_eq!(name, "cpu.tags_id");
+        assert!(name.capacity() >= name.len());
     }
 }
