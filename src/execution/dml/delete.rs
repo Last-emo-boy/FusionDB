@@ -249,7 +249,8 @@ impl Executor {
                                 }
                             }
                         } else if col.index_type == IndexType::HNSW {
-                            let idx_name = format!("hnsw_{}_{}", table_name_str, col.name);
+                            let idx_name =
+                                Self::hnsw_index_name_for_column(&table_name_str, &col.name);
                             self.vector_index.delete(&idx_name, row_id)?;
                         } else if let Some(val_str) = self.value_to_index_string(val) {
                             let index_key = delete_index_key_for_value(

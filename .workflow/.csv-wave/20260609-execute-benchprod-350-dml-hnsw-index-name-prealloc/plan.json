@@ -1,0 +1,51 @@
+{
+  "id": "BENCHPROD-350",
+  "title": "DML HNSW index name preallocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/dml/mod.rs",
+    "src/execution/dml/insert.rs",
+    "src/execution/dml/update.rs",
+    "src/execution/dml/delete.rs"
+  ],
+  "objective": "Preallocate DML HNSW index names while preserving the generated hnsw_<table>_<column> bytes.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-350"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test hnsw_index_name_for_column -- --nocapture",
+      "result": "passed: 2/2"
+    },
+    {
+      "command": "cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+      "result": "passed: 14/14"
+    },
+    {
+      "command": "cargo test --test sql_dml -- --nocapture",
+      "result": "passed: 44/44"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'format!(\"hnsw_\\{}_\\{}\"' src/execution/dml -n",
+      "result": "no matches"
+    },
+    {
+      "command": "rg 'format!(\"hnsw_\\{}_\\{}\"' src -n",
+      "result": "remaining matches only in src/execution/ddl/table.rs and src/storage/fusion.rs"
+    }
+  ]
+}

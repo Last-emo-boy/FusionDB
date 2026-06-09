@@ -67,6 +67,16 @@ impl Executor {
         prefix
     }
 
+    pub(crate) fn hnsw_index_name_for_column(table_name: &str, column_name: &str) -> String {
+        let mut name =
+            String::with_capacity("hnsw_".len() + table_name.len() + 1 + column_name.len());
+        name.push_str("hnsw_");
+        name.push_str(table_name);
+        name.push('_');
+        name.push_str(column_name);
+        name
+    }
+
     pub(crate) fn indexed_trigram_text_columns(schema: &TableSchema) -> Vec<usize> {
         let mut indices = Vec::with_capacity(schema.columns.len());
         for (idx, col) in schema.columns.iter().enumerate() {
@@ -410,5 +420,13 @@ mod tests {
 
         assert_eq!(prefix, "fts:docs:body:search:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn hnsw_index_name_for_column_preallocates_exact_name() {
+        let name = Executor::hnsw_index_name_for_column("docs", "embedding");
+
+        assert_eq!(name, "hnsw_docs_embedding");
+        assert!(name.capacity() >= name.len());
     }
 }

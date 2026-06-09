@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-350",
+  "title": "Preallocate DML HNSW index names",
+  "status": "completed",
+  "files": [
+    "src/execution/dml/mod.rs",
+    "src/execution/dml/insert.rs",
+    "src/execution/dml/update.rs",
+    "src/execution/dml/delete.rs"
+  ],
+  "description": "Replace DML-side format!(\"hnsw_{}_{}\", table, column) construction with a shared exact-capacity Executor helper.",
+  "convergence": {
+    "criteria": [
+      "Generated HNSW index name remains hnsw_<table>_<column>",
+      "src/execution/dml contains no format!(\"hnsw_{}_{}\") calls",
+      "Insert, upsert, update, and delete DML regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helper": "Executor::hnsw_index_name_for_column",
+    "notes": [
+      "The helper uses String::with_capacity with the exact literal and separator lengths.",
+      "DML insert, upsert-update, update, and delete HNSW paths now share the helper.",
+      "Remaining HNSW name construction call sites are outside DML and stay queued for later iterations."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test hnsw_index_name_for_column -- --nocapture",
+      "cargo test --test sql_returning_upsert_vector_rbac -- --nocapture",
+      "cargo test --test sql_dml -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!(\"hnsw_\\{}_\\{}\"' src/execution/dml -n",
+      "rg 'format!(\"hnsw_\\{}_\\{}\"' src -n"
+    ]
+  }
+}

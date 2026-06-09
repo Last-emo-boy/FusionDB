@@ -482,7 +482,10 @@ impl Executor {
                         );
                         for (idx, col) in context.schema.columns.iter().enumerate() {
                             if col.is_indexed && col.index_type == IndexType::HNSW {
-                                let idx_name = format!("hnsw_{}_{}", context.table_name, col.name);
+                                let idx_name = Self::hnsw_index_name_for_column(
+                                    &context.table_name,
+                                    &col.name,
+                                );
                                 if idx < old_existing_row.len()
                                     && old_existing_row[idx] != existing_row[idx]
                                 {
@@ -579,7 +582,8 @@ impl Executor {
                     }
                 } else if col.index_type == IndexType::HNSW {
                     if let Value::Vector(vec) = val {
-                        let idx_name = format!("hnsw_{}_{}", context.table_name, col.name);
+                        let idx_name =
+                            Self::hnsw_index_name_for_column(&context.table_name, &col.name);
                         self.vector_index
                             .insert(&idx_name, row_id.clone(), vec.clone())?;
                     }
@@ -906,8 +910,10 @@ impl Executor {
                                     );
                                     for (idx, col) in schema.columns.iter().enumerate() {
                                         if col.is_indexed && col.index_type == IndexType::HNSW {
-                                            let idx_name =
-                                                format!("hnsw_{}_{}", table_name_str, col.name);
+                                            let idx_name = Self::hnsw_index_name_for_column(
+                                                &table_name_str,
+                                                &col.name,
+                                            );
                                             if idx < old_existing_row.len()
                                                 && old_existing_row[idx] != existing_row[idx]
                                             {
@@ -1012,7 +1018,10 @@ impl Executor {
                                 }
                             } else if col.index_type == IndexType::HNSW {
                                 if let Value::Vector(vec) = val {
-                                    let idx_name = format!("hnsw_{}_{}", table_name_str, col.name);
+                                    let idx_name = Self::hnsw_index_name_for_column(
+                                        &table_name_str,
+                                        &col.name,
+                                    );
                                     self.vector_index.insert(
                                         &idx_name,
                                         row_id.clone(),
@@ -1124,7 +1133,8 @@ impl Executor {
                     for (idx, col) in schema.columns.iter().enumerate() {
                         if col.is_indexed && col.index_type == IndexType::HNSW {
                             if let Value::Vector(vec) = &row_values[idx] {
-                                let idx_name = format!("hnsw_{}_{}", table_name_str, col.name);
+                                let idx_name =
+                                    Self::hnsw_index_name_for_column(&table_name_str, &col.name);
                                 self.vector_index
                                     .insert(&idx_name, row_id.clone(), vec.clone())?;
                             }

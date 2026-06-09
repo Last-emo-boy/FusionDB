@@ -277,7 +277,8 @@ impl Executor {
                                     }
                                 }
                             } else if col.index_type == IndexType::HNSW {
-                                let idx_name = format!("hnsw_{}_{}", table_name_str, col.name);
+                                let idx_name =
+                                    Self::hnsw_index_name_for_column(&table_name_str, &col.name);
                                 if matches!(old_val, Value::Vector(_)) {
                                     self.vector_index.delete(&idx_name, row_id)?;
                                 }
