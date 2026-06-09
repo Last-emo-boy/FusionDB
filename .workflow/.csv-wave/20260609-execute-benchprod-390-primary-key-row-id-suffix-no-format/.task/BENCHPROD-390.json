@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-390",
+  "title": "Avoid primary key rewrite row-id suffix format allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/ddl/table.rs"
+  ],
+  "description": "Replace format!(\":{}\", old_row_id) in ALTER TABLE ADD PRIMARY KEY index rewrites with a preallocated suffix helper.",
+  "convergence": {
+    "criteria": [
+      "BTree secondary-index rewrite path no longer uses format! to build old row-id suffixes",
+      "FTS rewrite path no longer uses format! to build old row-id suffixes",
+      "Generated suffix bytes remain unchanged",
+      "ALTER TABLE ADD PRIMARY KEY regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "table_row_id_suffix"
+    ],
+    "notes": [
+      "The helper appends ':' and the row id into one exact-capacity String.",
+      "Index scanning, suffix matching, and new index key construction are unchanged.",
+      "The existing secondary BTree rewrite regression covers visible row-id migration behavior."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test table_row_id_suffix_preallocates_exact_suffix -- --nocapture",
+      "cargo test --test sql_ddl test_alter_table_add_primary_key_rewrites_secondary_btree_index_row_ids -- --nocapture",
+      "cargo test --test sql_ddl primary_key -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'table_row_id_suffix|format!\\(\":\\{\\}\"|old_suffix' src/execution/ddl/table.rs -n"
+    ]
+  }
+}

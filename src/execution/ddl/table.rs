@@ -126,6 +126,13 @@ fn table_column_primary_key_index_name(table_name: &str, column_name: &str) -> S
     name
 }
 
+fn table_row_id_suffix(row_id: &str) -> String {
+    let mut suffix = String::with_capacity(1 + row_id.len());
+    suffix.push(':');
+    suffix.push_str(row_id);
+    suffix
+}
+
 impl Executor {
     pub(crate) async fn handle_create_table(
         &self,
@@ -903,7 +910,7 @@ impl Executor {
             }
             match column.index_type {
                 IndexType::BTree => {
-                    let old_suffix = format!(":{}", old_row_id);
+                    let old_suffix = table_row_id_suffix(old_row_id);
                     let prefix = table_index_prefix_for_column(table_name, &column.name);
                     let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
                     for (index_key, index_value) in entries {
@@ -926,7 +933,7 @@ impl Executor {
                     }
                 }
                 IndexType::FTS => {
-                    let old_suffix = format!(":{}", old_row_id);
+                    let old_suffix = table_row_id_suffix(old_row_id);
                     let prefix = Self::fts_column_prefix_for_column(table_name, &column.name);
                     let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
                     for (index_key, index_value) in entries {
@@ -1035,7 +1042,8 @@ mod tests {
         table_column_primary_key_index_name, table_data_key_for_row_id,
         table_data_prefix_for_table, table_index_key_for_prefix_value_row,
         table_index_key_for_value, table_index_meta_key_for_index, table_index_prefix_for_column,
-        table_index_prefix_for_table, table_primary_key_index_name, table_schema_key_for_table,
+        table_index_prefix_for_table, table_primary_key_index_name, table_row_id_suffix,
+        table_schema_key_for_table,
     };
 
     #[test]
@@ -1117,5 +1125,13 @@ mod tests {
 
         assert_eq!(name, "accounts_id_pkey");
         assert!(name.capacity() >= name.len());
+    }
+
+    #[test]
+    fn table_row_id_suffix_preallocates_exact_suffix() {
+        let suffix = table_row_id_suffix("00042");
+
+        assert_eq!(suffix, ":00042");
+        assert!(suffix.capacity() >= suffix.len());
     }
 }
