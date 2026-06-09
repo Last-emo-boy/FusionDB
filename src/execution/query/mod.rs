@@ -153,6 +153,16 @@ fn simple_projected_group_aggregate_name(name: &ObjectName) -> Option<&'static s
     }
 }
 
+fn simple_join_group_aggregate_name(name: &ObjectName) -> Option<&'static str> {
+    if query_function_name_eq_ascii(name, "COUNT") {
+        Some("COUNT")
+    } else if query_function_name_eq_ascii(name, "SUM") {
+        Some("SUM")
+    } else {
+        None
+    }
+}
+
 impl Executor {
     const MAX_RECURSIVE_CTE_ITERATIONS: usize = 128;
     const MAX_RECURSIVE_CTE_ROWS: usize = 4096;
@@ -1483,8 +1493,10 @@ impl Executor {
                 return None;
             }
 
-            let func_name = func.name.to_string().to_uppercase();
-            let arg = match func_name.as_str() {
+            let Some(func_name) = simple_join_group_aggregate_name(&func.name) else {
+                return None;
+            };
+            let arg = match func_name {
                 "COUNT"
                     if matches!(
                         args.args[0],
@@ -1503,7 +1515,10 @@ impl Executor {
                 _ => return None,
             };
 
-            aggregates.push(SimpleJoinGroupAggregate { func_name, arg });
+            aggregates.push(SimpleJoinGroupAggregate {
+                func_name: func_name.to_string(),
+                arg,
+            });
             output_columns.push(output_name);
         }
 
@@ -3476,5 +3491,19 @@ mod tests {
             Some("ARRAY_AGG")
         );
         assert_eq!(simple_projected_group_aggregate_name(&qualified), None);
+    }
+
+    #[test]
+    fn simple_join_group_aggregate_name_matches_without_display_string() {
+        let count = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("Count"))]);
+        let sum = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("sum"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("count")),
+        ]);
+
+        assert_eq!(simple_join_group_aggregate_name(&count), Some("COUNT"));
+        assert_eq!(simple_join_group_aggregate_name(&sum), Some("SUM"));
+        assert_eq!(simple_join_group_aggregate_name(&qualified), None);
     }
 }

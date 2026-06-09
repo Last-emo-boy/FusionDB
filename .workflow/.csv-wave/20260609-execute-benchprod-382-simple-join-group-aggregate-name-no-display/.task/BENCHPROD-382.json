@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-382",
+  "title": "Avoid simple join group aggregate name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Replace simple_join_group_aggregate_projection dispatch via func.name.to_string().to_uppercase() with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "Simple join group aggregate planning no longer builds uppercase display names before classifying supported functions",
+      "COUNT star, COUNT column, and SUM column join aggregate behavior remains unchanged",
+      "Qualified names remain rejected by the simple aggregate check",
+      "sql_join regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "simple_join_group_aggregate_name"
+    ],
+    "notes": [
+      "The planner now maps supported function names to static accumulator names through direct ObjectNamePart comparisons.",
+      "The accumulator name String is allocated only after the function is recognized as supported.",
+      "COUNT and SUM argument rules remain unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test simple_join_group_aggregate_name -- --nocapture",
+      "cargo test --test sql_join join_group_by_aggregate -- --nocapture",
+      "cargo test --test sql_join join_projection_pushdown_with_group_by -- --nocapture",
+      "cargo test --test sql_join -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'simple_join_group_aggregate_name|let func_name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/mod.rs -n"
+    ]
+  }
+}
