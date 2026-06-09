@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-395",
+  "title": "Avoid constraint keyword case-conversion allocations",
+  "status": "completed",
+  "files": [
+    "src/execution/dml/constraints.rs"
+  ],
+  "description": "Replace CHECK prefix and keyword default matching case-conversion allocations with ASCII case-insensitive helpers.",
+  "convergence": {
+    "criteria": [
+      "CHECK prefix matching no longer allocates an uppercase string",
+      "Keyword default matching no longer allocates a lowercase string",
+      "ASCII case-insensitive behavior remains unchanged for CHECK, true, false, and null",
+      "Default column SQL regression passes",
+      "CHECK constraint SQL regression passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "starts_with_check_keyword_ascii",
+      "parse_keyword_default_value"
+    ],
+    "notes": [
+      "The CHECK helper compares the leading bytes against the ASCII keyword without constructing an uppercase String.",
+      "The default-value helper uses eq_ignore_ascii_case for true, false, and null.",
+      "Parsing, error handling, and fallback string behavior remain unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test check_keyword_prefix_matching_is_ascii_case_insensitive -- --nocapture",
+      "cargo test keyword_default_value_matching_is_ascii_case_insensitive -- --nocapture",
+      "cargo test --test sql_view_show_constraints test_default_column_values -- --nocapture",
+      "cargo test --test sql_view_show_constraints test_check_constraint -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'to_uppercase\\(\\)|to_lowercase\\(\\)|starts_with_check_keyword_ascii|parse_keyword_default_value' src/execution/dml/constraints.rs -n"
+    ]
+  }
+}

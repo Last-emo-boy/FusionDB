@@ -3,6 +3,27 @@ use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
 
 use super::super::Executor;
 
+const CHECK_KEYWORD: &[u8] = b"CHECK";
+
+fn starts_with_check_keyword_ascii(value: &str) -> bool {
+    match value.as_bytes().get(..CHECK_KEYWORD.len()) {
+        Some(prefix) => prefix.eq_ignore_ascii_case(CHECK_KEYWORD),
+        None => false,
+    }
+}
+
+fn parse_keyword_default_value(def_str: &str) -> Option<Value> {
+    if def_str.eq_ignore_ascii_case("true") {
+        Some(Value::Boolean(true))
+    } else if def_str.eq_ignore_ascii_case("false") {
+        Some(Value::Boolean(false))
+    } else if def_str.eq_ignore_ascii_case("null") {
+        Some(Value::Null)
+    } else {
+        None
+    }
+}
+
 impl Executor {
     fn evaluate_check_truth(
         &self,
@@ -78,7 +99,7 @@ impl Executor {
         // We build a minimal SELECT with a WHERE clause to reuse existing expression evaluation
         // Strip "CHECK" prefix if present (sqlparser Display may include it)
         let expr_str = check_sql.trim();
-        let expr_str = if expr_str.to_uppercase().starts_with("CHECK") {
+        let expr_str = if starts_with_check_keyword_ascii(expr_str) {
             let rest = expr_str[5..].trim();
             if rest.starts_with('(') && rest.ends_with(')') {
                 &rest[1..rest.len() - 1]
@@ -137,11 +158,8 @@ impl Executor {
             return Ok(Value::Float(f));
         }
         // Boolean
-        match def_str.to_lowercase().as_str() {
-            "true" => return Ok(Value::Boolean(true)),
-            "false" => return Ok(Value::Boolean(false)),
-            "null" => return Ok(Value::Null),
-            _ => {}
+        if let Some(value) = parse_keyword_default_value(def_str) {
+            return Ok(value);
         }
         // Strip quotes for string literals
         let trimmed = def_str.trim();
@@ -151,5 +169,34 @@ impl Executor {
             return Ok(Value::String(trimmed[1..trimmed.len() - 1].to_string()));
         }
         Ok(Value::String(def_str.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_keyword_default_value, starts_with_check_keyword_ascii};
+    use crate::common::Value;
+
+    #[test]
+    fn check_keyword_prefix_matching_is_ascii_case_insensitive() {
+        assert!(starts_with_check_keyword_ascii("CHECK(age > 0)"));
+        assert!(starts_with_check_keyword_ascii("check(age > 0)"));
+        assert!(starts_with_check_keyword_ascii("ChEcK age > 0"));
+        assert!(!starts_with_check_keyword_ascii("age CHECK > 0"));
+        assert!(!starts_with_check_keyword_ascii("chec"));
+    }
+
+    #[test]
+    fn keyword_default_value_matching_is_ascii_case_insensitive() {
+        assert_eq!(
+            parse_keyword_default_value("TRUE"),
+            Some(Value::Boolean(true))
+        );
+        assert_eq!(
+            parse_keyword_default_value("false"),
+            Some(Value::Boolean(false))
+        );
+        assert_eq!(parse_keyword_default_value("Null"), Some(Value::Null));
+        assert_eq!(parse_keyword_default_value("truthy"), None);
     }
 }
