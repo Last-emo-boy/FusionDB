@@ -26,6 +26,33 @@ fn insert_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+fn insert_index_key_for_value(
+    table_name: &str,
+    column_name: &str,
+    value: &str,
+    row_id: &str,
+) -> String {
+    let mut key = String::with_capacity(
+        "index:".len()
+            + table_name.len()
+            + 1
+            + column_name.len()
+            + 1
+            + value.len()
+            + 1
+            + row_id.len(),
+    );
+    key.push_str("index:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(column_name);
+    key.push(':');
+    key.push_str(value);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 fn insert_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -557,9 +584,11 @@ impl Executor {
                             .insert(&idx_name, row_id.clone(), vec.clone())?;
                     }
                 } else if let Some(val_str) = self.value_to_index_string(val) {
-                    let index_key = format!(
-                        "index:{}:{}:{}:{}",
-                        context.table_name, col.name, val_str, row_id
+                    let index_key = insert_index_key_for_value(
+                        &context.table_name,
+                        &col.name,
+                        &val_str,
+                        &row_id,
                     );
                     txn.put(index_key.as_bytes(), &[]).await?;
                 }
@@ -991,9 +1020,11 @@ impl Executor {
                                     )?;
                                 }
                             } else if let Some(val_str) = self.value_to_index_string(val) {
-                                let index_key = format!(
-                                    "index:{}:{}:{}:{}",
-                                    table_name_str, col.name, val_str, row_id
+                                let index_key = insert_index_key_for_value(
+                                    &table_name_str,
+                                    &col.name,
+                                    &val_str,
+                                    &row_id,
                                 );
                                 txn.put(index_key.as_bytes(), &[]).await?;
                             }
@@ -1154,7 +1185,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        insert_data_key_for_row_id, insert_data_prefix_for_table, insert_schema_key_for_table,
+        insert_data_key_for_row_id, insert_data_prefix_for_table, insert_index_key_for_value,
+        insert_schema_key_for_table,
     };
 
     #[test]
@@ -1171,6 +1203,14 @@ mod tests {
 
         assert_eq!(prefix, "data:orders:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn insert_index_key_for_value_preallocates_exact_key() {
+        let key = insert_index_key_for_value("orders", "status", "open", "00042");
+
+        assert_eq!(key, "index:orders:status:open:00042");
+        assert!(key.capacity() >= key.len());
     }
 
     #[test]
