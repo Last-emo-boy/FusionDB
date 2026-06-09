@@ -29,8 +29,22 @@ struct CompositeRangeBounds {
 
 impl CompositeIndexMeta {
     fn encoded_columns(&self) -> String {
-        self.columns.join(",")
+        join_composite_index_parts(&self.columns, ",")
     }
+}
+
+fn join_composite_index_parts(parts: &[String], separator: &str) -> String {
+    let parts_len = parts.iter().map(String::len).sum::<usize>();
+    let mut joined =
+        String::with_capacity(parts_len + separator.len() * parts.len().saturating_sub(1));
+    if let Some((first, rest)) = parts.split_first() {
+        joined.push_str(first);
+        for part in rest {
+            joined.push_str(separator);
+            joined.push_str(part);
+        }
+    }
+    joined
 }
 
 impl Executor {
@@ -423,7 +437,10 @@ impl Executor {
         for value in values {
             parts.push(self.index_component_for_meta(value, meta)?);
         }
-        Some(parts.join(Self::composite_index_component_separator()))
+        Some(join_composite_index_parts(
+            &parts,
+            Self::composite_index_component_separator(),
+        ))
     }
 
     fn composite_index_value_key(
@@ -446,7 +463,10 @@ impl Executor {
             parts.push(part);
         }
 
-        Some(parts.join(Self::composite_index_component_separator()))
+        Some(join_composite_index_parts(
+            &parts,
+            Self::composite_index_component_separator(),
+        ))
     }
 
     fn legacy_encoded_index_component(&self, value: &Value) -> Option<String> {
@@ -714,7 +734,8 @@ impl Executor {
         };
         let order_matches = order_direction.is_some();
 
-        let component_key = components.join(Self::composite_index_component_separator());
+        let component_key =
+            join_composite_index_parts(&components, Self::composite_index_component_separator());
         let base_prefix = Self::composite_index_prefix(table_name, &index.columns);
         let index_prefix = Self::composite_index_components_prefix(&base_prefix, &component_key);
 
@@ -1025,7 +1046,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::Executor;
+    use super::{join_composite_index_parts, CompositeIndexMeta, Executor};
 
     #[test]
     fn composite_index_table_marker_key_preallocates_exact_key() {
@@ -1154,5 +1175,29 @@ mod tests {
 
         assert_eq!(component, "i800000000000002a");
         assert!(component.capacity() >= component.len());
+    }
+
+    #[test]
+    fn join_composite_index_parts_preallocates_exact_parts() {
+        let parts = vec!["i1".to_string(), "sYWJj".to_string(), "n".to_string()];
+        let joined =
+            join_composite_index_parts(&parts, Executor::composite_index_component_separator());
+
+        assert_eq!(joined, "i1|sYWJj|n");
+        assert!(joined.capacity() >= joined.len());
+    }
+
+    #[test]
+    fn composite_index_meta_encoded_columns_preallocates_exact_columns() {
+        let meta = CompositeIndexMeta {
+            name: "idx_stock_warehouse_district".to_string(),
+            table: "stock".to_string(),
+            columns: vec!["warehouse_id".to_string(), "district_id".to_string()],
+            ordered_encoding: true,
+        };
+        let encoded = meta.encoded_columns();
+
+        assert_eq!(encoded, "warehouse_id,district_id");
+        assert!(encoded.capacity() >= encoded.len());
     }
 }

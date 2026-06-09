@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-388",
+  "title": "Preallocate composite index part joins",
+  "status": "completed",
+  "files": [
+    "src/execution/composite_index.rs"
+  ],
+  "description": "Replace composite index component and encoded-column join calls with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "Composite index component keys no longer call join(Self::composite_index_component_separator())",
+      "Composite index encoded column lists no longer call columns.join(\",\")",
+      "Generated component-key and encoded-column bytes remain unchanged",
+      "Composite index DML and index-cache regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "join_composite_index_parts"
+    ],
+    "notes": [
+      "The helper computes total part length plus separators and appends into one String.",
+      "It is used for metadata encoded column lists, row composite index value keys, meta-value lookup keys, and scan-prefix component keys.",
+      "Index matching, ordering, range bounds, and encoded component bytes are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test join_composite_index_parts_preallocates_exact_parts -- --nocapture",
+      "cargo test composite_index_meta_encoded_columns_preallocates_exact_columns -- --nocapture",
+      "cargo test --test sql_index_cache composite_index -- --nocapture",
+      "cargo test --test sql_dml composite_index -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'join_composite_index_parts|\\.join\\(Self::composite_index_component_separator\\(\\)\\)|columns\\.join\\(\",\"\\)' src/execution/composite_index.rs -n"
+    ]
+  }
+}
