@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-355",
+  "title": "Preallocate composite range scan boundaries",
+  "status": "completed",
+  "files": [
+    "src/execution/composite_index.rs"
+  ],
+  "description": "Replace composite index range-scan prefix and bound format! calls with exact-capacity helpers.",
+  "convergence": {
+    "criteria": [
+      "Generated range prefixes and bounds remain unchanged",
+      "Composite range query regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes",
+      "composite_index.rs has no non-error-message format! calls"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "Executor::composite_index_components_prefix",
+      "Executor::composite_index_range_prefix",
+      "Executor::composite_index_range_bound"
+    ],
+    "notes": [
+      "The helpers preserve the existing separator and bound suffix semantics.",
+      "Lower exclusive and upper inclusive bounds still append the NUL suffix after the colon.",
+      "The remaining format! in composite_index.rs is an error message, not key construction."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test composite_index_components_prefix -- --nocapture",
+      "cargo test composite_index_range -- --nocapture",
+      "cargo test --test sql_index_cache -- --nocapture",
+      "cargo test --test sql_dml test_tpcc_order_status_limit_finds_late_composite_index_match -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(' src/execution/composite_index.rs -n"
+    ]
+  }
+}

@@ -351,6 +351,30 @@ impl Executor {
         value_prefix
     }
 
+    fn composite_index_components_prefix(prefix: &str, components: &str) -> String {
+        let mut component_prefix = String::with_capacity(prefix.len() + components.len());
+        component_prefix.push_str(prefix);
+        component_prefix.push_str(components);
+        component_prefix
+    }
+
+    fn composite_index_range_prefix(index_prefix: &str) -> String {
+        let separator = Self::composite_index_component_separator();
+        let mut range_prefix = String::with_capacity(index_prefix.len() + separator.len());
+        range_prefix.push_str(index_prefix);
+        range_prefix.push_str(separator);
+        range_prefix
+    }
+
+    fn composite_index_range_bound(prefix: &str, component: &str, suffix: &str) -> String {
+        let mut bound = String::with_capacity(prefix.len() + component.len() + 1 + suffix.len());
+        bound.push_str(prefix);
+        bound.push_str(component);
+        bound.push(':');
+        bound.push_str(suffix);
+        bound
+    }
+
     pub(crate) fn composite_index_key(
         &self,
         table_name: &str,
@@ -690,11 +714,9 @@ impl Executor {
         };
         let order_matches = order_direction.is_some();
 
-        let index_prefix = format!(
-            "{}{}",
-            Self::composite_index_prefix(table_name, &index.columns),
-            components.join(Self::composite_index_component_separator())
-        );
+        let component_key = components.join(Self::composite_index_component_separator());
+        let base_prefix = Self::composite_index_prefix(table_name, &index.columns);
+        let index_prefix = Self::composite_index_components_prefix(&base_prefix, &component_key);
 
         let can_cover_predicates = all_index_columns_matched
             && predicates.len() == index.columns.len()
@@ -709,28 +731,17 @@ impl Executor {
         };
 
         let index_entries = if let Some(range) = range {
-            let range_prefix = format!(
-                "{}{}",
-                index_prefix,
-                Self::composite_index_component_separator()
-            );
+            let range_prefix = Self::composite_index_range_prefix(&index_prefix);
             let start = if let Some(lower) = range.lower {
-                format!(
-                    "{}{}:{}",
-                    range_prefix,
-                    lower.component,
-                    if lower.inclusive { "" } else { "\u{0}" }
-                )
+                let suffix = if lower.inclusive { "" } else { "\u{0}" };
+                Self::composite_index_range_bound(&range_prefix, &lower.component, suffix)
             } else {
                 range_prefix.clone()
             };
             if let Some(upper) = range.upper {
-                let end = format!(
-                    "{}{}:{}",
-                    range_prefix,
-                    upper.component,
-                    if upper.inclusive { "\u{0}" } else { "" }
-                );
+                let suffix = if upper.inclusive { "\u{0}" } else { "" };
+                let end =
+                    Self::composite_index_range_bound(&range_prefix, &upper.component, suffix);
                 txn.scan_range(start.as_bytes(), end.as_bytes(), scan_limit)
                     .await?
             } else {
@@ -1074,6 +1085,41 @@ mod tests {
 
         assert_eq!(prefix, "index:orders:warehouse_id,district_id:i1|i2:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn composite_index_components_prefix_preallocates_exact_prefix() {
+        let prefix = Executor::composite_index_components_prefix(
+            "index:orders:warehouse_id,district_id:",
+            "i1|i2",
+        );
+
+        assert_eq!(prefix, "index:orders:warehouse_id,district_id:i1|i2");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn composite_index_range_prefix_preallocates_exact_prefix() {
+        let prefix =
+            Executor::composite_index_range_prefix("index:orders:warehouse_id,district_id:i1|i2");
+
+        assert_eq!(prefix, "index:orders:warehouse_id,district_id:i1|i2|");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn composite_index_range_bound_preallocates_exact_bound() {
+        let bound = Executor::composite_index_range_bound(
+            "index:orders:warehouse_id,district_id:i1|i2|",
+            "i3",
+            "\u{0}",
+        );
+
+        assert_eq!(
+            bound,
+            "index:orders:warehouse_id,district_id:i1|i2|i3:\u{0}"
+        );
+        assert!(bound.capacity() >= bound.len());
     }
 
     #[test]

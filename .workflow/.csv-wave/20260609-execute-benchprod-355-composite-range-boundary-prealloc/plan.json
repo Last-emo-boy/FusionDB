@@ -1,0 +1,48 @@
+{
+  "id": "BENCHPROD-355",
+  "title": "Composite range boundary preallocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/composite_index.rs"
+  ],
+  "objective": "Preallocate composite index range-scan prefixes and bounds while preserving encoded boundary bytes.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-355"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test composite_index_components_prefix -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test composite_index_range -- --nocapture",
+      "result": "passed: 4/4"
+    },
+    {
+      "command": "cargo test --test sql_index_cache -- --nocapture",
+      "result": "passed: 38/38"
+    },
+    {
+      "command": "cargo test --test sql_dml test_tpcc_order_status_limit_finds_late_composite_index_match -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'format!\\(' src/execution/composite_index.rs -n",
+      "result": "only unique-constraint error message remains"
+    }
+  ]
+}
