@@ -104,6 +104,13 @@ impl Executor {
         value
     }
 
+    fn prefixed_index_component(prefix: char, encoded: &str) -> String {
+        let mut component = String::with_capacity(prefix.len_utf8() + encoded.len());
+        component.push(prefix);
+        component.push_str(encoded);
+        component
+    }
+
     pub(crate) fn parse_index_meta(index_name: &str, meta_str: &str) -> Option<CompositeIndexMeta> {
         let rest = meta_str
             .strip_prefix("v3:")
@@ -417,28 +424,20 @@ impl Executor {
     fn ordered_index_component(&self, value: &Value) -> Option<String> {
         Some(match value {
             Value::Integer(value) => {
-                format!(
-                    "i{}",
-                    crate::common::encoding::encode_i64_comparable(*value)
-                )
+                let encoded = crate::common::encoding::encode_i64_comparable(*value);
+                Self::prefixed_index_component('i', &encoded)
             }
             Value::Date(days) => {
-                format!(
-                    "d{}",
-                    crate::common::encoding::encode_i64_comparable(*days as i64)
-                )
+                let encoded = crate::common::encoding::encode_i64_comparable(*days as i64);
+                Self::prefixed_index_component('d', &encoded)
             }
             Value::Timestamp(micros) => {
-                format!(
-                    "t{}",
-                    crate::common::encoding::encode_i64_comparable(*micros)
-                )
+                let encoded = crate::common::encoding::encode_i64_comparable(*micros);
+                Self::prefixed_index_component('t', &encoded)
             }
             Value::Interval(micros) => {
-                format!(
-                    "v{}",
-                    crate::common::encoding::encode_i64_comparable(*micros)
-                )
+                let encoded = crate::common::encoding::encode_i64_comparable(*micros);
+                Self::prefixed_index_component('v', &encoded)
             }
             Value::Boolean(value) => {
                 if *value {
@@ -450,12 +449,12 @@ impl Executor {
             Value::String(value) => {
                 let encoded =
                     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
-                format!("s{}", encoded)
+                Self::prefixed_index_component('s', &encoded)
             }
             Value::Decimal(value) => {
                 let encoded =
                     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
-                format!("n{}", encoded)
+                Self::prefixed_index_component('n', &encoded)
             }
             _ => return None,
         })
@@ -1072,5 +1071,13 @@ mod tests {
 
         assert_eq!(value, "orders:status");
         assert!(value.capacity() >= value.len());
+    }
+
+    #[test]
+    fn prefixed_index_component_preallocates_exact_component() {
+        let component = Executor::prefixed_index_component('i', "800000000000002a");
+
+        assert_eq!(component, "i800000000000002a");
+        assert!(component.capacity() >= component.len());
     }
 }

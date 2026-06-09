@@ -1,0 +1,56 @@
+{
+  "id": "BENCHPROD-353",
+  "title": "Composite index component prefix preallocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/composite_index.rs"
+  ],
+  "objective": "Preallocate ordered composite index component prefixes while preserving encoded component bytes.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-353"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test prefixed_index_component -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_index_cache test_create_composite_btree_index_and_lookup -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_index_cache test_composite_index_range_order_limit_skips_outside_range_decode -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_dml test_dml_maintains_composite_index_entries -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_index_cache -- --nocapture",
+      "result": "passed: 38/38"
+    },
+    {
+      "command": "cargo test --test sql_dml -- --nocapture",
+      "result": "passed: 44/44"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'format!(\"[idtvns]\\{}\"' src/execution/composite_index.rs -n",
+      "result": "no matches"
+    }
+  ]
+}

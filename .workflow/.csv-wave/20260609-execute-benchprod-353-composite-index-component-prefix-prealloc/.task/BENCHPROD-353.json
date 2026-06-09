@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-353",
+  "title": "Preallocate composite index component prefixes",
+  "status": "completed",
+  "files": [
+    "src/execution/composite_index.rs"
+  ],
+  "description": "Replace ordered composite index component prefix format! calls with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "Generated component bytes remain unchanged",
+      "Integer, date, timestamp, interval, string, and decimal ordered components use the shared helper",
+      "Composite index query and DML regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helper": "Executor::prefixed_index_component",
+    "notes": [
+      "The helper allocates exactly for the one-byte prefix plus encoded component payload.",
+      "ordered_index_component now uses the helper for i/d/t/v/s/n component families.",
+      "Boolean components remain unchanged as fixed literals."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test prefixed_index_component -- --nocapture",
+      "cargo test --test sql_index_cache test_create_composite_btree_index_and_lookup -- --nocapture",
+      "cargo test --test sql_index_cache test_composite_index_range_order_limit_skips_outside_range_decode -- --nocapture",
+      "cargo test --test sql_dml test_dml_maintains_composite_index_entries -- --nocapture",
+      "cargo test --test sql_index_cache -- --nocapture",
+      "cargo test --test sql_dml -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!(\"[idtvns]\\{}\"' src/execution/composite_index.rs -n"
+    ]
+  }
+}
