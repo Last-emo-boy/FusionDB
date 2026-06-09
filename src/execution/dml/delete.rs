@@ -21,6 +21,33 @@ fn delete_data_key_for_prefix_row(prefix: &str, row_id: &str) -> String {
     key
 }
 
+fn delete_index_key_for_value(
+    table_name: &str,
+    column_name: &str,
+    value: &str,
+    row_id: &str,
+) -> String {
+    let mut key = String::with_capacity(
+        "index:".len()
+            + table_name.len()
+            + 1
+            + column_name.len()
+            + 1
+            + value.len()
+            + 1
+            + row_id.len(),
+    );
+    key.push_str("index:");
+    key.push_str(table_name);
+    key.push(':');
+    key.push_str(column_name);
+    key.push(':');
+    key.push_str(value);
+    key.push(':');
+    key.push_str(row_id);
+    key
+}
+
 fn delete_schema_key_for_table(table_name: &str) -> String {
     let mut key = String::with_capacity("schema:".len() + table_name.len());
     key.push_str("schema:");
@@ -225,9 +252,11 @@ impl Executor {
                             let idx_name = format!("hnsw_{}_{}", table_name_str, col.name);
                             self.vector_index.delete(&idx_name, row_id)?;
                         } else if let Some(val_str) = self.value_to_index_string(val) {
-                            let index_key = format!(
-                                "index:{}:{}:{}:{}",
-                                table_name_str, col.name, val_str, row_id
+                            let index_key = delete_index_key_for_value(
+                                &table_name_str,
+                                &col.name,
+                                &val_str,
+                                row_id,
                             );
                             txn.delete(index_key.as_bytes()).await?;
                         }
@@ -264,7 +293,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_data_key_for_prefix_row, delete_data_prefix_for_table, delete_schema_key_for_table,
+        delete_data_key_for_prefix_row, delete_data_prefix_for_table, delete_index_key_for_value,
+        delete_schema_key_for_table,
     };
 
     #[test]
@@ -281,6 +311,14 @@ mod tests {
         let key = delete_data_key_for_prefix_row(&prefix, "00042");
 
         assert_eq!(key, "data:accounts:00042");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn delete_index_key_for_value_preallocates_exact_key() {
+        let key = delete_index_key_for_value("accounts", "status", "active", "00042");
+
+        assert_eq!(key, "index:accounts:status:active:00042");
         assert!(key.capacity() >= key.len());
     }
 

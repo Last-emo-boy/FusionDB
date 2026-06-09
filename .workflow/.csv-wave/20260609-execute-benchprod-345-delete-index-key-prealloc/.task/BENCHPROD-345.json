@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-345",
+  "title": "Preallocate DELETE index keys",
+  "status": "completed",
+  "category": "database-performance",
+  "created_at": "2026-06-09T09:15:04+08:00",
+  "completed_at": "2026-06-09T09:15:04+08:00",
+  "files_changed": [
+    "src/execution/dml/delete.rs"
+  ],
+  "summary": "Replaced ordinary secondary index key format! construction in DELETE paths with an explicit-capacity helper.",
+  "verification": {
+    "unit": "cargo test delete_index_key_for_value -- --nocapture passed 1/1",
+    "focused": "DELETE secondary-index removal, row-cache reuse, and WHERE delete focused tests passed",
+    "integration": "cargo test --test sql_dml -- --nocapture passed 44/44",
+    "format": "cargo fmt --check passed",
+    "diff": "git diff --check passed",
+    "search": "rg 'index_key = format!\\(|\"index:\\{}:\\{}:\\{}:\\{}\"' src/execution/dml/delete.rs -n returned no matches"
+  },
+  "result": "DELETE still deletes index:<table>:<column>:<value>:<row_id> keys, but avoids the format! allocation path for ordinary secondary index entries."
+}

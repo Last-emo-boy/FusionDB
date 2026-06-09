@@ -1,0 +1,59 @@
+{
+  "id": "benchprod-345-delete-index-key-prealloc",
+  "objective": "Preallocate DELETE secondary index keys.",
+  "status": "completed",
+  "created_at": "2026-06-09T09:15:04+08:00",
+  "completed_at": "2026-06-09T09:15:04+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-345",
+      "title": "Preallocate DELETE index keys",
+      "status": "completed",
+      "evidence": [
+        "src/execution/dml/delete.rs"
+      ],
+      "result": "DELETE paths that remove ordinary secondary index entries now use an explicit-capacity helper instead of format!."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test delete_index_key_for_value -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_delete_primary_key_updates_secondary_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_delete_primary_key_reuses_row_cache_for_secondary_index -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_delete_with_where -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "rg 'index_key = format!\\(|\"index:\\{}:\\{}:\\{}:\\{}\"' src/execution/dml/delete.rs -n",
+      "status": "passed: no matches"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The generated secondary index key bytes remain index:<table>:<column>:<value>:<row_id>.",
+    "The optimization covers DELETE ordinary secondary index removal for deleted rows.",
+    "git diff --check printed the existing CRLF normalization warning for the edited Rust file while exiting successfully.",
+    "The sql_dml suite printed existing SSTable retry warnings while passing 44/44 tests."
+  ]
+}
