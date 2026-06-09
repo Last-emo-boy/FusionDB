@@ -67,6 +67,27 @@ fn column_suffix_for_fallback(fallback_name: &str) -> String {
     suffix
 }
 
+fn ascii_case_insensitive_ends_with(value: &str, suffix: &str) -> bool {
+    let value = value.as_bytes();
+    let suffix = suffix.as_bytes();
+    if suffix.len() > value.len() {
+        return false;
+    }
+
+    let start = value.len() - suffix.len();
+    value[start..]
+        .iter()
+        .zip(suffix)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn column_matches_fallback_name(column_name: &str, fallback_name: &str, suffix: &str) -> bool {
+    column_name == fallback_name
+        || column_name.ends_with(suffix)
+        || column_name.eq_ignore_ascii_case(fallback_name)
+        || ascii_case_insensitive_ends_with(column_name, suffix)
+}
+
 impl Executor {
     pub(crate) fn evaluate_value(
         &self,
@@ -491,16 +512,9 @@ impl Executor {
 
         let fallback_name = col_name.rsplit('.').next().unwrap_or(col_name);
         let suffix = column_suffix_for_fallback(fallback_name);
-        let fallback_lower = fallback_name.to_ascii_lowercase();
-        let suffix_lower = suffix.to_ascii_lowercase();
         let mut matches = Vec::with_capacity(schema.columns.len());
         for (index, column) in schema.columns.iter().enumerate() {
-            if column.name == fallback_name
-                || column.name.ends_with(&suffix)
-                || column.name.eq_ignore_ascii_case(fallback_name)
-                || column.name.to_ascii_lowercase().ends_with(&suffix_lower)
-                || column.name.to_ascii_lowercase() == fallback_lower
-            {
+            if column_matches_fallback_name(&column.name, fallback_name, &suffix) {
                 matches.push(index);
             }
         }
@@ -950,8 +964,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        column_suffix_for_fallback, concat_operator_values, concat_string_values,
-        decimal_index_string_for_value,
+        ascii_case_insensitive_ends_with, column_matches_fallback_name, column_suffix_for_fallback,
+        concat_operator_values, concat_string_values, decimal_index_string_for_value,
     };
     use crate::common::Value;
 
@@ -1004,5 +1018,49 @@ mod tests {
 
         assert_eq!(suffix, ".customer_id");
         assert!(suffix.capacity() >= suffix.len());
+    }
+
+    #[test]
+    fn ascii_case_insensitive_ends_with_matches_ascii_lowercase_suffix() {
+        let value = "Orders.CustomerID_Ä";
+        let suffix = ".customerid_Ä";
+
+        assert_eq!(
+            ascii_case_insensitive_ends_with(value, suffix),
+            value
+                .to_ascii_lowercase()
+                .ends_with(&suffix.to_ascii_lowercase())
+        );
+        assert!(!ascii_case_insensitive_ends_with(
+            "Orders.CustomerID_Ä",
+            ".orderid_Ä"
+        ));
+        assert!(!ascii_case_insensitive_ends_with("id", ".customerid"));
+    }
+
+    #[test]
+    fn column_matches_fallback_name_preserves_legacy_lowercase_matching() {
+        for (column_name, fallback_name) in [
+            ("customer_id", "customer_id"),
+            ("Orders.customer_id", "customer_id"),
+            ("Orders.CustomerID_Ä", "customerid_Ä"),
+            ("CUSTOMER_ID", "customer_id"),
+            ("different_customer_id", "customer_id"),
+        ] {
+            let suffix = column_suffix_for_fallback(fallback_name);
+            let fallback_lower = fallback_name.to_ascii_lowercase();
+            let suffix_lower = suffix.to_ascii_lowercase();
+            let legacy_match = column_name == fallback_name
+                || column_name.ends_with(&suffix)
+                || column_name.eq_ignore_ascii_case(fallback_name)
+                || column_name.to_ascii_lowercase().ends_with(&suffix_lower)
+                || column_name.to_ascii_lowercase() == fallback_lower;
+
+            assert_eq!(
+                column_matches_fallback_name(column_name, fallback_name, &suffix),
+                legacy_match,
+                "{column_name} should match legacy behavior for {fallback_name}"
+            );
+        }
     }
 }

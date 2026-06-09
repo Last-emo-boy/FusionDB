@@ -1,0 +1,22 @@
+{
+  "id": "BENCHPROD-405",
+  "title": "Avoid lowercase allocations in fallback column resolution",
+  "status": "completed",
+  "created_at": "2026-06-09",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-405"
+  ],
+  "scope": [
+    "src/execution/expr/value.rs"
+  ],
+  "goal": "Preserve resolve_column_index fallback matching while removing per-column to_ascii_lowercase allocations from the fallback path.",
+  "verification": [
+    "cargo test value --lib",
+    "cargo test --test sql_select",
+    "cargo test --test sql_join join",
+    "cargo fmt --check",
+    "git diff --check",
+    "rg -n \"fallback_lower|suffix_lower|column\\\\.name\\\\.to_ascii_lowercase\\\\(|to_ascii_lowercase\\\\(\\\\)\" src\\\\execution\\\\expr\\\\value.rs"
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-405",
+  "title": "Avoid lowercase allocations in fallback column resolution",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/value.rs"
+  ],
+  "description": "Replace fallback column-name lowercase allocations in resolve_column_index with allocation-free ASCII-insensitive suffix matching.",
+  "convergence": {
+    "criteria": [
+      "resolve_column_index fallback path no longer lowercases every schema column name.",
+      "Fallback matching preserves legacy lowercase-based behavior.",
+      "SELECT and JOIN regressions pass."
+    ]
+  },
+  "tests": [
+    {
+      "command": "cargo test value --lib",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --test sql_select",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --test sql_join join",
+      "result": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "notes": [
+    "Added a byte-level ASCII case-insensitive suffix helper to avoid UTF-8 slicing boundary panics.",
+    "Removed fallback_lower and suffix_lower temporary Strings from production column fallback resolution.",
+    "Added unit tests comparing new helper behavior against the previous to_ascii_lowercase matching expression."
+  ]
+}
