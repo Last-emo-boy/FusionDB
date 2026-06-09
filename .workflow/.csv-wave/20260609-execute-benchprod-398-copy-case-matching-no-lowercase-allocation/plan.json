@@ -1,0 +1,48 @@
+{
+  "id": "BENCHPROD-398",
+  "title": "COPY case matching without lowercase allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/copy.rs"
+  ],
+  "objective": "Avoid allocating lowercase strings while parsing COPY format names and COPY boolean fields.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-398"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test copy_from_options_matches_format_case_without_lowercase_allocation -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test copy_field_to_value_matches_boolean_case_without_lowercase_allocation -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_dml copy -- --nocapture",
+      "result": "passed: 6/6"
+    },
+    {
+      "command": "cargo test --test pg_integration copy_from_stdin -- --nocapture",
+      "result": "passed: 2/2"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg -n 'to_ascii_lowercase\\(\\)|eq_ignore_ascii_case\\(\"csv\"\\)|copy_field_to_value_matches_boolean' src/execution/copy.rs",
+      "result": "COPY format matching uses eq_ignore_ascii_case; old to_ascii_lowercase paths are absent from copy.rs"
+    }
+  ]
+}

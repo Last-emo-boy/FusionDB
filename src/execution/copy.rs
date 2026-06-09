@@ -198,14 +198,14 @@ impl Executor {
         for option in options {
             match option {
                 CopyOption::Format(format) => {
-                    let value = format.value.to_ascii_lowercase();
-                    if value != "csv" && value != "text" {
+                    let is_csv = format.value.eq_ignore_ascii_case("csv");
+                    if !is_csv && !format.value.eq_ignore_ascii_case("text") {
                         return Err(FusionError::Execution(format!(
                             "COPY FORMAT {} is not supported",
                             format.value
                         )));
                     }
-                    parsed.format_csv = value == "csv";
+                    parsed.format_csv = is_csv;
                     if parsed.format_csv && parsed.delimiter == b'\t' {
                         parsed.delimiter = b',';
                     }
@@ -366,10 +366,12 @@ impl Executor {
         if let Ok(value) = trimmed.parse::<f64>() {
             return Value::Float(value);
         }
-        match trimmed.to_ascii_lowercase().as_str() {
-            "true" | "t" => Value::Boolean(true),
-            "false" | "f" => Value::Boolean(false),
-            _ => Value::String(field.to_string()),
+        if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("t") {
+            Value::Boolean(true)
+        } else if trimmed.eq_ignore_ascii_case("false") || trimmed.eq_ignore_ascii_case("f") {
+            Value::Boolean(false)
+        } else {
+            Value::String(field.to_string())
         }
     }
 
@@ -477,6 +479,42 @@ mod tests {
                     Value::Null
                 ],
             ]
+        );
+    }
+
+    #[test]
+    fn copy_from_options_matches_format_case_without_lowercase_allocation() {
+        let csv_options =
+            Executor::copy_from_options(&[CopyOption::Format(Ident::new("cSv"))], &[]).unwrap();
+        assert!(csv_options.format_csv);
+        assert_eq!(csv_options.delimiter, b',');
+
+        let text_options =
+            Executor::copy_from_options(&[CopyOption::Format(Ident::new("TeXt"))], &[]).unwrap();
+        assert!(!text_options.format_csv);
+        assert_eq!(text_options.delimiter, b'\t');
+
+        let error = Executor::copy_from_options(&[CopyOption::Format(Ident::new("json"))], &[])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Execution error: COPY FORMAT json is not supported"
+        );
+    }
+
+    #[test]
+    fn copy_field_to_value_matches_boolean_case_without_lowercase_allocation() {
+        assert_eq!(
+            Executor::copy_field_to_value(" TrUe ", "NULL"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            Executor::copy_field_to_value(" F ", "NULL"),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            Executor::copy_field_to_value(" truth ", "NULL"),
+            Value::String(" truth ".to_string())
         );
     }
 }

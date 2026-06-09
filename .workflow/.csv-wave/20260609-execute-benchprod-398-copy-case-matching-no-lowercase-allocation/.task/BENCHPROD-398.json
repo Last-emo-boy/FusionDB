@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-398",
+  "title": "Avoid COPY case-matching lowercase allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/copy.rs"
+  ],
+  "description": "Replace COPY format and boolean field to_ascii_lowercase matching with direct ASCII case-insensitive comparisons.",
+  "convergence": {
+    "criteria": [
+      "COPY FORMAT CSV/TEXT parsing no longer allocates lowercase format strings",
+      "COPY boolean field parsing no longer allocates lowercase field strings",
+      "Mixed-case CSV, TEXT, TRUE/T, and FALSE/F inputs keep their existing behavior",
+      "Unsupported COPY FORMAT error text remains unchanged",
+      "COPY SQL and PostgreSQL COPY STDIN regressions pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [],
+    "notes": [
+      "FORMAT parsing computes is_csv with eq_ignore_ascii_case and checks TEXT with the same direct comparison.",
+      "copy_field_to_value now checks TRUE/T and FALSE/F with eq_ignore_ascii_case after the existing null, integer, and float parsing.",
+      "The fallback string branch still preserves the original field bytes via field.to_string()."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test copy_from_options_matches_format_case_without_lowercase_allocation -- --nocapture",
+      "cargo test copy_field_to_value_matches_boolean_case_without_lowercase_allocation -- --nocapture",
+      "cargo test --test sql_dml copy -- --nocapture",
+      "cargo test --test pg_integration copy_from_stdin -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg -n 'to_ascii_lowercase\\(\\)|eq_ignore_ascii_case\\(\"csv\"\\)|copy_field_to_value_matches_boolean' src/execution/copy.rs"
+    ]
+  }
+}
