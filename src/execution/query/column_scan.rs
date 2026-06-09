@@ -181,6 +181,19 @@ struct ColumnAggregateState {
     strings: Vec<String>,
 }
 
+fn join_string_aggregate_values(values: &[String]) -> String {
+    let values_len = values.iter().map(String::len).sum::<usize>();
+    let mut joined = String::with_capacity(values_len + values.len().saturating_sub(1));
+    if let Some((first, rest)) = values.split_first() {
+        joined.push_str(first);
+        for value in rest {
+            joined.push(',');
+            joined.push_str(value);
+        }
+    }
+    joined
+}
+
 impl ColumnAggregateState {
     fn new(kind: ColumnAggregateKind) -> Self {
         Self {
@@ -286,7 +299,7 @@ impl ColumnAggregateState {
                 if self.strings.is_empty() {
                     Value::Null
                 } else {
-                    Value::String(self.strings.join(","))
+                    Value::String(join_string_aggregate_values(&self.strings))
                 }
             }
         }
@@ -693,7 +706,7 @@ impl GroupColumnAggregateState {
                 if self.strings.is_empty() {
                     Value::Null
                 } else {
-                    Value::String(self.strings.join(","))
+                    Value::String(join_string_aggregate_values(&self.strings))
                 }
             }
         }
@@ -1708,6 +1721,15 @@ mod tests {
 
         let strings = GroupColumnAggregateState::new(GroupColumnAggregateKind::StringAgg);
         assert!(strings.strings.capacity() >= 1);
+    }
+
+    #[test]
+    fn join_string_aggregate_values_preallocates_exact_value() {
+        let values = vec!["alice".to_string(), "42".to_string(), "true".to_string()];
+        let joined = join_string_aggregate_values(&values);
+
+        assert_eq!(joined, "alice,42,true");
+        assert!(joined.capacity() >= joined.len());
     }
 
     #[test]

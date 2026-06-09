@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-389",
+  "title": "Preallocate string aggregate result joins",
+  "status": "completed",
+  "files": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "description": "Replace STRING_AGG/GROUP_CONCAT finalization via strings.join(\",\") with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "Column aggregate StringAgg finalization no longer calls strings.join(\",\")",
+      "Group column aggregate StringAgg finalization no longer calls strings.join(\",\")",
+      "STRING_AGG and GROUP_CONCAT output bytes remain unchanged",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "join_string_aggregate_values"
+    ],
+    "notes": [
+      "The helper computes total value length plus comma separators and appends into one String.",
+      "Empty aggregate state handling remains unchanged and still returns NULL.",
+      "Both bare aggregate and grouped aggregate finalizers reuse the same helper."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test join_string_aggregate_values_preallocates_exact_value -- --nocapture",
+      "cargo test --test sql_group_aggregate string_agg -- --nocapture",
+      "cargo test --test sql_group_aggregate group_concat -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'join_string_aggregate_values|strings\\.join\\(\",\"\\)' src/execution/query/column_scan.rs -n"
+    ]
+  }
+}
