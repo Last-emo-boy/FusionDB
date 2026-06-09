@@ -22,6 +22,16 @@ enum ColumnAggregateKind {
     StringAgg,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupColumnAggregateFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    StringAgg,
+}
+
 pub(super) struct ColumnAggregateScanPlan {
     kind: ColumnAggregateKind,
     column_index: Option<usize>,
@@ -79,6 +89,26 @@ fn column_scan_function_name_eq_ascii(name: &ObjectName, expected: &str) -> bool
         [ObjectNamePart::Identifier(ident)] => ident.value.eq_ignore_ascii_case(expected),
         [ObjectNamePart::Function(function)] => function.name.value.eq_ignore_ascii_case(expected),
         _ => false,
+    }
+}
+
+fn group_column_aggregate_function_kind(name: &ObjectName) -> Option<GroupColumnAggregateFunction> {
+    if column_scan_function_name_eq_ascii(name, "COUNT") {
+        Some(GroupColumnAggregateFunction::Count)
+    } else if column_scan_function_name_eq_ascii(name, "SUM") {
+        Some(GroupColumnAggregateFunction::Sum)
+    } else if column_scan_function_name_eq_ascii(name, "AVG") {
+        Some(GroupColumnAggregateFunction::Avg)
+    } else if column_scan_function_name_eq_ascii(name, "MIN") {
+        Some(GroupColumnAggregateFunction::Min)
+    } else if column_scan_function_name_eq_ascii(name, "MAX") {
+        Some(GroupColumnAggregateFunction::Max)
+    } else if column_scan_function_name_eq_ascii(name, "STRING_AGG")
+        || column_scan_function_name_eq_ascii(name, "GROUP_CONCAT")
+    {
+        Some(GroupColumnAggregateFunction::StringAgg)
+    } else {
+        None
     }
 }
 
@@ -1348,9 +1378,11 @@ impl Executor {
                 return None;
             }
 
-            let func_name = func.name.to_string().to_uppercase();
-            let (kind, column_index) = match func_name.as_str() {
-                "COUNT"
+            let Some(function) = group_column_aggregate_function_kind(&func.name) else {
+                return None;
+            };
+            let (kind, column_index) = match function {
+                GroupColumnAggregateFunction::Count
                     if args.duplicate_treatment == Some(DuplicateTreatment::Distinct)
                         && !matches!(
                             args.args[0],
@@ -1362,7 +1394,7 @@ impl Executor {
                         Some(Self::column_arg_index(&args.args[0], schema, None)?),
                     )
                 }
-                "COUNT"
+                GroupColumnAggregateFunction::Count
                     if matches!(
                         args.args[0],
                         FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
@@ -1373,7 +1405,7 @@ impl Executor {
                     }
                     (GroupColumnAggregateKind::CountStar, None)
                 }
-                "COUNT" => {
+                GroupColumnAggregateFunction::Count => {
                     if args.duplicate_treatment.is_some() {
                         return None;
                     }
@@ -1382,7 +1414,7 @@ impl Executor {
                         Some(Self::column_arg_index(&args.args[0], schema, None)?),
                     )
                 }
-                "SUM" => {
+                GroupColumnAggregateFunction::Sum => {
                     if args.duplicate_treatment.is_some() {
                         return None;
                     }
@@ -1391,7 +1423,7 @@ impl Executor {
                         Some(Self::column_arg_index(&args.args[0], schema, None)?),
                     )
                 }
-                "AVG" => {
+                GroupColumnAggregateFunction::Avg => {
                     if args.duplicate_treatment.is_some() {
                         return None;
                     }
@@ -1400,7 +1432,7 @@ impl Executor {
                         Some(Self::column_arg_index(&args.args[0], schema, None)?),
                     )
                 }
-                "MIN" => {
+                GroupColumnAggregateFunction::Min => {
                     if args.duplicate_treatment.is_some() {
                         return None;
                     }
@@ -1409,7 +1441,7 @@ impl Executor {
                         Some(Self::column_arg_index(&args.args[0], schema, None)?),
                     )
                 }
-                "MAX" => {
+                GroupColumnAggregateFunction::Max => {
                     if args.duplicate_treatment.is_some() {
                         return None;
                     }
@@ -1418,7 +1450,7 @@ impl Executor {
                         Some(Self::column_arg_index(&args.args[0], schema, None)?),
                     )
                 }
-                "STRING_AGG" | "GROUP_CONCAT" => {
+                GroupColumnAggregateFunction::StringAgg => {
                     if args.duplicate_treatment.is_some() {
                         return None;
                     }
@@ -1427,7 +1459,6 @@ impl Executor {
                         Some(Self::column_arg_index(&args.args[0], schema, None)?),
                     )
                 }
-                _ => return None,
             };
 
             aggregate_plans.push(GroupColumnAggregateScanPlan {
@@ -1717,6 +1748,26 @@ mod tests {
             &qualified,
             "STRING_AGG"
         ));
+    }
+
+    #[test]
+    fn group_column_aggregate_function_kind_matches_without_display_string() {
+        let count = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("count"))]);
+        let group_concat = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("Group_Concat"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("count")),
+        ]);
+
+        assert_eq!(
+            group_column_aggregate_function_kind(&count),
+            Some(GroupColumnAggregateFunction::Count)
+        );
+        assert_eq!(
+            group_column_aggregate_function_kind(&group_concat),
+            Some(GroupColumnAggregateFunction::StringAgg)
+        );
+        assert_eq!(group_column_aggregate_function_kind(&qualified), None);
     }
 
     #[test]

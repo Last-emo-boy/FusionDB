@@ -1,0 +1,45 @@
+{
+  "id": "BENCHPROD-378",
+  "title": "Avoid group column aggregate name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "description": "Replace simple_group_by_column_aggregate_projection dispatch via func.name.to_string().to_uppercase() with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "Group-by column aggregate projection detection no longer builds uppercase display names",
+      "COUNT star, COUNT column, and COUNT DISTINCT behavior remains unchanged",
+      "SUM, AVG, MIN, MAX, STRING_AGG, and GROUP_CONCAT behavior remains unchanged",
+      "Qualified names remain rejected by the simple aggregate check",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "GroupColumnAggregateFunction",
+      "group_column_aggregate_function_kind"
+    ],
+    "notes": [
+      "The planner now maps function names to a small base-kind enum through direct ObjectNamePart comparisons.",
+      "COUNT still applies the existing DISTINCT, wildcard, and column branches after name classification.",
+      "Value aggregates still reject DISTINCT and require a single column argument."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test group_column_aggregate_function_kind -- --nocapture",
+      "cargo test --test sql_group_aggregate group_by_column_aggregates -- --nocapture",
+      "cargo test --test sql_group_aggregate group_by_count_distinct -- --nocapture",
+      "cargo test --test sql_group_aggregate group_concat_group_by -- --nocapture",
+      "cargo test --test sql_group_aggregate string_agg_group_by -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'let func_name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/column_scan.rs -n"
+    ]
+  }
+}
