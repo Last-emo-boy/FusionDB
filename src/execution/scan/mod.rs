@@ -12,8 +12,8 @@ use crate::monitor;
 use crate::storage::Transaction;
 use futures::stream::StreamExt;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, TableFactor,
-    TableFunctionArgs,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+    ObjectNamePart, TableFactor, TableFunctionArgs,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,6 +23,14 @@ use super::Executor;
 
 const STATS_INDEX_PROBE_LIMIT_MAX: usize = 65_536;
 
+fn scan_object_name_eq_ascii(name: &ObjectName, expected: &str) -> bool {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.eq_ignore_ascii_case(expected),
+        [ObjectNamePart::Function(function)] => function.name.value.eq_ignore_ascii_case(expected),
+        _ => false,
+    }
+}
+
 impl Executor {
     pub(crate) fn generate_subscripts_schema(relation: &TableFactor) -> Option<TableSchema> {
         let TableFactor::Table {
@@ -31,7 +39,7 @@ impl Executor {
         else {
             return None;
         };
-        if !name.to_string().eq_ignore_ascii_case("generate_subscripts") || args.is_none() {
+        if !scan_object_name_eq_ascii(name, "generate_subscripts") || args.is_none() {
             return None;
         }
 
@@ -1402,7 +1410,8 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::Executor;
+    use super::{scan_object_name_eq_ascii, Executor};
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     #[test]
     fn scan_data_key_for_row_id_preallocates_exact_key() {
@@ -1446,5 +1455,23 @@ mod tests {
             "SELECT * FROM (SELECT id, name FROM vt WHERE score >= 80) AS _v"
         );
         assert!(sql.capacity() >= sql.len());
+    }
+
+    #[test]
+    fn scan_object_name_eq_ascii_matches_single_part_names_without_display_string() {
+        let name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+            "Generate_SubScripts",
+        ))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("generate_subscripts")),
+        ]);
+
+        assert!(scan_object_name_eq_ascii(&name, "generate_subscripts"));
+        assert!(!scan_object_name_eq_ascii(&name, "generate_series"));
+        assert!(!scan_object_name_eq_ascii(
+            &qualified,
+            "generate_subscripts"
+        ));
     }
 }

@@ -1,0 +1,38 @@
+{
+  "id": "BENCHPROD-372",
+  "title": "Avoid generate_subscripts ObjectName display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/scan/mod.rs"
+  ],
+  "description": "Replace generate_subscripts detection via name.to_string() with a direct ObjectNamePart helper.",
+  "convergence": {
+    "criteria": [
+      "Single-part generate_subscripts names still match case-insensitively",
+      "Qualified names remain rejected by the simple built-in function check",
+      "generate_subscripts regression passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "scan_object_name_eq_ascii"
+    ],
+    "notes": [
+      "Identifier and Function ObjectNamePart variants compare their inner identifier bytes directly.",
+      "No ObjectName display string is allocated for the generate_subscripts guard.",
+      "Multi-part names return false, preserving the existing simple table function recognition semantics."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test scan_object_name_eq_ascii -- --nocapture",
+      "cargo test --test sql_set_subquery generate_subscripts -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'name\\.to_string\\(\\)\\.eq_ignore_ascii_case\\(\"generate_subscripts\"\\)' src/execution/scan/mod.rs -n"
+    ]
+  }
+}
