@@ -1,5 +1,6 @@
 use crate::common::{FusionError, Result};
 use crate::monitor;
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,8 +61,28 @@ fn segment_path(base: &str, id: u64) -> String {
     if id == 0 {
         base.to_string()
     } else {
-        format!("{}.seg.{}", base, id)
+        let mut path = String::with_capacity(base.len() + ".seg.".len() + u64_decimal_len(id));
+        path.push_str(base);
+        path.push_str(".seg.");
+        write!(&mut path, "{id}").expect("writing to String cannot fail");
+        path
     }
+}
+
+fn wal_segment_file_prefix(base_name: &str) -> String {
+    let mut prefix = String::with_capacity(base_name.len() + ".seg.".len());
+    prefix.push_str(base_name);
+    prefix.push_str(".seg.");
+    prefix
+}
+
+fn u64_decimal_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 10 {
+        value /= 10;
+        len += 1;
+    }
+    len
 }
 
 fn wal_segment_list() -> Vec<(u64, String)> {
@@ -85,7 +106,7 @@ fn find_segments(base: &str) -> Vec<(u64, String)> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let prefix = format!("{}.seg.", base_name);
+    let prefix = wal_segment_file_prefix(&base_name);
 
     if let Ok(entries) = fs::read_dir(parent) {
         for entry in entries.flatten() {
@@ -579,6 +600,30 @@ mod tests {
             segment_path("data/fusion.wal", 42),
             "data/fusion.wal.seg.42"
         );
+    }
+
+    #[test]
+    fn test_segment_path_preallocates_segment_path() {
+        let path = segment_path("data/fusion.wal", 42);
+
+        assert_eq!(path, "data/fusion.wal.seg.42");
+        assert!(path.capacity() >= path.len());
+    }
+
+    #[test]
+    fn test_wal_segment_file_prefix_preallocates_exact_prefix() {
+        let prefix = wal_segment_file_prefix("fusion.wal");
+
+        assert_eq!(prefix, "fusion.wal.seg.");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn test_u64_decimal_len_counts_digits() {
+        assert_eq!(u64_decimal_len(0), 1);
+        assert_eq!(u64_decimal_len(9), 1);
+        assert_eq!(u64_decimal_len(10), 2);
+        assert_eq!(u64_decimal_len(u64::MAX), 20);
     }
 
     #[test]

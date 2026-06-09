@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-358",
+  "title": "Preallocate WAL segment path strings",
+  "status": "completed",
+  "files": [
+    "src/storage/wal.rs"
+  ],
+  "description": "Replace WAL segment path and segment scan-prefix format! calls with exact-capacity helpers.",
+  "convergence": {
+    "criteria": [
+      "Segment 0 path remains the base WAL path",
+      "Segment N path remains <base>.seg.<N>",
+      "Segment scan prefix remains <base_name>.seg.",
+      "WAL unit tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "segment_path",
+      "wal_segment_file_prefix",
+      "u64_decimal_len"
+    ],
+    "notes": [
+      "Segment path construction reserves base length, .seg. separator length, and decimal segment id length.",
+      "The segment scan prefix helper preserves the exact filename prefix used by find_segments.",
+      "Generated WAL segment filenames remain byte-for-byte equivalent to the prior format! strings."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test segment_path_preallocates_segment_path -- --nocapture",
+      "cargo test storage::wal::tests -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(\".*\\.seg\\.' src/storage/wal.rs -n"
+    ]
+  }
+}
