@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-367",
+  "title": "Concat value direct append",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/expr/function.rs"
+  ],
+  "objective": "Append CONCAT scalar and fallback values directly into the output buffer while preserving exact text.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-367"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test append_concat_value -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_expr_functions -- --nocapture",
+      "result": "passed: 22/22"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'result\\.push_str\\(&n\\.to_string\\(\\)\\)|result\\.push_str\\(&f\\.to_string\\(\\)\\)|result\\.push_str\\(&b\\.to_string\\(\\)\\)|result\\.push_str\\(&format!\\(\"\\{:\\?\\}\", val\\)\\)' src/execution/expr/function.rs -n",
+      "result": "no matches"
+    }
+  ]
+}

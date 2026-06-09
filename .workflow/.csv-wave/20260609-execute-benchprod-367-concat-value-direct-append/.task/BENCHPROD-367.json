@@ -1,0 +1,38 @@
+{
+  "id": "BENCHPROD-367",
+  "title": "Directly append CONCAT values",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/function.rs"
+  ],
+  "description": "Replace CONCAT's temporary scalar and debug fallback strings with direct writes into the result buffer.",
+  "convergence": {
+    "criteria": [
+      "CONCAT output text remains unchanged for strings, integers, floats, booleans, NULL, and debug fallback values",
+      "SQL expression function regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes",
+      "Old temporary string append pattern is absent"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "append_concat_value"
+    ],
+    "notes": [
+      "String values still append their bytes directly.",
+      "Integer, float, boolean, and fallback debug values write into the existing String buffer.",
+      "NULL remains a no-op, matching the previous CONCAT behavior."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test append_concat_value -- --nocapture",
+      "cargo test --test sql_expr_functions -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'result\\.push_str\\(&n\\.to_string\\(\\)\\)|result\\.push_str\\(&f\\.to_string\\(\\)\\)|result\\.push_str\\(&b\\.to_string\\(\\)\\)|result\\.push_str\\(&format!\\(\"\\{:\\?\\}\", val\\)\\)' src/execution/expr/function.rs -n"
+    ]
+  }
+}

@@ -1,8 +1,20 @@
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArguments};
+use std::fmt::Write as _;
 
 use super::Executor;
+
+fn append_concat_value(result: &mut String, value: Value) {
+    match value {
+        Value::String(s) => result.push_str(&s),
+        Value::Integer(n) => write!(result, "{}", n).expect("writing to String cannot fail"),
+        Value::Float(f) => write!(result, "{}", f).expect("writing to String cannot fail"),
+        Value::Boolean(b) => write!(result, "{}", b).expect("writing to String cannot fail"),
+        Value::Null => {}
+        other => write!(result, "{:?}", other).expect("writing to String cannot fail"),
+    }
+}
 
 impl Executor {
     pub(crate) fn evaluate_function(
@@ -120,14 +132,7 @@ impl Executor {
                 let mut result = String::new();
                 for arg in args {
                     let val = self.evaluate_arg(arg, row, schema, params)?;
-                    match val {
-                        Value::String(s) => result.push_str(&s),
-                        Value::Integer(n) => result.push_str(&n.to_string()),
-                        Value::Float(f) => result.push_str(&f.to_string()),
-                        Value::Boolean(b) => result.push_str(&b.to_string()),
-                        Value::Null => {}
-                        _ => result.push_str(&format!("{:?}", val)),
-                    }
+                    append_concat_value(&mut result, val);
                 }
                 Ok(Value::String(result))
             }
@@ -456,5 +461,27 @@ impl Executor {
                 v
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_concat_value;
+    use crate::common::Value;
+
+    #[test]
+    fn append_concat_value_preserves_exact_scalar_and_fallback_text() {
+        let mut result = String::with_capacity(64);
+        result.push_str("prefix:");
+
+        append_concat_value(&mut result, Value::String("db".to_string()));
+        append_concat_value(&mut result, Value::Integer(42));
+        append_concat_value(&mut result, Value::Float(3.5));
+        append_concat_value(&mut result, Value::Boolean(true));
+        append_concat_value(&mut result, Value::Null);
+        append_concat_value(&mut result, Value::Array(vec![Value::Integer(7)]));
+
+        assert_eq!(result, "prefix:db423.5trueArray([Integer(7)])");
+        assert!(result.capacity() >= result.len());
     }
 }
