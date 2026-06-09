@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-374",
+  "title": "Avoid evaluate_function success-path name allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/function.rs"
+  ],
+  "description": "Classify supported scalar function names with direct ObjectNamePart matching before dispatch.",
+  "convergence": {
+    "criteria": [
+      "Supported scalar function dispatch no longer builds an uppercase function-name String",
+      "Function aliases still classify case-insensitively",
+      "Qualified names remain rejected by the simple built-in function check",
+      "Expression function regression suite passes",
+      "Vector distance and embedding regressions pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "EvaluatedFunction",
+      "evaluated_function_kind"
+    ],
+    "notes": [
+      "The function evaluator now dispatches on a small enum derived from direct ObjectNamePart comparisons.",
+      "Supported function success paths avoid ObjectName display formatting and uppercase String allocation.",
+      "The unsupported-function error path still formats an uppercase name to preserve the previous error text."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test evaluated_function_kind -- --nocapture",
+      "cargo test --test sql_expr_functions -- --nocapture",
+      "cargo test --test sql_returning_upsert_vector_rbac test_vector_distance_accepts_numeric_array_literals -- --nocapture",
+      "cargo test --test sql_returning_upsert_vector_rbac test_hnsw_order_by_projection -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'let name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/expr/function.rs -n"
+    ]
+  }
+}

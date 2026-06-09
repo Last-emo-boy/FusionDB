@@ -1,10 +1,97 @@
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
-use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArguments};
+use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use super::Executor;
+use super::{function_name_eq_ascii, Executor};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvaluatedFunction {
+    VectorDistance,
+    Embedding,
+    CosineSimilarity,
+    Upper,
+    Lower,
+    Length,
+    Ascii,
+    Concat,
+    Coalesce,
+    ArrayAppend,
+    NullIf,
+    Substring,
+    Replace,
+    Trim,
+    Abs,
+    Round,
+    Ceil,
+    Floor,
+    Mod,
+    Power,
+    Sqrt,
+    ToTimestamp,
+    Now,
+    CurrentDate,
+}
+
+fn evaluated_function_kind(name: &ObjectName) -> Option<EvaluatedFunction> {
+    if function_name_eq_ascii(name, "VECTOR_DISTANCE") {
+        Some(EvaluatedFunction::VectorDistance)
+    } else if function_name_eq_ascii(name, "EMBEDDING") {
+        Some(EvaluatedFunction::Embedding)
+    } else if function_name_eq_ascii(name, "COSINE_SIMILARITY") {
+        Some(EvaluatedFunction::CosineSimilarity)
+    } else if function_name_eq_ascii(name, "UPPER") {
+        Some(EvaluatedFunction::Upper)
+    } else if function_name_eq_ascii(name, "LOWER") {
+        Some(EvaluatedFunction::Lower)
+    } else if function_name_eq_ascii(name, "LENGTH")
+        || function_name_eq_ascii(name, "CHAR_LENGTH")
+        || function_name_eq_ascii(name, "CHARACTER_LENGTH")
+    {
+        Some(EvaluatedFunction::Length)
+    } else if function_name_eq_ascii(name, "ASCII") {
+        Some(EvaluatedFunction::Ascii)
+    } else if function_name_eq_ascii(name, "CONCAT") {
+        Some(EvaluatedFunction::Concat)
+    } else if function_name_eq_ascii(name, "COALESCE") {
+        Some(EvaluatedFunction::Coalesce)
+    } else if function_name_eq_ascii(name, "ARRAY_APPEND") {
+        Some(EvaluatedFunction::ArrayAppend)
+    } else if function_name_eq_ascii(name, "NULLIF") {
+        Some(EvaluatedFunction::NullIf)
+    } else if function_name_eq_ascii(name, "SUBSTRING") || function_name_eq_ascii(name, "SUBSTR") {
+        Some(EvaluatedFunction::Substring)
+    } else if function_name_eq_ascii(name, "REPLACE") {
+        Some(EvaluatedFunction::Replace)
+    } else if function_name_eq_ascii(name, "TRIM") {
+        Some(EvaluatedFunction::Trim)
+    } else if function_name_eq_ascii(name, "ABS") {
+        Some(EvaluatedFunction::Abs)
+    } else if function_name_eq_ascii(name, "ROUND") {
+        Some(EvaluatedFunction::Round)
+    } else if function_name_eq_ascii(name, "CEIL") || function_name_eq_ascii(name, "CEILING") {
+        Some(EvaluatedFunction::Ceil)
+    } else if function_name_eq_ascii(name, "FLOOR") {
+        Some(EvaluatedFunction::Floor)
+    } else if function_name_eq_ascii(name, "MOD") {
+        Some(EvaluatedFunction::Mod)
+    } else if function_name_eq_ascii(name, "POWER") || function_name_eq_ascii(name, "POW") {
+        Some(EvaluatedFunction::Power)
+    } else if function_name_eq_ascii(name, "SQRT") {
+        Some(EvaluatedFunction::Sqrt)
+    } else if function_name_eq_ascii(name, "TO_TIMESTAMP") {
+        Some(EvaluatedFunction::ToTimestamp)
+    } else if function_name_eq_ascii(name, "NOW")
+        || function_name_eq_ascii(name, "CURRENT_TIMESTAMP")
+    {
+        Some(EvaluatedFunction::Now)
+    } else if function_name_eq_ascii(name, "CURRENT_DATE") {
+        Some(EvaluatedFunction::CurrentDate)
+    } else {
+        None
+    }
+}
 
 fn append_concat_value(result: &mut String, value: Value) {
     match value {
@@ -32,7 +119,7 @@ impl Executor {
         schema: &TableSchema,
         params: &[Value],
     ) -> Result<Value> {
-        let name = func.name.to_string().to_uppercase();
+        let function = evaluated_function_kind(&func.name);
 
         let args = match &func.args {
             FunctionArguments::List(list) => &list.args,
@@ -43,8 +130,8 @@ impl Executor {
             }
         };
 
-        match name.as_str() {
-            "VECTOR_DISTANCE" => {
+        match function {
+            Some(EvaluatedFunction::VectorDistance) => {
                 if args.len() != 2 {
                     return Err(FusionError::Execution(
                         "VECTOR_DISTANCE requires 2 arguments".to_string(),
@@ -56,7 +143,7 @@ impl Executor {
 
                 self.compute_vector_distance(&v1, &v2)
             }
-            "EMBEDDING" => {
+            Some(EvaluatedFunction::Embedding) => {
                 if args.len() != 1 {
                     return Err(FusionError::Execution(
                         "EMBEDDING requires 1 argument (text)".to_string(),
@@ -71,7 +158,7 @@ impl Executor {
                     )),
                 }
             }
-            "COSINE_SIMILARITY" => {
+            Some(EvaluatedFunction::CosineSimilarity) => {
                 if args.len() != 2 {
                     return Err(FusionError::Execution(
                         "COSINE_SIMILARITY requires 2 arguments".to_string(),
@@ -96,28 +183,28 @@ impl Executor {
                 };
                 Ok(Value::Float(sim as f64))
             }
-            "UPPER" => {
+            Some(EvaluatedFunction::Upper) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
                     Value::String(s) => Ok(Value::String(s.to_uppercase())),
                     _ => Ok(Value::Null),
                 }
             }
-            "LOWER" => {
+            Some(EvaluatedFunction::Lower) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
                     Value::String(s) => Ok(Value::String(s.to_lowercase())),
                     _ => Ok(Value::Null),
                 }
             }
-            "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+            Some(EvaluatedFunction::Length) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
                     Value::String(s) => Ok(Value::Integer(s.len() as i64)),
                     _ => Ok(Value::Null),
                 }
             }
-            "ASCII" => {
+            Some(EvaluatedFunction::Ascii) => {
                 if args.len() != 1 {
                     return Err(FusionError::Execution(
                         "ASCII requires 1 argument".to_string(),
@@ -133,7 +220,7 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "CONCAT" => {
+            Some(EvaluatedFunction::Concat) => {
                 let mut result = String::new();
                 for arg in args {
                     let val = self.evaluate_arg(arg, row, schema, params)?;
@@ -141,7 +228,7 @@ impl Executor {
                 }
                 Ok(Value::String(result))
             }
-            "COALESCE" => {
+            Some(EvaluatedFunction::Coalesce) => {
                 for arg in args {
                     let val = self.evaluate_arg(arg, row, schema, params)?;
                     if val != Value::Null {
@@ -150,7 +237,7 @@ impl Executor {
                 }
                 Ok(Value::Null)
             }
-            "ARRAY_APPEND" => {
+            Some(EvaluatedFunction::ArrayAppend) => {
                 if args.len() != 2 {
                     return Err(FusionError::Execution(
                         "ARRAY_APPEND requires 2 arguments".to_string(),
@@ -167,7 +254,7 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "NULLIF" => {
+            Some(EvaluatedFunction::NullIf) => {
                 if args.len() != 2 {
                     return Err(FusionError::Execution(
                         "NULLIF requires 2 arguments".to_string(),
@@ -181,7 +268,7 @@ impl Executor {
                     Ok(v1)
                 }
             }
-            "SUBSTRING" | "SUBSTR" => {
+            Some(EvaluatedFunction::Substring) => {
                 if args.is_empty() || args.len() > 3 {
                     return Err(FusionError::Execution(
                         "SUBSTRING requires 1-3 arguments".to_string(),
@@ -215,7 +302,7 @@ impl Executor {
                 let result: String = chars[start.min(chars.len())..end].iter().collect();
                 Ok(Value::String(result))
             }
-            "REPLACE" => {
+            Some(EvaluatedFunction::Replace) => {
                 if args.len() != 3 {
                     return Err(FusionError::Execution(
                         "REPLACE requires 3 arguments".to_string(),
@@ -231,14 +318,14 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "TRIM" => {
+            Some(EvaluatedFunction::Trim) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
                     Value::String(s) => Ok(Value::String(s.trim().to_string())),
                     _ => Ok(Value::Null),
                 }
             }
-            "ABS" => {
+            Some(EvaluatedFunction::Abs) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
                     Value::Integer(n) => Ok(Value::Integer(n.abs())),
@@ -246,7 +333,7 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "ROUND" => {
+            Some(EvaluatedFunction::Round) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 let precision = if args.len() >= 2 {
                     match self.evaluate_arg(&args[1], row, schema, params)? {
@@ -265,7 +352,7 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "CEIL" | "CEILING" => {
+            Some(EvaluatedFunction::Ceil) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
                     Value::Float(f) => Ok(Value::Integer(f.ceil() as i64)),
@@ -273,7 +360,7 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "FLOOR" => {
+            Some(EvaluatedFunction::Floor) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
                     Value::Float(f) => Ok(Value::Integer(f.floor() as i64)),
@@ -281,7 +368,7 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "MOD" => {
+            Some(EvaluatedFunction::Mod) => {
                 if args.len() < 2 {
                     return Err(FusionError::Execution(
                         "MOD requires 2 arguments".to_string(),
@@ -301,7 +388,7 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "POWER" | "POW" => {
+            Some(EvaluatedFunction::Power) => {
                 if args.len() < 2 {
                     return Err(FusionError::Execution(
                         "POWER requires 2 arguments".to_string(),
@@ -321,7 +408,7 @@ impl Executor {
                 };
                 Ok(Value::Float(b.powf(e)))
             }
-            "SQRT" => {
+            Some(EvaluatedFunction::Sqrt) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
                     Value::Integer(n) => Ok(Value::Float((n as f64).sqrt())),
@@ -329,7 +416,7 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "TO_TIMESTAMP" => {
+            Some(EvaluatedFunction::ToTimestamp) => {
                 if args.len() != 1 {
                     return Err(FusionError::Execution(
                         "TO_TIMESTAMP requires 1 argument".to_string(),
@@ -368,22 +455,22 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
-            "NOW" | "CURRENT_TIMESTAMP" => {
+            Some(EvaluatedFunction::Now) => {
                 let dur = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
                 Ok(Value::Integer(dur.as_secs() as i64))
             }
-            "CURRENT_DATE" => {
+            Some(EvaluatedFunction::CurrentDate) => {
                 let dur = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
                 let days = dur.as_secs() / 86400;
                 Ok(Value::Integer(days as i64))
             }
-            _ => Err(FusionError::Execution(format!(
+            None => Err(FusionError::Execution(format!(
                 "Unsupported function: {}",
-                name
+                func.name.to_string().to_uppercase()
             ))),
         }
     }
@@ -471,8 +558,9 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_concat_value, embedding_text_for_value};
+    use super::{append_concat_value, embedding_text_for_value, evaluated_function_kind};
     use crate::common::Value;
+    use sqlparser::ast::{Ident, ObjectName};
     use std::borrow::Cow;
 
     #[test]
@@ -502,5 +590,29 @@ mod tests {
         let text = embedding_text_for_value(&fallback_value);
 
         assert_eq!(text, Cow::Owned::<str>("Integer(42)".to_string()));
+    }
+
+    #[test]
+    fn evaluated_function_kind_matches_aliases_without_display_string() {
+        let lower = ObjectName::from(vec![Ident::new("lower")]);
+        let char_length = ObjectName::from(vec![Ident::new("char_length")]);
+        let substr = ObjectName::from(vec![Ident::new("substr")]);
+        let current_timestamp = ObjectName::from(vec![Ident::new("current_timestamp")]);
+        let qualified = ObjectName::from(vec![Ident::new("pg_catalog"), Ident::new("lower")]);
+
+        assert!(evaluated_function_kind(&lower).is_some());
+        assert_eq!(
+            evaluated_function_kind(&char_length),
+            evaluated_function_kind(&ObjectName::from(vec![Ident::new("length")]))
+        );
+        assert_eq!(
+            evaluated_function_kind(&substr),
+            evaluated_function_kind(&ObjectName::from(vec![Ident::new("substring")]))
+        );
+        assert_eq!(
+            evaluated_function_kind(&current_timestamp),
+            evaluated_function_kind(&ObjectName::from(vec![Ident::new("now")]))
+        );
+        assert!(evaluated_function_kind(&qualified).is_none());
     }
 }
