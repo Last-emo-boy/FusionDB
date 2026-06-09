@@ -334,6 +334,23 @@ impl Executor {
         prefix
     }
 
+    fn composite_index_entry_key(prefix: &str, value_key: &str, row_id: &str) -> String {
+        let mut key = String::with_capacity(prefix.len() + value_key.len() + 1 + row_id.len());
+        key.push_str(prefix);
+        key.push_str(value_key);
+        key.push(':');
+        key.push_str(row_id);
+        key
+    }
+
+    fn composite_index_value_prefix(prefix: &str, value_key: &str) -> String {
+        let mut value_prefix = String::with_capacity(prefix.len() + value_key.len() + 1);
+        value_prefix.push_str(prefix);
+        value_prefix.push_str(value_key);
+        value_prefix.push(':');
+        value_prefix
+    }
+
     pub(crate) fn composite_index_key(
         &self,
         table_name: &str,
@@ -343,12 +360,8 @@ impl Executor {
         row_id: &str,
     ) -> Option<String> {
         let value_key = self.composite_index_value_key(columns, row, schema, true)?;
-        Some(format!(
-            "{}{}:{}",
-            Self::composite_index_prefix(table_name, columns),
-            value_key,
-            row_id
-        ))
+        let prefix = Self::composite_index_prefix(table_name, columns);
+        Some(Self::composite_index_entry_key(&prefix, &value_key, row_id))
     }
 
     fn composite_index_key_for_meta(
@@ -361,12 +374,8 @@ impl Executor {
     ) -> Option<String> {
         let value_key =
             self.composite_index_value_key(&meta.columns, row, schema, meta.ordered_encoding)?;
-        Some(format!(
-            "{}{}:{}",
-            Self::composite_index_prefix(table_name, &meta.columns),
-            value_key,
-            row_id
-        ))
+        let prefix = Self::composite_index_prefix(table_name, &meta.columns);
+        Some(Self::composite_index_entry_key(&prefix, &value_key, row_id))
     }
 
     pub(crate) fn composite_index_value_key_for_columns(
@@ -502,11 +511,8 @@ impl Executor {
             else {
                 continue;
             };
-            let prefix = format!(
-                "{}{}:",
-                Self::composite_index_prefix(table_name, &index.columns),
-                value_key
-            );
+            let index_prefix = Self::composite_index_prefix(table_name, &index.columns);
+            let prefix = Self::composite_index_value_prefix(&index_prefix, &value_key);
             let entries = txn.scan_prefix(prefix.as_bytes(), Some(1)).await?;
             for (key, _) in entries {
                 let Some(row_id) = Self::row_id_from_key(&key) else {
@@ -1044,6 +1050,29 @@ mod tests {
         let prefix = Executor::composite_index_prefix("orders", &columns);
 
         assert_eq!(prefix, "index:orders:warehouse_id,district_id,customer_id:");
+        assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn composite_index_entry_key_preallocates_exact_key() {
+        let key = Executor::composite_index_entry_key(
+            "index:orders:warehouse_id,district_id:",
+            "i1|i2",
+            "0007",
+        );
+
+        assert_eq!(key, "index:orders:warehouse_id,district_id:i1|i2:0007");
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn composite_index_value_prefix_preallocates_exact_prefix() {
+        let prefix = Executor::composite_index_value_prefix(
+            "index:orders:warehouse_id,district_id:",
+            "i1|i2",
+        );
+
+        assert_eq!(prefix, "index:orders:warehouse_id,district_id:i1|i2:");
         assert!(prefix.capacity() >= prefix.len());
     }
 

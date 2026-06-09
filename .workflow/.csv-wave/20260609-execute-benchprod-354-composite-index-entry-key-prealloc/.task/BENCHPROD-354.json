@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-354",
+  "title": "Preallocate composite index entry keys",
+  "status": "completed",
+  "files": [
+    "src/execution/composite_index.rs"
+  ],
+  "description": "Replace composite index entry key and value-prefix format! calls with exact-capacity helpers.",
+  "convergence": {
+    "criteria": [
+      "Generated composite index entry keys remain unchanged",
+      "Generated composite unique value prefixes remain unchanged",
+      "Composite index query and DML regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "Executor::composite_index_entry_key",
+      "Executor::composite_index_value_prefix"
+    ],
+    "notes": [
+      "composite_index_key and composite_index_key_for_meta now build entry keys with exact capacity.",
+      "validate_composite_unique_constraints now builds the scan prefix with exact capacity.",
+      "Range-scan boundary builders remain separate candidates for later iterations."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test composite_index_entry_key -- --nocapture",
+      "cargo test composite_index_value_prefix -- --nocapture",
+      "cargo test --test sql_index_cache test_create_composite_btree_index_and_lookup -- --nocapture",
+      "cargo test --test sql_index_cache test_composite_index_prefix_scan_skips_nonmatching_row_decode -- --nocapture",
+      "cargo test --test sql_dml test_dml_maintains_composite_index_entries -- --nocapture",
+      "cargo test --test sql_index_cache -- --nocapture",
+      "cargo test --test sql_dml -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check"
+    ]
+  }
+}
