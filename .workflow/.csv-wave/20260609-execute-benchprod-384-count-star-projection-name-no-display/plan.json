@@ -1,0 +1,48 @@
+{
+  "id": "BENCHPROD-384",
+  "title": "Count star projection detection without display allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/query/mod.rs"
+  ],
+  "objective": "Avoid ObjectName display and uppercase allocations while recognizing COUNT(*) projection column handling.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-384"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test query_function_name_eq_ascii_matches_without_display_string -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate test_select_count_star -- --nocapture",
+      "result": "passed: 2/2"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate select_count -- --nocapture",
+      "result": "passed: 7/7"
+    },
+    {
+      "command": "cargo test --test sql_group_aggregate -- --nocapture",
+      "result": "passed: 50/50"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\) == \"COUNT\"|query_function_name_eq_ascii\\(&func\\.name, \"COUNT\"\\)|let fname = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/mod.rs -n",
+      "result": "COUNT(*) projection path uses query_function_name_eq_ascii; window function uppercase allocation remains as next candidate"
+    }
+  ]
+}

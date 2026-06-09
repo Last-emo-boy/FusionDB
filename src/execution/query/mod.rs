@@ -2596,7 +2596,7 @@ impl Executor {
                     };
 
                     if let Some(Expr::Function(func)) = expr {
-                        if func.name.to_string().to_uppercase() == "COUNT" {
+                        if query_function_name_eq_ascii(&func.name, "COUNT") {
                             if let FunctionArguments::List(args) = &func.args {
                                 if args.args.len() == 1 {
                                     if let FunctionArg::Unnamed(FunctionArgExpr::Wildcard) =
@@ -3491,6 +3491,20 @@ mod tests {
 
         assert_eq!(name, "cpu.tags_id");
         assert!(name.capacity() >= name.len());
+    }
+
+    #[test]
+    fn query_function_name_eq_ascii_matches_without_display_string() {
+        let count = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("Count"))]);
+        let sum = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("sum"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("count")),
+        ]);
+
+        assert!(query_function_name_eq_ascii(&count, "COUNT"));
+        assert!(!query_function_name_eq_ascii(&sum, "COUNT"));
+        assert!(!query_function_name_eq_ascii(&qualified, "COUNT"));
     }
 
     #[test]

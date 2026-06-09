@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-384",
+  "title": "Avoid count star projection name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Replace projected COUNT(*) function-name detection via func.name.to_string().to_uppercase() with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "COUNT(*) projection column handling no longer builds an uppercase display name before classification",
+      "COUNT(*) output column naming remains COUNT(*)",
+      "Non-wildcard COUNT expressions continue using expression display formatting",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "query_function_name_eq_ascii"
+    ],
+    "notes": [
+      "The projection column setup path now recognizes COUNT through direct ObjectNamePart comparisons.",
+      "The wildcard-argument eligibility check is unchanged.",
+      "The COUNT(*) column name literal and fallback expression formatting are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test query_function_name_eq_ascii_matches_without_display_string -- --nocapture",
+      "cargo test --test sql_group_aggregate test_select_count_star -- --nocapture",
+      "cargo test --test sql_group_aggregate select_count -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\) == \"COUNT\"|query_function_name_eq_ascii\\(&func\\.name, \"COUNT\"\\)|let fname = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/mod.rs -n"
+    ]
+  }
+}
