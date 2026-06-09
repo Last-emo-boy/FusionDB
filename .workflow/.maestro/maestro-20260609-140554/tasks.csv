@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+"0","manage-status","记录当前 BENCHPROD 长跑收尾状态","1","completed","Paused after BENCHPROD-405 commit 3cd4c8e; no next iteration selected.",".workflow/.maestro/maestro-20260609-140554/context.md",""
