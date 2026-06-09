@@ -1,0 +1,45 @@
+{
+  "id": "BENCHPROD-392",
+  "title": "SUBSTRING character slice without intermediate Vec",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/expr/function.rs",
+    "tests/sql_expr_functions.rs"
+  ],
+  "objective": "Avoid allocating an intermediate Vec<char> while evaluating SUBSTRING by character positions.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-392"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test substring_by_chars_preserves_character_boundaries -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_expr_functions test_string_functions -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_expr_functions -- --nocapture",
+      "result": "passed: 22/22"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg 'substring_by_chars|Vec<char>|chars\\(\\)\\.collect' src/execution/expr/function.rs -n",
+      "result": "SUBSTRING uses substring_by_chars; old Vec<char> collection path is absent"
+    }
+  ]
+}

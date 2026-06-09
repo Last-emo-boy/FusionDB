@@ -108,6 +108,35 @@ fn concat_result_buffer(arg_count: usize) -> String {
     String::with_capacity(arg_count)
 }
 
+fn char_boundary_byte_index(s: &str, char_pos: usize) -> Option<usize> {
+    if char_pos == 0 {
+        return Some(0);
+    }
+
+    let mut seen = 0;
+    for (byte_index, _) in s.char_indices() {
+        if seen == char_pos {
+            return Some(byte_index);
+        }
+        seen += 1;
+    }
+
+    (seen == char_pos).then_some(s.len())
+}
+
+fn substring_by_chars(s: &str, start: usize, len: Option<usize>) -> String {
+    let start_byte = match char_boundary_byte_index(s, start) {
+        Some(start_byte) => start_byte,
+        None => return String::new(),
+    };
+    let end_byte = match len {
+        Some(len) => char_boundary_byte_index(s, start + len).unwrap_or(s.len()),
+        None => s.len(),
+    };
+
+    s[start_byte..end_byte].to_string()
+}
+
 fn embedding_text_for_value(value: &Value) -> Cow<'_, str> {
     match value {
         Value::String(s) => Cow::Borrowed(s.as_str()),
@@ -299,12 +328,7 @@ impl Executor {
                 } else {
                     None
                 };
-                let chars: Vec<char> = s.chars().collect();
-                let end = len
-                    .map(|l| (start + l).min(chars.len()))
-                    .unwrap_or(chars.len());
-                let result: String = chars[start.min(chars.len())..end].iter().collect();
-                Ok(Value::String(result))
+                Ok(Value::String(substring_by_chars(&s, start, len)))
             }
             Some(EvaluatedFunction::Replace) => {
                 if args.len() != 3 {
@@ -563,8 +587,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_concat_value, concat_result_buffer, embedding_text_for_value,
-        evaluated_function_kind,
+        append_concat_value, char_boundary_byte_index, concat_result_buffer,
+        embedding_text_for_value, evaluated_function_kind, substring_by_chars,
     };
     use crate::common::Value;
     use sqlparser::ast::{Ident, ObjectName};
@@ -576,6 +600,21 @@ mod tests {
 
         assert_eq!(result, "");
         assert!(result.capacity() >= 3);
+    }
+
+    #[test]
+    fn substring_by_chars_preserves_character_boundaries() {
+        let value = "a\u{e9}bc";
+
+        assert_eq!(char_boundary_byte_index(value, 0), Some(0));
+        assert_eq!(char_boundary_byte_index(value, 1), Some(1));
+        assert_eq!(char_boundary_byte_index(value, 2), Some(3));
+        assert_eq!(char_boundary_byte_index(value, 4), Some(value.len()));
+        assert_eq!(char_boundary_byte_index(value, 5), None);
+        assert_eq!(substring_by_chars(value, 1, Some(2)), "\u{e9}b");
+        assert_eq!(substring_by_chars(value, 2, None), "bc");
+        assert_eq!(substring_by_chars(value, 4, Some(1)), "");
+        assert_eq!(substring_by_chars(value, 5, Some(1)), "");
     }
 
     #[test]

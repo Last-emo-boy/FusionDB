@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-392",
+  "title": "Avoid SUBSTRING intermediate Vec<char>",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/function.rs",
+    "tests/sql_expr_functions.rs"
+  ],
+  "description": "Replace SUBSTRING evaluation's intermediate Vec<char> allocation with byte slicing based on computed character boundaries.",
+  "convergence": {
+    "criteria": [
+      "SUBSTRING evaluation no longer collects chars into Vec<char>",
+      "Character-position semantics remain unchanged",
+      "Out-of-range start positions still return an empty string",
+      "Focused helper test covers ASCII-compatible and multibyte character boundaries",
+      "SQL expression function regressions pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "char_boundary_byte_index",
+      "substring_by_chars"
+    ],
+    "notes": [
+      "The helper finds UTF-8 byte boundaries for character offsets without allocating a Vec<char>.",
+      "SUBSTRING still evaluates arguments once and preserves the previous one-based start and optional length behavior.",
+      "SQL regression coverage includes ASCII and multibyte-character substring cases."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test substring_by_chars_preserves_character_boundaries -- --nocapture",
+      "cargo test --test sql_expr_functions test_string_functions -- --nocapture",
+      "cargo test --test sql_expr_functions -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'substring_by_chars|Vec<char>|chars\\(\\)\\.collect' src/execution/expr/function.rs -n"
+    ]
+  }
+}

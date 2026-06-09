@@ -266,6 +266,16 @@ async fn test_string_functions() {
         rows[0][0],
         fusiondb::common::Value::String("abc".to_string())
     );
+    let (_, rows) = query(&executor, "SELECT SUBSTRING('abcdef', 2, 3)").await;
+    assert_eq!(
+        rows[0][0],
+        fusiondb::common::Value::String("bcd".to_string())
+    );
+    let (_, rows) = query(&executor, "SELECT SUBSTRING('a\u{e9}bc', 2, 2)").await;
+    assert_eq!(
+        rows[0][0],
+        fusiondb::common::Value::String("\u{e9}b".to_string())
+    );
     cleanup(&wal);
 }
 
