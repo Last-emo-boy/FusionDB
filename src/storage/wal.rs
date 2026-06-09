@@ -76,6 +76,13 @@ fn wal_segment_file_prefix(base_name: &str) -> String {
     prefix
 }
 
+fn wal_snapshot_path(base: &str) -> String {
+    let mut path = String::with_capacity(base.len() + ".snap".len());
+    path.push_str(base);
+    path.push_str(".snap");
+    path
+}
+
 fn u64_decimal_len(mut value: u64) -> usize {
     let mut len = 1;
     while value >= 10 {
@@ -525,7 +532,7 @@ impl WalManager {
     where
         I: Iterator<Item = (Vec<u8>, Vec<u8>)>,
     {
-        let snap_path = format!("{}.snap", self.path);
+        let snap_path = wal_snapshot_path(&self.path);
         let mut file = BufWriter::new(File::create(&snap_path).map_err(Self::io_err)?);
 
         for (k, v) in iter {
@@ -619,6 +626,14 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_snapshot_path_preallocates_exact_path() {
+        let path = wal_snapshot_path("data/fusion.wal");
+
+        assert_eq!(path, "data/fusion.wal.snap");
+        assert!(path.capacity() >= path.len());
+    }
+
+    #[test]
     fn test_u64_decimal_len_counts_digits() {
         assert_eq!(u64_decimal_len(0), 1);
         assert_eq!(u64_decimal_len(9), 1);
@@ -656,6 +671,30 @@ mod tests {
         // Cleanup
         wal2.truncate().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_create_checkpoint_replays_snapshot_entries() {
+        let path = format!("test_wal_checkpoint_{}.wal", std::process::id());
+        let wal = WalManager::new(&path).unwrap();
+        wal.create_checkpoint(
+            vec![(b"checkpoint-key".to_vec(), b"checkpoint-value".to_vec())].into_iter(),
+        )
+        .unwrap();
+
+        let wal2 = WalManager::new(&path).unwrap();
+        let entries = wal2.replay().unwrap();
+        match entries.as_slice() {
+            [WalEntry::Put(k, v)] => {
+                assert_eq!(k, b"checkpoint-key");
+                assert_eq!(v, b"checkpoint-value");
+            }
+            other => panic!("unexpected checkpoint entries: {:?}", other),
+        }
+
+        wal2.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(wal_snapshot_path(&path));
     }
 
     #[test]

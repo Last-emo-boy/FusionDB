@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-360",
+  "title": "Preallocate WAL checkpoint snapshot paths",
+  "status": "completed",
+  "files": [
+    "src/storage/wal.rs"
+  ],
+  "description": "Replace WAL checkpoint snapshot path format! construction with an exact-capacity helper.",
+  "convergence": {
+    "criteria": [
+      "WAL snapshot path remains <base>.snap",
+      "Checkpoint creation still writes a replayable snapshot file",
+      "WAL regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "wal_snapshot_path"
+    ],
+    "notes": [
+      "The helper reserves the base path length plus the .snap suffix before appending.",
+      "Generated checkpoint snapshot paths remain byte-for-byte equivalent to the prior format! string.",
+      "A checkpoint replay test covers the create_checkpoint caller path."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test wal_snapshot_path -- --nocapture",
+      "cargo test test_wal_create_checkpoint_replays_snapshot_entries -- --nocapture",
+      "cargo test storage::wal::tests -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\(\"\\{\\}\\.snap\", self\\.path\\)' src/storage/wal.rs -n"
+    ]
+  }
+}
