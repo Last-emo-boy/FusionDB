@@ -944,7 +944,8 @@ impl Executor {
                                 FusionError::Execution(format!("Data deserialization error: {}", e))
                             })?
                         {
-                            let index_name = format!("hnsw_{}_{}", table_name, column.name);
+                            let index_name =
+                                Self::hnsw_index_name_for_column(table_name, &column.name);
                             self.vector_index.delete(&index_name, old_row_id)?;
                             self.vector_index.insert(
                                 &index_name,

@@ -101,6 +101,15 @@ fn vector_rebuild_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+fn vector_rebuild_hnsw_index_name_for_column(table_name: &str, column_name: &str) -> String {
+    let mut name = String::with_capacity("hnsw_".len() + table_name.len() + 1 + column_name.len());
+    name.push_str("hnsw_");
+    name.push_str(table_name);
+    name.push('_');
+    name.push_str(column_name);
+    name
+}
+
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::sstable::{SsTable, SsTableBuilder};
 use crate::storage::vector_index::VectorIndex;
@@ -567,7 +576,9 @@ impl FusionStorage {
                         let mut hnsw_cols = Vec::with_capacity(schema.columns.len());
                         for (idx, col) in schema.columns.iter().enumerate() {
                             if col.is_indexed && col.index_type == crate::catalog::IndexType::HNSW {
-                                let idx_name = format!("hnsw_{}_{}", table_name, col.name);
+                                let idx_name = vector_rebuild_hnsw_index_name_for_column(
+                                    table_name, &col.name,
+                                );
                                 self.vector_index.create_index(&idx_name);
                                 hnsw_cols.push((idx, idx_name));
                             }
@@ -1806,6 +1817,14 @@ mod tests {
 
         assert_eq!(prefix, "data:embeddings:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn vector_rebuild_hnsw_index_name_for_column_preallocates_exact_name() {
+        let name = vector_rebuild_hnsw_index_name_for_column("docs", "embedding");
+
+        assert_eq!(name, "hnsw_docs_embedding");
+        assert!(name.capacity() >= name.len());
     }
 
     #[test]

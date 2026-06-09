@@ -749,9 +749,9 @@ impl Executor {
                                                     params,
                                                 )?;
                                                 if let Value::Vector(query_vec) = query_val {
-                                                    let idx_name = format!(
-                                                        "hnsw_{}_{}",
-                                                        table_name, storage_col_name
+                                                    let idx_name = Self::hnsw_index_name_for_column(
+                                                        &table_name,
+                                                        &storage_col_name,
                                                     );
                                                     let search_results = self
                                                         .vector_index

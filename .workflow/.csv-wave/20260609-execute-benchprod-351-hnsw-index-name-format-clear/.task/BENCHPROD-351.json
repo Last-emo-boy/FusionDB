@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-351",
+  "title": "Preallocate remaining HNSW index names",
+  "status": "completed",
+  "files": [
+    "src/execution/ddl/table.rs",
+    "src/execution/scan/mod.rs",
+    "src/storage/fusion.rs"
+  ],
+  "description": "Replace the remaining HNSW index name format! construction in DDL table rewrite, scan vector search, and storage vector rebuild paths.",
+  "convergence": {
+    "criteria": [
+      "Generated HNSW index name remains hnsw_<table>_<column>",
+      "src contains no format!(\"hnsw_...\") calls",
+      "HNSW scan and vector rebuild regressions pass",
+      "DDL regressions pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "Executor::hnsw_index_name_for_column",
+      "vector_rebuild_hnsw_index_name_for_column"
+    ],
+    "notes": [
+      "DDL table rewrite and scan vector search paths now reuse the existing Executor helper.",
+      "Fusion storage vector rebuild uses a local exact-capacity helper because it is outside Executor.",
+      "A multiline rg search confirms there are no remaining format!(\"hnsw_...\") calls under src."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test hnsw_index_name_for_column -- --nocapture",
+      "cargo test --test sql_returning_upsert_vector_rbac test_hnsw_order_by_projection -- --nocapture",
+      "cargo test fusion_rebuild_vector_index_decodes_only_hnsw_columns -- --nocapture",
+      "cargo test --test sql_ddl -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'format!\\s*\\(\\s*\"hnsw_' src -n -U"
+    ]
+  }
+}
