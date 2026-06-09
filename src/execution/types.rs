@@ -309,19 +309,40 @@ impl Executor {
         }
     }
 
+    fn is_true_boolean_literal(value: &str) -> bool {
+        value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("t")
+            || value == "1"
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    }
+
+    fn is_false_boolean_literal(value: &str) -> bool {
+        value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("f")
+            || value == "0"
+            || value.eq_ignore_ascii_case("no")
+            || value.eq_ignore_ascii_case("off")
+    }
+
     fn coerce_to_boolean(value: Value) -> Result<Value> {
         match value {
             Value::Boolean(_) => Ok(value),
             Value::Integer(n) => Ok(Value::Boolean(n != 0)),
             Value::Decimal(s) => Ok(Value::Boolean(s != "0")),
-            Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
-                "true" | "t" | "1" | "yes" | "on" => Ok(Value::Boolean(true)),
-                "false" | "f" | "0" | "no" | "off" => Ok(Value::Boolean(false)),
-                _ => Err(FusionError::Execution(format!(
-                    "Cannot cast '{}' to BOOLEAN",
-                    s
-                ))),
-            },
+            Value::String(s) => {
+                let trimmed = s.trim();
+                if Self::is_true_boolean_literal(trimmed) {
+                    Ok(Value::Boolean(true))
+                } else if Self::is_false_boolean_literal(trimmed) {
+                    Ok(Value::Boolean(false))
+                } else {
+                    Err(FusionError::Execution(format!(
+                        "Cannot cast '{}' to BOOLEAN",
+                        s
+                    )))
+                }
+            }
             other => Err(FusionError::Execution(format!(
                 "Cannot cast {:?} to BOOLEAN",
                 other
@@ -393,5 +414,37 @@ impl Executor {
                 other
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Executor, Value};
+
+    #[test]
+    fn coerce_to_boolean_matches_ascii_case_without_lowercase_allocation() {
+        for literal in [" TrUe ", "T", "1", "YeS", "oN"] {
+            assert_eq!(
+                Executor::coerce_to_boolean(Value::String(literal.to_string())).unwrap(),
+                Value::Boolean(true)
+            );
+        }
+
+        for literal in [" FaLsE ", "F", "0", "nO", "oFf"] {
+            assert_eq!(
+                Executor::coerce_to_boolean(Value::String(literal.to_string())).unwrap(),
+                Value::Boolean(false)
+            );
+        }
+    }
+
+    #[test]
+    fn coerce_to_boolean_preserves_invalid_error_text() {
+        let error = Executor::coerce_to_boolean(Value::String(" maybe ".to_string())).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Execution error: Cannot cast ' maybe ' to BOOLEAN"
+        );
     }
 }

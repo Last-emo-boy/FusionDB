@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-401",
+  "title": "Avoid BOOLEAN cast lowercase allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/types.rs"
+  ],
+  "description": "Replace string-to-BOOLEAN cast matching's to_ascii_lowercase allocation with direct ASCII case-insensitive literal checks.",
+  "convergence": {
+    "criteria": [
+      "String-to-BOOLEAN coercion no longer allocates lowercase strings",
+      "Accepted true literals true/t/1/yes/on remain recognized case-insensitively",
+      "Accepted false literals false/f/0/no/off remain recognized case-insensitively",
+      "Invalid string error text preserves the original input",
+      "SQL CAST regression passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "is_true_boolean_literal",
+      "is_false_boolean_literal"
+    ],
+    "notes": [
+      "coerce_to_boolean still trims strings before matching accepted BOOLEAN literals.",
+      "The invalid-literal branch still reports the original untrimmed string.",
+      "Non-string BOOLEAN coercion behavior is unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test coerce_to_boolean_matches_ascii_case_without_lowercase_allocation -- --nocapture",
+      "cargo test coerce_to_boolean_preserves_invalid_error_text -- --nocapture",
+      "cargo test --test sql_expr_functions test_cast_expressions -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg -n 'coerce_to_boolean|to_ascii_lowercase\\(\\)|is_true_boolean_literal|is_false_boolean_literal' src/execution/types.rs"
+    ]
+  }
+}
