@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-380",
+  "title": "Avoid COUNT star name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/column_scan.rs"
+  ],
+  "description": "Replace is_simple_count_star COUNT detection via func.name.to_string().eq_ignore_ascii_case with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "COUNT star detection no longer builds a display string for the function name",
+      "COUNT star and count-column group-by fast paths remain unchanged",
+      "COUNT SELECT fast paths remain unchanged",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "column_scan_function_name_eq_ascii",
+      "is_simple_count_star"
+    ],
+    "notes": [
+      "is_simple_count_star now reuses the direct ObjectNamePart helper.",
+      "The new focused test parses Count(*) and exercises the private helper directly.",
+      "The duplicate-treatment, argument-count, and wildcard checks are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test is_simple_count_star -- --nocapture",
+      "cargo test --test sql_group_aggregate group_by_count -- --nocapture",
+      "cargo test --test sql_group_aggregate select_count -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'func\\.name\\.to_string\\(\\)\\.eq_ignore_ascii_case\\(\"COUNT\"\\)' src/execution/query/column_scan.rs -n"
+    ]
+  }
+}

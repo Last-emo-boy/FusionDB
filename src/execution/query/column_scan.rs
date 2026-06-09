@@ -1274,7 +1274,7 @@ impl Executor {
     }
 
     fn is_simple_count_star(func: &sqlparser::ast::Function) -> bool {
-        if !func.name.to_string().eq_ignore_ascii_case("COUNT") {
+        if !column_scan_function_name_eq_ascii(&func.name, "COUNT") {
             return false;
         }
 
@@ -1770,6 +1770,25 @@ mod tests {
             Some(GroupColumnAggregateFunction::StringAgg)
         );
         assert_eq!(group_column_aggregate_function_kind(&qualified), None);
+    }
+
+    #[test]
+    fn is_simple_count_star_matches_without_display_string() {
+        let statement = crate::parser::parse_sql("SELECT Count(*) FROM metrics")
+            .expect("COUNT query parses")
+            .pop()
+            .expect("statement exists");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] else {
+            panic!("expected function projection");
+        };
+
+        assert!(Executor::is_simple_count_star(func));
     }
 
     #[test]
