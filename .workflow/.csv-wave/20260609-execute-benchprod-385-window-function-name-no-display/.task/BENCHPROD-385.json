@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-385",
+  "title": "Avoid window function name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/query/mod.rs"
+  ],
+  "description": "Replace window function dispatch via func.name.to_string().to_uppercase() with direct ObjectNamePart matching.",
+  "convergence": {
+    "criteria": [
+      "Window function precomputation no longer builds uppercase display names before classifying supported functions",
+      "ROW_NUMBER, RANK, DENSE_RANK, LAG, and LEAD still dispatch to compute_window_function with canonical names",
+      "Qualified window function names remain unsupported as before",
+      "sql_window regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "query_window_function_name"
+    ],
+    "notes": [
+      "The window precompute path now maps supported functions to static canonical names through direct ObjectNamePart comparisons.",
+      "compute_window_function still receives the same canonical function name values.",
+      "Window OVER clause checks and window result projection behavior are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test query_window_function_name_matches_without_display_string -- --nocapture",
+      "cargo test --test sql_window -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'query_window_function_name|let fname = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)|func\\.name\\.to_string\\(\\)|to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/query/mod.rs -n"
+    ]
+  }
+}

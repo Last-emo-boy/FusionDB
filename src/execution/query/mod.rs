@@ -175,6 +175,22 @@ fn single_table_prefix_aggregate_name(name: &ObjectName) -> Option<&'static str>
     }
 }
 
+fn query_window_function_name(name: &ObjectName) -> Option<&'static str> {
+    if query_function_name_eq_ascii(name, "ROW_NUMBER") {
+        Some("ROW_NUMBER")
+    } else if query_function_name_eq_ascii(name, "RANK") {
+        Some("RANK")
+    } else if query_function_name_eq_ascii(name, "DENSE_RANK") {
+        Some("DENSE_RANK")
+    } else if query_function_name_eq_ascii(name, "LAG") {
+        Some("LAG")
+    } else if query_function_name_eq_ascii(name, "LEAD") {
+        Some("LEAD")
+    } else {
+        None
+    }
+}
+
 impl Executor {
     const MAX_RECURSIVE_CTE_ITERATIONS: usize = 128;
     const MAX_RECURSIVE_CTE_ROWS: usize = 4096;
@@ -2976,15 +2992,11 @@ impl Executor {
                         _ => None,
                     };
                     if let Some(Expr::Function(func)) = expr {
-                        let fname = func.name.to_string().to_uppercase();
-                        if matches!(
-                            fname.as_str(),
-                            "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "LEAD"
-                        ) {
+                        if let Some(fname) = query_window_function_name(&func.name) {
                             if let Some(ref over) = func.over {
                                 if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
                                     results.push(Some(self.compute_window_function(
-                                        &fname, spec, func, &rows, &schema, params,
+                                        fname, spec, func, &rows, &schema, params,
                                     )));
                                     continue;
                                 }
@@ -3552,5 +3564,27 @@ mod tests {
         assert_eq!(single_table_prefix_aggregate_name(&min), Some("MIN"));
         assert_eq!(single_table_prefix_aggregate_name(&max), Some("MAX"));
         assert_eq!(single_table_prefix_aggregate_name(&qualified), None);
+    }
+
+    #[test]
+    fn query_window_function_name_matches_without_display_string() {
+        let row_number = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("row_number"))]);
+        let rank = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("Rank"))]);
+        let dense_rank = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("DENSE_RANK"))]);
+        let lag = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("lag"))]);
+        let lead = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("LEAD"))]);
+        let sum = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("sum"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("row_number")),
+        ]);
+
+        assert_eq!(query_window_function_name(&row_number), Some("ROW_NUMBER"));
+        assert_eq!(query_window_function_name(&rank), Some("RANK"));
+        assert_eq!(query_window_function_name(&dense_rank), Some("DENSE_RANK"));
+        assert_eq!(query_window_function_name(&lag), Some("LAG"));
+        assert_eq!(query_window_function_name(&lead), Some("LEAD"));
+        assert_eq!(query_window_function_name(&sum), None);
+        assert_eq!(query_window_function_name(&qualified), None);
     }
 }
