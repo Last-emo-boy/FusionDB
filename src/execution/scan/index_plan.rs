@@ -300,40 +300,44 @@ impl Executor {
         pk_index: Option<usize>,
         row_id: &str,
     ) -> Vec<Value> {
-        let pk_type_upper = pk_index
+        let pk_type = pk_index
             .and_then(|pk_idx| schema.columns.get(pk_idx))
-            .map(|column| column.data_type.to_ascii_uppercase());
-        Self::primary_key_row_from_parts(
-            schema.columns.len(),
-            pk_index,
-            pk_type_upper.as_deref(),
-            row_id,
-        )
+            .map(|column| column.data_type.as_str());
+        Self::primary_key_row_from_parts(schema.columns.len(), pk_index, pk_type, row_id)
+    }
+
+    fn primary_key_type_starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+        value
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
     }
 
     pub(super) fn primary_key_row_from_parts(
         schema_width: usize,
         pk_index: Option<usize>,
-        pk_type_upper: Option<&str>,
+        pk_type: Option<&str>,
         row_id: &str,
     ) -> Vec<Value> {
         let mut row = vec![Value::Null; schema_width];
-        let (Some(pk_idx), Some(upper)) = (pk_index, pk_type_upper) else {
+        let (Some(pk_idx), Some(pk_type)) = (pk_index, pk_type) else {
             return row;
         };
         if pk_idx >= schema_width {
             return row;
         }
 
-        row[pk_idx] = if crate::execution::Executor::is_integer_type_name(upper) {
+        row[pk_idx] = if crate::execution::Executor::is_integer_type_name(pk_type) {
             crate::common::encoding::decode_i64_comparable(row_id)
                 .map(Value::Integer)
                 .unwrap_or_else(|| Value::String(row_id.to_string()))
-        } else if upper == "DATE" {
+        } else if pk_type.eq_ignore_ascii_case("DATE") {
             crate::common::encoding::decode_i64_comparable(row_id)
                 .map(|days| Value::Date(days as i32))
                 .unwrap_or_else(|| Value::String(row_id.to_string()))
-        } else if upper.starts_with("TIMESTAMP") || upper == "DATETIME" {
+        } else if Self::primary_key_type_starts_with_ascii_case_insensitive(pk_type, "TIMESTAMP")
+            || pk_type.eq_ignore_ascii_case("DATETIME")
+        {
             crate::common::encoding::decode_i64_comparable(row_id)
                 .map(Value::Timestamp)
                 .unwrap_or_else(|| Value::String(row_id.to_string()))
@@ -853,6 +857,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::Executor;
+    use crate::common::{encoding::encode_i64_comparable, Value};
 
     #[test]
     fn data_key_for_row_id_preallocates_exact_key() {
@@ -884,5 +889,32 @@ mod tests {
 
         assert_eq!(prefix, "index:orders:status:op");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn primary_key_row_from_parts_matches_type_case_without_uppercase_allocation() {
+        let integer_row = Executor::primary_key_row_from_parts(
+            2,
+            Some(0),
+            Some("iNt4"),
+            &encode_i64_comparable(7),
+        );
+        assert_eq!(integer_row, vec![Value::Integer(7), Value::Null]);
+
+        let date_row = Executor::primary_key_row_from_parts(
+            2,
+            Some(1),
+            Some("dAtE"),
+            &encode_i64_comparable(31),
+        );
+        assert_eq!(date_row, vec![Value::Null, Value::Date(31)]);
+
+        let timestamp_row = Executor::primary_key_row_from_parts(
+            1,
+            Some(0),
+            Some("timeStamp(6)"),
+            &encode_i64_comparable(123_456),
+        );
+        assert_eq!(timestamp_row, vec![Value::Timestamp(123_456)]);
     }
 }

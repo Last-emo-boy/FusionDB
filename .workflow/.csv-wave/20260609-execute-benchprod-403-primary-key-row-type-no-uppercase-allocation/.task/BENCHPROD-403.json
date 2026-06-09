@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-403",
+  "title": "Avoid primary-key row type uppercase allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/scan/index_plan.rs"
+  ],
+  "description": "Replace primary_key_row_from_id's primary-key data type to_ascii_uppercase allocation with borrowed type-name matching.",
+  "convergence": {
+    "criteria": [
+      "Primary-key row reconstruction no longer allocates uppercase data type strings",
+      "Integer, DATE, TIMESTAMP(...), and DATETIME primary-key row-id decoding remains case-insensitive where supported",
+      "String fallback for unsupported or undecodable row ids remains unchanged",
+      "Primary-key lookup, projection, and order regressions pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "primary_key_type_starts_with_ascii_case_insensitive"
+    ],
+    "notes": [
+      "primary_key_row_from_id now borrows schema column data_type as &str instead of allocating an uppercase String.",
+      "primary_key_row_from_parts now uses is_integer_type_name, eq_ignore_ascii_case, and a local ASCII case-insensitive prefix helper.",
+      "Data key construction, row-id parsing, row cache behavior, and ordered row-id handling are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test primary_key_row_from_parts_matches_type_case_without_uppercase_allocation -- --nocapture",
+      "cargo test --test sql_index_cache test_primary_key_point_lookup_reuses_row_cache -- --nocapture",
+      "cargo test --test sql_index_cache test_primary_key_projection_reuses_full_row_cache -- --nocapture",
+      "cargo test --test sql_index_cache test_select_order_by_primary_key_limit_offset -- --nocapture",
+      "cargo test --test sql_index_cache test_primary_key_only_projection_with_pk_order -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg -n 'primary_key_row_from_id|primary_key_row_from_parts|to_ascii_uppercase\\(\\)|primary_key_type_starts_with_ascii_case_insensitive' src/execution/scan/index_plan.rs"
+    ]
+  }
+}
