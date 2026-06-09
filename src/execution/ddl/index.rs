@@ -66,6 +66,15 @@ fn drop_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
     prefix
 }
 
+fn hnsw_index_name_for_column(table_name: &str, column_name: &str) -> String {
+    let mut name = String::with_capacity("hnsw_".len() + table_name.len() + 1 + column_name.len());
+    name.push_str("hnsw_");
+    name.push_str(table_name);
+    name.push('_');
+    name.push_str(column_name);
+    name
+}
+
 impl Executor {
     pub(crate) async fn handle_create_index(
         &self,
@@ -152,7 +161,7 @@ impl Executor {
 
             // If HNSW, initialize the vector index
             if index_type == IndexType::HNSW {
-                let idx_name = format!("hnsw_{}_{}", table_name_str, col_name);
+                let idx_name = hnsw_index_name_for_column(&table_name_str, &col_name);
                 self.vector_index.create_index(&idx_name);
             }
         }
@@ -220,7 +229,7 @@ impl Executor {
                 self.update_trigram_index_for_value(&table_name_str, col_name, &val, row_id, txn);
             } else if index_type == IndexType::HNSW {
                 if let Value::Vector(vec) = &val {
-                    let idx_name = format!("hnsw_{}_{}", table_name_str, col_name);
+                    let idx_name = hnsw_index_name_for_column(&table_name_str, col_name);
                     self.vector_index
                         .insert(&idx_name, row_id.to_string(), vec.clone())?;
                 }
@@ -333,7 +342,8 @@ impl Executor {
 mod tests {
     use super::{
         create_index_data_prefix_for_table, create_index_key_for_value,
-        drop_index_prefix_for_column, index_meta_key_for_index, index_schema_key_for_table,
+        drop_index_prefix_for_column, hnsw_index_name_for_column, index_meta_key_for_index,
+        index_schema_key_for_table,
     };
 
     #[test]
@@ -374,5 +384,13 @@ mod tests {
 
         assert_eq!(prefix, "index:orders:status:");
         assert!(prefix.capacity() >= prefix.len());
+    }
+
+    #[test]
+    fn hnsw_index_name_for_column_preallocates_exact_name() {
+        let name = hnsw_index_name_for_column("docs", "embedding");
+
+        assert_eq!(name, "hnsw_docs_embedding");
+        assert!(name.capacity() >= name.len());
     }
 }
