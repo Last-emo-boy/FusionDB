@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-404",
+  "title": "Avoid lowercase allocations in EXISTS membership cache keys",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/subquery.rs"
+  ],
+  "description": "Replace temporary String allocations from to_ascii_lowercase in EXISTS membership cache key construction with direct ASCII-lowercase appends.",
+  "convergence": {
+    "criteria": [
+      "Production EXISTS membership key builders do not call to_ascii_lowercase for column names.",
+      "Generated cache key bytes match the previous format.",
+      "Correlated EXISTS and NOT EXISTS membership regressions pass."
+    ]
+  },
+  "tests": [
+    {
+      "command": "cargo test subquery --lib",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --test sql_set_subquery exists",
+      "result": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "notes": [
+    "Added a private ASCII-lowercase append helper that preserves non-ASCII bytes exactly as str::to_ascii_lowercase does.",
+    "Added private unit tests comparing helper and cache key output against the legacy to_ascii_lowercase format.",
+    "The remaining to_ascii_lowercase matches in the touched file are only in tests that assert legacy equivalence."
+  ]
+}

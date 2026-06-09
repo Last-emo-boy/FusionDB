@@ -95,6 +95,67 @@ fn subquery_table_cache_name_for_factor(name: &ObjectName, alias_name: &str) -> 
     cache_name
 }
 
+fn subquery_push_ascii_lowercase(output: &mut String, value: &str) {
+    let mut chunk_start = 0;
+    for (index, byte) in value.bytes().enumerate() {
+        if byte.is_ascii_uppercase() {
+            if chunk_start < index {
+                output.push_str(&value[chunk_start..index]);
+            }
+            output.push((byte + b'a' - b'A') as char);
+            chunk_start = index + 1;
+        }
+    }
+    if chunk_start < value.len() {
+        output.push_str(&value[chunk_start..]);
+    }
+}
+
+fn subquery_exists_membership_cache_key(
+    table_factor_cache_name: &str,
+    column_name: &str,
+) -> String {
+    let mut key = String::with_capacity(table_factor_cache_name.len() + 1 + column_name.len());
+    key.push_str(table_factor_cache_name);
+    key.push('|');
+    subquery_push_ascii_lowercase(&mut key, column_name);
+    key
+}
+
+fn subquery_exists_join_membership_cache_key(
+    left_table_factor_cache_name: &str,
+    right_table_factor_cache_name: &str,
+    left_join_column: &str,
+    right_join_column: &str,
+    filter_column: &str,
+    filter_expr: &Expr,
+    probe_column: &str,
+) -> String {
+    let mut key = String::with_capacity(
+        left_table_factor_cache_name.len()
+            + right_table_factor_cache_name.len()
+            + left_join_column.len()
+            + right_join_column.len()
+            + filter_column.len()
+            + probe_column.len()
+            + 6,
+    );
+    key.push_str(left_table_factor_cache_name);
+    key.push('|');
+    key.push_str(right_table_factor_cache_name);
+    key.push('|');
+    subquery_push_ascii_lowercase(&mut key, left_join_column);
+    key.push('|');
+    subquery_push_ascii_lowercase(&mut key, right_join_column);
+    key.push('|');
+    subquery_push_ascii_lowercase(&mut key, filter_column);
+    key.push('|');
+    write!(&mut key, "{filter_expr}").expect("writing to String cannot fail");
+    key.push('|');
+    subquery_push_ascii_lowercase(&mut key, probe_column);
+    key
+}
+
 impl Executor {
     pub(crate) async fn materialize_subqueries(
         &self,
@@ -552,11 +613,8 @@ impl Executor {
     }
 
     fn exists_membership_cache_key(&self, plan: &ExistsMembershipPlan) -> String {
-        format!(
-            "{}|{}",
-            Self::table_factor_cache_name(&plan.table_factor),
-            plan.column_name.to_ascii_lowercase()
-        )
+        let table_factor_cache_name = Self::table_factor_cache_name(&plan.table_factor);
+        subquery_exists_membership_cache_key(&table_factor_cache_name, &plan.column_name)
     }
 
     async fn evaluate_exists_join_membership(
@@ -684,15 +742,16 @@ impl Executor {
     }
 
     fn exists_join_membership_cache_key(&self, plan: &ExistsJoinMembershipPlan) -> String {
-        format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            Self::table_factor_cache_name(&plan.left_table_factor),
-            Self::table_factor_cache_name(&plan.right_table_factor),
-            plan.left_join_column.to_ascii_lowercase(),
-            plan.right_join_column.to_ascii_lowercase(),
-            plan.filter_column.to_ascii_lowercase(),
-            plan.filter_expr,
-            plan.probe_column.to_ascii_lowercase()
+        let left_table_factor_cache_name = Self::table_factor_cache_name(&plan.left_table_factor);
+        let right_table_factor_cache_name = Self::table_factor_cache_name(&plan.right_table_factor);
+        subquery_exists_join_membership_cache_key(
+            &left_table_factor_cache_name,
+            &right_table_factor_cache_name,
+            &plan.left_join_column,
+            &plan.right_join_column,
+            &plan.filter_column,
+            &plan.filter_expr,
+            &plan.probe_column,
         )
     }
 
@@ -1322,10 +1381,11 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{
-        subquery_derived_cache_name_for_alias, subquery_schema_key_for_table,
-        subquery_table_cache_name_for_factor,
+        subquery_derived_cache_name_for_alias, subquery_exists_join_membership_cache_key,
+        subquery_exists_membership_cache_key, subquery_push_ascii_lowercase,
+        subquery_schema_key_for_table, subquery_table_cache_name_for_factor,
     };
-    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+    use sqlparser::ast::{Expr, Ident, ObjectName, ObjectNamePart};
 
     #[test]
     fn subquery_schema_key_for_table_preallocates_exact_key() {
@@ -1353,5 +1413,57 @@ mod tests {
 
         assert_eq!(name, "table:public.orders:o");
         assert!(name.capacity() >= name.len());
+    }
+
+    #[test]
+    fn subquery_push_ascii_lowercase_matches_to_ascii_lowercase() {
+        let value = "CustomerID_Ä_2024";
+        let mut output = String::from("prefix:");
+
+        subquery_push_ascii_lowercase(&mut output, value);
+
+        assert_eq!(output, format!("prefix:{}", value.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn subquery_exists_membership_cache_key_preserves_legacy_key() {
+        let table_cache_name = "table:public.orders:o";
+        let column_name = "CustomerID_Ä";
+        let key = subquery_exists_membership_cache_key(table_cache_name, column_name);
+
+        assert_eq!(
+            key,
+            format!("{}|{}", table_cache_name, column_name.to_ascii_lowercase())
+        );
+        assert!(key.capacity() >= key.len());
+    }
+
+    #[test]
+    fn subquery_exists_join_membership_cache_key_preserves_legacy_key() {
+        let filter_expr = Expr::Identifier(Ident::new("OrderStatus"));
+        let key = subquery_exists_join_membership_cache_key(
+            "table:public.orders:o",
+            "table:public.customers:c",
+            "CustomerID",
+            "ID",
+            "Status",
+            &filter_expr,
+            "ProbeID",
+        );
+
+        assert_eq!(
+            key,
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                "table:public.orders:o",
+                "table:public.customers:c",
+                "CustomerID".to_ascii_lowercase(),
+                "ID".to_ascii_lowercase(),
+                "Status".to_ascii_lowercase(),
+                filter_expr,
+                "ProbeID".to_ascii_lowercase()
+            )
+        );
+        assert!(key.capacity() >= key.len());
     }
 }

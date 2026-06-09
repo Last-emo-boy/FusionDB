@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-404",
+  "title": "Avoid lowercase allocations in EXISTS membership cache keys",
+  "status": "completed",
+  "created_at": "2026-06-09",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-404"
+  ],
+  "scope": [
+    "src/execution/expr/subquery.rs"
+  ],
+  "goal": "Preserve EXISTS membership cache key bytes while removing production to_ascii_lowercase allocations from key construction.",
+  "verification": [
+    "cargo test subquery --lib",
+    "cargo test --test sql_set_subquery exists",
+    "cargo fmt --check",
+    "git diff --check",
+    "rg -n \"plan\\\\.[a-z_]*column\\\\.to_ascii_lowercase\\\\(|to_ascii_lowercase\\\\(\\\\)\" src\\\\execution\\\\expr\\\\subquery.rs"
+  ]
+}
