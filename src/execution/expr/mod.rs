@@ -38,6 +38,28 @@ fn function_name_eq_ascii(name: &ObjectName, expected: &str) -> bool {
     }
 }
 
+fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
+    if function_name_eq_ascii(name, "COUNT") {
+        Some("COUNT")
+    } else if function_name_eq_ascii(name, "SUM") {
+        Some("SUM")
+    } else if function_name_eq_ascii(name, "AVG") {
+        Some("AVG")
+    } else if function_name_eq_ascii(name, "MIN") {
+        Some("MIN")
+    } else if function_name_eq_ascii(name, "MAX") {
+        Some("MAX")
+    } else if function_name_eq_ascii(name, "ARRAY_AGG") {
+        Some("ARRAY_AGG")
+    } else if function_name_eq_ascii(name, "STRING_AGG") {
+        Some("STRING_AGG")
+    } else if function_name_eq_ascii(name, "GROUP_CONCAT") {
+        Some("GROUP_CONCAT")
+    } else {
+        None
+    }
+}
+
 impl Executor {
     pub(crate) fn placeholder_index(placeholder: &str) -> usize {
         placeholder
@@ -320,18 +342,7 @@ impl Executor {
     ) {
         match expr {
             Expr::Function(func) => {
-                let name = func.name.to_string().to_uppercase();
-                if matches!(
-                    name.as_str(),
-                    "COUNT"
-                        | "SUM"
-                        | "AVG"
-                        | "MIN"
-                        | "MAX"
-                        | "ARRAY_AGG"
-                        | "STRING_AGG"
-                        | "GROUP_CONCAT"
-                ) {
+                if let Some(name) = aggregate_function_name(&func.name) {
                     // Check for DISTINCT modifier (e.g., COUNT(DISTINCT col))
                     let is_distinct = if let FunctionArguments::List(args) = &func.args {
                         args.duplicate_treatment
@@ -340,12 +351,12 @@ impl Executor {
                         false
                     };
                     let effective_name = if is_distinct && name == "COUNT" {
-                        "COUNT_DISTINCT".to_string()
+                        "COUNT_DISTINCT"
                     } else {
                         name
                     };
                     if !aggregates.iter().any(|(e, _)| e == expr) {
-                        aggregates.push((expr.clone(), effective_name));
+                        aggregates.push((expr.clone(), effective_name.to_string()));
                     }
                 } else if let FunctionArguments::List(args) = &func.args {
                     for arg in &args.args {
@@ -659,7 +670,10 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{function_name_eq_ascii, group_function_arg_name, usize_decimal_len, Executor};
+    use super::{
+        aggregate_function_name, function_name_eq_ascii, group_function_arg_name,
+        usize_decimal_len, Executor,
+    };
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     #[test]
@@ -690,6 +704,20 @@ mod tests {
 
         assert!(function_name_eq_ascii(&name, "COALESCE"));
         assert!(!function_name_eq_ascii(&name, "COUNT"));
+    }
+
+    #[test]
+    fn aggregate_function_name_matches_known_names_without_display_string() {
+        let count = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("count"))]);
+        let string_agg = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("String_Agg"))]);
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+            ObjectNamePart::Identifier(Ident::new("count")),
+        ]);
+
+        assert_eq!(aggregate_function_name(&count), Some("COUNT"));
+        assert_eq!(aggregate_function_name(&string_agg), Some("STRING_AGG"));
+        assert_eq!(aggregate_function_name(&qualified), None);
     }
 
     #[test]

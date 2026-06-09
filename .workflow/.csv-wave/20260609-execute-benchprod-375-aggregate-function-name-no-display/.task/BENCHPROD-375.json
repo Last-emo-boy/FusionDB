@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-375",
+  "title": "Avoid aggregate extraction name display allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/mod.rs"
+  ],
+  "description": "Classify aggregate function names with direct ObjectNamePart matching before extracting aggregates.",
+  "convergence": {
+    "criteria": [
+      "Non-aggregate function expressions no longer allocate an uppercase display name during aggregate extraction",
+      "Aggregate names still record the same uppercase accumulator names",
+      "COUNT DISTINCT still records COUNT_DISTINCT",
+      "Qualified names remain rejected by the simple built-in aggregate check",
+      "sql_group_aggregate regression suite passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "aggregate_function_name"
+    ],
+    "notes": [
+      "The extractor now asks aggregate_function_name for a static aggregate accumulator name.",
+      "The effective aggregate String is allocated only when a new aggregate is recorded.",
+      "Non-aggregate functions recurse into arguments without allocating an ObjectName display string or uppercase String."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test aggregate_function_name -- --nocapture",
+      "cargo test --test sql_group_aggregate test_count_distinct -- --nocapture",
+      "cargo test --test sql_group_aggregate string_agg -- --nocapture",
+      "cargo test --test sql_group_aggregate group_concat -- --nocapture",
+      "cargo test --test sql_group_aggregate -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'let name = func\\.name\\.to_string\\(\\)\\.to_uppercase\\(\\)' src/execution/expr/mod.rs -n"
+    ]
+  }
+}
