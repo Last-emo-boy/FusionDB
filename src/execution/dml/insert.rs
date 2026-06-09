@@ -68,6 +68,16 @@ fn insert_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+fn is_serial_default_data_type(data_type: &str) -> bool {
+    let data_type = data_type.trim();
+    data_type.eq_ignore_ascii_case("SERIAL")
+        || data_type.eq_ignore_ascii_case("SERIAL2")
+        || data_type.eq_ignore_ascii_case("SERIAL4")
+        || data_type.eq_ignore_ascii_case("SERIAL8")
+        || data_type.eq_ignore_ascii_case("SMALLSERIAL")
+        || data_type.eq_ignore_ascii_case("BIGSERIAL")
+}
+
 impl Executor {
     fn insert_trace_enabled() -> bool {
         std::env::var("FUSIONDB_INSERT_TRACE")
@@ -84,11 +94,7 @@ impl Executor {
     fn serial_default_candidate_column_indexes(schema: &TableSchema) -> Vec<usize> {
         let mut indices = Vec::with_capacity(schema.columns.len());
         for (idx, column) in schema.columns.iter().enumerate() {
-            let ty = column.data_type.trim().to_ascii_uppercase();
-            if matches!(
-                ty.as_str(),
-                "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL"
-            ) {
+            if is_serial_default_data_type(&column.data_type) {
                 indices.push(idx);
             }
         }
@@ -1196,8 +1202,18 @@ impl Executor {
 mod tests {
     use super::{
         insert_data_key_for_row_id, insert_data_prefix_for_table, insert_index_key_for_value,
-        insert_schema_key_for_table,
+        insert_schema_key_for_table, is_serial_default_data_type,
     };
+
+    #[test]
+    fn serial_default_data_type_matching_is_ascii_case_insensitive() {
+        assert!(is_serial_default_data_type("SERIAL"));
+        assert!(is_serial_default_data_type(" serial4 "));
+        assert!(is_serial_default_data_type("SmallSerial"));
+        assert!(is_serial_default_data_type("bigserial"));
+        assert!(!is_serial_default_data_type("INTEGER"));
+        assert!(!is_serial_default_data_type("SERIALIZED"));
+    }
 
     #[test]
     fn insert_data_key_for_row_id_preallocates_exact_key() {

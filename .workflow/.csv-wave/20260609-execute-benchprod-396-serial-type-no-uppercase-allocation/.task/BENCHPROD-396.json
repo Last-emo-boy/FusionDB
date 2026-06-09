@@ -1,0 +1,41 @@
+{
+  "id": "BENCHPROD-396",
+  "title": "Avoid SERIAL data type uppercase allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/dml/insert.rs"
+  ],
+  "description": "Replace SERIAL default candidate type matching's to_ascii_uppercase allocation with an ASCII case-insensitive helper.",
+  "convergence": {
+    "criteria": [
+      "SERIAL default candidate detection no longer allocates uppercase data type strings",
+      "SERIAL, SERIAL2, SERIAL4, SERIAL8, SMALLSERIAL, and BIGSERIAL remain recognized",
+      "Whitespace trimming behavior remains unchanged",
+      "Focused helper test passes",
+      "SERIAL insert SQL regression passes",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "is_serial_default_data_type"
+    ],
+    "notes": [
+      "The helper trims the data type and uses eq_ignore_ascii_case for each supported serial alias.",
+      "serial_default_candidate_column_indexes still returns the same candidate indexes.",
+      "Serial default value generation and row scanning are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test serial_default_data_type_matching_is_ascii_case_insensitive -- --nocapture",
+      "cargo test --test sql_dml test_insert_omitted_serial_primary_key_generates_ids -- --nocapture",
+      "cargo test --test sql_dml serial -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'is_serial_default_data_type|to_ascii_uppercase\\(\\)' src/execution/dml/insert.rs -n"
+    ]
+  }
+}
