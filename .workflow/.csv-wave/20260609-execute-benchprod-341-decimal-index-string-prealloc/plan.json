@@ -1,0 +1,79 @@
+{
+  "id": "benchprod-341-decimal-index-string-prealloc",
+  "objective": "Preallocate decimal index string encoding values.",
+  "status": "completed",
+  "created_at": "2026-06-09T08:54:04+08:00",
+  "completed_at": "2026-06-09T08:54:04+08:00",
+  "tasks": [
+    {
+      "id": "BENCHPROD-341",
+      "title": "Preallocate decimal index strings",
+      "status": "completed",
+      "evidence": [
+        "src/execution/expr/value.rs"
+      ],
+      "result": "Decimal index value encoding now uses an explicit-capacity helper instead of format!, while preserving the exact dec:<decimal> bytes."
+    }
+  ],
+  "verification": [
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test decimal_index_string -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_expr_functions test_cast_expressions -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_expr_functions test_production_scalar_types_insert_compare_and_order -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_update_primary_key_simple_table_fast_path -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml test_tpcc_district_composite_primary_key_lookup_with_for_update -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_group_aggregate test_bare_aggregate_sum_avg_decimal -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_group_aggregate test_group_by_sum_decimal_column_scan -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_group_aggregate test_chbenchmark_q6_timestamp_decimal_filter_shape -- --nocapture",
+      "status": "passed: 1/1"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_expr_functions -- --nocapture",
+      "status": "passed: 22/22"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo test --test sql_dml -- --nocapture",
+      "status": "passed: 44/44"
+    },
+    {
+      "command": "$env:TEMP=(Resolve-Path '.tmp').Path; $env:TMP=$env:TEMP; $env:CARGO_PROFILE_TEST_DEBUG='0'; cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "rg 'format!\\(\"dec:\\{}\"' src/execution src/storage -n",
+      "status": "passed: no matches"
+    }
+  ],
+  "notes": [
+    "Cargo verification used an E: workspace temp directory and CARGO_PROFILE_TEST_DEBUG=0 to avoid recurring MSVC PDB pressure.",
+    "The optimization targets index value encoding rather than storage metadata keys.",
+    "Generated index encoding remains dec:<decimal> for Value::Decimal.",
+    "git diff --check printed the existing CRLF normalization warning for the edited Rust file while exiting successfully.",
+    "The sql_dml suite printed existing SSTable retry warnings while passing 44/44 tests."
+  ]
+}

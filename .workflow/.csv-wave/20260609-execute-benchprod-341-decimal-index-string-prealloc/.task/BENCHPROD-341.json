@@ -1,0 +1,21 @@
+{
+  "id": "BENCHPROD-341",
+  "title": "Preallocate decimal index strings",
+  "status": "completed",
+  "category": "database-performance",
+  "created_at": "2026-06-09T08:54:04+08:00",
+  "completed_at": "2026-06-09T08:54:04+08:00",
+  "files_changed": [
+    "src/execution/expr/value.rs"
+  ],
+  "summary": "Replaced Decimal index value format! construction with an explicit-capacity helper and added a focused helper test.",
+  "verification": {
+    "unit": "cargo test decimal_index_string -- --nocapture passed 1/1",
+    "focused": "Decimal cast, scalar type, DML primary-key, decimal aggregate, and timestamp decimal filter focused tests passed",
+    "integration": "cargo test --test sql_expr_functions -- --nocapture passed 22/22; cargo test --test sql_dml -- --nocapture passed 44/44",
+    "format": "cargo fmt --check passed",
+    "diff": "git diff --check passed",
+    "search": "rg 'format!\\(\"dec:\\{}\"' src/execution src/storage -n returned no matches"
+  },
+  "result": "Decimal index value encoding still emits dec:<decimal>, but avoids the format! allocation path."
+}

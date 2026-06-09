@@ -8,6 +8,13 @@ use std::cmp::Ordering;
 
 use super::Executor;
 
+fn decimal_index_string_for_value(decimal: &str) -> String {
+    let mut value = String::with_capacity("dec:".len() + decimal.len());
+    value.push_str("dec:");
+    value.push_str(decimal);
+    value
+}
+
 impl Executor {
     pub(crate) fn evaluate_value(
         &self,
@@ -789,7 +796,7 @@ impl Executor {
             Value::Integer(i) => Some(crate::common::encoding::encode_i64_comparable(*i)),
             Value::String(s) => Some(s.clone()),
             Value::Boolean(b) => Some(b.to_string()),
-            Value::Decimal(d) => Some(format!("dec:{}", d)),
+            Value::Decimal(d) => Some(decimal_index_string_for_value(d)),
             Value::Date(days) => Some(crate::common::encoding::encode_i64_comparable(*days as i64)),
             Value::Timestamp(micros) => {
                 Some(crate::common::encoding::encode_i64_comparable(*micros))
@@ -919,4 +926,17 @@ where
         .map_err(|_| FusionError::Execution(format!("Cannot use '{}' as DECIMAL", right)))?;
     Value::decimal_from_f64(op(l, r))
         .ok_or_else(|| FusionError::Execution("DECIMAL arithmetic overflow".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decimal_index_string_for_value;
+
+    #[test]
+    fn decimal_index_string_for_value_preallocates_exact_value() {
+        let value = decimal_index_string_for_value("123.45");
+
+        assert_eq!(value, "dec:123.45");
+        assert!(value.capacity() >= value.len());
+    }
 }
