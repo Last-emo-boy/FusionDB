@@ -676,13 +676,17 @@ impl Executor {
         }
 
         let predicates = Self::collect_conjunctive_predicates(expr);
-        let equality_values = self.composite_index_equality_values(&predicates, schema, params)?;
+        let equality_values =
+            self.composite_index_equality_values_by_column_index(&predicates, schema, params)?;
 
         let mut best: Option<(CompositeIndexMeta, Vec<String>, bool)> = None;
         for index in indexes {
             let mut components = Vec::with_capacity(index.columns.len());
             for column in &index.columns {
-                let Some(value) = equality_values.get(&column.to_ascii_lowercase()) else {
+                let Some(column_idx) = schema.get_column_index(column) else {
+                    break;
+                };
+                let Some(value) = equality_values.get(&column_idx) else {
                     break;
                 };
                 let Some(component) = self.index_component_for_meta(value, &index) else {
@@ -814,12 +818,12 @@ impl Executor {
         }))
     }
 
-    fn composite_index_equality_values(
+    fn composite_index_equality_values_by_column_index(
         &self,
         predicates: &[Expr],
         schema: &TableSchema,
         params: &[Value],
-    ) -> Result<HashMap<String, Value>> {
+    ) -> Result<HashMap<usize, Value>> {
         let mut values = HashMap::with_capacity(predicates.len());
 
         for predicate in predicates {
@@ -832,7 +836,7 @@ impl Executor {
                 continue;
             };
 
-            let Some((_, column, value_expr)) =
+            let Some((column_idx, _, value_expr)) =
                 self.equality_schema_column_value_expr(left, right, schema)
             else {
                 continue;
@@ -840,7 +844,7 @@ impl Executor {
 
             let value = self.evaluate_value(value_expr, &[], schema, params)?;
             if self.value_to_index_string(&value).is_some() {
-                values.insert(column.to_ascii_lowercase(), value);
+                values.insert(column_idx, value);
             }
         }
 
@@ -1090,6 +1094,30 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::{join_composite_index_parts, CompositeIndexMeta, Executor};
+    use crate::catalog::{Column, IndexType, TableSchema};
+    use crate::common::Value;
+    use crate::storage::memory::MemoryStorage;
+    use std::sync::Arc;
+
+    fn test_column(name: &str, data_type: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            is_primary: false,
+            is_indexed: false,
+            index_type: IndexType::None,
+            default_value: None,
+            is_nullable: true,
+            is_unique: false,
+            check_expr: None,
+        }
+    }
+
+    fn test_executor() -> Executor {
+        let wal_path = format!("test_composite_index_{}.wal", uuid::Uuid::new_v4());
+        let storage = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+        Executor::new(storage)
+    }
 
     #[test]
     fn composite_index_table_marker_key_preallocates_exact_key() {
@@ -1242,6 +1270,40 @@ mod tests {
 
         assert_eq!(encoded, "warehouse_id,district_id");
         assert!(encoded.capacity() >= encoded.len());
+    }
+
+    #[test]
+    fn composite_index_equality_values_use_column_indices_without_lowercase_keys() {
+        let executor = test_executor();
+        let schema = TableSchema::new(
+            "orders".to_string(),
+            vec![
+                test_column("Warehouse_ID", "INTEGER"),
+                test_column("Status", "TEXT"),
+                test_column("Total", "INTEGER"),
+            ],
+        );
+        let statements = crate::parser::parse_sql(
+            "SELECT * FROM orders WHERE warehouse_id = 7 AND STATUS = 'open' AND total > 10",
+        )
+        .unwrap();
+        let statement = statements.into_iter().next().unwrap();
+        let selection = match statement {
+            sqlparser::ast::Statement::Query(query) => match *query.body {
+                sqlparser::ast::SetExpr::Select(select) => select.selection.unwrap(),
+                _ => panic!("expected select query"),
+            },
+            _ => panic!("expected query statement"),
+        };
+        let predicates = Executor::collect_conjunctive_predicates(&selection);
+
+        let values = executor
+            .composite_index_equality_values_by_column_index(&predicates, &schema, &[])
+            .unwrap();
+
+        assert_eq!(values.get(&0), Some(&Value::Integer(7)));
+        assert_eq!(values.get(&1), Some(&Value::String("open".to_string())));
+        assert!(!values.contains_key(&2));
     }
 
     #[test]

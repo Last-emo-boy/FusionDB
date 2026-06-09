@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-400",
+  "title": "Avoid composite equality lowercase key allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/composite_index.rs"
+  ],
+  "description": "Store composite index equality predicate values by schema column index instead of allocating lowercase column-name keys.",
+  "convergence": {
+    "criteria": [
+      "Composite index equality predicate collection no longer allocates lowercase column-name keys",
+      "Composite index candidate matching no longer lowercases index column names for HashMap lookup",
+      "Mixed-case predicate column names still resolve through schema column lookup",
+      "Composite prefix and range scan SQL regressions pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "composite_index_equality_values_by_column_index"
+    ],
+    "notes": [
+      "The equality map now uses HashMap<usize, Value> keyed by schema column index returned from equality_schema_column_value_expr.",
+      "try_composite_index_scan resolves each index column through TableSchema::get_column_index before probing the map.",
+      "Composite index key encoding, index entry scanning, and row-id ordering are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test composite_index_equality_values_use_column_indices_without_lowercase_keys -- --nocapture",
+      "cargo test --test sql_index_cache composite_index -- --nocapture",
+      "cargo test --test sql_dml composite_index -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg -n 'to_ascii_lowercase\\(\\)|composite_index_equality_values_by_column_index|HashMap<usize, Value>|column.to_ascii_lowercase' src/execution/composite_index.rs"
+    ]
+  }
+}

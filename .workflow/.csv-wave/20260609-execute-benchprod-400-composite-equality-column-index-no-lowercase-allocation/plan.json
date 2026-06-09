@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-400",
+  "title": "Composite equality matching by column index without lowercase allocation",
+  "status": "completed",
+  "created_at": "2026-06-09T00:00:00+08:00",
+  "scope": [
+    "src/execution/composite_index.rs"
+  ],
+  "objective": "Avoid allocating lowercase column-name keys while matching composite index equality predicates.",
+  "waves": [
+    {
+      "wave": 1,
+      "tasks": [
+        "BENCHPROD-400"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test composite_index_equality_values_use_column_indices_without_lowercase_keys -- --nocapture",
+      "result": "passed: 1/1"
+    },
+    {
+      "command": "cargo test --test sql_index_cache composite_index -- --nocapture",
+      "result": "passed: 3/3"
+    },
+    {
+      "command": "cargo test --test sql_dml composite_index -- --nocapture",
+      "result": "passed: 4/4"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "rg -n 'to_ascii_lowercase\\(\\)|composite_index_equality_values_by_column_index|HashMap<usize, Value>|column.to_ascii_lowercase' src/execution/composite_index.rs",
+      "result": "composite equality matching uses HashMap<usize, Value>; old column-name lowercase paths are absent"
+    }
+  ]
+}
