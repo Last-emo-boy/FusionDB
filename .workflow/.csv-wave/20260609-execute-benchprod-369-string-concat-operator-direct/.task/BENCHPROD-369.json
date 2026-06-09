@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-369",
+  "title": "Direct SQL string concat operator",
+  "status": "completed",
+  "files": [
+    "src/execution/expr/value.rs"
+  ],
+  "description": "Replace SQL StringConcat operand clones and temporary scalar strings with a direct helper path.",
+  "convergence": {
+    "criteria": [
+      "Array concatenation behavior remains unchanged",
+      "Scalar string concat output remains unchanged for strings, numbers, booleans, NULL, and fallback debug values",
+      "SQL expression function regression tests pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "concat_operator_values",
+      "append_string_concat_value"
+    ],
+    "notes": [
+      "String-string concat still uses the exact-capacity concat_string_values helper.",
+      "Array concat consumes operands directly instead of cloning left_val/right_val.",
+      "Scalar fallback values write directly into the result buffer with the same Display/Debug text as before."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test concat_operator_values -- --nocapture",
+      "cargo test --test sql_expr_functions test_string_concat_operator -- --nocapture",
+      "cargo test --test sql_expr_functions -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg 'let l = match left_val|let r = match right_val|concat_string_values\\(&l, &r\\)|left_val\\.clone\\(\\)|right_val\\.clone\\(\\)' src/execution/expr/value.rs -n"
+    ]
+  }
+}

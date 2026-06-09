@@ -5,6 +5,7 @@ use sqlparser::ast::{
     AccessExpr, BinaryOperator, DateTimeField, Expr, Subscript, Value as SqlValue,
 };
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 
 use super::Executor;
 
@@ -20,6 +21,43 @@ fn concat_string_values(left: &str, right: &str) -> String {
     value.push_str(left);
     value.push_str(right);
     value
+}
+
+fn append_string_concat_value(result: &mut String, value: Value) {
+    match value {
+        Value::String(s) => result.push_str(&s),
+        Value::Integer(n) => write!(result, "{}", n).expect("writing to String cannot fail"),
+        Value::Float(f) => write!(result, "{}", f).expect("writing to String cannot fail"),
+        Value::Boolean(b) => write!(result, "{}", b).expect("writing to String cannot fail"),
+        other => write!(result, "{:?}", other).expect("writing to String cannot fail"),
+    }
+}
+
+fn concat_operator_values(left_val: Value, right_val: Value) -> Value {
+    match (left_val, right_val) {
+        (Value::Array(mut left), Value::Array(right)) => {
+            left.extend(right);
+            Value::Array(left)
+        }
+        (Value::Array(mut left), right) => {
+            left.push(right);
+            Value::Array(left)
+        }
+        (left, Value::Array(mut right)) => {
+            right.insert(0, left);
+            Value::Array(right)
+        }
+        (Value::Null, _) | (_, Value::Null) => Value::Null,
+        (Value::String(left), Value::String(right)) => {
+            Value::String(concat_string_values(&left, &right))
+        }
+        (left, right) => {
+            let mut result = String::new();
+            append_string_concat_value(&mut result, left);
+            append_string_concat_value(&mut result, right);
+            Value::String(result)
+        }
+    }
 }
 
 fn column_suffix_for_fallback(fallback_name: &str) -> String {
@@ -191,40 +229,7 @@ impl Executor {
                     BinaryOperator::Modulo => {
                         self.compute_math_op(&left_val, &right_val, |a, b| a % b, |a, b| a % b)
                     }
-                    BinaryOperator::StringConcat => {
-                        if let (Value::Array(mut left), Value::Array(right)) =
-                            (left_val.clone(), right_val.clone())
-                        {
-                            left.extend(right);
-                            return Ok(Value::Array(left));
-                        }
-                        if let Value::Array(mut left) = left_val.clone() {
-                            left.push(right_val);
-                            return Ok(Value::Array(left));
-                        }
-                        if let Value::Array(mut right) = right_val.clone() {
-                            right.insert(0, left_val);
-                            return Ok(Value::Array(right));
-                        }
-
-                        let l = match left_val {
-                            Value::String(s) => s,
-                            Value::Integer(n) => n.to_string(),
-                            Value::Float(f) => f.to_string(),
-                            Value::Boolean(b) => b.to_string(),
-                            Value::Null => return Ok(Value::Null),
-                            other => format!("{:?}", other),
-                        };
-                        let r = match right_val {
-                            Value::String(s) => s,
-                            Value::Integer(n) => n.to_string(),
-                            Value::Float(f) => f.to_string(),
-                            Value::Boolean(b) => b.to_string(),
-                            Value::Null => return Ok(Value::Null),
-                            other => format!("{:?}", other),
-                        };
-                        Ok(Value::String(concat_string_values(&l, &r)))
-                    }
+                    BinaryOperator::StringConcat => Ok(concat_operator_values(left_val, right_val)),
                     BinaryOperator::Arrow => {
                         if let Value::Object(map) = left_val {
                             if let Value::String(key) = right_val {
@@ -944,7 +949,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{column_suffix_for_fallback, concat_string_values, decimal_index_string_for_value};
+    use super::{
+        column_suffix_for_fallback, concat_operator_values, concat_string_values,
+        decimal_index_string_for_value,
+    };
+    use crate::common::Value;
 
     #[test]
     fn decimal_index_string_for_value_preallocates_exact_value() {
@@ -960,6 +969,33 @@ mod tests {
 
         assert_eq!(value, "hello world");
         assert!(value.capacity() >= value.len());
+    }
+
+    #[test]
+    fn concat_operator_values_preserves_scalar_null_and_array_behavior() {
+        assert_eq!(
+            concat_operator_values(Value::String("id=".to_string()), Value::Integer(42)),
+            Value::String("id=42".to_string())
+        );
+        assert_eq!(
+            concat_operator_values(Value::Float(3.5), Value::Boolean(false)),
+            Value::String("3.5false".to_string())
+        );
+        assert_eq!(
+            concat_operator_values(Value::Blob(vec![1, 2]), Value::String("x".to_string())),
+            Value::String("Blob([1, 2])x".to_string())
+        );
+        assert_eq!(
+            concat_operator_values(Value::Null, Value::String("x".to_string())),
+            Value::Null
+        );
+        assert_eq!(
+            concat_operator_values(
+                Value::Array(vec![Value::Integer(1)]),
+                Value::Array(vec![Value::Integer(2)])
+            ),
+            Value::Array(vec![Value::Integer(1), Value::Integer(2)])
+        );
     }
 
     #[test]
