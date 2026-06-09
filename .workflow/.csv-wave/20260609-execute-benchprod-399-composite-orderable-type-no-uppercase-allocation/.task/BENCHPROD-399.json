@@ -1,0 +1,44 @@
+{
+  "id": "BENCHPROD-399",
+  "title": "Avoid composite orderable type uppercase allocation",
+  "status": "completed",
+  "files": [
+    "src/execution/composite_index.rs"
+  ],
+  "description": "Replace composite index orderable-column data type to_ascii_uppercase matching with direct ASCII case-insensitive comparisons.",
+  "convergence": {
+    "criteria": [
+      "Composite index orderable type matching no longer allocates uppercase data type strings",
+      "Integer, boolean, date, timestamp, datetime, and interval type recognition remains ASCII case-insensitive",
+      "Timestamp/datetime parameterized forms and interval subtypes remain recognized by prefix",
+      "Non-orderable text-like and near-miss type names remain rejected",
+      "Composite index SQL regressions pass",
+      "cargo fmt --check passes",
+      "git diff --check passes"
+    ]
+  },
+  "implementation": {
+    "helpers": [
+      "starts_with_ascii_case_insensitive",
+      "composite_column_type_matches_any",
+      "composite_column_type_is_integer"
+    ],
+    "notes": [
+      "The helper uses byte-prefix comparison to avoid allocating uppercase strings.",
+      "composite_column_type_is_orderable now checks exact type names and known prefixes with ASCII case-insensitive comparisons.",
+      "Composite index key encoding, range bound construction, and SQL-visible output are unchanged."
+    ]
+  },
+  "verification": {
+    "passed": true,
+    "commands": [
+      "cargo test composite_column_type_orderable_matches_case_without_uppercase_allocation -- --nocapture",
+      "cargo test composite_column_type_orderable_rejects_non_orderable_names -- --nocapture",
+      "cargo test --test sql_index_cache composite_index -- --nocapture",
+      "cargo test --test sql_dml composite_index -- --nocapture",
+      "cargo fmt --check",
+      "git diff --check",
+      "rg -n 'composite_column_type_is_orderable|to_ascii_uppercase\\(\\)|starts_with_ascii_case_insensitive' src/execution/composite_index.rs"
+    ]
+  }
+}

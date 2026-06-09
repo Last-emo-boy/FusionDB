@@ -991,19 +991,62 @@ impl Executor {
         }
     }
 
+    fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+        value
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    }
+
+    fn composite_column_type_matches_any(data_type: &str, candidates: &[&str]) -> bool {
+        candidates
+            .iter()
+            .any(|candidate| data_type.eq_ignore_ascii_case(candidate))
+    }
+
+    fn composite_column_type_is_integer(data_type: &str) -> bool {
+        Self::composite_column_type_matches_any(
+            data_type,
+            &[
+                "INT",
+                "INT2",
+                "INT4",
+                "INT8",
+                "INTEGER",
+                "SMALLINT",
+                "BIGINT",
+                "TINYINT",
+                "MEDIUMINT",
+                "SERIAL",
+                "SERIAL2",
+                "SERIAL4",
+                "SERIAL8",
+                "SMALLSERIAL",
+                "BIGSERIAL",
+            ],
+        )
+    }
+
     fn composite_column_type_is_orderable(data_type: &str) -> bool {
-        let upper = data_type.to_ascii_uppercase();
-        Self::is_integer_type_name(&upper)
-            || matches!(upper.as_str(), "BOOL" | "BOOLEAN" | "DATE" | "DATE32")
-            || upper == "TIMESTAMP"
-            || upper == "TIMESTAMP WITHOUT TIME ZONE"
-            || upper == "TIMESTAMP WITH TIME ZONE"
-            || upper == "TIMESTAMPTZ"
-            || upper == "DATETIME"
-            || upper.starts_with("TIMESTAMP(")
-            || upper.starts_with("DATETIME(")
-            || upper == "INTERVAL"
-            || upper.starts_with("INTERVAL ")
+        Self::composite_column_type_is_integer(data_type)
+            || Self::composite_column_type_matches_any(
+                data_type,
+                &[
+                    "BOOL",
+                    "BOOLEAN",
+                    "DATE",
+                    "DATE32",
+                    "TIMESTAMP",
+                    "TIMESTAMP WITHOUT TIME ZONE",
+                    "TIMESTAMP WITH TIME ZONE",
+                    "TIMESTAMPTZ",
+                    "DATETIME",
+                    "INTERVAL",
+                ],
+            )
+            || Self::starts_with_ascii_case_insensitive(data_type, "TIMESTAMP(")
+            || Self::starts_with_ascii_case_insensitive(data_type, "DATETIME(")
+            || Self::starts_with_ascii_case_insensitive(data_type, "INTERVAL ")
     }
 
     pub(crate) async fn delete_index_meta_for_table(
@@ -1199,5 +1242,43 @@ mod tests {
 
         assert_eq!(encoded, "warehouse_id,district_id");
         assert!(encoded.capacity() >= encoded.len());
+    }
+
+    #[test]
+    fn composite_column_type_orderable_matches_case_without_uppercase_allocation() {
+        for data_type in [
+            "iNt4",
+            "bigSerial",
+            "BoOlEaN",
+            "date32",
+            "timeStamp",
+            "timestamp without time zone",
+            "TIMESTAMP WITH TIME ZONE",
+            "timestamp(6)",
+            "dateTime(3)",
+            "interval day",
+        ] {
+            assert!(
+                Executor::composite_column_type_is_orderable(data_type),
+                "{data_type} should be orderable"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_column_type_orderable_rejects_non_orderable_names() {
+        for data_type in [
+            "TEXT",
+            "varchar(20)",
+            "timestampz",
+            "datetimeoffset",
+            "intervals",
+            " TIMESTAMP",
+        ] {
+            assert!(
+                !Executor::composite_column_type_is_orderable(data_type),
+                "{data_type} should not be orderable"
+            );
+        }
     }
 }
