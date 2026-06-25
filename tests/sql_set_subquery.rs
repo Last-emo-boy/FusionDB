@@ -1199,6 +1199,81 @@ async fn test_correlated_exists_two_table_membership_matches_ldbc_q6_shape() {
 }
 
 #[tokio::test]
+async fn test_correlated_exists_binds_outer_reference_in_having() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE corr_having_parent (id INTEGER PRIMARY KEY, min_orders INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE corr_having_order (id INTEGER PRIMARY KEY, parent_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO corr_having_parent VALUES (1, 2), (2, 2), (3, 1)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO corr_having_order VALUES (10, 1), (11, 1), (20, 2)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id
+         FROM corr_having_parent p
+         WHERE EXISTS (
+             SELECT parent_id
+             FROM corr_having_order o
+             WHERE o.parent_id = p.id
+             GROUP BY parent_id
+             HAVING COUNT(*) >= p.min_orders
+         )
+         ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_correlated_scalar_subquery_binds_outer_reference_in_projection() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE corr_projection_parent (id INTEGER PRIMARY KEY, label TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO corr_projection_parent VALUES (1, 'alpha'), (2, 'beta')",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, (SELECT p.label) AS copied_label
+         FROM corr_projection_parent p
+         ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::String("alpha".to_string())],
+            vec![Value::Integer(2), Value::String("beta".to_string())],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_generate_subscripts_from_array_literal() {
     let (executor, wal) = setup().await;
     let (_, rows) = query(

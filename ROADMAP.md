@@ -47,7 +47,7 @@
 - [x] **P2-33: UPSERT** — INSERT ... ON CONFLICT DO UPDATE SET / DO NOTHING with EXCLUDED references
 - [x] **P2-34: CROSS JOIN** — Cartesian product join support
 - [x] **P2-35: Multi-column ORDER BY** — Mixed ASC/DESC verified with tests
-- [ ] **P2-36: Correlated subqueries** — EXISTS with outer row references
+- [x] **P2-36: Correlated subqueries** — EXISTS/NOT EXISTS outer row references, aggregate HAVING binding, and scalar projection materialization
 
 ## Phase 3: Security
 

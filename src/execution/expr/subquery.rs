@@ -2,8 +2,8 @@ use crate::catalog::TableSchema;
 use crate::common::{Result, Value};
 use crate::storage::Transaction;
 use sqlparser::ast::{
-    BinaryOperator, Expr, ObjectName, ObjectNamePart, Query, Select, SetExpr, TableFactor,
-    TableWithJoins, UnaryOperator, Value as SqlValue,
+    BinaryOperator, Expr, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr,
+    TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -776,14 +776,31 @@ impl Executor {
     }
 
     fn exists_membership_plan(&self, subquery: &Query) -> Option<ExistsMembershipPlan> {
+        if subquery.limit_clause.is_some() || subquery.fetch.is_some() {
+            return None;
+        }
         let select = match subquery.body.as_ref() {
             SetExpr::Select(select) => select,
             SetExpr::Query(inner) => match inner.body.as_ref() {
-                SetExpr::Select(select) => select,
+                SetExpr::Select(select) => {
+                    if inner.limit_clause.is_some() || inner.fetch.is_some() {
+                        return None;
+                    }
+                    select
+                }
                 _ => return None,
             },
             _ => return None,
         };
+        if select.having.is_some()
+            || select.distinct.is_some()
+            || !matches!(
+                select.group_by,
+                sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty()
+            )
+        {
+            return None;
+        }
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return None;
         }
@@ -840,14 +857,31 @@ impl Executor {
         subquery: &Query,
         txn: &mut dyn Transaction,
     ) -> Result<Option<ExistsJoinMembershipPlan>> {
+        if subquery.limit_clause.is_some() || subquery.fetch.is_some() {
+            return Ok(None);
+        }
         let select = match subquery.body.as_ref() {
             SetExpr::Select(select) => select,
             SetExpr::Query(inner) => match inner.body.as_ref() {
-                SetExpr::Select(select) => select,
+                SetExpr::Select(select) => {
+                    if inner.limit_clause.is_some() || inner.fetch.is_some() {
+                        return Ok(None);
+                    }
+                    select
+                }
                 _ => return Ok(None),
             },
             _ => return Ok(None),
         };
+        if select.having.is_some()
+            || select.distinct.is_some()
+            || !matches!(
+                select.group_by,
+                sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty()
+            )
+        {
+            return Ok(None);
+        }
         if !select.projection.iter().all(|item| {
             matches!(
                 item,
@@ -1119,6 +1153,24 @@ impl Executor {
                 params,
             )?);
         }
+        if let Some(having) = &select.having {
+            select.having = Some(self.bind_outer_references_in_expr(
+                having,
+                outer_row,
+                outer_schema,
+                &local_scope,
+                params,
+            )?);
+        }
+        for item in &mut select.projection {
+            self.bind_outer_references_in_select_item(
+                item,
+                outer_row,
+                outer_schema,
+                &local_scope,
+                params,
+            )?;
+        }
         Ok(())
     }
 
@@ -1242,6 +1294,38 @@ impl Executor {
             }
         }
 
+        Ok(())
+    }
+
+    fn bind_outer_references_in_select_item(
+        &self,
+        item: &mut SelectItem,
+        outer_row: &[Value],
+        outer_schema: &crate::catalog::TableSchema,
+        local_scope: &SubqueryLocalScope,
+        params: &[Value],
+    ) -> Result<()> {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                *expr = self.bind_outer_references_in_expr(
+                    expr,
+                    outer_row,
+                    outer_schema,
+                    local_scope,
+                    params,
+                )?;
+            }
+            SelectItem::ExprWithAlias { expr, .. } => {
+                *expr = self.bind_outer_references_in_expr(
+                    expr,
+                    outer_row,
+                    outer_schema,
+                    local_scope,
+                    params,
+                )?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 

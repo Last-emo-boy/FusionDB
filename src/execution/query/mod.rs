@@ -654,6 +654,30 @@ impl Executor {
         }
     }
 
+    fn extract_subquery_outer_columns(&self, expr: &Expr, cols: &mut HashSet<String>) {
+        match expr {
+            Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+                self.extract_query_outer_columns(subquery, cols)
+            }
+            Expr::InSubquery {
+                expr: inner_expr,
+                subquery,
+                ..
+            } => {
+                self.extract_columns_from_expr(inner_expr, cols);
+                self.extract_query_outer_columns(subquery, cols);
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.extract_subquery_outer_columns(left, cols);
+                self.extract_subquery_outer_columns(right, cols);
+            }
+            Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+                self.extract_subquery_outer_columns(inner, cols);
+            }
+            _ => {}
+        }
+    }
+
     fn extract_query_outer_columns(
         &self,
         query: &sqlparser::ast::Query,
@@ -2418,10 +2442,12 @@ impl Executor {
                 for item in &select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
-                            self.extract_columns_from_expr(expr, &mut cols)
+                            self.extract_columns_from_expr(expr, &mut cols);
+                            self.extract_subquery_outer_columns(expr, &mut cols);
                         }
                         SelectItem::ExprWithAlias { expr, .. } => {
-                            self.extract_columns_from_expr(expr, &mut cols)
+                            self.extract_columns_from_expr(expr, &mut cols);
+                            self.extract_subquery_outer_columns(expr, &mut cols);
                         }
                         _ => {}
                     }
@@ -2474,10 +2500,12 @@ impl Executor {
                 for item in &select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
-                            self.extract_columns_from_expr(expr, &mut cols)
+                            self.extract_columns_from_expr(expr, &mut cols);
+                            self.extract_subquery_outer_columns(expr, &mut cols);
                         }
                         SelectItem::ExprWithAlias { expr, .. } => {
-                            self.extract_columns_from_expr(expr, &mut cols)
+                            self.extract_columns_from_expr(expr, &mut cols);
+                            self.extract_subquery_outer_columns(expr, &mut cols);
                         }
                         _ => {}
                     }
@@ -3025,12 +3053,24 @@ impl Executor {
                             continue;
                         }
                         let val = match item {
-                            SelectItem::UnnamedExpr(expr) => self
-                                .evaluate_value(expr, row, &schema, params)
-                                .unwrap_or(Value::Null),
-                            SelectItem::ExprWithAlias { expr, .. } => self
-                                .evaluate_value(expr, row, &schema, params)
-                                .unwrap_or(Value::Null),
+                            SelectItem::UnnamedExpr(expr)
+                            | SelectItem::ExprWithAlias { expr, .. } => {
+                                let materialized = if Self::contains_subquery(expr) {
+                                    Box::pin(self.materialize_subqueries_with_outer(
+                                        expr,
+                                        Some(row),
+                                        Some(&schema),
+                                        txn,
+                                        params,
+                                    ))
+                                    .await
+                                    .unwrap_or_else(|_| expr.clone())
+                                } else {
+                                    expr.clone()
+                                };
+                                self.evaluate_value(&materialized, row, &schema, params)
+                                    .unwrap_or(Value::Null)
+                            }
                             _ => Value::Null,
                         };
                         new_row.push(val);

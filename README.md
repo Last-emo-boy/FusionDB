@@ -35,7 +35,7 @@
 
 | Capability | Description |
 |---|---|
-| **Relational SQL** | SELECT, INSERT, UPDATE, DELETE, JOIN (INNER/LEFT/RIGHT/CROSS), GROUP BY, ORDER BY (multi-column ASC/DESC), HAVING, DISTINCT, LIMIT/OFFSET, BETWEEN, IN, LIKE, ILIKE, IS NULL, CASE WHEN, UNION/INTERSECT/EXCEPT, subqueries, CTE (`WITH ... AS`), EXISTS/NOT EXISTS |
+| **Relational SQL** | SELECT, INSERT, UPDATE, DELETE, JOIN (INNER/LEFT/RIGHT/CROSS), GROUP BY, ORDER BY (multi-column ASC/DESC), HAVING, DISTINCT, LIMIT/OFFSET, BETWEEN, IN, LIKE, ILIKE, IS NULL, CASE WHEN, UNION/INTERSECT/EXCEPT, subqueries, correlated EXISTS/NOT EXISTS, CTE (`WITH ... AS`) |
 | **DDL** | CREATE/DROP TABLE (IF NOT EXISTS / IF EXISTS), CREATE/DROP VIEW, ALTER TABLE (ADD/DROP/RENAME COLUMN), CREATE/DROP INDEX (IF EXISTS), TRUNCATE, SHOW TABLES/VIEWS, SHOW CREATE TABLE, NOT NULL / DEFAULT / UNIQUE / CHECK constraints |
 | **Functions** | UPPER, LOWER, LENGTH, CONCAT, SUBSTRING, REPLACE, TRIM, ABS, ROUND, CEIL, FLOOR, MOD, POWER, SQRT, COALESCE, NULLIF, CAST, NOW() |
 | **Window Functions** | ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD with `OVER (PARTITION BY ... ORDER BY ...)` |
@@ -967,7 +967,6 @@ These are known gaps that should be addressed before production use:
 
 ### SQL Completeness
 - No stored procedures / user-defined functions / triggers
-- No correlated subqueries in EXISTS (only non-correlated)
 
 ### Storage & Reliability
 - No online backup / point-in-time recovery

@@ -216,12 +216,7 @@ impl Executor {
         if cols.len().saturating_mul(schema.columns.len()) <= 32 {
             let mut indices = Vec::with_capacity(cols.len());
             for name in cols {
-                if let Some((idx, _)) = schema
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .find(|(_, col)| col.name.eq_ignore_ascii_case(name))
-                {
+                if let Some(idx) = Self::projection_index_for_name(name, schema) {
                     indices.push(idx);
                 }
             }
@@ -243,6 +238,8 @@ impl Executor {
         for name in cols {
             if let Some(idx) = column_indices.get(&name.to_ascii_lowercase()) {
                 indices.push(*idx);
+            } else if let Some(idx) = Self::projection_index_for_name(name, schema) {
+                indices.push(idx);
             }
         }
 
@@ -250,6 +247,39 @@ impl Executor {
             None
         } else {
             Some(indices)
+        }
+    }
+
+    fn projection_index_for_name(name: &str, schema: &TableSchema) -> Option<usize> {
+        if let Some((idx, _)) = schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, col)| col.name.eq_ignore_ascii_case(name))
+        {
+            return Some(idx);
+        }
+
+        let fallback_name = name.rsplit('.').next().unwrap_or(name);
+        let suffix = format!(".{}", fallback_name);
+        let suffix_lower = suffix.to_ascii_lowercase();
+        let mut matches = schema.columns.iter().enumerate().filter_map(|(idx, col)| {
+            if col.name.eq_ignore_ascii_case(fallback_name)
+                || col.name.eq_ignore_ascii_case(name)
+                || col.name.ends_with(&suffix)
+                || col.name.to_ascii_lowercase().ends_with(&suffix_lower)
+            {
+                Some(idx)
+            } else {
+                None
+            }
+        });
+
+        let first = matches.next()?;
+        if matches.next().is_none() {
+            Some(first)
+        } else {
+            None
         }
     }
 
