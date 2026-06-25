@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-422",
+  "title": "Reject pgwire COPY rows routed to non-local shard owners",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-422"
+  ],
+  "scope": [
+    "src/common/error.rs",
+    "src/execution/copy.rs",
+    "src/server/pg_server.rs",
+    "tests/pg_integration.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Continue P5-3 by making pgwire COPY FROM STDIN reject deterministic explicit-primary-key rows that route to a non-local shard owner.",
+  "verification": [
+    "cargo test --test pg_integration test_pg_protocol_copy_from_stdin_rejects_non_local_shard_owner_rows -- --nocapture",
+    "cargo test --test pg_integration shard_owner -- --nocapture",
+    "cargo test --test pg_integration -- --nocapture",
+    "cargo fmt --check",
+    "cargo check --bins",
+    "cargo test --lib shard_owner -- --nocapture",
+    "cargo test --lib",
+    "cargo test --test sql_index_cache",
+    "cargo test --test sql_expr_functions",
+    "git diff --check"
+  ],
+  "code_commit": "76a0504",
+  "remaining_gaps": [
+    "P5-3 automatic cross-node SQL forwarding remains open",
+    "P5-3 distributed index ownership and maintenance remain open",
+    "P5-3 broad multi-shard query routing remains open",
+    "P5-3 INSERT/COPY routing remains conservative for generated/default primary keys, composite primary keys, INSERT ... SELECT, partially nondeterministic VALUES rows, and COPY column lists that omit the primary key",
+    "P5-3 HNSW/vector and trigram in-memory index shard ownership remain open",
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations"
+  ]
+}

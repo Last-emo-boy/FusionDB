@@ -1,0 +1,54 @@
+{
+  "session_id": "maestro-20260626-023033",
+  "source": "maestro",
+  "created_at": "2026-06-26T02:30:36+08:00",
+  "updated_at": "2026-06-26T02:30:36+08:00",
+  "intent": "Continue BENCHPROD production-readiness iteration toward a fully production-ready database",
+  "task_type": "continue",
+  "chain_name": "manual-maestro-iteration",
+  "auto_mode": true,
+  "exec_mode": "local-fallback",
+  "cli_tool": "codex",
+  "lifecycle_position": "benchprod-production-readiness-resumed",
+  "target": "database-production-readiness",
+  "context": {
+    "phase": "benchprod-production-readiness",
+    "scope": [
+      "src/common/error.rs",
+      "src/execution/copy.rs",
+      "src/server/pg_server.rs",
+      "tests/pg_integration.rs",
+      "README.md",
+      "ROADMAP.md",
+      ".workflow/.csv-wave/20260626-execute-benchprod-422-pgwire-copy-shard-owner-guard/"
+    ],
+    "last_completed_task": "BENCHPROD-422",
+    "last_commit": "76a0504",
+    "last_commit_message": "feat: 支持 pgwire COPY 分片 owner 校验",
+    "previous_session": ".workflow/.maestro/maestro-20260626-022047/",
+    "mode": "explicit_resume_from_goal",
+    "next_action": "Continue P5-3 with automatic cross-node SQL forwarding, distributed index ownership/maintenance, broad multi-shard query routing, remaining conservative INSERT/COPY routing expansions, and in-memory index shard ownership. P3-3 remains blocked by pgwire 0.37 SCRAM-SHA-256 limitations."
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "summary": "Made pgwire COPY FROM STDIN reject deterministic explicit-primary-key rows routed to non-local shard owners."
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro",
+      "args": "continue BENCHPROD production-readiness iteration",
+      "status": "completed",
+      "started_at": "2026-06-26T02:30:36+08:00",
+      "completed_at": "2026-06-26T02:30:36+08:00",
+      "error": "spawn_agents_on_csv unavailable; executed local fallback with maestro-compatible artifacts",
+      "wave_n": 1
+    }
+  ],
+  "current_step": 1,
+  "status": "completed",
+  "completed_at": "2026-06-26T02:30:36+08:00"
+}
