@@ -68,6 +68,7 @@ fn column_scan_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+#[cfg(test)]
 fn column_scan_index_prefix_for_value(
     table_name: &str,
     column_name: &str,
@@ -948,9 +949,13 @@ impl Executor {
                 visitor.visit_row(&data)?;
             }
         } else if let Some(value_key) = self.value_to_index_string(&value) {
-            let index_prefix =
-                column_scan_index_prefix_for_value(table_name, &column_name, &value_key);
-            let entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
+            let entries = self
+                .scan_routed_prefixes(
+                    self.routed_index_prefixes_for_value(table_name, &column_name, &value_key),
+                    txn,
+                    None,
+                )
+                .await?;
             for (key, _) in entries {
                 let Some(row_id) = Self::row_id_from_key(&key) else {
                     continue;

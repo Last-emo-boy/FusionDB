@@ -29,6 +29,7 @@ fn is_trigram_text_data_type(data_type: &str) -> bool {
 }
 
 impl Executor {
+    #[cfg(test)]
     pub(crate) fn fts_index_key_for_row(
         table_name: &str,
         column_name: &str,
@@ -56,6 +57,7 @@ impl Executor {
         key
     }
 
+    #[cfg(test)]
     pub(crate) fn fts_column_prefix_for_column(table_name: &str, column_name: &str) -> String {
         let mut prefix =
             String::with_capacity("fts:".len() + table_name.len() + 1 + column_name.len() + 1);
@@ -67,6 +69,7 @@ impl Executor {
         prefix
     }
 
+    #[cfg(test)]
     pub(crate) fn fts_token_prefix_for_token(
         table_name: &str,
         column_name: &str,

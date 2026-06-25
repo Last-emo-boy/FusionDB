@@ -29,6 +29,7 @@ fn index_meta_key_for_index(index_name: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn create_index_key_for_value(
     table_name: &str,
     column_name: &str,
@@ -56,6 +57,7 @@ fn create_index_key_for_value(
     key
 }
 
+#[cfg(test)]
 fn drop_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
     let mut prefix =
         String::with_capacity("index:".len() + table_name.len() + 1 + column_name.len() + 1);
@@ -223,8 +225,12 @@ impl Executor {
             if index_type == IndexType::FTS {
                 if let Value::String(text) = &val {
                     for token in Self::tokenize_unique(text) {
-                        let index_key =
-                            Self::fts_index_key_for_row(&table_name_str, col_name, &token, row_id);
+                        let index_key = self.routed_fts_index_key_for_row(
+                            &table_name_str,
+                            col_name,
+                            &token,
+                            row_id,
+                        );
                         txn.put(index_key.as_bytes(), &[]).await?;
                     }
                 }
@@ -237,8 +243,12 @@ impl Executor {
                 }
             } else {
                 if let Some(val_str) = self.value_to_index_string(&val) {
-                    let index_key =
-                        create_index_key_for_value(&table_name_str, col_name, &val_str, row_id);
+                    let index_key = self.routed_index_key_for_value(
+                        &table_name_str,
+                        col_name,
+                        &val_str,
+                        row_id,
+                    );
                     txn.put(index_key.as_bytes(), &[]).await?;
                 } else {
                     continue;
@@ -289,13 +299,35 @@ impl Executor {
                     let table_name = meta.table;
 
                     // Delete index entries
-                    let index_prefix = if meta.columns.len() == 1 {
-                        drop_index_prefix_for_column(&table_name, &meta.columns[0])
+                    let index_entries = if meta.columns.len() == 1 {
+                        let mut entries = self
+                            .scan_routed_prefixes(
+                                self.routed_index_prefixes_for_column(
+                                    &table_name,
+                                    &meta.columns[0],
+                                ),
+                                txn,
+                                None,
+                            )
+                            .await?;
+                        let mut fts_entries = self
+                            .scan_routed_prefixes(
+                                self.routed_fts_prefixes_for_column(&table_name, &meta.columns[0]),
+                                txn,
+                                None,
+                            )
+                            .await?;
+                        entries.append(&mut fts_entries);
+                        entries
                     } else {
-                        Self::composite_index_prefix(&table_name, &meta.columns)
+                        self.scan_routed_prefixes(
+                            self.routed_composite_index_prefixes(&table_name, &meta.columns),
+                            txn,
+                            None,
+                        )
+                        .await?
                     };
-                    let entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
-                    for (k, _) in entries {
+                    for (k, _) in index_entries {
                         txn.delete(&k).await?;
                     }
 

@@ -41,6 +41,7 @@ impl Executor {
         key
     }
 
+    #[cfg(test)]
     fn secondary_index_prefix_for_value(
         table_name: &str,
         column_name: &str,
@@ -59,6 +60,7 @@ impl Executor {
         prefix
     }
 
+    #[cfg(test)]
     fn secondary_index_prefix_for_value_start(
         table_name: &str,
         column_name: &str,
@@ -449,8 +451,11 @@ impl Executor {
                             )
                             .unwrap_or(Value::Null);
                             if let Some(val_str) = self.value_to_index_string(&val) {
-                                let primary_order_asc =
-                                    self.order_by_primary_key_direction(order_by, schema);
+                                let primary_order_asc = if self.shard_router.is_none() {
+                                    self.order_by_primary_key_direction(order_by, schema)
+                                } else {
+                                    None
+                                };
                                 let scan_limit = if primary_order_asc == Some(true) {
                                     ordered_limit.or(limit)
                                 } else if primary_order_asc == Some(false) {
@@ -458,13 +463,17 @@ impl Executor {
                                 } else {
                                     limit
                                 };
-                                let index_prefix = Self::secondary_index_prefix_for_value(
-                                    table_name,
-                                    &storage_col_name,
-                                    &val_str,
-                                );
-                                let index_entries =
-                                    txn.scan_prefix(index_prefix.as_bytes(), scan_limit).await?;
+                                let index_entries = self
+                                    .scan_routed_prefixes(
+                                        self.routed_index_prefixes_for_value(
+                                            table_name,
+                                            &storage_col_name,
+                                            &val_str,
+                                        ),
+                                        txn,
+                                        scan_limit,
+                                    )
+                                    .await?;
 
                                 let mut row_ids = HashSet::with_capacity(index_entries.len());
                                 let mut ordered_row_ids = primary_order_asc
@@ -532,11 +541,14 @@ impl Executor {
                                         let mut candidate_row_ids: Option<HashSet<String>> = None;
 
                                         for token in tokens {
-                                            let index_prefix = Self::fts_token_prefix_for_token(
-                                                table_name, &col_name, &token,
-                                            );
-                                            let index_entries = txn
-                                                .scan_prefix(index_prefix.as_bytes(), None)
+                                            let index_entries = self
+                                                .scan_routed_prefixes(
+                                                    self.routed_fts_prefixes_for_token(
+                                                        table_name, &col_name, &token,
+                                                    ),
+                                                    txn,
+                                                    None,
+                                                )
                                                 .await?;
 
                                             let mut current_token_row_ids =
@@ -612,13 +624,17 @@ impl Executor {
                                         }
                                     }
                                 } else if let Some(val_str) = self.value_to_index_string(&val) {
-                                    let index_prefix = Self::secondary_index_prefix_for_value(
-                                        table_name,
-                                        &storage_col_name,
-                                        &val_str,
-                                    );
-                                    let kv =
-                                        txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
+                                    let kv = self
+                                        .scan_routed_prefixes(
+                                            self.routed_index_prefixes_for_value(
+                                                table_name,
+                                                &storage_col_name,
+                                                &val_str,
+                                            ),
+                                            txn,
+                                            limit,
+                                        )
+                                        .await?;
                                     all_row_ids.reserve(kv.len());
                                     for (k, _) in kv {
                                         if let Some(row_id) = Self::row_id_from_key(&k) {
@@ -680,14 +696,17 @@ impl Executor {
                                         }
                                         row_ids
                                     } else {
-                                        let index_prefix =
-                                            Self::secondary_index_prefix_for_value_start(
-                                                table_name,
-                                                &storage_col_name,
-                                                &prefix,
-                                            );
-                                        let kv =
-                                            txn.scan_prefix(index_prefix.as_bytes(), limit).await?;
+                                        let kv = self
+                                            .scan_routed_prefixes(
+                                                self.routed_index_prefixes_for_value_start(
+                                                    table_name,
+                                                    &storage_col_name,
+                                                    &prefix,
+                                                ),
+                                                txn,
+                                                limit,
+                                            )
+                                            .await?;
                                         let mut row_ids = HashSet::with_capacity(kv.len());
                                         for (k, _) in kv {
                                             if let Some(row_id) = Self::row_id_from_key(&k) {

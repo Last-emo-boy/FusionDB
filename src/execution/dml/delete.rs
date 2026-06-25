@@ -23,6 +23,7 @@ fn delete_data_key_for_prefix_row(prefix: &str, row_id: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn delete_index_key_for_value(
     table_name: &str,
     column_name: &str,
@@ -243,7 +244,7 @@ impl Executor {
                         if col.index_type == IndexType::FTS {
                             if let Value::String(text) = val {
                                 for token in Self::tokenize_unique(text) {
-                                    let index_key = Self::fts_index_key_for_row(
+                                    let index_key = self.routed_fts_index_key_for_row(
                                         &table_name_str,
                                         &col.name,
                                         &token,
@@ -257,7 +258,7 @@ impl Executor {
                                 Self::hnsw_index_name_for_column(&table_name_str, &col.name);
                             self.vector_index.delete(&idx_name, row_id)?;
                         } else if let Some(val_str) = self.value_to_index_string(val) {
-                            let index_key = delete_index_key_for_value(
+                            let index_key = self.routed_index_key_for_value(
                                 &table_name_str,
                                 &col.name,
                                 &val_str,

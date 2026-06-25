@@ -208,6 +208,116 @@ impl Executor {
         prefix
     }
 
+    fn legacy_index_prefix_for_table(table_name: &str) -> String {
+        let mut prefix = String::with_capacity("index:".len() + table_name.len() + 1);
+        prefix.push_str("index:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn legacy_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
+        let mut prefix =
+            String::with_capacity("index:".len() + table_name.len() + 1 + column_name.len() + 1);
+        prefix.push_str("index:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn sharded_index_prefix_for_table(shard_id: u64, table_name: &str) -> String {
+        let shard = shard_id.to_string();
+        let mut prefix = String::with_capacity(
+            "shard:".len() + shard.len() + ":index:".len() + table_name.len() + 1,
+        );
+        prefix.push_str("shard:");
+        prefix.push_str(&shard);
+        prefix.push_str(":index:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn sharded_index_prefix_for_column(
+        shard_id: u64,
+        table_name: &str,
+        column_name: &str,
+    ) -> String {
+        let shard = shard_id.to_string();
+        let mut prefix = String::with_capacity(
+            "shard:".len()
+                + shard.len()
+                + ":index:".len()
+                + table_name.len()
+                + 1
+                + column_name.len()
+                + 1,
+        );
+        prefix.push_str("shard:");
+        prefix.push_str(&shard);
+        prefix.push_str(":index:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn legacy_fts_prefix_for_table(table_name: &str) -> String {
+        let mut prefix = String::with_capacity("fts:".len() + table_name.len() + 1);
+        prefix.push_str("fts:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn legacy_fts_prefix_for_column(table_name: &str, column_name: &str) -> String {
+        let mut prefix =
+            String::with_capacity("fts:".len() + table_name.len() + 1 + column_name.len() + 1);
+        prefix.push_str("fts:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn sharded_fts_prefix_for_table(shard_id: u64, table_name: &str) -> String {
+        let shard = shard_id.to_string();
+        let mut prefix = String::with_capacity(
+            "shard:".len() + shard.len() + ":fts:".len() + table_name.len() + 1,
+        );
+        prefix.push_str("shard:");
+        prefix.push_str(&shard);
+        prefix.push_str(":fts:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn sharded_fts_prefix_for_column(shard_id: u64, table_name: &str, column_name: &str) -> String {
+        let shard = shard_id.to_string();
+        let mut prefix = String::with_capacity(
+            "shard:".len()
+                + shard.len()
+                + ":fts:".len()
+                + table_name.len()
+                + 1
+                + column_name.len()
+                + 1,
+        );
+        prefix.push_str("shard:");
+        prefix.push_str(&shard);
+        prefix.push_str(":fts:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix
+    }
+
     pub(crate) fn routed_data_key_for_row_id(&self, table_name: &str, row_id: &str) -> String {
         if let Some(router) = &self.shard_router {
             let route = router.route_key(table_name, row_id);
@@ -233,14 +343,169 @@ impl Executor {
         vec![Self::legacy_data_prefix_for_table(table_name)]
     }
 
-    pub(crate) async fn scan_routed_data_prefixes_for_table(
+    pub(crate) fn routed_index_key_for_value(
         &self,
         table_name: &str,
+        column_name: &str,
+        value: &str,
+        row_id: &str,
+    ) -> String {
+        let mut key = if let Some(router) = &self.shard_router {
+            let route = router.route_key(table_name, row_id);
+            Self::sharded_index_prefix_for_column(route.shard_id, table_name, column_name)
+        } else {
+            Self::legacy_index_prefix_for_column(table_name, column_name)
+        };
+        key.reserve(value.len() + 1 + row_id.len());
+        key.push_str(value);
+        key.push(':');
+        key.push_str(row_id);
+        key
+    }
+
+    pub(crate) fn routed_index_prefixes_for_table(&self, table_name: &str) -> Vec<String> {
+        if let Some(router) = &self.shard_router {
+            let shard_count = router.shard_count();
+            let mut prefixes = Vec::with_capacity(shard_count as usize);
+            for shard_id in 0..shard_count {
+                prefixes.push(Self::sharded_index_prefix_for_table(shard_id, table_name));
+            }
+            return prefixes;
+        }
+
+        vec![Self::legacy_index_prefix_for_table(table_name)]
+    }
+
+    pub(crate) fn routed_index_prefixes_for_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Vec<String> {
+        if let Some(router) = &self.shard_router {
+            let shard_count = router.shard_count();
+            let mut prefixes = Vec::with_capacity(shard_count as usize);
+            for shard_id in 0..shard_count {
+                prefixes.push(Self::sharded_index_prefix_for_column(
+                    shard_id,
+                    table_name,
+                    column_name,
+                ));
+            }
+            return prefixes;
+        }
+
+        vec![Self::legacy_index_prefix_for_column(
+            table_name,
+            column_name,
+        )]
+    }
+
+    pub(crate) fn routed_index_prefixes_for_value(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        value: &str,
+    ) -> Vec<String> {
+        let mut prefixes = self.routed_index_prefixes_for_column(table_name, column_name);
+        for prefix in &mut prefixes {
+            prefix.reserve(value.len() + 1);
+            prefix.push_str(value);
+            prefix.push(':');
+        }
+        prefixes
+    }
+
+    pub(crate) fn routed_index_prefixes_for_value_start(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        value_prefix: &str,
+    ) -> Vec<String> {
+        let mut prefixes = self.routed_index_prefixes_for_column(table_name, column_name);
+        for prefix in &mut prefixes {
+            prefix.reserve(value_prefix.len());
+            prefix.push_str(value_prefix);
+        }
+        prefixes
+    }
+
+    pub(crate) fn routed_fts_index_key_for_row(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        token: &str,
+        row_id: &str,
+    ) -> String {
+        let mut key = if let Some(router) = &self.shard_router {
+            let route = router.route_key(table_name, row_id);
+            Self::sharded_fts_prefix_for_column(route.shard_id, table_name, column_name)
+        } else {
+            Self::legacy_fts_prefix_for_column(table_name, column_name)
+        };
+        key.reserve(token.len() + 1 + row_id.len());
+        key.push_str(token);
+        key.push(':');
+        key.push_str(row_id);
+        key
+    }
+
+    pub(crate) fn routed_fts_prefixes_for_table(&self, table_name: &str) -> Vec<String> {
+        if let Some(router) = &self.shard_router {
+            let shard_count = router.shard_count();
+            let mut prefixes = Vec::with_capacity(shard_count as usize);
+            for shard_id in 0..shard_count {
+                prefixes.push(Self::sharded_fts_prefix_for_table(shard_id, table_name));
+            }
+            return prefixes;
+        }
+
+        vec![Self::legacy_fts_prefix_for_table(table_name)]
+    }
+
+    pub(crate) fn routed_fts_prefixes_for_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Vec<String> {
+        if let Some(router) = &self.shard_router {
+            let shard_count = router.shard_count();
+            let mut prefixes = Vec::with_capacity(shard_count as usize);
+            for shard_id in 0..shard_count {
+                prefixes.push(Self::sharded_fts_prefix_for_column(
+                    shard_id,
+                    table_name,
+                    column_name,
+                ));
+            }
+            return prefixes;
+        }
+
+        vec![Self::legacy_fts_prefix_for_column(table_name, column_name)]
+    }
+
+    pub(crate) fn routed_fts_prefixes_for_token(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        token: &str,
+    ) -> Vec<String> {
+        let mut prefixes = self.routed_fts_prefixes_for_column(table_name, column_name);
+        for prefix in &mut prefixes {
+            prefix.reserve(token.len() + 1);
+            prefix.push_str(token);
+            prefix.push(':');
+        }
+        prefixes
+    }
+
+    pub(crate) async fn scan_routed_prefixes(
+        &self,
+        prefixes: Vec<String>,
         txn: &mut dyn Transaction,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut pairs = Vec::new();
-        for prefix in self.routed_data_prefixes_for_table(table_name) {
+        for prefix in prefixes {
             let remaining = limit.map(|limit| limit.saturating_sub(pairs.len()));
             if remaining == Some(0) {
                 break;
@@ -252,6 +517,16 @@ impl Executor {
             }
         }
         Ok(pairs)
+    }
+
+    pub(crate) async fn scan_routed_data_prefixes_for_table(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_routed_prefixes(self.routed_data_prefixes_for_table(table_name), txn, limit)
+            .await
     }
 
     pub(crate) async fn scan_routed_data_prefixes_for_each(
@@ -1719,6 +1994,24 @@ mod tests {
             .execute_sql("CREATE INDEX idx_sharded_users_name ON sharded_users (name)")
             .await
             .expect("create index");
+        let second_row_id = crate::common::encoding::encode_i64_comparable(2);
+        let bob_index_key =
+            executor.routed_index_key_for_value("sharded_users", "name", "bob", &second_row_id);
+        let legacy_bob_index_key = format!("index:sharded_users:name:bob:{second_row_id}");
+        {
+            let txn = storage.begin_transaction().await.expect("begin txn");
+            assert!(txn
+                .get(bob_index_key.as_bytes())
+                .await
+                .expect("get routed index key")
+                .is_some());
+            assert!(txn
+                .get(legacy_bob_index_key.as_bytes())
+                .await
+                .expect("get legacy index key")
+                .is_none());
+        }
+
         let index_lookup = executor
             .execute_sql("SELECT id FROM sharded_users WHERE name = 'bob'")
             .await
@@ -1729,6 +2022,95 @@ mod tests {
                 assert_eq!(rows, &vec![vec![Value::Integer(2)]]);
             }
             other => panic!("expected indexed select result, got {other:?}"),
+        }
+
+        executor
+            .execute_sql("UPDATE sharded_users SET name = 'dave' WHERE id = 2")
+            .await
+            .expect("indexed update");
+        let dave_index_key =
+            executor.routed_index_key_for_value("sharded_users", "name", "dave", &second_row_id);
+        {
+            let txn = storage.begin_transaction().await.expect("begin txn");
+            assert!(txn
+                .get(bob_index_key.as_bytes())
+                .await
+                .expect("get old routed index key")
+                .is_none());
+            assert!(txn
+                .get(dave_index_key.as_bytes())
+                .await
+                .expect("get new routed index key")
+                .is_some());
+        }
+        let updated_index_lookup = executor
+            .execute_sql("SELECT id FROM sharded_users WHERE name = 'dave'")
+            .await
+            .expect("updated secondary index lookup");
+        match updated_index_lookup.as_slice() {
+            [QueryResult::Select { columns, rows }] => {
+                assert_eq!(columns, &vec!["id".to_string()]);
+                assert_eq!(rows, &vec![vec![Value::Integer(2)]]);
+            }
+            other => panic!("expected updated indexed select result, got {other:?}"),
+        }
+
+        executor
+            .execute_sql(
+                "CREATE TABLE sharded_docs (id INTEGER PRIMARY KEY, body TEXT); \
+                 INSERT INTO sharded_docs VALUES (1, 'quick brown fox'), (2, 'quick blue hare'); \
+                 CREATE INDEX idx_sharded_docs_body ON sharded_docs (body) USING FTS",
+            )
+            .await
+            .expect("create fts index");
+        let doc_row_id = crate::common::encoding::encode_i64_comparable(1);
+        let fts_index_key =
+            executor.routed_fts_index_key_for_row("sharded_docs", "body", "quick", &doc_row_id);
+        let legacy_fts_index_key = format!("fts:sharded_docs:body:quick:{doc_row_id}");
+        {
+            let txn = storage.begin_transaction().await.expect("begin txn");
+            assert!(txn
+                .get(fts_index_key.as_bytes())
+                .await
+                .expect("get routed fts key")
+                .is_some());
+            assert!(txn
+                .get(legacy_fts_index_key.as_bytes())
+                .await
+                .expect("get legacy fts key")
+                .is_none());
+        }
+        let fts_lookup = executor
+            .execute_sql("SELECT id FROM sharded_docs WHERE MATCH(body) AGAINST('quick fox')")
+            .await
+            .expect("fts lookup");
+        match fts_lookup.as_slice() {
+            [QueryResult::Select { columns, rows }] => {
+                assert_eq!(columns, &vec!["id".to_string()]);
+                assert_eq!(rows, &vec![vec![Value::Integer(1)]]);
+            }
+            other => panic!("expected fts select result, got {other:?}"),
+        }
+
+        executor
+            .execute_sql(
+                "CREATE TABLE sharded_orders (id INTEGER PRIMARY KEY, region TEXT, status TEXT); \
+                 INSERT INTO sharded_orders VALUES (1, 'west', 'open'); \
+                 INSERT INTO sharded_orders VALUES (2, 'west', 'closed'); \
+                 CREATE INDEX idx_sharded_orders_region_status ON sharded_orders (region, status)",
+            )
+            .await
+            .expect("create composite index");
+        let composite_lookup = executor
+            .execute_sql("SELECT id FROM sharded_orders WHERE region = 'west' AND status = 'open'")
+            .await
+            .expect("composite index lookup");
+        match composite_lookup.as_slice() {
+            [QueryResult::Select { columns, rows }] => {
+                assert_eq!(columns, &vec!["id".to_string()]);
+                assert_eq!(rows, &vec![vec![Value::Integer(1)]]);
+            }
+            other => panic!("expected composite index select result, got {other:?}"),
         }
 
         executor

@@ -325,6 +325,7 @@ impl Executor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn composite_index_prefix(table_name: &str, columns: &[String]) -> String {
         let columns_len = columns.iter().map(String::len).sum::<usize>();
         let mut prefix = String::with_capacity(
@@ -348,6 +349,27 @@ impl Executor {
         prefix
     }
 
+    pub(crate) fn routed_composite_index_prefixes(
+        &self,
+        table_name: &str,
+        columns: &[String],
+    ) -> Vec<String> {
+        let column_key = join_composite_index_parts(columns, ",");
+        self.routed_index_prefixes_for_column(table_name, &column_key)
+    }
+
+    fn routed_composite_index_entry_key(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        value_key: &str,
+        row_id: &str,
+    ) -> String {
+        let column_key = join_composite_index_parts(columns, ",");
+        self.routed_index_key_for_value(table_name, &column_key, value_key, row_id)
+    }
+
+    #[cfg(test)]
     fn composite_index_entry_key(prefix: &str, value_key: &str, row_id: &str) -> String {
         let mut key = String::with_capacity(prefix.len() + value_key.len() + 1 + row_id.len());
         key.push_str(prefix);
@@ -398,8 +420,7 @@ impl Executor {
         row_id: &str,
     ) -> Option<String> {
         let value_key = self.composite_index_value_key(columns, row, schema, true)?;
-        let prefix = Self::composite_index_prefix(table_name, columns);
-        Some(Self::composite_index_entry_key(&prefix, &value_key, row_id))
+        Some(self.routed_composite_index_entry_key(table_name, columns, &value_key, row_id))
     }
 
     fn composite_index_key_for_meta(
@@ -412,8 +433,7 @@ impl Executor {
     ) -> Option<String> {
         let value_key =
             self.composite_index_value_key(&meta.columns, row, schema, meta.ordered_encoding)?;
-        let prefix = Self::composite_index_prefix(table_name, &meta.columns);
-        Some(Self::composite_index_entry_key(&prefix, &value_key, row_id))
+        Some(self.routed_composite_index_entry_key(table_name, &meta.columns, &value_key, row_id))
     }
 
     pub(crate) fn composite_index_value_key_for_columns(
@@ -555,20 +575,21 @@ impl Executor {
             else {
                 continue;
             };
-            let index_prefix = Self::composite_index_prefix(table_name, &index.columns);
-            let prefix = Self::composite_index_value_prefix(&index_prefix, &value_key);
-            let entries = txn.scan_prefix(prefix.as_bytes(), Some(1)).await?;
-            for (key, _) in entries {
-                let Some(row_id) = Self::row_id_from_key(&key) else {
-                    continue;
-                };
-                if current_row_id.is_some_and(|current| current == row_id) {
-                    continue;
+            for index_prefix in self.routed_composite_index_prefixes(table_name, &index.columns) {
+                let prefix = Self::composite_index_value_prefix(&index_prefix, &value_key);
+                let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                for (key, _) in entries {
+                    let Some(row_id) = Self::row_id_from_key(&key) else {
+                        continue;
+                    };
+                    if current_row_id.is_some_and(|current| current == row_id) {
+                        continue;
+                    }
+                    return Err(crate::common::FusionError::Execution(format!(
+                        "UNIQUE constraint violated for columns '{}'",
+                        index.columns.join(", ")
+                    )));
                 }
-                return Err(crate::common::FusionError::Execution(format!(
-                    "UNIQUE constraint violated for columns '{}'",
-                    index.columns.join(", ")
-                )));
             }
         }
         Ok(())
@@ -731,7 +752,10 @@ impl Executor {
             .map(|range| usize::from(range.lower.is_some()) + usize::from(range.upper.is_some()))
             .unwrap_or(0);
 
-        let order_direction = if index.ordered_encoding && range_column_orderable {
+        let order_direction = if self.shard_router.is_none()
+            && index.ordered_encoding
+            && range_column_orderable
+        {
             Self::composite_order_next_column_direction(order_by, range_column.map(String::as_str))
         } else {
             None
@@ -740,8 +764,13 @@ impl Executor {
 
         let component_key =
             join_composite_index_parts(&components, Self::composite_index_component_separator());
-        let base_prefix = Self::composite_index_prefix(table_name, &index.columns);
-        let index_prefix = Self::composite_index_components_prefix(&base_prefix, &component_key);
+        let index_prefixes = self
+            .routed_composite_index_prefixes(table_name, &index.columns)
+            .into_iter()
+            .map(|base_prefix| {
+                Self::composite_index_components_prefix(&base_prefix, &component_key)
+            })
+            .collect::<Vec<_>>();
 
         let can_cover_predicates = all_index_columns_matched
             && predicates.len() == index.columns.len()
@@ -755,34 +784,48 @@ impl Executor {
             None
         };
 
-        let index_entries = if let Some(range) = range {
-            let range_prefix = Self::composite_index_range_prefix(&index_prefix);
-            let start = if let Some(lower) = range.lower {
-                let suffix = if lower.inclusive { "" } else { "\u{0}" };
-                Self::composite_index_range_bound(&range_prefix, &lower.component, suffix)
-            } else {
-                range_prefix.clone()
-            };
-            if let Some(upper) = range.upper {
-                let suffix = if upper.inclusive { "\u{0}" } else { "" };
-                let end =
-                    Self::composite_index_range_bound(&range_prefix, &upper.component, suffix);
-                txn.scan_range(start.as_bytes(), end.as_bytes(), scan_limit)
-                    .await?
-            } else {
-                let mut end = range_prefix.into_bytes();
-                end.push(0xFF);
-                txn.scan_range(start.as_bytes(), &end, scan_limit).await?
+        let mut index_entries = Vec::new();
+        if let Some(range) = range {
+            for index_prefix in index_prefixes {
+                let remaining = scan_limit.map(|limit| limit.saturating_sub(index_entries.len()));
+                if remaining == Some(0) {
+                    break;
+                }
+                let range_prefix = Self::composite_index_range_prefix(&index_prefix);
+                let start = if let Some(lower) = range.lower.as_ref() {
+                    let suffix = if lower.inclusive { "" } else { "\u{0}" };
+                    Self::composite_index_range_bound(&range_prefix, &lower.component, suffix)
+                } else {
+                    range_prefix.clone()
+                };
+                let mut scanned = if let Some(upper) = range.upper.as_ref() {
+                    let suffix = if upper.inclusive { "\u{0}" } else { "" };
+                    let end =
+                        Self::composite_index_range_bound(&range_prefix, &upper.component, suffix);
+                    txn.scan_range(start.as_bytes(), end.as_bytes(), remaining)
+                        .await?
+                } else {
+                    let mut end = range_prefix.into_bytes();
+                    end.push(0xFF);
+                    txn.scan_range(start.as_bytes(), &end, remaining).await?
+                };
+                index_entries.append(&mut scanned);
+                if scan_limit.is_some_and(|limit| index_entries.len() >= limit) {
+                    break;
+                }
             }
         } else {
-            let mut prefix = index_prefix;
-            if all_index_columns_matched {
-                prefix.push(':');
-            } else {
-                prefix.push_str(Self::composite_index_component_separator());
+            let mut prefixes = Vec::with_capacity(index_prefixes.len());
+            for mut prefix in index_prefixes {
+                if all_index_columns_matched {
+                    prefix.push(':');
+                } else {
+                    prefix.push_str(Self::composite_index_component_separator());
+                }
+                prefixes.push(prefix);
             }
-            txn.scan_prefix(prefix.as_bytes(), scan_limit).await?
-        };
+            index_entries = self.scan_routed_prefixes(prefixes, txn, scan_limit).await?;
+        }
 
         let mut row_ids = std::collections::HashSet::with_capacity(index_entries.len());
         let mut ordered_row_ids = if order_matches {

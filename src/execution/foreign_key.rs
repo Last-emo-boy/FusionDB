@@ -508,14 +508,18 @@ impl Executor {
             }
             if let Some(value_key) = self.composite_index_value_key_for_meta_values(&index, values)
             {
-                let index_prefix = Self::composite_index_prefix(parent_table, &index.columns);
-                let prefix = foreign_key_composite_index_value_prefix(&index_prefix, &value_key);
-                if !txn
-                    .scan_prefix(prefix.as_bytes(), Some(1))
-                    .await?
-                    .is_empty()
+                for index_prefix in
+                    self.routed_composite_index_prefixes(parent_table, &index.columns)
                 {
-                    return Ok(true);
+                    let prefix =
+                        foreign_key_composite_index_value_prefix(&index_prefix, &value_key);
+                    if !txn
+                        .scan_prefix(prefix.as_bytes(), Some(1))
+                        .await?
+                        .is_empty()
+                    {
+                        return Ok(true);
+                    }
                 }
             }
         }

@@ -67,7 +67,7 @@
 
 - [x] **P5-1: Wire OpenRaft into main loop** — Configurable Raft startup, `/raft/*` routes, leader-forwarded writes, local follower reads
 - [x] **P5-2: Snapshot transfer** — Serialized visible key-value state for new node bootstrap
-- [ ] **P5-3: Automatic sharding** — Hash/range control plane and local row-data shard layout started; secondary index partitioning and cross-node execution routing remain
+- [ ] **P5-3: Automatic sharding** — Hash/range control plane plus local row-data and secondary-index KV shard layouts started; distributed index ownership and cross-node execution routing remain
 
 ## Phase 6: Operations & Ecosystem ✅
 

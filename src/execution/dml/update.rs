@@ -23,6 +23,7 @@ fn update_data_key_for_prefix_row(prefix: &str, row_id: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn update_index_key_for_value(
     table_name: &str,
     column_name: &str,
@@ -256,7 +257,7 @@ impl Executor {
                             if col.index_type == IndexType::FTS {
                                 if let Value::String(text) = old_val {
                                     for token in Self::tokenize_unique(text) {
-                                        let index_key = Self::fts_index_key_for_row(
+                                        let index_key = self.routed_fts_index_key_for_row(
                                             &table_name_str,
                                             &col.name,
                                             &token,
@@ -267,7 +268,7 @@ impl Executor {
                                 }
                                 if let Value::String(text) = new_val {
                                     for token in Self::tokenize_unique(text) {
-                                        let index_key = Self::fts_index_key_for_row(
+                                        let index_key = self.routed_fts_index_key_for_row(
                                             &table_name_str,
                                             &col.name,
                                             &token,
@@ -291,7 +292,7 @@ impl Executor {
                                 }
                             } else {
                                 if let Some(old_val_str) = self.value_to_index_string(old_val) {
-                                    let old_index_key = update_index_key_for_value(
+                                    let old_index_key = self.routed_index_key_for_value(
                                         &table_name_str,
                                         &col.name,
                                         &old_val_str,
@@ -301,7 +302,7 @@ impl Executor {
                                 }
 
                                 if let Some(new_val_str) = self.value_to_index_string(new_val) {
-                                    let new_index_key = update_index_key_for_value(
+                                    let new_index_key = self.routed_index_key_for_value(
                                         &table_name_str,
                                         &col.name,
                                         &new_val_str,

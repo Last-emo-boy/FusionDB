@@ -40,6 +40,7 @@ fn join_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+#[cfg(test)]
 fn join_index_prefix_for_value(table_name: &str, column_name: &str, value_key: &str) -> String {
     let mut prefix = String::with_capacity(
         "index:".len() + table_name.len() + 1 + column_name.len() + 1 + value_key.len() + 1,
@@ -728,8 +729,13 @@ impl Executor {
             return Ok(Vec::new());
         };
 
-        let index_prefix = join_index_prefix_for_value(table_name, &column.name, &value_str);
-        let index_entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
+        let index_entries = self
+            .scan_routed_prefixes(
+                self.routed_index_prefixes_for_value(table_name, &column.name, &value_str),
+                txn,
+                None,
+            )
+            .await?;
         let mut seen_row_ids = HashSet::with_capacity(index_entries.len());
         let mut rows = Vec::with_capacity(index_entries.len());
 

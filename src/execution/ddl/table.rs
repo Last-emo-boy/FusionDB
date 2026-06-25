@@ -50,6 +50,7 @@ fn table_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn table_index_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("index:".len() + table_name.len() + 1);
     prefix.push_str("index:");
@@ -58,6 +59,7 @@ fn table_index_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+#[cfg(test)]
 fn table_index_prefix_for_column(table_name: &str, column_name: &str) -> String {
     let mut prefix =
         String::with_capacity("index:".len() + table_name.len() + 1 + column_name.len() + 1);
@@ -69,6 +71,7 @@ fn table_index_prefix_for_column(table_name: &str, column_name: &str) -> String 
     prefix
 }
 
+#[cfg(test)]
 fn table_index_key_for_value(
     table_name: &str,
     column_name: &str,
@@ -96,6 +99,7 @@ fn table_index_key_for_value(
     key
 }
 
+#[cfg(test)]
 fn table_index_key_for_prefix_value_row(prefix: &str, value: &str, row_id: &str) -> String {
     let mut key = String::with_capacity(prefix.len() + value.len() + 1 + row_id.len());
     key.push_str(prefix);
@@ -440,8 +444,13 @@ impl Executor {
                 }
             }
 
-            let index_prefix = table_index_prefix_for_table(&table_name);
-            let index_entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
+            let mut index_entries = self
+                .scan_routed_prefixes(self.routed_index_prefixes_for_table(&table_name), txn, None)
+                .await?;
+            let mut fts_entries = self
+                .scan_routed_prefixes(self.routed_fts_prefixes_for_table(&table_name), txn, None)
+                .await?;
+            index_entries.append(&mut fts_entries);
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
             }
@@ -483,8 +492,13 @@ impl Executor {
             }
             count += kv_pairs.len();
 
-            let index_prefix = table_index_prefix_for_table(&table_name);
-            let index_entries = txn.scan_prefix(index_prefix.as_bytes(), None).await?;
+            let mut index_entries = self
+                .scan_routed_prefixes(self.routed_index_prefixes_for_table(&table_name), txn, None)
+                .await?;
+            let mut fts_entries = self
+                .scan_routed_prefixes(self.routed_fts_prefixes_for_table(&table_name), txn, None)
+                .await?;
+            index_entries.append(&mut fts_entries);
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
             }
@@ -890,7 +904,7 @@ impl Executor {
                 .unwrap_or(Value::Null);
             if let Some(index_value) = self.value_to_index_string(&pk_value) {
                 let index_key =
-                    table_index_key_for_value(table_name, &column_name, &index_value, row_id);
+                    self.routed_index_key_for_value(table_name, &column_name, &index_value, row_id);
                 txn.put(index_key.as_bytes(), &[]).await?;
             }
         }
@@ -919,52 +933,58 @@ impl Executor {
             match column.index_type {
                 IndexType::BTree => {
                     let old_suffix = table_row_id_suffix(old_row_id);
-                    let prefix = table_index_prefix_for_column(table_name, &column.name);
-                    let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
-                    for (index_key, index_value) in entries {
-                        let Ok(index_key_str) = std::str::from_utf8(&index_key) else {
-                            continue;
-                        };
-                        if !index_key_str.ends_with(&old_suffix) {
-                            continue;
+                    for prefix in self.routed_index_prefixes_for_column(table_name, &column.name) {
+                        let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                        for (index_key, index_value) in entries {
+                            let Ok(index_key_str) = std::str::from_utf8(&index_key) else {
+                                continue;
+                            };
+                            if !index_key_str.ends_with(&old_suffix) {
+                                continue;
+                            }
+                            let Some(value_part) = index_key_str
+                                .strip_prefix(&prefix)
+                                .and_then(|suffix| suffix.rsplit_once(':').map(|(value, _)| value))
+                            else {
+                                continue;
+                            };
+                            let new_index_key = self.routed_index_key_for_value(
+                                table_name,
+                                &column.name,
+                                value_part,
+                                new_row_id,
+                            );
+                            txn.delete(&index_key).await?;
+                            txn.put(new_index_key.as_bytes(), &index_value).await?;
                         }
-                        let Some(value_part) = index_key_str
-                            .strip_prefix(&prefix)
-                            .and_then(|suffix| suffix.rsplit_once(':').map(|(value, _)| value))
-                        else {
-                            continue;
-                        };
-                        let new_index_key =
-                            table_index_key_for_prefix_value_row(&prefix, value_part, new_row_id);
-                        txn.delete(&index_key).await?;
-                        txn.put(new_index_key.as_bytes(), &index_value).await?;
                     }
                 }
                 IndexType::FTS => {
                     let old_suffix = table_row_id_suffix(old_row_id);
-                    let prefix = Self::fts_column_prefix_for_column(table_name, &column.name);
-                    let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
-                    for (index_key, index_value) in entries {
-                        let Ok(index_key_str) = std::str::from_utf8(&index_key) else {
-                            continue;
-                        };
-                        if !index_key_str.ends_with(&old_suffix) {
-                            continue;
+                    for prefix in self.routed_fts_prefixes_for_column(table_name, &column.name) {
+                        let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                        for (index_key, index_value) in entries {
+                            let Ok(index_key_str) = std::str::from_utf8(&index_key) else {
+                                continue;
+                            };
+                            if !index_key_str.ends_with(&old_suffix) {
+                                continue;
+                            }
+                            let Some(token) = index_key_str
+                                .strip_prefix(&prefix)
+                                .and_then(|suffix| suffix.rsplit_once(':').map(|(token, _)| token))
+                            else {
+                                continue;
+                            };
+                            let new_index_key = self.routed_fts_index_key_for_row(
+                                table_name,
+                                &column.name,
+                                token,
+                                new_row_id,
+                            );
+                            txn.delete(&index_key).await?;
+                            txn.put(new_index_key.as_bytes(), &index_value).await?;
                         }
-                        let Some(token) = index_key_str
-                            .strip_prefix(&prefix)
-                            .and_then(|suffix| suffix.rsplit_once(':').map(|(token, _)| token))
-                        else {
-                            continue;
-                        };
-                        let new_index_key = Self::fts_index_key_for_row(
-                            table_name,
-                            &column.name,
-                            token,
-                            new_row_id,
-                        );
-                        txn.delete(&index_key).await?;
-                        txn.put(new_index_key.as_bytes(), &index_value).await?;
                     }
                 }
                 IndexType::HNSW => {

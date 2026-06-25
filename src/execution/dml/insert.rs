@@ -27,6 +27,7 @@ fn insert_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn insert_index_key_for_value(
     table_name: &str,
     column_name: &str,
@@ -180,6 +181,70 @@ impl Executor {
                 other
             ))),
         }
+    }
+
+    async fn update_single_column_indexes_for_upsert(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        old_row: &[Value],
+        new_row: &[Value],
+        row_id: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if !col.is_indexed || old_row.get(idx) == new_row.get(idx) {
+                continue;
+            }
+
+            let old_val = old_row.get(idx).unwrap_or(&Value::Null);
+            let new_val = new_row.get(idx).unwrap_or(&Value::Null);
+            if col.index_type == IndexType::FTS {
+                if let Value::String(text) = old_val {
+                    for token in Self::tokenize_unique(text) {
+                        let index_key = self
+                            .routed_fts_index_key_for_row(table_name, &col.name, &token, row_id);
+                        txn.delete(index_key.as_bytes()).await?;
+                    }
+                }
+                if let Value::String(text) = new_val {
+                    for token in Self::tokenize_unique(text) {
+                        let index_key = self
+                            .routed_fts_index_key_for_row(table_name, &col.name, &token, row_id);
+                        txn.put(index_key.as_bytes(), &[]).await?;
+                    }
+                }
+            } else if col.index_type == IndexType::HNSW {
+                let idx_name = Self::hnsw_index_name_for_column(table_name, &col.name);
+                if matches!(old_val, Value::Vector(_)) {
+                    self.vector_index.delete(&idx_name, row_id)?;
+                }
+                if let Value::Vector(vec) = new_val {
+                    self.vector_index
+                        .insert(&idx_name, row_id.to_string(), vec.clone())?;
+                }
+            } else {
+                if let Some(old_val_str) = self.value_to_index_string(old_val) {
+                    let index_key = self.routed_index_key_for_value(
+                        table_name,
+                        &col.name,
+                        &old_val_str,
+                        row_id,
+                    );
+                    txn.delete(index_key.as_bytes()).await?;
+                }
+                if let Some(new_val_str) = self.value_to_index_string(new_val) {
+                    let index_key = self.routed_index_key_for_value(
+                        table_name,
+                        &col.name,
+                        &new_val_str,
+                        row_id,
+                    );
+                    txn.put(index_key.as_bytes(), &[]).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn build_insert_rows_context(
@@ -490,28 +555,15 @@ impl Executor {
                             &context.trigram_column_indices,
                             txn,
                         );
-                        for (idx, col) in context.schema.columns.iter().enumerate() {
-                            if col.is_indexed && col.index_type == IndexType::HNSW {
-                                let idx_name = Self::hnsw_index_name_for_column(
-                                    &context.table_name,
-                                    &col.name,
-                                );
-                                if idx < old_existing_row.len()
-                                    && old_existing_row[idx] != existing_row[idx]
-                                {
-                                    if matches!(old_existing_row[idx], Value::Vector(_)) {
-                                        self.vector_index.delete(&idx_name, &row_id)?;
-                                    }
-                                    if let Value::Vector(vec) = &existing_row[idx] {
-                                        self.vector_index.insert(
-                                            &idx_name,
-                                            row_id.clone(),
-                                            vec.clone(),
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
+                        self.update_single_column_indexes_for_upsert(
+                            &context.table_name,
+                            &context.schema,
+                            &old_existing_row,
+                            &existing_row,
+                            &row_id,
+                            txn,
+                        )
+                        .await?;
                         self.update_loaded_composite_indexes_for_row(
                             &context.composite_indexes,
                             &context.table_name,
@@ -581,7 +633,7 @@ impl Executor {
                 if col.index_type == IndexType::FTS {
                     if let Value::String(text) = val {
                         for token in Self::tokenize_unique(text) {
-                            let index_key = Self::fts_index_key_for_row(
+                            let index_key = self.routed_fts_index_key_for_row(
                                 &context.table_name,
                                 &col.name,
                                 &token,
@@ -598,7 +650,7 @@ impl Executor {
                             .insert(&idx_name, row_id.clone(), vec.clone())?;
                     }
                 } else if let Some(val_str) = self.value_to_index_string(val) {
-                    let index_key = insert_index_key_for_value(
+                    let index_key = self.routed_index_key_for_value(
                         &context.table_name,
                         &col.name,
                         &val_str,
@@ -919,29 +971,15 @@ impl Executor {
                                         &trigram_column_indices,
                                         txn,
                                     );
-                                    for (idx, col) in schema.columns.iter().enumerate() {
-                                        if col.is_indexed && col.index_type == IndexType::HNSW {
-                                            let idx_name = Self::hnsw_index_name_for_column(
-                                                &table_name_str,
-                                                &col.name,
-                                            );
-                                            if idx < old_existing_row.len()
-                                                && old_existing_row[idx] != existing_row[idx]
-                                            {
-                                                if matches!(old_existing_row[idx], Value::Vector(_))
-                                                {
-                                                    self.vector_index.delete(&idx_name, &row_id)?;
-                                                }
-                                                if let Value::Vector(vec) = &existing_row[idx] {
-                                                    self.vector_index.insert(
-                                                        &idx_name,
-                                                        row_id.clone(),
-                                                        vec.clone(),
-                                                    )?;
-                                                }
-                                            }
-                                        }
-                                    }
+                                    self.update_single_column_indexes_for_upsert(
+                                        &table_name_str,
+                                        &schema,
+                                        &old_existing_row,
+                                        &existing_row,
+                                        &row_id,
+                                        txn,
+                                    )
+                                    .await?;
                                     self.update_loaded_composite_indexes_for_row(
                                         &composite_indexes,
                                         &table_name_str,
@@ -1018,7 +1056,7 @@ impl Executor {
                             if col.index_type == IndexType::FTS {
                                 if let Value::String(text) = val {
                                     for token in Self::tokenize_unique(text) {
-                                        let index_key = Self::fts_index_key_for_row(
+                                        let index_key = self.routed_fts_index_key_for_row(
                                             &table_name_str,
                                             &col.name,
                                             &token,
@@ -1040,7 +1078,7 @@ impl Executor {
                                     )?;
                                 }
                             } else if let Some(val_str) = self.value_to_index_string(val) {
-                                let index_key = insert_index_key_for_value(
+                                let index_key = self.routed_index_key_for_value(
                                     &table_name_str,
                                     &col.name,
                                     &val_str,
@@ -1142,12 +1180,41 @@ impl Executor {
                     );
 
                     for (idx, col) in schema.columns.iter().enumerate() {
-                        if col.is_indexed && col.index_type == IndexType::HNSW {
-                            if let Value::Vector(vec) = &row_values[idx] {
-                                let idx_name =
-                                    Self::hnsw_index_name_for_column(&table_name_str, &col.name);
-                                self.vector_index
-                                    .insert(&idx_name, row_id.clone(), vec.clone())?;
+                        if col.is_indexed {
+                            let val = &row_values[idx];
+
+                            if col.index_type == IndexType::FTS {
+                                if let Value::String(text) = val {
+                                    for token in Self::tokenize_unique(text) {
+                                        let index_key = self.routed_fts_index_key_for_row(
+                                            &table_name_str,
+                                            &col.name,
+                                            &token,
+                                            &row_id,
+                                        );
+                                        txn.put(index_key.as_bytes(), &[]).await?;
+                                    }
+                                }
+                            } else if col.index_type == IndexType::HNSW {
+                                if let Value::Vector(vec) = val {
+                                    let idx_name = Self::hnsw_index_name_for_column(
+                                        &table_name_str,
+                                        &col.name,
+                                    );
+                                    self.vector_index.insert(
+                                        &idx_name,
+                                        row_id.clone(),
+                                        vec.clone(),
+                                    )?;
+                                }
+                            } else if let Some(val_str) = self.value_to_index_string(val) {
+                                let index_key = self.routed_index_key_for_value(
+                                    &table_name_str,
+                                    &col.name,
+                                    &val_str,
+                                    &row_id,
+                                );
+                                txn.put(index_key.as_bytes(), &[]).await?;
                             }
                         }
                     }
