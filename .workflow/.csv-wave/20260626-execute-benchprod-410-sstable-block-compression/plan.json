@@ -1,0 +1,30 @@
+{
+  "id": "BENCHPROD-410",
+  "title": "Add SSTable block compression",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-410"
+  ],
+  "scope": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "src/storage/sstable.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Close the P4-4 page compression gap by adding LZ4-compressed SSTable data blocks while preserving CRC verification and legacy block compatibility.",
+  "verification": [
+    "cargo check --lib",
+    "cargo test --lib sstable -- --nocapture",
+    "cargo test --lib fusion_get_uses_latest_mvcc_timestamp_after_compaction -- --nocapture",
+    "cargo test --test sql_dml test_fusion_storage_sstable_seek_finds_tpcc_district_mid_block -- --nocapture",
+    "cargo test --test sql_dml test_fusion_storage_prefix_scan_seeks_inside_sstable_block -- --nocapture",
+    "cargo test --lib",
+    "cargo check --bins",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "code_commit": "51af602"
+}
