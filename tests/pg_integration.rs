@@ -1,7 +1,10 @@
 use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime};
 use fusiondb::auth::UserRecord;
-use fusiondb::config::StorageConfig;
+use fusiondb::config::{
+    Config, DistributedPeerConfig, ShardingConfig, ShardingStrategy, StorageConfig,
+};
+use fusiondb::distributed::sharding::ShardRouter;
 use fusiondb::execution::Executor;
 use fusiondb::server::pg_server;
 use fusiondb::storage::memory::MemoryStorage;
@@ -32,6 +35,65 @@ fn unique_pg_storage_dir(test_name: &str) -> std::path::PathBuf {
 
 fn cleanup_storage_dir(path: &std::path::Path) {
     let _ = std::fs::remove_dir_all(path);
+}
+
+fn sharded_pg_test_config(shard_count: u64) -> Config {
+    let mut config = Config::default();
+    config.distributed.enabled = true;
+    config.distributed.node_id = 1;
+    config.distributed.initial_members = vec![
+        DistributedPeerConfig {
+            node_id: 1,
+            addr: "127.0.0.1:8091".to_string(),
+        },
+        DistributedPeerConfig {
+            node_id: 2,
+            addr: "127.0.0.1:8093".to_string(),
+        },
+    ];
+    config.distributed.sharding = ShardingConfig {
+        enabled: true,
+        strategy: ShardingStrategy::Hash,
+        shard_count,
+        range_boundaries: Vec::new(),
+    };
+    config
+}
+
+fn integer_primary_key_for_owner(
+    router: &ShardRouter,
+    table_name: &str,
+    owner_node_id: u64,
+) -> i32 {
+    for value in 1_i32..10_000 {
+        let row_id = fusiondb::common::encoding::encode_i64_comparable(value as i64);
+        if router.route_key(table_name, &row_id).owner_node_id == owner_node_id {
+            return value;
+        }
+    }
+    panic!("no integer key routed to owner node {}", owner_node_id);
+}
+
+fn assert_pg_shard_route_conflict(error: &tokio_postgres::Error, table_name: &str) {
+    assert_pg_shard_route_conflict_with_operation(error, table_name, None);
+}
+
+fn assert_pg_shard_route_conflict_with_operation(
+    error: &tokio_postgres::Error,
+    table_name: &str,
+    operation: Option<&str>,
+) {
+    let db_error = error
+        .as_db_error()
+        .unwrap_or_else(|| panic!("database error, got: {:?}", error));
+    assert_eq!(db_error.code().code(), "0A000");
+    assert!(db_error.message().contains("Shard route conflict"));
+    assert!(db_error.message().contains(table_name));
+    if let Some(operation) = operation {
+        assert!(db_error.message().contains(operation));
+    }
+    assert!(db_error.message().contains("owned by node 2"));
+    assert!(db_error.message().contains("local node 1"));
 }
 
 #[tokio::test]
@@ -2083,6 +2145,200 @@ async fn test_pg_protocol_extended_tpcc_payment_district_update_count() {
         .expect("updated district should be queryable");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, String>("d_ytd_text"), "32849.77001953125");
+
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
+async fn test_pg_protocol_simple_query_rejects_non_local_shard_owner_insert() {
+    let wal_path = format!("test_pg_shard_owner_simple_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let config = sharded_pg_test_config(4);
+    let shard_router = ShardRouter::from_config(&config).expect("shard router");
+    let local_key = integer_primary_key_for_owner(
+        &shard_router,
+        "pg_route_simple",
+        shard_router.local_node_id(),
+    );
+    let remote_key = integer_primary_key_for_owner(&shard_router, "pg_route_simple", 2);
+    let batch_remote_key = integer_primary_key_for_owner(&shard_router, "pg_route_simple_batch", 2);
+    let executor = Arc::new(Executor::with_config_and_shard_router(
+        storage.clone(),
+        &StorageConfig::default(),
+        Some(shard_router),
+    ));
+    let port = next_pg_test_port();
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query("CREATE TABLE pg_route_simple (id INTEGER PRIMARY KEY, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query(&format!(
+            "INSERT INTO pg_route_simple VALUES ({}, 'local')",
+            local_key
+        ))
+        .await
+        .expect("local owner insert should succeed");
+
+    let remote_insert = client
+        .simple_query(&format!(
+            "INSERT INTO pg_route_simple VALUES ({}, 'remote')",
+            remote_key
+        ))
+        .await;
+    assert_pg_shard_route_conflict(
+        &remote_insert.expect_err("remote owner insert should fail"),
+        "pg_route_simple",
+    );
+
+    let remote_batch_insert = client
+        .simple_query(&format!(
+            "CREATE TABLE pg_route_simple_batch (id INTEGER PRIMARY KEY, name TEXT); \
+             INSERT INTO pg_route_simple_batch VALUES ({}, 'remote')",
+            batch_remote_key
+        ))
+        .await;
+    assert_pg_shard_route_conflict_with_operation(
+        &remote_batch_insert.expect_err("remote owner batch insert should fail"),
+        "pg_route_simple_batch",
+        Some("INSERT"),
+    );
+
+    client
+        .simple_query(&format!(
+            "UPDATE pg_route_simple SET name = 'local-updated' WHERE id = {}",
+            local_key
+        ))
+        .await
+        .expect("local owner update should succeed");
+
+    let remote_update = client
+        .simple_query(&format!(
+            "UPDATE pg_route_simple SET name = 'remote-updated' WHERE id = {}",
+            remote_key
+        ))
+        .await;
+    assert_pg_shard_route_conflict_with_operation(
+        &remote_update.expect_err("remote owner update should fail"),
+        "pg_route_simple",
+        Some("UPDATE"),
+    );
+
+    let remote_delete = client
+        .simple_query(&format!(
+            "DELETE FROM pg_route_simple WHERE id = {}",
+            remote_key
+        ))
+        .await;
+    assert_pg_shard_route_conflict_with_operation(
+        &remote_delete.expect_err("remote owner delete should fail"),
+        "pg_route_simple",
+        Some("DELETE"),
+    );
+
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
+async fn test_pg_protocol_extended_query_rejects_non_local_shard_owner_insert() {
+    let wal_path = format!("test_pg_shard_owner_extended_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let config = sharded_pg_test_config(4);
+    let shard_router = ShardRouter::from_config(&config).expect("shard router");
+    let remote_key = i64::from(integer_primary_key_for_owner(
+        &shard_router,
+        "pg_route_extended",
+        2,
+    ));
+    let executor = Arc::new(Executor::with_config_and_shard_router(
+        storage.clone(),
+        &StorageConfig::default(),
+        Some(shard_router),
+    ));
+    let port = next_pg_test_port();
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query("CREATE TABLE pg_route_extended (id BIGINT PRIMARY KEY, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    let remote_insert = client
+        .execute(
+            "INSERT INTO pg_route_extended (name, id) VALUES ($1, $2)",
+            &[&"remote", &remote_key],
+        )
+        .await;
+    assert_pg_shard_route_conflict(
+        &remote_insert.expect_err("remote owner insert should fail"),
+        "pg_route_extended",
+    );
+
+    let remote_update = client
+        .execute(
+            "UPDATE pg_route_extended SET name = $1 WHERE id = $2",
+            &[&"remote-updated", &remote_key],
+        )
+        .await;
+    assert_pg_shard_route_conflict_with_operation(
+        &remote_update.expect_err("remote owner update should fail"),
+        "pg_route_extended",
+        Some("UPDATE"),
+    );
+
+    let remote_delete = client
+        .execute(
+            "DELETE FROM pg_route_extended WHERE id = $1",
+            &[&remote_key],
+        )
+        .await;
+    assert_pg_shard_route_conflict_with_operation(
+        &remote_delete.expect_err("remote owner delete should fail"),
+        "pg_route_extended",
+        Some("DELETE"),
+    );
 
     let _ = std::fs::remove_file(&wal_path);
 }

@@ -34,7 +34,7 @@ use sqlparser::ast::{
 
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Value}; // Import FusionError
-use crate::execution::{Executor, ForeignKeyMeta, QueryResult};
+use crate::execution::{Executor, ForeignKeyMeta, QueryResult, SqlShardRoutingDecision};
 use crate::monitor;
 use crate::parser::parse_sql;
 use crate::storage::{Storage, Transaction};
@@ -171,6 +171,10 @@ impl PgHandler {
         pgwire::error::ErrorInfo::new("ERROR".to_string(), "XX000".to_string(), message.into())
     }
 
+    fn shard_route_error(message: impl Into<String>) -> pgwire::error::ErrorInfo {
+        pgwire::error::ErrorInfo::new("ERROR".to_string(), "0A000".to_string(), message.into())
+    }
+
     fn fusion_error(prefix: &str, error: &FusionError) -> pgwire::error::ErrorInfo {
         pgwire::error::ErrorInfo::new(
             "ERROR".to_string(),
@@ -212,6 +216,50 @@ impl PgHandler {
             };
             eprintln!("[pgwire-trace] {event}: {preview}");
         }
+    }
+
+    async fn shard_route_conflict_message_for_sql(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<Option<String>, FusionError> {
+        let decisions = self
+            .executor
+            .shard_routing_decisions_for_sql(query, params)
+            .await?;
+        Ok(Self::non_local_shard_route_message(decisions))
+    }
+
+    async fn shard_route_conflict_message_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> std::result::Result<Option<String>, FusionError> {
+        let decisions = self
+            .executor
+            .shard_routing_decisions_for_statements(statements, params)
+            .await?;
+        Ok(Self::non_local_shard_route_message(decisions))
+    }
+
+    fn non_local_shard_route_message(decisions: Vec<SqlShardRoutingDecision>) -> Option<String> {
+        decisions
+            .into_iter()
+            .find(|decision| !decision.is_local_owner())
+            .map(|decision| Self::shard_route_conflict_message(&decision))
+    }
+
+    fn shard_route_conflict_message(decision: &SqlShardRoutingDecision) -> String {
+        format!(
+            "Shard route conflict: {} on table {} with shard key {} routes to shard {} owned by node {} at {}; local node {} must not execute this write",
+            decision.operation,
+            decision.route.table,
+            decision.route.shard_key,
+            decision.route.shard_id,
+            decision.route.owner_node_id,
+            decision.route.owner_addr,
+            decision.local_node_id
+        )
     }
 
     fn is_pg_metadata_query(query: &str) -> bool {
@@ -3324,7 +3372,8 @@ impl PgHandler {
         provided_oids: &[u32],
     ) -> Vec<Type> {
         Self::trace_query("infer-params start", query);
-        let placeholder_count = parse_sql(query)
+        let text_placeholder_count = Self::max_placeholder_in_text(query);
+        let ast_placeholder_count = parse_sql(query)
             .ok()
             .map(|statements| {
                 statements
@@ -3333,7 +3382,8 @@ impl PgHandler {
                     .max()
                     .unwrap_or(0)
             })
-            .unwrap_or_else(|| Self::max_placeholder_in_text(query));
+            .unwrap_or(0);
+        let placeholder_count = ast_placeholder_count.max(text_placeholder_count);
         let count = placeholder_count.max(provided_oids.len());
         let mut types = vec![Type::TEXT; count];
         let mut client_provided = vec![false; count];
@@ -5459,6 +5509,24 @@ impl SimpleQueryHandler for PgHandler {
                 _ => {}
             }
 
+            match self
+                .shard_route_conflict_message_for_statements(std::slice::from_ref(&stmt), &[])
+                .await
+            {
+                Ok(Some(message)) => {
+                    return Ok(vec![Response::Error(Box::new(Self::shard_route_error(
+                        message,
+                    )))]);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Ok(vec![Response::Error(Box::new(Self::fusion_error(
+                        "Shard routing error",
+                        &e,
+                    )))]);
+                }
+            }
+
             // Execute Normal Statements
             let result = if session.transaction.is_some() {
                 // Execute in current transaction
@@ -5748,7 +5816,37 @@ impl ExtendedQueryHandler for PgHandler {
         let (result, is_metadata_result) =
             match self.try_execute_pg_metadata_query(&query, &params).await {
                 Ok(Some(result)) => (Ok(result), true),
-                Ok(None) => (self.execute_first_statement(&query, &params).await, false),
+                Ok(None) => {
+                    match self
+                        .shard_route_conflict_message_for_sql(&query, &params)
+                        .await
+                    {
+                        Ok(Some(message)) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::shard_route_error(message).into(),
+                                ))
+                                .await
+                                .map_err(|_| {
+                                    PgWireError::IoError(std::io::Error::other("Sink Error"))
+                                })?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::fusion_error("Shard routing error", &e).into(),
+                                ))
+                                .await
+                                .map_err(|_| {
+                                    PgWireError::IoError(std::io::Error::other("Sink Error"))
+                                })?;
+                            return Ok(());
+                        }
+                    }
+                    (self.execute_first_statement(&query, &params).await, false)
+                }
                 Err(e) => (Err(e), false),
             };
 
