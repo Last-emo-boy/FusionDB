@@ -51,6 +51,10 @@ chrono = { version = "0.4.42", default-features = false, features = ["clock", "s
 name = "fusiondb"
 path = "src/main.rs"
 
+[[bin]]
+name = "fusiondb-cli"
+path = "src/bin/fusiondb-cli.rs"
+
 [dev-dependencies]
 env_logger = "0.11.8"
 tokio-postgres = { version = "0.7.15", features = ["with-chrono-0_4"] }

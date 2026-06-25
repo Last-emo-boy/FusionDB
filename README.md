@@ -142,6 +142,23 @@ The benchmark covers **8 scenarios** in a single run:
 
 Results are printed to terminal and saved as `benchmark_report_<scale>.json`, including latency percentiles, standard deviation, coefficient of variation, success/error counts, row throughput, and concurrent workload throughput.
 
+### Admin CLI
+
+```bash
+# Health and metadata
+cargo run --bin fusiondb-cli -- health
+cargo run --bin fusiondb-cli -- capabilities
+cargo run --bin fusiondb-cli -- tables
+
+# SQL and operations
+cargo run --bin fusiondb-cli -- query "SELECT * FROM users LIMIT 5"
+cargo run --bin fusiondb-cli -- checkpoint
+cargo run --bin fusiondb-cli -- vacuum
+
+# Custom endpoint/user
+cargo run --bin fusiondb-cli -- --url http://127.0.0.1:8091 --user admin metrics
+```
+
 ### Dashboard UI (FusionDB Studio)
 
 ```bash
@@ -559,6 +576,8 @@ All endpoints are served from `http://127.0.0.1:8091`.
 | `GET` | `/metrics/prometheus` | Prometheus-compatible metrics (OpenMetrics text) |
 | `GET` | `/slow_queries` | Recent slow queries (JSON array) |
 | `POST` | `/checkpoint` | Force SSTable flush / snapshot |
+| `POST` | `/compact` | Run manual FusionStorage compaction (`fusiondb-cli vacuum`) |
+| `GET` | `/capabilities` | Show backend and feature capabilities |
 | `POST` | `/vector_search` | Direct vector search (bypass SQL) |
 | `POST` | `/hybrid_search` | Combined text + vector search |
 
@@ -844,6 +863,9 @@ FusionDB/
 ├── src/
 │   ├── main.rs                     # Entry point (config loading, graceful shutdown)
 │   ├── lib.rs                      # Module declarations
+│   ├── bin/
+│   │   ├── fusiondb-cli.rs         # Admin CLI for HTTP health/query/ops endpoints
+│   │   └── benchmark.rs            # TCP benchmark harness
 │   ├── config.rs                   # TOML config file parsing (fusiondb.toml)
 │   ├── monitor.rs                  # Metrics, slow query log, Prometheus export
 │   ├── ai/

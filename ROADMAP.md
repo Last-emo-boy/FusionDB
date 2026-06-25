@@ -76,7 +76,7 @@
 - [x] **P6-3: Slow queries API** — `/slow_queries` JSON endpoint
 - [x] **P6-4: Query timing** — Every query timed, total µs tracked in metrics
 - [x] **P6-5: VACUUM** — SQL manual compaction trigger backed by FusionStorage compaction
-- [ ] **P6-6: Admin CLI** — `fusiondb-cli` tool
+- [x] **P6-6: Admin CLI** — `fusiondb-cli` health/query/tables/metrics/checkpoint/compact operations
 - [ ] **P6-7: CDC** — Change Data Capture for streaming replication
 
 ## Phase 7: Dashboard UI (FusionDB Studio) ✅
