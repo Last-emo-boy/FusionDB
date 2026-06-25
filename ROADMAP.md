@@ -66,7 +66,7 @@
 ## Phase 5: Distributed
 
 - [x] **P5-1: Wire OpenRaft into main loop** — Configurable Raft startup, `/raft/*` routes, leader-forwarded writes, local follower reads
-- [ ] **P5-2: Snapshot transfer** — For new node bootstrap
+- [x] **P5-2: Snapshot transfer** — Serialized visible key-value state for new node bootstrap
 - [ ] **P5-3: Automatic sharding** — Hash/range partitioning
 
 ## Phase 6: Operations & Ecosystem ✅

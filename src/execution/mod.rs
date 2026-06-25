@@ -157,6 +157,12 @@ impl Executor {
         self.query_result_cache.invalidate_all();
     }
 
+    pub(crate) fn invalidate_storage_caches(&self) {
+        self.invalidate_query_result_cache();
+        self.invalidate_update_fast_path_cache();
+        self.row_cache.invalidate_all();
+    }
+
     fn invalidate_update_fast_path_cache(&self) {
         self.simple_pk_update_fast_path_cache.invalidate_all();
     }

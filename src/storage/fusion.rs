@@ -696,6 +696,60 @@ impl FusionStorage {
         Ok(())
     }
 
+    pub async fn replace_visible_entries_for_snapshot(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<()> {
+        let read_ts = self.current_ts.load(Ordering::SeqCst);
+        let snapshot_txn = FusionTransaction {
+            storage: self.clone(),
+            write_buffer: transaction_write_buffer(),
+            read_ts,
+        };
+        let existing = snapshot_txn.scan_range(start, end, None).await?;
+        let commit_ts = self.current_ts.fetch_add(1, Ordering::SeqCst) + 1;
+        let total_entries = existing.len().saturating_add(entries.len());
+        let mut wal_entries = Vec::with_capacity(total_entries);
+        let mut mem_entries = Vec::with_capacity(total_entries);
+
+        for (key, _) in existing {
+            let encoded_key = FusionStorage::encode_key(&key, commit_ts);
+            let encoded_value = FusionStorage::encode_value(false, &[]);
+            wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
+            mem_entries.push((encoded_key, encoded_value));
+        }
+        for (key, value) in entries {
+            let encoded_key = FusionStorage::encode_key(key, commit_ts);
+            let encoded_value = FusionStorage::encode_value(true, value);
+            wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
+            mem_entries.push((encoded_key, encoded_value));
+        }
+
+        if !wal_entries.is_empty() {
+            self.wal.append_batch_async(wal_entries).await?;
+            {
+                let active = self.active_memtable.read().unwrap();
+                for (key, value) in mem_entries {
+                    active.insert(key, value);
+                }
+            }
+
+            let needs_rotate = {
+                let active = self.active_memtable.read().unwrap();
+                active.size.load(Ordering::Relaxed) > self.memtable_threshold as u64
+            };
+            if needs_rotate {
+                self.rotate_memtable().await;
+            }
+        }
+
+        self.vector_index.clear();
+        self.rebuild_vector_index().await;
+        Ok(())
+    }
+
     async fn rebuild_vector_index(&self) {
         println!("Rebuilding Vector Index from Storage...");
         let txn = match self.begin_transaction().await {

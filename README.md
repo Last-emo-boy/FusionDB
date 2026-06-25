@@ -995,8 +995,8 @@ These are known gaps that should be addressed before production use:
 
 ### Distributed
 - OpenRaft can be enabled via `[distributed]`, with `/raft/*` HTTP RPCs, leader-forwarded writes, and local follower reads
-- Raft state is currently in-memory and intended as the control-plane wiring foundation
-- Snapshot transfer for node bootstrap is still placeholder-level
+- Raft log/state metadata is currently in-memory and intended as the control-plane wiring foundation
+- Snapshot transfer serializes visible key-value state for new node bootstrap
 - No automatic sharding / partitioning
 - No dedicated read-replica topology management
 - No distributed transactions (2PC)
@@ -1023,7 +1023,7 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 | **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
 | **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
 | **4. Performance** | ✅ Done | Connection slots, parallel scan, LZ4 SSTable compression, cost-based optimizer |
-| **5. Distributed** | 🔲 Planned | OpenRaft main-loop wiring, snapshot transfer, automatic sharding |
+| **5. Distributed** | 🔲 Planned | OpenRaft main-loop wiring and snapshot transfer; automatic sharding remains |
 | **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
 
 ---

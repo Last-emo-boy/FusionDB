@@ -146,6 +146,10 @@ impl VectorIndex {
         let _ = self.get_or_create_wrapper(name);
     }
 
+    pub fn clear(&self) {
+        self.indexes.write().clear();
+    }
+
     pub fn insert(&self, name: &str, id: String, vector: Vec<f32>) -> Result<()> {
         let wrapper_lock = self.get_or_create_wrapper(name);
         let mut wrapper = wrapper_lock.write();

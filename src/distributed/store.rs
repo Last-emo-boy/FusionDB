@@ -5,13 +5,24 @@ use std::sync::Arc;
 
 use openraft::log_id::RaftLogId;
 use openraft::{
-    Entry, EntryPayload, LogId, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot,
-    SnapshotMeta, StorageError, StoredMembership, Vote,
+    AnyError, Entry, EntryPayload, LogId, RaftLogReader, RaftSnapshotBuilder, RaftStorage,
+    Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
+use serde::{Deserialize, Serialize};
 
 use super::typ::{NodeId, Request, Response, TypeConfig};
 use crate::execution::{Executor, QueryResult};
-use crate::storage::Storage;
+use crate::storage::{FusionStorage, Storage};
+
+const SNAPSHOT_PAYLOAD_VERSION: u16 = 1;
+const SNAPSHOT_SCAN_START: &[u8] = b"";
+const SNAPSHOT_SCAN_END: &[u8] = &[0xff];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FusionSnapshotPayload {
+    version: u16,
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
 
 /// Combined Raft storage: log + state machine + snapshots.
 /// Used with `openraft::storage::Adaptor` to satisfy both
@@ -68,6 +79,91 @@ impl FusionRaftStore {
             message: results.join("; "),
         }
     }
+
+    async fn build_snapshot_payload(&self) -> Result<FusionSnapshotPayload, StorageError<NodeId>> {
+        let entries = export_visible_storage(&self.storage).await?;
+        Ok(FusionSnapshotPayload {
+            version: SNAPSHOT_PAYLOAD_VERSION,
+            entries,
+        })
+    }
+}
+
+fn snapshot_write_error(error: impl ToString) -> StorageError<NodeId> {
+    StorageIOError::write_snapshot(None, AnyError::error(error.to_string())).into()
+}
+
+fn snapshot_read_error(error: impl ToString) -> StorageError<NodeId> {
+    StorageIOError::read_snapshot(None, AnyError::error(error.to_string())).into()
+}
+
+fn state_machine_read_error(error: impl ToString) -> StorageError<NodeId> {
+    StorageIOError::read_state_machine(AnyError::error(error.to_string())).into()
+}
+
+fn state_machine_write_error(error: impl ToString) -> StorageError<NodeId> {
+    StorageIOError::write_state_machine(AnyError::error(error.to_string())).into()
+}
+
+fn encode_snapshot_payload(
+    payload: &FusionSnapshotPayload,
+) -> Result<Vec<u8>, StorageError<NodeId>> {
+    bincode::serialize(payload).map_err(snapshot_write_error)
+}
+
+fn decode_snapshot_payload(bytes: &[u8]) -> Result<FusionSnapshotPayload, StorageError<NodeId>> {
+    let payload: FusionSnapshotPayload =
+        bincode::deserialize(bytes).map_err(snapshot_read_error)?;
+    if payload.version != SNAPSHOT_PAYLOAD_VERSION {
+        return Err(snapshot_read_error(format!(
+            "unsupported FusionDB snapshot payload version {}",
+            payload.version
+        )));
+    }
+    Ok(payload)
+}
+
+async fn export_visible_storage(
+    storage: &Arc<dyn Storage>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError<NodeId>> {
+    let txn = storage
+        .begin_transaction()
+        .await
+        .map_err(state_machine_read_error)?;
+    txn.scan_range(SNAPSHOT_SCAN_START, SNAPSHOT_SCAN_END, None)
+        .await
+        .map_err(state_machine_read_error)
+}
+
+async fn replace_visible_storage(
+    storage: &Arc<dyn Storage>,
+    entries: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(), StorageError<NodeId>> {
+    if let Some(fusion) = storage.as_any().downcast_ref::<FusionStorage>() {
+        return fusion
+            .replace_visible_entries_for_snapshot(SNAPSHOT_SCAN_START, SNAPSHOT_SCAN_END, entries)
+            .await
+            .map_err(state_machine_write_error);
+    }
+
+    let mut txn = storage
+        .begin_transaction()
+        .await
+        .map_err(state_machine_write_error)?;
+    let existing = txn
+        .scan_range(SNAPSHOT_SCAN_START, SNAPSHOT_SCAN_END, None)
+        .await
+        .map_err(state_machine_read_error)?;
+
+    for (key, _) in existing {
+        txn.delete(&key).await.map_err(state_machine_write_error)?;
+    }
+    for (key, value) in entries {
+        txn.put(key, value)
+            .await
+            .map_err(state_machine_write_error)?;
+    }
+    txn.commit().await.map_err(state_machine_write_error)
 }
 
 // --- RaftLogReader ---
@@ -92,6 +188,8 @@ impl RaftSnapshotBuilder<TypeConfig> for FusionRaftStore {
             .last_applied
             .map(|id| format!("{}-{}", id.leader_id, id.index))
             .unwrap_or_else(|| "empty".to_string());
+        let payload = self.build_snapshot_payload().await?;
+        let snapshot_bytes = encode_snapshot_payload(&payload)?;
 
         let meta = SnapshotMeta {
             last_log_id: self.last_applied,
@@ -99,9 +197,14 @@ impl RaftSnapshotBuilder<TypeConfig> for FusionRaftStore {
             snapshot_id,
         };
 
+        self.snapshot = Some(Snapshot {
+            meta: meta.clone(),
+            snapshot: Box::new(Cursor::new(snapshot_bytes.clone())),
+        });
+
         let snap = Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(Vec::new())),
+            snapshot: Box::new(Cursor::new(snapshot_bytes)),
         };
         Ok(snap)
     }
@@ -243,11 +346,16 @@ impl RaftStorage<TypeConfig> for FusionRaftStore {
         meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
+        let snapshot_bytes = (*snapshot).into_inner();
+        let payload = decode_snapshot_payload(&snapshot_bytes)?;
+        replace_visible_storage(&self.storage, &payload.entries).await?;
+        self.executor.invalidate_storage_caches();
+
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         self.snapshot = Some(Snapshot {
             meta: meta.clone(),
-            snapshot,
+            snapshot: Box::new(Cursor::new(snapshot_bytes)),
         });
         Ok(())
     }
@@ -255,9 +363,8 @@ impl RaftStorage<TypeConfig> for FusionRaftStore {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        // Return a clone of the snapshot if available
         if let Some(snap) = &self.snapshot {
-            let data = Vec::new(); // simplified
+            let data = snap.snapshot.get_ref().clone();
             Ok(Some(Snapshot {
                 meta: snap.meta.clone(),
                 snapshot: Box::new(Cursor::new(data)),
@@ -265,5 +372,150 @@ impl RaftStorage<TypeConfig> for FusionRaftStore {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::StorageConfig;
+    use crate::storage::memory::MemoryStorage;
+    use crate::storage::FusionStorage;
+    use std::path::{Path, PathBuf};
+
+    fn test_store(name: &str) -> (FusionRaftStore, Arc<dyn Storage>, String) {
+        let wal_path = format!("test_raft_snapshot_{}_{}.wal", name, uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+        let executor = Arc::new(Executor::new(storage.clone()));
+        (
+            FusionRaftStore::new(executor, storage.clone()),
+            storage,
+            wal_path,
+        )
+    }
+
+    async fn test_fusion_store(name: &str) -> (FusionRaftStore, Arc<dyn Storage>, PathBuf) {
+        let data_dir = std::env::temp_dir().join(format!(
+            "fusiondb_raft_snapshot_{}_{}",
+            name,
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        config.wal_file = "fusion.wal".to_string();
+        config.sstable_dir = "sstables".to_string();
+        let wal_path = config.wal_path();
+        let storage: Arc<dyn Storage> = Arc::new(
+            FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                .await
+                .unwrap(),
+        );
+        let executor = Arc::new(Executor::new(storage.clone()));
+        (
+            FusionRaftStore::new(executor, storage.clone()),
+            storage,
+            data_dir,
+        )
+    }
+
+    fn cleanup_dir(path: &Path) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    async fn put_entry(storage: &Arc<dyn Storage>, key: &[u8], value: &[u8]) {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(key, value).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_builder_persists_visible_storage_payload() {
+        let (mut store, storage, wal_path) = test_store("builder_payload");
+        put_entry(&storage, b"schema:users", b"schema-bytes").await;
+        put_entry(&storage, b"data:users:1", b"row-one").await;
+
+        let built = store.build_snapshot().await.unwrap();
+        let current = store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot should be cached");
+
+        assert_eq!(current.meta, built.meta);
+        let payload = decode_snapshot_payload(current.snapshot.get_ref()).unwrap();
+        assert_eq!(payload.version, SNAPSHOT_PAYLOAD_VERSION);
+        assert!(payload
+            .entries
+            .contains(&(b"schema:users".to_vec(), b"schema-bytes".to_vec())));
+        assert!(payload
+            .entries
+            .contains(&(b"data:users:1".to_vec(), b"row-one".to_vec())));
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_replaces_visible_storage_payload() {
+        let (mut source_store, source_storage, source_wal) = test_store("source");
+        let (mut target_store, target_storage, target_wal) = test_store("target");
+        put_entry(&source_storage, b"schema:users", b"schema-bytes").await;
+        put_entry(&source_storage, b"data:users:1", b"row-one").await;
+        put_entry(&target_storage, b"schema:stale", b"stale-schema").await;
+
+        let snapshot = source_store.build_snapshot().await.unwrap();
+        let mut receiving = target_store.begin_receiving_snapshot().await.unwrap();
+        *receiving = Cursor::new(snapshot.snapshot.get_ref().clone());
+        target_store
+            .install_snapshot(&snapshot.meta, receiving)
+            .await
+            .unwrap();
+
+        let txn = target_storage.begin_transaction().await.unwrap();
+        assert_eq!(
+            txn.get(b"schema:users").await.unwrap(),
+            Some(b"schema-bytes".to_vec())
+        );
+        assert_eq!(
+            txn.get(b"data:users:1").await.unwrap(),
+            Some(b"row-one".to_vec())
+        );
+        assert_eq!(txn.get(b"schema:stale").await.unwrap(), None);
+
+        let current = target_store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("installed snapshot should be cached");
+        assert_eq!(current.meta, snapshot.meta);
+
+        let _ = std::fs::remove_file(source_wal);
+        let _ = std::fs::remove_file(target_wal);
+    }
+
+    #[tokio::test]
+    async fn fusion_snapshot_install_restores_exact_visible_payload_without_cdc_side_effects() {
+        let (mut source_store, source_storage, source_dir) =
+            test_fusion_store("fusion_source").await;
+        let (mut target_store, target_storage, target_dir) =
+            test_fusion_store("fusion_target").await;
+        put_entry(&source_storage, b"schema:users", b"schema-bytes").await;
+        put_entry(&source_storage, b"data:users:1", b"row-one").await;
+
+        let snapshot = source_store.build_snapshot().await.unwrap();
+        let payload = decode_snapshot_payload(snapshot.snapshot.get_ref()).unwrap();
+        let mut receiving = target_store.begin_receiving_snapshot().await.unwrap();
+        *receiving = Cursor::new(snapshot.snapshot.get_ref().clone());
+
+        target_store
+            .install_snapshot(&snapshot.meta, receiving)
+            .await
+            .unwrap();
+
+        let installed_entries = export_visible_storage(&target_storage).await.unwrap();
+        assert_eq!(installed_entries, payload.entries);
+
+        cleanup_dir(&source_dir);
+        cleanup_dir(&target_dir);
     }
 }
