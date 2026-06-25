@@ -1,0 +1,16 @@
+{
+  "id": "BENCHPROD-408",
+  "title": "Add durable CDC event feed",
+  "status": "completed",
+  "created_at": "2026-06-25",
+  "completed_at": "2026-06-25T23:52:53+08:00",
+  "commit": "abe89bf",
+  "summary": "Committed FusionStorage writes now produce durable CDC records queryable via HTTP and fusiondb-cli.",
+  "acceptance": [
+    "Committed put and delete writes produce ordered CDC events",
+    "CDC events survive snapshot and storage reopen",
+    "HTTP endpoint supports since/limit polling",
+    "Registered non-superusers cannot read CDC",
+    "fusiondb-cli can request the CDC endpoint with since/limit"
+  ]
+}

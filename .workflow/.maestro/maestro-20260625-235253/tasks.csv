@@ -1,0 +1,2 @@
+id,skill,args,wave_n,status,findings,artifacts,error
+BENCHPROD-408,maestro,"continue production readiness iteration",1,completed,"Implemented durable CDC event feed",".workflow/.csv-wave/20260625-execute-benchprod-408-cdc-feed/","spawn_agents_on_csv unavailable; local fallback"
