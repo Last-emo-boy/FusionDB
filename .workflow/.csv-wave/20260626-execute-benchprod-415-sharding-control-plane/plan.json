@@ -1,0 +1,37 @@
+{
+  "id": "BENCHPROD-415",
+  "title": "Add sharding control-plane routing",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-415"
+  ],
+  "scope": [
+    "src/config.rs",
+    "src/distributed/sharding.rs",
+    "src/distributed/api.rs",
+    "src/distributed/mod.rs",
+    "src/server/http_server.rs",
+    "src/server/mod.rs",
+    "src/main.rs",
+    "fusiondb.toml",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Start P5-3 by adding a configurable hash/range sharding control plane, deterministic shard ownership, route API, capability reporting, and documentation without claiming physical table/index partitioning is complete.",
+  "verification": [
+    "cargo test --lib distributed::sharding::tests -- --nocapture",
+    "cargo test --lib config::tests -- --nocapture",
+    "cargo test --lib server::http_server::tests::http_capabilities_reports_sharding_control_plane -- --nocapture",
+    "cargo check --bins",
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo test --lib"
+  ],
+  "code_commit": "bf5e5ff",
+  "remaining_gaps": [
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations",
+    "P5-3 physical table/index partitioning and execution routing remain open"
+  ]
+}
