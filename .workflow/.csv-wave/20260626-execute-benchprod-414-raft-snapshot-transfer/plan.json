@@ -1,0 +1,31 @@
+{
+  "id": "BENCHPROD-414",
+  "title": "Implement Raft snapshot transfer payloads",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-414"
+  ],
+  "scope": [
+    "src/distributed/store.rs",
+    "src/storage/fusion.rs",
+    "src/storage/vector_index.rs",
+    "src/execution/mod.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Close P5-2 by making OpenRaft snapshots carry visible key-value state and install it on receiving nodes without CDC side effects on FusionStorage.",
+  "verification": [
+    "cargo test --lib distributed::store::tests -- --nocapture",
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo test --lib",
+    "cargo check --bins"
+  ],
+  "code_commit": "10fbce3",
+  "remaining_gaps": [
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations",
+    "P5-3 Automatic sharding with hash/range partitioning"
+  ]
+}
