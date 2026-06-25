@@ -223,11 +223,21 @@ impl PgHandler {
         query: &str,
         params: &[Value],
     ) -> std::result::Result<Option<String>, FusionError> {
-        let decisions = self
-            .executor
-            .shard_routing_decisions_for_sql(query, params)
-            .await?;
-        Ok(Self::non_local_shard_route_message(decisions))
+        let statements = parse_sql(query)
+            .map_err(|e| FusionError::Execution(format!("Parse Error: {:?}", e)))?;
+        let mut session = self.session.lock().await;
+        if let Some(txn) = session.transaction.as_mut() {
+            return self
+                .shard_route_conflict_message_for_statements_in_transaction(
+                    &statements,
+                    &mut **txn,
+                    params,
+                )
+                .await;
+        }
+        drop(session);
+        self.shard_route_conflict_message_for_statements(&statements, params)
+            .await
     }
 
     async fn shard_route_conflict_message_for_statements(
@@ -238,6 +248,19 @@ impl PgHandler {
         let decisions = self
             .executor
             .shard_routing_decisions_for_statements(statements, params)
+            .await?;
+        Ok(Self::non_local_shard_route_message(decisions))
+    }
+
+    async fn shard_route_conflict_message_for_statements_in_transaction(
+        &self,
+        statements: &[Statement],
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> std::result::Result<Option<String>, FusionError> {
+        let decisions = self
+            .executor
+            .shard_routing_decisions_for_statements_in_transaction(statements, txn, params)
             .await?;
         Ok(Self::non_local_shard_route_message(decisions))
     }
@@ -3371,6 +3394,26 @@ impl PgHandler {
         query: &str,
         provided_oids: &[u32],
     ) -> Vec<Type> {
+        self.infer_parameter_types_from_query_with_schema_loader(query, provided_oids, None)
+            .await
+    }
+
+    async fn infer_parameter_types_from_query_in_transaction(
+        &self,
+        query: &str,
+        provided_oids: &[u32],
+        txn: &dyn Transaction,
+    ) -> Vec<Type> {
+        self.infer_parameter_types_from_query_with_schema_loader(query, provided_oids, Some(txn))
+            .await
+    }
+
+    async fn infer_parameter_types_from_query_with_schema_loader(
+        &self,
+        query: &str,
+        provided_oids: &[u32],
+        txn: Option<&dyn Transaction>,
+    ) -> Vec<Type> {
         Self::trace_query("infer-params start", query);
         let text_placeholder_count = Self::max_placeholder_in_text(query);
         let ast_placeholder_count = parse_sql(query)
@@ -3397,7 +3440,11 @@ impl PgHandler {
         }
 
         if let Ok(statements) = parse_sql(query) {
-            let schemas = self.load_parameter_inference_schemas(&statements).await;
+            let schemas = if let Some(txn) = txn {
+                Self::load_parameter_inference_schemas_in_transaction(&statements, txn).await
+            } else {
+                self.load_parameter_inference_schemas(&statements).await
+            };
             for stmt in &statements {
                 Self::infer_parameter_types_from_statement(
                     stmt,
@@ -3423,6 +3470,16 @@ impl PgHandler {
         &self,
         statements: &[Statement],
     ) -> HashMap<String, TableSchema> {
+        let Ok(txn) = self.storage.begin_transaction().await else {
+            return HashMap::new();
+        };
+        Self::load_parameter_inference_schemas_in_transaction(statements, &*txn).await
+    }
+
+    async fn load_parameter_inference_schemas_in_transaction(
+        statements: &[Statement],
+        txn: &dyn Transaction,
+    ) -> HashMap<String, TableSchema> {
         let mut table_names = Vec::new();
         for stmt in statements {
             Self::collect_inference_table_names_from_statement(stmt, &mut table_names);
@@ -3430,9 +3487,6 @@ impl PgHandler {
         table_names.sort();
         table_names.dedup();
 
-        let Ok(txn) = self.storage.begin_transaction().await else {
-            return HashMap::new();
-        };
         let mut schemas = HashMap::new();
         for table_name in table_names {
             let schema_key = format!("schema:{}", table_name);
@@ -5509,10 +5563,18 @@ impl SimpleQueryHandler for PgHandler {
                 _ => {}
             }
 
-            match self
-                .shard_route_conflict_message_for_statements(std::slice::from_ref(&stmt), &[])
+            let shard_route_conflict = if let Some(txn) = session.transaction.as_mut() {
+                self.shard_route_conflict_message_for_statements_in_transaction(
+                    std::slice::from_ref(&stmt),
+                    &mut **txn,
+                    &[],
+                )
                 .await
-            {
+            } else {
+                self.shard_route_conflict_message_for_statements(std::slice::from_ref(&stmt), &[])
+                    .await
+            };
+            match shard_route_conflict {
                 Ok(Some(message)) => {
                     return Ok(vec![Response::Error(Box::new(Self::shard_route_error(
                         message,
@@ -5628,9 +5690,17 @@ impl ExtendedQueryHandler for PgHandler {
 
         let mut session = self.session.lock().await;
         let name = message.name.clone().unwrap_or_default();
-        let parameter_types = self
-            .infer_parameter_types_from_query(&message.query, &message.type_oids)
-            .await;
+        let parameter_types = if let Some(txn) = session.transaction.as_ref() {
+            self.infer_parameter_types_from_query_in_transaction(
+                &message.query,
+                &message.type_oids,
+                &**txn,
+            )
+            .await
+        } else {
+            self.infer_parameter_types_from_query(&message.query, &message.type_oids)
+                .await
+        };
         session.statements.insert(
             name,
             StatementData {

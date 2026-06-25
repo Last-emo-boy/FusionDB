@@ -600,15 +600,25 @@ impl Executor {
         statements: &[Statement],
         params: &[Value],
     ) -> Result<Vec<SqlShardRoutingDecision>> {
+        let mut txn = self.storage.begin_transaction().await?;
+        self.shard_routing_decisions_for_statements_in_transaction(statements, &mut *txn, params)
+            .await
+    }
+
+    pub(crate) async fn shard_routing_decisions_for_statements_in_transaction(
+        &self,
+        statements: &[Statement],
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardRoutingDecision>> {
         let Some(router) = self.shard_router.clone() else {
             return Ok(Vec::new());
         };
 
-        let mut txn = self.storage.begin_transaction().await?;
         let mut decisions = Vec::new();
         for statement in statements {
             for (operation, table_name, row_id) in self
-                .shard_point_write_targets_for_statement(statement, &mut *txn, params)
+                .shard_point_write_targets_for_statement(statement, txn, params)
                 .await?
             {
                 decisions.push(Self::shard_routing_decision_for_row_id(
