@@ -6,6 +6,7 @@ use sqlparser::ast::Expr;
 
 use super::super::{Executor, QueryResult};
 
+#[cfg(test)]
 fn create_index_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -169,8 +170,9 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema serialization error: {}", e)))?;
         txn.put(schema_key.as_bytes(), &new_schema_value).await?;
 
-        let prefix = create_index_data_prefix_for_table(&table_name_str);
-        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let kv_pairs = self
+            .scan_routed_data_prefixes_for_table(&table_name_str, txn, None)
+            .await?;
 
         let mut count = 0;
         for (k, v) in kv_pairs {

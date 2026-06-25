@@ -6,6 +6,7 @@ use sqlparser::ast::TableFactor;
 
 use super::super::{Executor, QueryResult};
 
+#[cfg(test)]
 fn update_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -14,6 +15,7 @@ fn update_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+#[cfg(test)]
 fn update_data_key_for_prefix_row(prefix: &str, row_id: &str) -> String {
     let mut key = String::with_capacity(prefix.len() + row_id.len());
     key.push_str(prefix);
@@ -79,8 +81,6 @@ impl Executor {
         let schema: TableSchema = bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
-        let prefix = update_data_prefix_for_table(&table_name_str);
-
         // Optimization: Check for Primary Key (Clustered Index) Update
         let allowed_qualifiers = Self::primary_key_qualifiers(relation);
         let target_row_id = self.primary_key_row_id_from_eq_selection(
@@ -95,7 +95,6 @@ impl Executor {
                     update,
                     &table_name_str,
                     &schema,
-                    &prefix,
                     row_id,
                     txn,
                     params,
@@ -117,7 +116,7 @@ impl Executor {
 
         let kv_pairs = if let Some(row_id) = target_row_id {
             // Point Lookup
-            let key = update_data_key_for_prefix_row(&prefix, &row_id);
+            let key = self.routed_data_key_for_row_id(&table_name_str, &row_id);
             if let Some(v) = txn.get(key.as_bytes()).await? {
                 vec![(key.into_bytes(), v)]
             } else {
@@ -125,7 +124,8 @@ impl Executor {
             }
         } else {
             // Full Scan Fallback
-            txn.scan_prefix(prefix.as_bytes(), None).await?
+            self.scan_routed_data_prefixes_for_table(&table_name_str, txn, None)
+                .await?
         };
 
         let mut updated_count = 0;
@@ -346,7 +346,6 @@ impl Executor {
         update: &sqlparser::ast::Update,
         table_name: &str,
         schema: &TableSchema,
-        prefix: &str,
         row_id: &str,
         txn: &mut dyn Transaction,
         params: &[Value],
@@ -421,7 +420,7 @@ impl Executor {
             return Ok(None);
         }
 
-        let key = update_data_key_for_prefix_row(prefix, row_id);
+        let key = self.routed_data_key_for_row_id(table_name, row_id);
         let Some(value) = txn.get(key.as_bytes()).await? else {
             return Ok(Some(QueryResult::Success {
                 message: "Updated 0 rows".to_string(),

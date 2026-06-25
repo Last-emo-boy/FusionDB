@@ -16,9 +16,10 @@ pub(crate) use foreign_key::ForeignKeyMeta;
 use crate::ai::embedding::EmbeddingRegistry;
 use crate::common::{FusionError, Result, Value};
 use crate::config::StorageConfig;
+use crate::distributed::sharding::ShardRouter;
 use crate::monitor;
 use crate::parser::parse_sql;
-use crate::storage::{vector_index::VectorIndex, FusionStorage, Storage, Transaction};
+use crate::storage::{vector_index::VectorIndex, FusionStorage, ScanVisitor, Storage, Transaction};
 use moka::sync::Cache;
 use parking_lot::RwLock;
 use sqlparser::ast::{
@@ -65,8 +66,24 @@ struct CachedSelectResult {
     rows: Vec<Vec<Value>>,
 }
 
+struct StopAwareScanVisitor<'a> {
+    inner: &'a mut dyn ScanVisitor,
+    stopped: bool,
+}
+
+impl ScanVisitor for StopAwareScanVisitor<'_> {
+    fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let keep_scanning = self.inner.visit(key, value);
+        if !keep_scanning {
+            self.stopped = true;
+        }
+        keep_scanning
+    }
+}
+
 pub struct Executor {
     pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) shard_router: Option<ShardRouter>,
     statement_cache: Cache<String, Vec<Statement>>,
     query_result_cache: Cache<String, CachedSelectResult>,
     simple_pk_update_fast_path_cache: Cache<String, bool>,
@@ -133,6 +150,14 @@ impl Executor {
     }
 
     pub fn with_config(storage: Arc<dyn Storage>, config: &StorageConfig) -> Self {
+        Self::with_config_and_shard_router(storage, config, None)
+    }
+
+    pub fn with_config_and_shard_router(
+        storage: Arc<dyn Storage>,
+        config: &StorageConfig,
+        shard_router: Option<ShardRouter>,
+    ) -> Self {
         let shared_vector_index = storage
             .as_any()
             .downcast_ref::<FusionStorage>()
@@ -141,6 +166,7 @@ impl Executor {
 
         Self {
             storage,
+            shard_router,
             statement_cache: Cache::new(config.statement_cache_capacity),
             query_result_cache: Cache::new(config.statement_cache_capacity.max(1)),
             simple_pk_update_fast_path_cache: Cache::new(config.statement_cache_capacity.max(1)),
@@ -150,6 +176,124 @@ impl Executor {
             vector_index: shared_vector_index,
             embedding_registry: Arc::new(EmbeddingRegistry::new()),
         }
+    }
+
+    fn legacy_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
+        let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
+        key.push_str("data:");
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(row_id);
+        key
+    }
+
+    fn legacy_data_prefix_for_table(table_name: &str) -> String {
+        let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
+        prefix.push_str("data:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn sharded_data_prefix_for_table(shard_id: u64, table_name: &str) -> String {
+        let shard = shard_id.to_string();
+        let mut prefix = String::with_capacity(
+            "shard:".len() + shard.len() + ":data:".len() + table_name.len() + 1,
+        );
+        prefix.push_str("shard:");
+        prefix.push_str(&shard);
+        prefix.push_str(":data:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    pub(crate) fn routed_data_key_for_row_id(&self, table_name: &str, row_id: &str) -> String {
+        if let Some(router) = &self.shard_router {
+            let route = router.route_key(table_name, row_id);
+            let mut key = Self::sharded_data_prefix_for_table(route.shard_id, table_name);
+            key.reserve(row_id.len());
+            key.push_str(row_id);
+            return key;
+        }
+
+        Self::legacy_data_key_for_row_id(table_name, row_id)
+    }
+
+    pub(crate) fn routed_data_prefixes_for_table(&self, table_name: &str) -> Vec<String> {
+        if let Some(router) = &self.shard_router {
+            let shard_count = router.shard_count();
+            let mut prefixes = Vec::with_capacity(shard_count as usize);
+            for shard_id in 0..shard_count {
+                prefixes.push(Self::sharded_data_prefix_for_table(shard_id, table_name));
+            }
+            return prefixes;
+        }
+
+        vec![Self::legacy_data_prefix_for_table(table_name)]
+    }
+
+    pub(crate) async fn scan_routed_data_prefixes_for_table(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut pairs = Vec::new();
+        for prefix in self.routed_data_prefixes_for_table(table_name) {
+            let remaining = limit.map(|limit| limit.saturating_sub(pairs.len()));
+            if remaining == Some(0) {
+                break;
+            }
+            let mut shard_pairs = txn.scan_prefix(prefix.as_bytes(), remaining).await?;
+            pairs.append(&mut shard_pairs);
+            if limit.is_some_and(|limit| pairs.len() >= limit) {
+                break;
+            }
+        }
+        Ok(pairs)
+    }
+
+    pub(crate) async fn scan_routed_data_prefixes_for_each(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        let mut visited = 0usize;
+        for prefix in self.routed_data_prefixes_for_table(table_name) {
+            let remaining = limit.map(|limit| limit.saturating_sub(visited));
+            if remaining == Some(0) {
+                break;
+            }
+            let mut stop_aware = StopAwareScanVisitor {
+                inner: visitor,
+                stopped: false,
+            };
+            visited += txn
+                .scan_prefix_for_each(prefix.as_bytes(), remaining, &mut stop_aware)
+                .await?;
+            if stop_aware.stopped {
+                break;
+            }
+            if limit.is_some_and(|limit| visited >= limit) {
+                break;
+            }
+        }
+        Ok(visited)
+    }
+
+    pub(crate) async fn count_routed_data_prefixes_for_table(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<usize> {
+        let mut count = 0usize;
+        for prefix in self.routed_data_prefixes_for_table(table_name) {
+            count = count.saturating_add(txn.count_prefix(prefix.as_bytes()).await?);
+        }
+        Ok(count)
     }
 
     pub(crate) fn invalidate_query_result_cache(&self) {
@@ -1383,6 +1527,19 @@ mod tests {
         result
     }
 
+    fn sharded_test_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.distributed.enabled = true;
+        config.distributed.node_id = 1;
+        config.distributed.sharding = crate::config::ShardingConfig {
+            enabled: true,
+            strategy: crate::config::ShardingStrategy::Hash,
+            shard_count: 4,
+            range_boundaries: Vec::new(),
+        };
+        config
+    }
+
     #[test]
     fn statement_permissions_preserve_preallocated_entries() {
         assert_eq!(
@@ -1478,5 +1635,118 @@ mod tests {
             Some(CacheableAggregateFunction::Value)
         );
         assert_eq!(cacheable_aggregate_function_kind(&qualified), None);
+    }
+
+    #[tokio::test]
+    async fn sharded_executor_uses_physical_shard_data_keys_for_crud() {
+        let wal_path = format!("test_sharded_executor_crud_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let config = sharded_test_config();
+        let shard_router =
+            crate::distributed::sharding::ShardRouter::from_config(&config).expect("router");
+        let executor = Executor::with_config_and_shard_router(
+            storage.clone(),
+            &crate::config::StorageConfig::default(),
+            Some(shard_router),
+        );
+
+        executor
+            .execute_sql(
+                "CREATE TABLE sharded_users (id INTEGER PRIMARY KEY, name TEXT); \
+                 INSERT INTO sharded_users VALUES (1, 'alice'); \
+                 INSERT INTO sharded_users VALUES (2, 'bob')",
+            )
+            .await
+            .expect("create and insert");
+
+        let first_row_id = crate::common::encoding::encode_i64_comparable(1);
+        let first_sharded_key = executor.routed_data_key_for_row_id("sharded_users", &first_row_id);
+        {
+            let txn = storage.begin_transaction().await.expect("begin txn");
+            assert!(txn
+                .get(first_sharded_key.as_bytes())
+                .await
+                .expect("get sharded key")
+                .is_some());
+            assert!(txn
+                .get(b"data:sharded_users:10000000000000001")
+                .await
+                .expect("get legacy key")
+                .is_none());
+        }
+
+        let selected = executor
+            .execute_sql("SELECT name FROM sharded_users WHERE id = 1")
+            .await
+            .expect("select");
+        match selected.as_slice() {
+            [QueryResult::Select { columns, rows }] => {
+                assert_eq!(columns, &vec!["name".to_string()]);
+                assert_eq!(rows, &vec![vec![Value::String("alice".to_string())]]);
+            }
+            other => panic!("expected select result, got {other:?}"),
+        }
+
+        executor
+            .execute_sql("UPDATE sharded_users SET name = 'carol' WHERE id = 1")
+            .await
+            .expect("update");
+        let counted = executor
+            .execute_sql("SELECT COUNT(*) FROM sharded_users")
+            .await
+            .expect("count");
+        match counted.as_slice() {
+            [QueryResult::Select { columns, rows }] => {
+                assert_eq!(columns, &vec!["COUNT(*)".to_string()]);
+                assert_eq!(rows, &vec![vec![Value::Integer(2)]]);
+            }
+            other => panic!("expected count result, got {other:?}"),
+        }
+
+        let analyzed = executor
+            .execute_sql("ANALYZE TABLE sharded_users COMPUTE STATISTICS")
+            .await
+            .expect("analyze");
+        match analyzed.as_slice() {
+            [QueryResult::Success { message }] => {
+                assert!(message.contains("2 rows"));
+            }
+            other => panic!("expected analyze success, got {other:?}"),
+        }
+
+        executor
+            .execute_sql("CREATE INDEX idx_sharded_users_name ON sharded_users (name)")
+            .await
+            .expect("create index");
+        let index_lookup = executor
+            .execute_sql("SELECT id FROM sharded_users WHERE name = 'bob'")
+            .await
+            .expect("secondary index lookup");
+        match index_lookup.as_slice() {
+            [QueryResult::Select { columns, rows }] => {
+                assert_eq!(columns, &vec!["id".to_string()]);
+                assert_eq!(rows, &vec![vec![Value::Integer(2)]]);
+            }
+            other => panic!("expected indexed select result, got {other:?}"),
+        }
+
+        executor
+            .execute_sql("DELETE FROM sharded_users WHERE id = 1")
+            .await
+            .expect("delete");
+        let remaining = executor
+            .execute_sql("SELECT name FROM sharded_users WHERE id = 1")
+            .await
+            .expect("select deleted");
+        match remaining.as_slice() {
+            [QueryResult::Select { columns, rows }] => {
+                assert_eq!(columns, &vec!["name".to_string()]);
+                assert!(rows.is_empty());
+            }
+            other => panic!("expected empty select result, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(wal_path);
     }
 }

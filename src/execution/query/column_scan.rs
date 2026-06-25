@@ -49,6 +49,7 @@ pub(super) struct ColumnPredicateScanPlan {
     column_indices: Vec<usize>,
 }
 
+#[cfg(test)]
 fn column_scan_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
     key.push_str("data:");
@@ -58,6 +59,7 @@ fn column_scan_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn column_scan_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -866,7 +868,6 @@ impl Executor {
             }
         }
 
-        let prefix = column_scan_data_prefix_for_table(table_name);
         let mut states = column_aggregate_states(plans);
 
         let scan_error = {
@@ -877,7 +878,7 @@ impl Executor {
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
                 error: None,
             };
-            txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
+            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
             visitor.error
         };
@@ -942,7 +943,7 @@ impl Executor {
             let Some(row_id) = Self::value_to_primary_row_id(&value) else {
                 return Ok(None);
             };
-            let data_key = column_scan_data_key_for_row_id(table_name, &row_id);
+            let data_key = self.routed_data_key_for_row_id(table_name, &row_id);
             if let Some(data) = txn.get(data_key.as_bytes()).await? {
                 visitor.visit_row(&data)?;
             }
@@ -954,7 +955,7 @@ impl Executor {
                 let Some(row_id) = Self::row_id_from_key(&key) else {
                     continue;
                 };
-                let data_key = column_scan_data_key_for_row_id(table_name, row_id);
+                let data_key = self.routed_data_key_for_row_id(table_name, row_id);
                 if let Some(data) = txn.get(data_key.as_bytes()).await? {
                     visitor.visit_row(&data)?;
                 }
@@ -1123,8 +1124,9 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<i64> {
-        let prefix = column_scan_data_prefix_for_table(table_name);
-        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let kv_pairs = self
+            .scan_routed_data_prefixes_for_table(table_name, txn, None)
+            .await?;
         let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
         let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
 
@@ -1208,8 +1210,9 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
-        let prefix = column_scan_data_prefix_for_table(table_name);
-        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let kv_pairs = self
+            .scan_routed_data_prefixes_for_table(table_name, txn, None)
+            .await?;
         let distinct_capacity = kv_pairs.len().min(4096);
         let mut seen = HashSet::with_capacity(distinct_capacity);
         let mut rows = Vec::with_capacity(distinct_capacity);
@@ -1310,7 +1313,6 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
-        let prefix = column_scan_data_prefix_for_table(table_name);
         let mut counts: HashMap<Value, i64> = HashMap::with_capacity(4096);
 
         let scan_error = {
@@ -1321,7 +1323,7 @@ impl Executor {
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
                 error: None,
             };
-            txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
+            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
             visitor.error
         };
@@ -1504,7 +1506,6 @@ impl Executor {
                 .await;
         }
 
-        let prefix = column_scan_data_prefix_for_table(table_name);
         let mut groups: HashMap<Vec<Value>, Vec<GroupColumnAggregateState>> =
             HashMap::with_capacity(4096);
 
@@ -1517,7 +1518,7 @@ impl Executor {
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
                 error: None,
             };
-            txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
+            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
             visitor.error
         };
@@ -1544,7 +1545,6 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
-        let prefix = column_scan_data_prefix_for_table(table_name);
         let mut groups: HashMap<Value, Vec<GroupColumnAggregateState>> =
             HashMap::with_capacity(4096);
 
@@ -1557,7 +1557,7 @@ impl Executor {
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
                 error: None,
             };
-            txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
+            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
             visitor.error
         };

@@ -6,6 +6,7 @@ use sqlparser::ast::{ColumnOption, ColumnOptionDef, ForeignKeyConstraint, Ident,
 
 use super::Executor;
 
+#[cfg(test)]
 fn foreign_key_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
     key.push_str("data:");
@@ -15,6 +16,7 @@ fn foreign_key_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn foreign_key_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -470,7 +472,7 @@ impl Executor {
             let parent_idx = schema.get_column_index(&parent_columns[0]).unwrap();
             if schema.get_primary_key_index() == Some(parent_idx) {
                 if let Some(row_id) = Self::value_to_primary_row_id(&values[0]) {
-                    let key = foreign_key_data_key_for_row_id(parent_table, &row_id);
+                    let key = self.routed_data_key_for_row_id(parent_table, &row_id);
                     return Ok(txn.get(key.as_bytes()).await?.is_some());
                 }
                 return Ok(false);
@@ -490,7 +492,7 @@ impl Executor {
                 continue;
             }
             if let Some(row_id) = self.composite_index_value_key_for_meta_values(&index, values) {
-                let key = foreign_key_data_key_for_row_id(parent_table, &row_id);
+                let key = self.routed_data_key_for_row_id(parent_table, &row_id);
                 if txn.get(key.as_bytes()).await?.is_some() {
                     return Ok(true);
                 }
@@ -553,8 +555,9 @@ impl Executor {
             };
             column_indexes.push(column_idx);
         }
-        let prefix = foreign_key_data_prefix_for_table(table_name);
-        let rows = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let rows = self
+            .scan_routed_data_prefixes_for_table(table_name, txn, None)
+            .await?;
         for (key, bytes) in rows {
             let row = if let Ok(key_str) = std::str::from_utf8(&key) {
                 if let Some(row) = self.row_cache.get(key_str) {

@@ -48,6 +48,7 @@ fn query_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn aggregate_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -2197,11 +2198,12 @@ impl Executor {
                                                         Some(&aggregate_qualifiers),
                                                     )
                                                 {
-                                                    let prefix = aggregate_data_prefix_for_table(
-                                                        &table_name_str,
-                                                    );
-                                                    let count =
-                                                        txn.count_prefix(prefix.as_bytes()).await?;
+                                                    let count = self
+                                                        .count_routed_data_prefixes_for_table(
+                                                            &table_name_str,
+                                                            txn,
+                                                        )
+                                                        .await?;
                                                     result_row.push(Value::Integer(count as i64));
                                                     col_names.push(format!("{}", func));
                                                     item_handled = true;
@@ -2215,30 +2217,49 @@ impl Executor {
                                                         &schema,
                                                         Some(&aggregate_qualifiers),
                                                     ) {
-                                                        let prefix =
-                                                            aggregate_data_prefix_for_table(
+                                                        let column = &schema.columns[idx];
+                                                        let mut best = None;
+                                                        for prefix in self
+                                                            .routed_data_prefixes_for_table(
                                                                 &table_name_str,
-                                                            );
-                                                        let min_key = prefix.as_bytes().to_vec();
-                                                        let mut max_key =
-                                                            prefix.as_bytes().to_vec();
-                                                        max_key.push(0xFF);
-
-                                                        let res = if func_name == "MIN" {
-                                                            txn.first(&min_key, &max_key).await?
-                                                        } else {
-                                                            txn.last(&min_key, &max_key).await?
-                                                        };
-
-                                                        let val = if let Some((key, _)) = res {
-                                                            let column = &schema.columns[idx];
-                                                            Self::primary_key_value_from_data_key(
-                                                                &key, &prefix, column,
                                                             )
-                                                            .unwrap_or(Value::Null)
-                                                        } else {
-                                                            Value::Null
-                                                        };
+                                                        {
+                                                            let min_key =
+                                                                prefix.as_bytes().to_vec();
+                                                            let mut max_key =
+                                                                prefix.as_bytes().to_vec();
+                                                            max_key.push(0xFF);
+
+                                                            let res = if func_name == "MIN" {
+                                                                txn.first(&min_key, &max_key)
+                                                                    .await?
+                                                            } else {
+                                                                txn.last(&min_key, &max_key).await?
+                                                            };
+
+                                                            if let Some((key, _)) = res {
+                                                                let value = Self::primary_key_value_from_data_key(
+                                                                    &key, &prefix, column,
+                                                                )
+                                                                .unwrap_or(Value::Null);
+                                                                let replace =
+                                                                    best.as_ref().is_none_or(
+                                                                        |current: &Value| {
+                                                                            let ordering = value
+                                                                                .compare(current);
+                                                                            if func_name == "MIN" {
+                                                                                ordering.is_lt()
+                                                                            } else {
+                                                                                ordering.is_gt()
+                                                                            }
+                                                                        },
+                                                                    );
+                                                                if replace {
+                                                                    best = Some(value);
+                                                                }
+                                                            }
+                                                        }
+                                                        let val = best.unwrap_or(Value::Null);
                                                         result_row.push(val);
                                                         col_names.push(format!("{}", func));
                                                         item_handled = true;

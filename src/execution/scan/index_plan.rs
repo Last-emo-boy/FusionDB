@@ -19,6 +19,7 @@ pub(crate) struct IndexScanPlan {
 }
 
 impl Executor {
+    #[cfg(test)]
     fn data_key_for_row_id(table_name: &str, row_id: &str) -> String {
         let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
         key.push_str("data:");
@@ -28,6 +29,7 @@ impl Executor {
         key
     }
 
+    #[cfg(test)]
     fn data_key_upper_bound_for_row_id(table_name: &str, row_id: &str) -> String {
         let mut key =
             String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len() + 1);
@@ -364,7 +366,7 @@ impl Executor {
         row_id: &str,
         txn: &mut dyn Transaction,
     ) -> Result<Option<Vec<Value>>> {
-        let data_key = Self::data_key_for_row_id(table_name, row_id);
+        let data_key = self.routed_data_key_for_row_id(table_name, row_id);
         if let Some(row) = self.row_cache.get(&data_key) {
             monitor::inc_row_cache_hit();
             return Ok(Some(row));
@@ -604,7 +606,7 @@ impl Executor {
                                 if col.is_primary {
                                     let val_str = Self::value_to_primary_row_id(&val);
                                     if let Some(s) = val_str {
-                                        let key = Self::data_key_for_row_id(table_name, &s);
+                                        let key = self.routed_data_key_for_row_id(table_name, &s);
                                         if txn.get(key.as_bytes()).await?.is_some() {
                                             all_row_ids.insert(s);
                                         }
@@ -652,10 +654,24 @@ impl Executor {
                                 let col = &schema.columns[col_idx];
                                 if col.is_indexed {
                                     let all_row_ids = if col.is_primary {
-                                        let key_prefix =
-                                            Self::data_key_for_row_id(table_name, &prefix);
-                                        let kv =
-                                            txn.scan_prefix(key_prefix.as_bytes(), limit).await?;
+                                        let mut kv = Vec::new();
+                                        for mut key_prefix in
+                                            self.routed_data_prefixes_for_table(table_name)
+                                        {
+                                            key_prefix.push_str(&prefix);
+                                            let remaining =
+                                                limit.map(|limit| limit.saturating_sub(kv.len()));
+                                            if remaining == Some(0) {
+                                                break;
+                                            }
+                                            let mut scanned = txn
+                                                .scan_prefix(key_prefix.as_bytes(), remaining)
+                                                .await?;
+                                            kv.append(&mut scanned);
+                                            if limit.is_some_and(|limit| kv.len() >= limit) {
+                                                break;
+                                            }
+                                        }
                                         let mut row_ids = HashSet::with_capacity(kv.len());
                                         for (k, _) in kv {
                                             if let Some(row_id) = Self::row_id_from_key(&k) {
@@ -751,12 +767,25 @@ impl Executor {
                             let high_encoded = Self::value_to_primary_row_id(&high_val);
 
                             if let (Some(low_key), Some(high_key)) = (low_encoded, high_encoded) {
-                                let start = Self::data_key_for_row_id(table_name, &low_key);
-                                let end =
-                                    Self::data_key_upper_bound_for_row_id(table_name, &high_key);
-                                let kv = txn
-                                    .scan_range(start.as_bytes(), end.as_bytes(), limit)
-                                    .await?;
+                                let mut kv = Vec::new();
+                                for prefix in self.routed_data_prefixes_for_table(table_name) {
+                                    let mut start = prefix.as_bytes().to_vec();
+                                    start.extend_from_slice(low_key.as_bytes());
+                                    let mut end = prefix.as_bytes().to_vec();
+                                    end.extend_from_slice(high_key.as_bytes());
+                                    end.push(0);
+                                    let remaining =
+                                        limit.map(|limit| limit.saturating_sub(kv.len()));
+                                    if remaining == Some(0) {
+                                        break;
+                                    }
+                                    let mut scanned =
+                                        txn.scan_range(&start, &end, remaining).await?;
+                                    kv.append(&mut scanned);
+                                    if limit.is_some_and(|limit| kv.len() >= limit) {
+                                        break;
+                                    }
+                                }
                                 let mut row_ids = HashSet::with_capacity(kv.len());
                                 for (k, _) in kv {
                                     if let Some(row_id) = Self::row_id_from_key(&k) {

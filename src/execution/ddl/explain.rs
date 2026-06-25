@@ -31,6 +31,7 @@ impl ExplainAccessPath {
     }
 }
 
+#[cfg(test)]
 fn explain_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -649,8 +650,7 @@ impl Executor {
             let base_rows = if let Some(stats) = &stats {
                 stats.row_count
             } else {
-                let data_prefix = explain_data_prefix_for_table(&table_name);
-                txn.count_prefix(data_prefix.as_bytes())
+                self.count_routed_data_prefixes_for_table(&table_name, txn)
                     .await
                     .unwrap_or(usize::MAX)
             };

@@ -837,7 +837,7 @@ cluster_name = "fusiondb"  # OpenRaft cluster name
 initial_members = []       # Optional [{ node_id = 1, addr = "127.0.0.1:8091" }]
 
 [distributed.sharding]
-enabled = false            # Enable shard map and routing metadata
+enabled = false            # Enable shard map, routing metadata, and local row shard layout
 strategy = "hash"          # "hash" or "range"
 shard_count = 16           # Hash shard count; range uses boundaries + 1
 range_boundaries = []      # Optional lexicographic range upper bounds
@@ -1005,7 +1005,8 @@ These are known gaps that should be addressed before production use:
 - OpenRaft can be enabled via `[distributed]`, with `/raft/*` HTTP RPCs, leader-forwarded writes, and local follower reads
 - Raft log/state metadata is currently in-memory and intended as the control-plane wiring foundation
 - Snapshot transfer serializes visible key-value state for new node bootstrap
-- Sharding has a configurable hash/range control plane and route API; physical table/index partitioning is still in progress
+- Sharding has a configurable hash/range control plane, route API, and local row-data shard key layout (`shard:{id}:data:{table}:{row_id}`)
+- Secondary index partitioning and cross-node SQL execution routing are still in progress
 - No dedicated read-replica topology management
 - No distributed transactions (2PC)
 
@@ -1031,7 +1032,7 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 | **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
 | **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
 | **4. Performance** | ✅ Done | Connection slots, parallel scan, LZ4 SSTable compression, cost-based optimizer |
-| **5. Distributed** | 🔲 Planned | OpenRaft main-loop wiring and snapshot transfer; automatic sharding remains |
+| **5. Distributed** | 🔲 In progress | OpenRaft main-loop wiring and snapshot transfer; sharding control plane plus local row-data shard layout |
 | **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
 
 ---

@@ -12,6 +12,7 @@ fn analyze_distinct_capacity(row_count: usize) -> usize {
     row_count.min(ANALYZE_DISTINCT_PREALLOC_LIMIT)
 }
 
+#[cfg(test)]
 fn analyze_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -99,8 +100,9 @@ impl Executor {
         schema: &TableSchema,
         txn: &mut dyn Transaction,
     ) -> Result<TableStats> {
-        let prefix = analyze_data_prefix_for_table(table_name);
-        let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let kv_pairs = self
+            .scan_routed_data_prefixes_for_table(table_name, txn, None)
+            .await?;
         let distinct_capacity = analyze_distinct_capacity(kv_pairs.len());
         let mut collectors = Vec::with_capacity(schema.columns.len());
         for column in &schema.columns {

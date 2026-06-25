@@ -6,6 +6,7 @@ use sqlparser::ast::TableFactor;
 
 use super::super::{Executor, QueryResult};
 
+#[cfg(test)]
 fn delete_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -14,6 +15,7 @@ fn delete_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
+#[cfg(test)]
 fn delete_data_key_for_prefix_row(prefix: &str, row_id: &str) -> String {
     let mut key = String::with_capacity(prefix.len() + row_id.len());
     key.push_str(prefix);
@@ -103,7 +105,6 @@ impl Executor {
         let schema: TableSchema = bincode::deserialize(&schema_bytes)
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
 
-        let prefix = delete_data_prefix_for_table(&table_name_str);
         let allowed_qualifiers = match &delete.from {
             sqlparser::ast::FromTable::WithFromKeyword(tables) => tables
                 .first()
@@ -135,7 +136,7 @@ impl Executor {
                 && parent_foreign_keys.is_empty();
             if no_secondary_indexes {
                 if let Some(row_id) = &target_row_id {
-                    let key = delete_data_key_for_prefix_row(&prefix, row_id);
+                    let key = self.routed_data_key_for_row_id(&table_name_str, row_id);
                     if txn.get(key.as_bytes()).await?.is_some() {
                         txn.delete(key.as_bytes()).await?;
                         self.row_cache.invalidate(&key);
@@ -150,7 +151,9 @@ impl Executor {
                 }
 
                 if delete.selection.is_none() {
-                    let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                    let kv_pairs = self
+                        .scan_routed_data_prefixes_for_table(&table_name_str, txn, None)
+                        .await?;
                     let deleted_count = kv_pairs.len();
                     for (k, _) in kv_pairs {
                         txn.delete(&k).await?;
@@ -167,14 +170,15 @@ impl Executor {
         }
 
         let kv_pairs = if let Some(row_id) = target_row_id {
-            let key = delete_data_key_for_prefix_row(&prefix, &row_id);
+            let key = self.routed_data_key_for_row_id(&table_name_str, &row_id);
             if let Some(v) = txn.get(key.as_bytes()).await? {
                 vec![(key.into_bytes(), v)]
             } else {
                 vec![]
             }
         } else {
-            txn.scan_prefix(prefix.as_bytes(), None).await?
+            self.scan_routed_data_prefixes_for_table(&table_name_str, txn, None)
+                .await?
         };
 
         let mut deleted_count = 0;

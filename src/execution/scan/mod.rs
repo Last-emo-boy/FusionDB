@@ -164,6 +164,7 @@ impl Executor {
         TableSchema::new(table_name, schema_columns)
     }
 
+    #[cfg(test)]
     fn scan_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
         let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
         key.push_str("data:");
@@ -173,6 +174,7 @@ impl Executor {
         key
     }
 
+    #[cfg(test)]
     fn scan_data_prefix_for_table(table_name: &str) -> String {
         let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
         prefix.push_str("data:");
@@ -330,8 +332,9 @@ impl Executor {
                         FusionError::Execution(format!("Schema deserialization error: {}", e))
                     })?;
 
-                    let prefix = Self::scan_data_prefix_for_table(&table_name);
-                    let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                    let kv_pairs = self
+                        .scan_routed_data_prefixes_for_table(&table_name, txn, None)
+                        .await?;
                     let mut rows = Vec::with_capacity(kv_pairs.len());
                     for (k, v) in kv_pairs {
                         let row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
@@ -805,7 +808,7 @@ impl Executor {
                                                         .search(&idx_name, &query_vec, l)?;
 
                                                     for (id, _dist) in search_results {
-                                                        let key = Self::scan_data_key_for_row_id(
+                                                        let key = self.routed_data_key_for_row_id(
                                                             &table_name,
                                                             &id,
                                                         );
@@ -878,7 +881,7 @@ impl Executor {
                             };
 
                             if let Some(id) = row_id {
-                                let key = Self::scan_data_key_for_row_id(&table_name, &id);
+                                let key = self.routed_data_key_for_row_id(&table_name, &id);
 
                                 if key_only_scan {
                                     if txn.get(key.as_bytes()).await?.is_some() {
@@ -975,64 +978,63 @@ impl Executor {
                                     Value::Timestamp(micros) => Some(micros),
                                     _ => None,
                                 } {
-                                    let table_prefix =
-                                        Self::scan_data_prefix_for_table(&table_name);
-                                    let min_key = table_prefix.as_bytes().to_vec();
-                                    let mut max_key = table_prefix.as_bytes().to_vec();
-                                    max_key.push(0xFF);
+                                    let encoded =
+                                        crate::common::encoding::encode_i64_comparable(limit_val);
+                                    let mut kv_pairs = Vec::new();
+                                    for table_prefix in
+                                        self.routed_data_prefixes_for_table(&table_name)
+                                    {
+                                        let min_key = table_prefix.as_bytes().to_vec();
+                                        let mut max_key = table_prefix.as_bytes().to_vec();
+                                        max_key.push(0xFF);
 
-                                    let (start_key, end_key) = match range_op {
-                                        BinaryOperator::Gt => {
-                                            let encoded =
-                                                crate::common::encoding::encode_i64_comparable(
-                                                    limit_val,
-                                                );
-                                            let mut key = table_prefix.into_bytes();
-                                            key.extend_from_slice(encoded.as_bytes());
-                                            key.push(0x00);
-                                            (Some(key), Some(max_key))
-                                        }
-                                        BinaryOperator::GtEq => {
-                                            let encoded =
-                                                crate::common::encoding::encode_i64_comparable(
-                                                    limit_val,
-                                                );
-                                            let mut key = table_prefix.into_bytes();
-                                            key.extend_from_slice(encoded.as_bytes());
-                                            (Some(key), Some(max_key))
-                                        }
-                                        BinaryOperator::Lt => {
-                                            let encoded =
-                                                crate::common::encoding::encode_i64_comparable(
-                                                    limit_val,
-                                                );
-                                            let mut key = table_prefix.into_bytes();
-                                            key.extend_from_slice(encoded.as_bytes());
-                                            (Some(min_key), Some(key))
-                                        }
-                                        BinaryOperator::LtEq => {
-                                            let encoded =
-                                                crate::common::encoding::encode_i64_comparable(
-                                                    limit_val,
-                                                );
-                                            let mut key = table_prefix.into_bytes();
-                                            key.extend_from_slice(encoded.as_bytes());
-                                            key.push(0x00);
-                                            (Some(min_key), Some(key))
-                                        }
-                                        _ => (None, None),
-                                    };
+                                        let (start_key, end_key) = match range_op {
+                                            BinaryOperator::Gt => {
+                                                let mut key = table_prefix.into_bytes();
+                                                key.extend_from_slice(encoded.as_bytes());
+                                                key.push(0x00);
+                                                (Some(key), Some(max_key))
+                                            }
+                                            BinaryOperator::GtEq => {
+                                                let mut key = table_prefix.into_bytes();
+                                                key.extend_from_slice(encoded.as_bytes());
+                                                (Some(key), Some(max_key))
+                                            }
+                                            BinaryOperator::Lt => {
+                                                let mut key = table_prefix.into_bytes();
+                                                key.extend_from_slice(encoded.as_bytes());
+                                                (Some(min_key), Some(key))
+                                            }
+                                            BinaryOperator::LtEq => {
+                                                let mut key = table_prefix.into_bytes();
+                                                key.extend_from_slice(encoded.as_bytes());
+                                                key.push(0x00);
+                                                (Some(min_key), Some(key))
+                                            }
+                                            _ => (None, None),
+                                        };
 
-                                    if let (Some(start), Some(end)) = (start_key, end_key) {
+                                        if let (Some(start), Some(end)) = (start_key, end_key) {
+                                            let remaining = limit
+                                                .map(|limit| limit.saturating_sub(kv_pairs.len()));
+                                            if remaining == Some(0) {
+                                                break;
+                                            }
+                                            let mut scanned =
+                                                txn.scan_range(&start, &end, remaining).await?;
+                                            kv_pairs.append(&mut scanned);
+                                            if limit.is_some_and(|limit| kv_pairs.len() >= limit) {
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if !kv_pairs.is_empty() {
                                         index_used = true;
                                         selection_fully_applied = true;
-                                        let kv_pairs = txn.scan_range(&start, &end, limit).await?;
                                         for (k, v) in kv_pairs {
                                             let row = if key_only_scan {
-                                                let k_str = String::from_utf8_lossy(&k);
-                                                let prefix =
-                                                    Self::scan_data_prefix_for_table(&table_name);
-                                                if let Some(pk_str) = k_str.strip_prefix(&prefix) {
+                                                if let Some(pk_str) = Self::row_id_from_key(&k) {
                                                     Self::primary_key_row_from_id(
                                                         &schema, pk_index, pk_str,
                                                     )
@@ -1164,7 +1166,7 @@ impl Executor {
                                 {
                                     for row_id in row_ids_vec {
                                         let data_key =
-                                            Self::scan_data_key_for_row_id(&table_name, &row_id);
+                                            self.routed_data_key_for_row_id(&table_name, &row_id);
 
                                         let row = if let Some(row) = self.row_cache.get(&data_key) {
                                             monitor::inc_row_cache_hit();
@@ -1241,7 +1243,7 @@ impl Executor {
                                             let executor = executor_for_stream;
 
                                             async move {
-                                                let data_key = Self::scan_data_key_for_row_id(
+                                                let data_key = executor.routed_data_key_for_row_id(
                                                     table_name.as_ref(),
                                                     &row_id,
                                                 );
@@ -1301,7 +1303,7 @@ impl Executor {
                                             if read_storage {
                                                 monitor::inc_row_read();
                                                 if cacheable {
-                                                    let data_key = Self::scan_data_key_for_row_id(
+                                                    let data_key = self.routed_data_key_for_row_id(
                                                         &table_name,
                                                         &row_id,
                                                     );
@@ -1334,22 +1336,19 @@ impl Executor {
 
                 // Full Table Scan
                 if !index_used {
-                    let prefix_str = Self::scan_data_prefix_for_table(&table_name);
-                    let prefix = prefix_str.as_bytes().to_vec();
-
                     let scan_limit = if selection.is_none() {
                         effective_limit
                     } else {
                         None
                     };
 
-                    let kv_pairs = txn.scan_prefix(&prefix, scan_limit).await?;
+                    let kv_pairs = self
+                        .scan_routed_data_prefixes_for_table(&table_name, txn, scan_limit)
+                        .await?;
 
                     for (k, v) in kv_pairs {
                         let row_res = if key_only_scan {
-                            let k_str = String::from_utf8_lossy(&k);
-                            let prefix_str = String::from_utf8_lossy(&prefix);
-                            if let Some(pk_str) = k_str.strip_prefix(prefix_str.as_ref()) {
+                            if let Some(pk_str) = Self::row_id_from_key(&k) {
                                 Some(Self::primary_key_row_from_id(&schema, pk_index, pk_str))
                             } else {
                                 None

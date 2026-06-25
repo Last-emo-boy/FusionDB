@@ -24,6 +24,7 @@ impl TablePrimaryKeySpec {
     }
 }
 
+#[cfg(test)]
 fn table_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
     key.push_str("data:");
@@ -33,6 +34,7 @@ fn table_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn table_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -428,8 +430,9 @@ impl Executor {
 
             txn.delete(schema_key.as_bytes()).await?;
 
-            let prefix = table_data_prefix_for_table(&table_name);
-            let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+            let kv_pairs = self
+                .scan_routed_data_prefixes_for_table(&table_name, txn, None)
+                .await?;
             for (k, _) in kv_pairs {
                 txn.delete(&k).await?;
                 if let Ok(key_str) = std::str::from_utf8(&k) {
@@ -469,8 +472,9 @@ impl Executor {
                 )));
             }
 
-            let prefix = table_data_prefix_for_table(&table_name);
-            let kv_pairs = txn.scan_prefix(prefix.as_bytes(), None).await?;
+            let kv_pairs = self
+                .scan_routed_data_prefixes_for_table(&table_name, txn, None)
+                .await?;
             for (k, _) in &kv_pairs {
                 txn.delete(k).await?;
                 if let Ok(key_str) = std::str::from_utf8(k) {
@@ -595,8 +599,9 @@ impl Executor {
                                 schema.columns.remove(idx);
 
                                 // Rewrite existing rows: remove the column at idx
-                                let data_prefix = table_data_prefix_for_table(&table_name);
-                                let rows = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
+                                let rows = self
+                                    .scan_routed_data_prefixes_for_table(&table_name, txn, None)
+                                    .await?;
                                 for (k, v) in rows {
                                     let key_str = std::str::from_utf8(&k).ok();
                                     let row = if let Some(key_str) = key_str {
@@ -779,8 +784,9 @@ impl Executor {
             )));
         }
 
-        let data_prefix = table_data_prefix_for_table(table_name);
-        let rows = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
+        let rows = self
+            .scan_routed_data_prefixes_for_table(table_name, txn, None)
+            .await?;
         let mut seen = HashSet::with_capacity(rows.len());
         let mut rewrites = Vec::with_capacity(rows.len());
 
@@ -846,7 +852,7 @@ impl Executor {
         column.index_type = IndexType::BTree;
 
         for (old_key, old_row_id, new_row_id, value) in rewrites {
-            let new_key = table_data_key_for_row_id(table_name, &new_row_id);
+            let new_key = self.routed_data_key_for_row_id(table_name, &new_row_id);
             let old_key_str = std::str::from_utf8(&old_key)
                 .map_err(|e| FusionError::Execution(format!("Data key decode error: {}", e)))?
                 .to_string();
@@ -873,7 +879,9 @@ impl Executor {
             }
         }
 
-        let rows_after_rewrite = txn.scan_prefix(data_prefix.as_bytes(), None).await?;
+        let rows_after_rewrite = self
+            .scan_routed_data_prefixes_for_table(table_name, txn, None)
+            .await?;
         for (key, value) in rows_after_rewrite {
             let row_id = Self::row_id_from_key(&key)
                 .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?;

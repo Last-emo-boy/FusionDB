@@ -1,4 +1,5 @@
 use fusiondb::config::Config;
+use fusiondb::distributed::sharding::ShardRouter;
 use fusiondb::execution::Executor;
 use fusiondb::server;
 use fusiondb::storage::{FusionStorage, Storage};
@@ -70,7 +71,16 @@ async fn main() -> Result<()> {
     let storage: Arc<dyn Storage> = fusion.clone();
 
     // 4. Initialize Executor
-    let executor = Arc::new(Executor::with_config(storage.clone(), &config.storage));
+    let shard_router = if config.distributed.enabled {
+        ShardRouter::from_config(&config)
+    } else {
+        None
+    };
+    let executor = Arc::new(Executor::with_config_and_shard_router(
+        storage.clone(),
+        &config.storage,
+        shard_router,
+    ));
 
     // 5. Start Servers (returns shutdown handle)
     let shutdown_tx = server::start_server(executor, storage, &config).await;

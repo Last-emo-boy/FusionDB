@@ -21,6 +21,7 @@ fn join_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn join_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
     key.push_str("data:");
@@ -30,6 +31,7 @@ fn join_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     key
 }
 
+#[cfg(test)]
 fn join_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -701,7 +703,7 @@ impl Executor {
             let Some(row_id) = Self::value_to_primary_row_id(key_value) else {
                 return Ok(Vec::new());
             };
-            let data_key = join_data_key_for_row_id(table_name, &row_id);
+            let data_key = self.routed_data_key_for_row_id(table_name, &row_id);
             if let Some(row) = self.row_cache.get(&data_key) {
                 monitor::inc_row_cache_hit();
                 return Ok(vec![row]);
@@ -743,7 +745,7 @@ impl Executor {
                     rows.push(row);
                 }
             } else {
-                let data_key = join_data_key_for_row_id(table_name, row_id);
+                let data_key = self.routed_data_key_for_row_id(table_name, row_id);
                 if let Some(row) = self.row_cache.get(&data_key) {
                     monitor::inc_row_cache_hit();
                     rows.push(row);
@@ -976,8 +978,7 @@ impl Executor {
             let estimated_rows = if let Some(stats) = &stats {
                 stats.row_count
             } else {
-                let data_prefix = join_data_prefix_for_table(&table_name);
-                txn.count_prefix(data_prefix.as_bytes())
+                self.count_routed_data_prefixes_for_table(&table_name, txn)
                     .await
                     .unwrap_or(usize::MAX)
             };

@@ -17,6 +17,7 @@ struct InsertRowsContext {
     col_mapping: Option<Vec<usize>>,
 }
 
+#[cfg(test)]
 fn insert_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
     let mut key = String::with_capacity("data:".len() + table_name.len() + 1 + row_id.len());
     key.push_str("data:");
@@ -53,6 +54,7 @@ fn insert_index_key_for_value(
     key
 }
 
+#[cfg(test)]
 fn insert_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -108,8 +110,9 @@ impl Executor {
         column_idx: usize,
         txn: &mut dyn Transaction,
     ) -> Result<Value> {
-        let prefix = insert_data_prefix_for_table(table_name);
-        let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        let existing = self
+            .scan_routed_data_prefixes_for_table(table_name, txn, None)
+            .await?;
         let mut max_seen = 0_i64;
         for (key, value) in existing {
             let candidate = if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -377,8 +380,9 @@ impl Executor {
 
         for (idx, col) in context.schema.columns.iter().enumerate() {
             if col.is_unique && !col.is_primary && row_values[idx] != Value::Null {
-                let prefix = insert_data_prefix_for_table(&context.table_name);
-                let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                let existing = self
+                    .scan_routed_data_prefixes_for_table(&context.table_name, txn, None)
+                    .await?;
                 for (k, v) in &existing {
                     let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
                         if let Some(row) = self.row_cache.get(key_str) {
@@ -417,7 +421,7 @@ impl Executor {
             context.table_name, row_index, row_id
         ));
 
-        let key = insert_data_key_for_row_id(&context.table_name, &row_id);
+        let key = self.routed_data_key_for_row_id(&context.table_name, &row_id);
 
         if let Some(OnInsert::OnConflict(oc)) = on_conflict {
             if let Some(existing_bytes) = txn.get(key.as_bytes()).await? {
@@ -793,8 +797,9 @@ impl Executor {
                     for (idx, col) in schema.columns.iter().enumerate() {
                         if col.is_unique && !col.is_primary && row_values[idx] != Value::Null {
                             // Scan existing rows for duplicate value
-                            let prefix = insert_data_prefix_for_table(&table_name_str);
-                            let existing = txn.scan_prefix(prefix.as_bytes(), None).await?;
+                            let existing = self
+                                .scan_routed_data_prefixes_for_table(&table_name_str, txn, None)
+                                .await?;
                             for (k, v) in &existing {
                                 let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
                                     if let Some(row) = self.row_cache.get(key_str) {
@@ -834,7 +839,7 @@ impl Executor {
                         table_name_str, count, row_id
                     ));
 
-                    let key = insert_data_key_for_row_id(&table_name_str, &row_id);
+                    let key = self.routed_data_key_for_row_id(&table_name_str, &row_id);
 
                     // Handle ON CONFLICT (UPSERT)
                     if let Some(sqlparser::ast::OnInsert::OnConflict(oc)) = on_conflict {
@@ -1101,7 +1106,7 @@ impl Executor {
                     let row_values = self.coerce_row_to_schema(row_values, &schema)?;
                     let row_id =
                         self.row_id_for_insert(&schema, &row_values, &composite_unique_indexes);
-                    let key = insert_data_key_for_row_id(&table_name_str, &row_id);
+                    let key = self.routed_data_key_for_row_id(&table_name_str, &row_id);
                     if txn.get(key.as_bytes()).await?.is_some() {
                         return Err(FusionError::Execution(
                             "PRIMARY KEY constraint violated: duplicate row key".to_string(),
