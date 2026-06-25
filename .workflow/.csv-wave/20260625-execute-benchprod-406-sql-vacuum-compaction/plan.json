@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-406",
+  "title": "Add SQL VACUUM manual compaction trigger",
+  "status": "completed",
+  "created_at": "2026-06-25",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-406"
+  ],
+  "scope": [
+    "src/execution/mod.rs",
+    "src/server/pg_server.rs",
+    "tests/sql_ddl.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Close the production operations gap for manual compaction by exposing FusionStorage compaction through SQL VACUUM.",
+  "verification": [
+    "cargo test --test sql_ddl vacuum -- --nocapture",
+    "cargo check --lib",
+    "cargo test --test sql_ddl",
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo test --lib"
+  ]
+}

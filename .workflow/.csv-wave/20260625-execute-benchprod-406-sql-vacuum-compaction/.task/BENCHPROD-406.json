@@ -1,0 +1,52 @@
+{
+  "id": "BENCHPROD-406",
+  "title": "Add SQL VACUUM manual compaction trigger",
+  "status": "completed",
+  "files": [
+    "src/execution/mod.rs",
+    "src/server/pg_server.rs",
+    "tests/sql_ddl.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "description": "Expose FusionStorage manual compaction through SQL VACUUM and document the production operations capability.",
+  "convergence": {
+    "criteria": [
+      "VACUUM routes through the normal SQL statement execution path.",
+      "FusionStorage VACUUM calls compact_now and preserves table rows after compaction.",
+      "Non-Fusion backends and unsupported VACUUM forms return clear errors.",
+      "Roadmap and README no longer list SQL manual compaction as missing."
+    ]
+  },
+  "tests": [
+    {
+      "command": "cargo test --test sql_ddl vacuum -- --nocapture",
+      "result": "passed"
+    },
+    {
+      "command": "cargo check --lib",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --test sql_ddl",
+      "result": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --lib",
+      "result": "passed"
+    }
+  ],
+  "notes": [
+    "VACUUM is a full-database maintenance operation in this iteration; table-specific VACUUM remains explicit unsupported behavior.",
+    "VACUUM FULL is accepted and maps to the same FusionStorage compaction primitive.",
+    "Superuser authorization is enforced through authorize_statement for non-legacy users."
+  ]
+}

@@ -1,0 +1,2 @@
+id,status,skill_call,summary,artifacts,error
+"0","completed","$maestro continue production readiness","Completed BENCHPROD-406: SQL VACUUM backed by FusionStorage compaction.",".workflow/.csv-wave/20260625-execute-benchprod-406-sql-vacuum-compaction/context.md","spawn_agents_on_csv unavailable; used local fallback"
