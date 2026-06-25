@@ -1617,6 +1617,104 @@ async fn test_pg_protocol_copy_from_stdin_text_and_csv() {
 }
 
 #[tokio::test]
+async fn test_pg_protocol_copy_from_stdin_rejects_non_local_shard_owner_rows() {
+    let wal_path = format!("test_pg_shard_owner_copy_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let config = sharded_pg_test_config(4);
+    let shard_router = ShardRouter::from_config(&config).expect("shard router");
+    let local_key =
+        integer_primary_key_for_owner(&shard_router, "pg_route_copy", shard_router.local_node_id());
+    let remote_key = integer_primary_key_for_owner(&shard_router, "pg_route_copy", 2);
+    let txn_remote_key = integer_primary_key_for_owner(&shard_router, "pg_route_copy_txn", 2);
+    let executor = Arc::new(Executor::with_config_and_shard_router(
+        storage.clone(),
+        &StorageConfig::default(),
+        Some(shard_router),
+    ));
+    let port = next_pg_test_port();
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query("CREATE TABLE pg_route_copy (id INTEGER PRIMARY KEY, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    let mut local_sink = std::pin::pin!(client
+        .copy_in("COPY pg_route_copy (id, name) FROM STDIN")
+        .await
+        .expect("local owner COPY should enter copy-in mode"));
+    local_sink
+        .send(Bytes::from(format!("{}\tlocal\n", local_key)))
+        .await
+        .expect("local owner COPY payload should send");
+    assert_eq!(
+        local_sink
+            .finish()
+            .await
+            .expect("local owner COPY should finish"),
+        1
+    );
+
+    let mut remote_sink = std::pin::pin!(client
+        .copy_in("COPY pg_route_copy (id, name) FROM STDIN")
+        .await
+        .expect("remote owner COPY should enter copy-in mode"));
+    remote_sink
+        .send(Bytes::from(format!("{}\tremote\n", remote_key)))
+        .await
+        .expect("remote owner COPY payload should send");
+    let remote_copy = remote_sink.finish().await;
+    assert_pg_shard_route_conflict_with_operation(
+        &remote_copy.expect_err("remote owner COPY should fail"),
+        "pg_route_copy",
+        Some("COPY"),
+    );
+
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    client
+        .simple_query("CREATE TABLE pg_route_copy_txn (id INTEGER PRIMARY KEY, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    let mut remote_txn_sink = std::pin::pin!(client
+        .copy_in("COPY pg_route_copy_txn (id, name) FROM STDIN")
+        .await
+        .expect("transaction-local remote owner COPY should enter copy-in mode"));
+    remote_txn_sink
+        .send(Bytes::from(format!("{}\tremote\n", txn_remote_key)))
+        .await
+        .expect("transaction-local remote owner COPY payload should send");
+    let remote_txn_copy = remote_txn_sink.finish().await;
+    assert_pg_shard_route_conflict_with_operation(
+        &remote_txn_copy.expect_err("transaction-local remote owner COPY should fail"),
+        "pg_route_copy_txn",
+        Some("COPY"),
+    );
+    let _ = client.simple_query("ROLLBACK").await;
+
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
 async fn test_pg_protocol_transaction_commit() {
     let wal_path = format!("test_pg_txn_{}.wal", std::process::id());
     let storage: Arc<dyn Storage> =

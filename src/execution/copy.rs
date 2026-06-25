@@ -168,6 +168,8 @@ impl Executor {
         ));
         let rows = Self::read_copy_bytes(payload, &copy_options)?;
         let table_name = Self::copy_table_name(table_name)?;
+        self.ensure_copy_rows_owned_locally(&table_name, columns, &rows, txn)
+            .await?;
         Self::copy_trace(format!(
             "stdin copy insert start table={} columns={} rows={} first_row={:?}",
             table_name,
@@ -176,6 +178,97 @@ impl Executor {
             rows.first()
         ));
         self.insert_copy_rows(table_name, columns, rows, txn).await
+    }
+
+    async fn ensure_copy_rows_owned_locally(
+        &self,
+        table_name: &str,
+        columns: &[Ident],
+        rows: &[Vec<Value>],
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let Some(router) = self.shard_router.clone() else {
+            return Ok(());
+        };
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(table_name, txn)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(pk_idx) = schema.get_primary_key_index() else {
+            return Ok(());
+        };
+        let composite_unique_indexes = self
+            .load_composite_unique_indexes_for_table(table_name, txn)
+            .await?;
+        if composite_unique_indexes
+            .iter()
+            .any(|index| index.name.ends_with("_pkey"))
+        {
+            return Ok(());
+        }
+        let Some(pk_value_idx) = Self::copy_primary_key_value_index(columns, &schema, pk_idx)
+        else {
+            return Ok(());
+        };
+
+        for row in rows {
+            if !Self::copy_row_shape_can_be_routed(columns, &schema, row) {
+                return Ok(());
+            }
+            let Some(value) = row.get(pk_value_idx) else {
+                return Ok(());
+            };
+            let value = Self::coerce_value_to_column_type(
+                value.clone(),
+                &schema.columns[pk_idx].data_type,
+            )?;
+            let Some(row_id) = Self::value_to_primary_row_id(&value) else {
+                return Ok(());
+            };
+            let route = router.route_key(table_name, &row_id);
+            let local_node_id = router.local_node_id();
+            if route.owner_node_id != local_node_id {
+                return Err(FusionError::ShardRouteConflict(format!(
+                    "Shard route conflict: COPY on table {} with shard key {} routes to shard {} owned by node {} at {}; local node {} must not execute this write",
+                    route.table,
+                    route.shard_key,
+                    route.shard_id,
+                    route.owner_node_id,
+                    route.owner_addr,
+                    local_node_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_primary_key_value_index(
+        columns: &[Ident],
+        schema: &crate::catalog::TableSchema,
+        pk_idx: usize,
+    ) -> Option<usize> {
+        if columns.is_empty() {
+            return Some(pk_idx);
+        }
+
+        let pk_column = &schema.columns[pk_idx].name;
+        columns
+            .iter()
+            .position(|column| column.value.eq_ignore_ascii_case(pk_column))
+    }
+
+    fn copy_row_shape_can_be_routed(
+        columns: &[Ident],
+        schema: &crate::catalog::TableSchema,
+        row: &[Value],
+    ) -> bool {
+        if columns.is_empty() {
+            row.len() == schema.columns.len()
+        } else {
+            row.len() == columns.len()
+        }
     }
 
     fn copy_table_name(table_name: &ObjectName) -> Result<String> {

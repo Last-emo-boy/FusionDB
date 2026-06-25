@@ -17,6 +17,9 @@ pub enum FusionError {
     #[error("Execution error: {0}")]
     Execution(String),
 
+    #[error("{0}")]
+    ShardRouteConflict(String),
+
     #[error("Not implemented: {0}")]
     NotImplemented(String),
 

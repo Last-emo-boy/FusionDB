@@ -183,8 +183,16 @@ impl PgHandler {
         )
     }
 
+    fn copy_error(error: FusionError) -> pgwire::error::ErrorInfo {
+        match error {
+            FusionError::ShardRouteConflict(message) => Self::shard_route_error(message),
+            other => Self::execution_error(format!("COPY execution error: {:?}", other)),
+        }
+    }
+
     fn sqlstate_for_fusion_error(error: &FusionError) -> &'static str {
         match error {
+            FusionError::ShardRouteConflict(_) => "0A000",
             FusionError::Storage(message) if message.starts_with("Write conflict:") => "40001",
             _ => "XX000",
         }
@@ -6158,12 +6166,7 @@ impl CopyHandler for PgHandler {
                     .executor
                     .execute_copy_stdin_payload(&copy_in.statement, &copy_in.data, &mut **txn)
                     .await
-                    .map_err(|e| {
-                        PgWireError::UserError(Box::new(Self::execution_error(format!(
-                            "COPY execution error: {:?}",
-                            e
-                        ))))
-                    })?;
+                    .map_err(|e| PgWireError::UserError(Box::new(Self::copy_error(e))))?;
                 session.transaction_may_change_query_results = true;
                 CopyDoneWork::Count {
                     count,
@@ -6221,9 +6224,7 @@ impl CopyHandler for PgHandler {
                     }
                     Err(e) => {
                         let _ = txn.rollback().await;
-                        return Err(PgWireError::UserError(Box::new(Self::execution_error(
-                            format!("COPY execution error: {:?}", e),
-                        ))));
+                        return Err(PgWireError::UserError(Box::new(Self::copy_error(e))));
                     }
                 }
             }
