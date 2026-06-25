@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-416",
+  "title": "Route local SQL row storage through physical shard data keys",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-416"
+  ],
+  "scope": [
+    "src/main.rs",
+    "src/execution/mod.rs",
+    "src/execution/analyze.rs",
+    "src/execution/ddl/explain.rs",
+    "src/execution/ddl/index.rs",
+    "src/execution/ddl/table.rs",
+    "src/execution/dml/delete.rs",
+    "src/execution/dml/insert.rs",
+    "src/execution/dml/update.rs",
+    "src/execution/foreign_key.rs",
+    "src/execution/query/column_scan.rs",
+    "src/execution/query/mod.rs",
+    "src/execution/scan/index_plan.rs",
+    "src/execution/scan/join.rs",
+    "src/execution/scan/mod.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Continue P5-3 by routing local SQL row storage, scans, DML, DDL rewrites, stats collection, and row fetches through shard-aware physical data keys while keeping legacy data keys for non-sharded mode.",
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --bins",
+    "cargo test --lib",
+    "git diff --check"
+  ],
+  "code_commit": "bccd31b",
+  "remaining_gaps": [
+    "P5-3 secondary index partitioning remains open",
+    "P5-3 cross-node SQL execution routing remains open",
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations"
+  ]
+}
