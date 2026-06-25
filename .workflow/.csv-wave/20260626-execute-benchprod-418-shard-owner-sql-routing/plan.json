@@ -1,0 +1,37 @@
+{
+  "id": "BENCHPROD-418",
+  "title": "Add shard-owner guard for deterministic HTTP SQL point writes",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-418"
+  ],
+  "scope": [
+    "src/distributed/sharding.rs",
+    "src/execution/mod.rs",
+    "src/server/http_server.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Continue P5-3 by preventing deterministic non-local shard-owner point writes from executing through HTTP SQL endpoints while preserving existing local and unroutable SQL behavior.",
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --bins",
+    "cargo test --lib shard_owner -- --nocapture",
+    "cargo test --lib execution::tests::sharded_executor_uses_physical_shard_data_keys_for_crud -- --nocapture",
+    "cargo test --lib",
+    "cargo test --test sql_index_cache",
+    "cargo test --test sql_expr_functions",
+    "git diff --check"
+  ],
+  "code_commit": "128cf46",
+  "remaining_gaps": [
+    "P5-3 automatic cross-node SQL forwarding remains open",
+    "P5-3 distributed index ownership and maintenance remain open",
+    "P5-3 broad multi-shard query routing remains open",
+    "P5-3 INSERT owner routing remains open because row-id calculation can depend on defaults, composite primary keys, and conflict handling",
+    "P5-3 HNSW/vector and trigram in-memory index shard ownership remain open",
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations"
+  ]
+}
