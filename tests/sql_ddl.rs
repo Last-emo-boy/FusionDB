@@ -1,12 +1,34 @@
 use fusiondb::common::Value;
+use fusiondb::config::StorageConfig;
 use fusiondb::execution::{Executor, QueryResult};
-use fusiondb::storage::memory::MemoryStorage;
-use fusiondb::storage::Storage;
+use fusiondb::storage::{memory::MemoryStorage, FusionStorage, Storage};
+use std::path::Path;
 use std::sync::Arc;
 
 #[path = "sql/common.rs"]
 mod common;
 use common::{cleanup, exec_ok, query, setup};
+
+async fn setup_fusion_storage(
+    test_name: &str,
+) -> (Arc<Executor>, FusionStorage, std::path::PathBuf) {
+    let data_dir =
+        std::env::temp_dir().join(format!("fusiondb_{}_{}", test_name, uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut config = StorageConfig::default();
+    config.data_dir = data_dir.to_string_lossy().to_string();
+    let wal_path = config.wal_path();
+    let fusion = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+        .await
+        .unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+    let executor = Arc::new(Executor::new(storage));
+    (executor, fusion, data_dir)
+}
+
+fn cleanup_storage_dir(path: &Path) {
+    let _ = std::fs::remove_dir_all(path);
+}
 
 #[tokio::test]
 async fn test_create_table() {
@@ -46,6 +68,64 @@ async fn test_show_all_returns_settings_rows() {
     }
 
     cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_vacuum_requires_fusion_storage() {
+    let (executor, wal) = setup().await;
+
+    let err = executor.execute_sql("VACUUM").await.unwrap_err();
+    assert!(format!("{:?}", err).contains("VACUUM is only available for FusionStorage"));
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_vacuum_runs_fusion_compaction_and_preserves_rows() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("vacuum_compaction").await;
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE vacuum_items (id INTEGER PRIMARY KEY, label TEXT)",
+    )
+    .await;
+
+    for id in 1..=3 {
+        exec_ok(
+            &executor,
+            &format!("INSERT INTO vacuum_items VALUES ({id}, 'before-{id}')"),
+        )
+        .await;
+        fusion.create_snapshot_now().await.unwrap();
+    }
+
+    exec_ok(&executor, "INSERT INTO vacuum_items VALUES (4, 'after')").await;
+    let results = executor.execute_sql("VACUUM").await.unwrap();
+    match &results[0] {
+        QueryResult::Success { message } => {
+            assert!(message.contains("VACUUM completed"));
+            assert!(message.contains("compaction completed"));
+        }
+        other => panic!("Expected VACUUM success, got {:?}", other),
+    }
+
+    let (_, rows) = query(&executor, "SELECT COUNT(*) FROM vacuum_items").await;
+    assert_eq!(rows, vec![vec![Value::Integer(4)]]);
+
+    cleanup_storage_dir(&data_dir);
+}
+
+#[tokio::test]
+async fn test_vacuum_rejects_table_specific_syntax() {
+    let (executor, _fusion, data_dir) = setup_fusion_storage("vacuum_table_specific").await;
+
+    let err = executor
+        .execute_sql("VACUUM vacuum_items")
+        .await
+        .unwrap_err();
+    assert!(format!("{:?}", err).contains("Table-specific VACUUM is not supported yet"));
+
+    cleanup_storage_dir(&data_dir);
 }
 
 #[tokio::test]

@@ -75,7 +75,7 @@
 - [x] **P6-2: Prometheus metrics** — `/metrics/prometheus` endpoint (OpenMetrics format)
 - [x] **P6-3: Slow queries API** — `/slow_queries` JSON endpoint
 - [x] **P6-4: Query timing** — Every query timed, total µs tracked in metrics
-- [ ] **P6-5: VACUUM** — Manual compaction trigger
+- [x] **P6-5: VACUUM** — SQL manual compaction trigger backed by FusionStorage compaction
 - [ ] **P6-6: Admin CLI** — `fusiondb-cli` tool
 - [ ] **P6-7: CDC** — Change Data Capture for streaming replication
 

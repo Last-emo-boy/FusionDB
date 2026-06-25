@@ -2555,6 +2555,9 @@ impl PgHandler {
         if lower.starts_with("truncated ") {
             return "TRUNCATE TABLE".to_string();
         }
+        if lower.starts_with("vacuum ") || lower == "vacuum" {
+            return "VACUUM".to_string();
+        }
         if lower.contains(" column ") || lower.starts_with("renamed column ") {
             return "ALTER TABLE".to_string();
         }

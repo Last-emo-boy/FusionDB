@@ -649,6 +649,7 @@ impl Executor {
             Statement::Explain {
                 statement, analyze, ..
             } => self.handle_explain(statement, *analyze, txn, params).await,
+            Statement::Vacuum(vacuum) => self.handle_vacuum(vacuum).await,
             Statement::Analyze(analyze) => self.handle_analyze(analyze, txn).await,
             Statement::Copy {
                 source,
@@ -770,6 +771,10 @@ impl Executor {
     pub async fn authorize_statement(&self, username: &str, stmt: &Statement) -> Result<()> {
         if Self::is_legacy_superuser(username) {
             return Ok(());
+        }
+
+        if matches!(stmt, Statement::Vacuum(_)) {
+            return self.require_superuser(username).await;
         }
 
         for (table, operation) in Self::statement_permissions(stmt) {
@@ -1005,6 +1010,16 @@ impl Executor {
         }
 
         let stmts = self.prepare(sql)?;
+        if stmts.len() > 1
+            && stmts
+                .iter()
+                .any(|stmt| matches!(stmt, Statement::Vacuum(_)))
+        {
+            return Err(FusionError::Execution(
+                "VACUUM must be executed as a standalone statement".to_string(),
+            ));
+        }
+
         if stmts.len() == 1
             && (Self::is_cacheable_group_aggregate_statement(&stmts[0])
                 || Self::is_cacheable_join_group_aggregate_statement(&stmts[0]))
@@ -1062,6 +1077,44 @@ impl Executor {
         }
         crate::monitor::record_query(trimmed, start.elapsed());
         Ok(results)
+    }
+
+    async fn handle_vacuum(&self, vacuum: &sqlparser::ast::VacuumStatement) -> Result<QueryResult> {
+        if vacuum.table_name.is_some() {
+            return Err(FusionError::Execution(
+                "Table-specific VACUUM is not supported yet; use VACUUM for full database compaction"
+                    .to_string(),
+            ));
+        }
+
+        if vacuum.sort_only
+            || vacuum.delete_only
+            || vacuum.reindex
+            || vacuum.recluster
+            || vacuum.threshold.is_some()
+            || vacuum.boost
+        {
+            return Err(FusionError::Execution(
+                "VACUUM options other than FULL are not supported yet".to_string(),
+            ));
+        }
+
+        let Some(fusion) = self.storage.as_any().downcast_ref::<FusionStorage>() else {
+            return Err(FusionError::Execution(
+                "VACUUM is only available for FusionStorage".to_string(),
+            ));
+        };
+
+        let compacted = fusion.compact_now().await?;
+        let detail = if compacted {
+            "compaction completed"
+        } else {
+            "compaction skipped: not enough SSTables"
+        };
+
+        Ok(QueryResult::Success {
+            message: format!("VACUUM completed: {detail}"),
+        })
     }
 
     async fn handle_show_users(&self, txn: &mut dyn Transaction) -> Result<QueryResult> {

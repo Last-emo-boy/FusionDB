@@ -290,6 +290,10 @@ ALTER TABLE users RENAME COLUMN email TO mail;
 -- Truncate (delete all rows, keep schema)
 TRUNCATE TABLE users;
 
+-- Manual compaction / space reclamation trigger
+VACUUM;
+VACUUM FULL;
+
 -- Drop table
 DROP TABLE users;
 DROP TABLE IF EXISTS users;
@@ -937,7 +941,7 @@ These are known gaps that should be addressed before production use:
 
 ### Operations
 - No connection pooling
-- No `VACUUM` / manual compaction trigger
+- No automatic compaction tuning / maintenance scheduler
 
 ---
 
