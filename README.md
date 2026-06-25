@@ -1006,7 +1006,8 @@ These are known gaps that should be addressed before production use:
 - Raft log/state metadata is currently in-memory and intended as the control-plane wiring foundation
 - Snapshot transfer serializes visible key-value state for new node bootstrap
 - Sharding has a configurable hash/range control plane, route API, local row-data shard key layout (`shard:{id}:data:{table}:{row_id}`), and local secondary-index KV shard layouts (`shard:{id}:index:*`, `shard:{id}:fts:*`)
-- Distributed index ownership/maintenance and cross-node SQL execution routing are still in progress
+- HTTP SQL execution now rejects deterministic non-local shard-owner point writes (`UPDATE`/`DELETE` by primary-key equality) with a route hint instead of silently executing them on the wrong node
+- Distributed index ownership/maintenance, automatic cross-node SQL forwarding, and broad multi-shard query routing are still in progress
 - No dedicated read-replica topology management
 - No distributed transactions (2PC)
 
@@ -1032,7 +1033,7 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 | **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
 | **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
 | **4. Performance** | ✅ Done | Connection slots, parallel scan, LZ4 SSTable compression, cost-based optimizer |
-| **5. Distributed** | 🔲 In progress | OpenRaft main-loop wiring and snapshot transfer; sharding control plane plus local row/index shard layouts |
+| **5. Distributed** | 🔲 In progress | OpenRaft main-loop wiring and snapshot transfer; sharding control plane, local row/index shard layouts, and point-write owner guard |
 | **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
 
 ---

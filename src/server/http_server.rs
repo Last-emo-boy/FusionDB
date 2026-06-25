@@ -16,7 +16,7 @@ use crate::common::{FusionError, Value};
 use crate::distributed::api::{raft_routes, submit_raft_write, RaftAppState};
 use crate::distributed::sharding::ShardRouter;
 use crate::distributed::FusionRaft;
-use crate::execution::{Executor, PreparedStatementRecord};
+use crate::execution::{Executor, PreparedStatementRecord, SqlShardRoutingDecision};
 use crate::storage::Storage;
 
 use crate::storage::fusion::{CdcEvent, FusionStorage};
@@ -393,6 +393,10 @@ async fn handle_query(
         return json_error(StatusCode::FORBIDDEN, format!("{:?}", e));
     }
 
+    if let Err(message) = ensure_local_shard_write_routes_for_sql(&state, &payload.sql, &[]).await {
+        return json_error(StatusCode::CONFLICT, message);
+    }
+
     if let Some(raft) = &state.raft {
         match state.executor.sql_requires_raft_write(&payload.sql) {
             Ok(true) => {
@@ -413,6 +417,56 @@ async fn handle_query(
         Ok(results) => json_ok(results.into_iter().map(|r| r.into()).collect()),
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{:?}", e)),
     }
+}
+
+async fn ensure_local_shard_write_routes_for_sql(
+    state: &AppState,
+    sql: &str,
+    params: &[Value],
+) -> std::result::Result<(), String> {
+    let decisions = state
+        .executor
+        .shard_routing_decisions_for_sql(sql, params)
+        .await
+        .map_err(|e| format!("Shard routing error: {:?}", e))?;
+    ensure_local_shard_write_routes(decisions)
+}
+
+async fn ensure_local_shard_write_routes_for_statements(
+    state: &AppState,
+    statements: &[sqlparser::ast::Statement],
+    params: &[Value],
+) -> std::result::Result<(), String> {
+    let decisions = state
+        .executor
+        .shard_routing_decisions_for_statements(statements, params)
+        .await
+        .map_err(|e| format!("Shard routing error: {:?}", e))?;
+    ensure_local_shard_write_routes(decisions)
+}
+
+fn ensure_local_shard_write_routes(
+    decisions: Vec<SqlShardRoutingDecision>,
+) -> std::result::Result<(), String> {
+    for decision in decisions {
+        if !decision.is_local_owner() {
+            return Err(non_local_shard_write_message(&decision));
+        }
+    }
+    Ok(())
+}
+
+fn non_local_shard_write_message(decision: &SqlShardRoutingDecision) -> String {
+    format!(
+        "Shard route conflict: {} on table {} with shard key {} routes to shard {} owned by node {} at {}; local node {} must not execute this write",
+        decision.operation,
+        decision.route.table,
+        decision.route.shard_key,
+        decision.route.shard_id,
+        decision.route.owner_node_id,
+        decision.route.owner_addr,
+        decision.local_node_id
+    )
 }
 
 async fn handle_tables(
@@ -552,6 +606,13 @@ async fn handle_execute(
             let mut results = Vec::new();
             let params: Vec<Value> = payload.params.iter().map(Value::from_json).collect();
             let return_results = payload.return_results.unwrap_or(true);
+
+            if let Err(message) =
+                ensure_local_shard_write_routes_for_statements(&state, &record.statements, &params)
+                    .await
+            {
+                return json_error(StatusCode::CONFLICT, message);
+            }
 
             let mut may_change_query_results = false;
             match state.storage.begin_transaction().await {
@@ -919,7 +980,8 @@ mod tests {
         assert!(
             status.is_success()
                 || status == StatusCode::FORBIDDEN
-                || status == StatusCode::NOT_FOUND,
+                || status == StatusCode::NOT_FOUND
+                || status == StatusCode::CONFLICT,
             "unexpected status: {status}, body: {}",
             String::from_utf8_lossy(&body)
         );
@@ -964,7 +1026,11 @@ mod tests {
     }
 
     fn test_app_with_shard_router(storage: Arc<dyn Storage>, shard_router: ShardRouter) -> Router {
-        let executor = Arc::new(Executor::new(storage.clone()));
+        let executor = Arc::new(Executor::with_config_and_shard_router(
+            storage.clone(),
+            &StorageConfig::default(),
+            Some(shard_router.clone()),
+        ));
         build_router(AppState {
             executor,
             storage,
@@ -973,6 +1039,53 @@ mod tests {
             distributed_mode: "raft(node_id=1)".to_string(),
             shard_router: Some(shard_router),
         })
+    }
+
+    fn sharded_http_test_config(shard_count: u64) -> Config {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.node_id = 1;
+        config.distributed.initial_members = vec![
+            DistributedPeerConfig {
+                node_id: 1,
+                addr: "127.0.0.1:8091".to_string(),
+            },
+            DistributedPeerConfig {
+                node_id: 2,
+                addr: "127.0.0.1:8093".to_string(),
+            },
+        ];
+        config.distributed.sharding = ShardingConfig {
+            enabled: true,
+            strategy: ShardingStrategy::Hash,
+            shard_count,
+            range_boundaries: Vec::new(),
+        };
+        config
+    }
+
+    fn integer_primary_key_for_owner(
+        router: &ShardRouter,
+        table_name: &str,
+        owner_node_id: u64,
+    ) -> i64 {
+        for value in 1_i64..10_000 {
+            let row_id = crate::common::encoding::encode_i64_comparable(value);
+            if router.route_key(table_name, &row_id).owner_node_id == owner_node_id {
+                return value;
+            }
+        }
+        panic!("no integer key routed to owner node {}", owner_node_id);
+    }
+
+    async fn post_query(app: &Router, sql: &str) -> Response {
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "sql": sql }).to_string()))
+            .expect("query request");
+        app.clone().oneshot(request).await.expect("query response")
     }
 
     #[tokio::test]
@@ -1303,6 +1416,153 @@ mod tests {
         assert!(capability_data.sharding_enabled);
         assert_eq!(capability_data.sharding_strategy.as_deref(), Some("hash"));
         assert_eq!(capability_data.shard_count, Some(8));
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_rejects_non_local_shard_owner_point_update() {
+        let wal_path = format!("test_http_shard_owner_query_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let config = sharded_http_test_config(4);
+        let shard_router = ShardRouter::from_config(&config).expect("shard router");
+        let local_key = integer_primary_key_for_owner(
+            &shard_router,
+            "route_users",
+            shard_router.local_node_id(),
+        );
+        let remote_key = integer_primary_key_for_owner(&shard_router, "route_users", 2);
+        let remote_route = shard_router.route_key(
+            "route_users",
+            &crate::common::encoding::encode_i64_comparable(remote_key),
+        );
+        let app = test_app_with_shard_router(storage.clone(), shard_router);
+
+        let create_response = post_query(
+            &app,
+            "CREATE TABLE route_users (id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .await;
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let local_response = post_query(
+            &app,
+            &format!(
+                "UPDATE route_users SET name = 'local' WHERE id = {}",
+                local_key
+            ),
+        )
+        .await;
+        assert_eq!(local_response.status(), StatusCode::OK);
+
+        let remote_response = post_query(
+            &app,
+            &format!(
+                "UPDATE route_users SET name = 'remote' WHERE id = {}",
+                remote_key
+            ),
+        )
+        .await;
+        assert_eq!(remote_response.status(), StatusCode::CONFLICT);
+        let envelope: Envelope<Vec<QueryResultJson>> = response_json(remote_response).await;
+        let error = envelope.error.expect("route conflict error");
+        assert!(error.contains("UPDATE"));
+        assert!(error.contains("route_users"));
+        assert!(error.contains(&format!("shard {}", remote_route.shard_id)));
+        assert!(error.contains("owned by node 2"));
+        assert!(error.contains("127.0.0.1:8093"));
+        assert!(error.contains("local node 1"));
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_execute_rejects_non_local_shard_owner_point_update_with_params() {
+        let wal_path = format!("test_http_shard_owner_execute_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let config = sharded_http_test_config(4);
+        let shard_router = ShardRouter::from_config(&config).expect("shard router");
+        let remote_key = integer_primary_key_for_owner(&shard_router, "route_users", 2);
+        let app = test_app_with_shard_router(storage.clone(), shard_router);
+
+        let create_response = post_query(
+            &app,
+            "CREATE TABLE route_users (id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .await;
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let prepare_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"UPDATE route_users SET name = $1 WHERE id = $2"}"#,
+            ))
+            .expect("prepare request");
+        let prepare_response = app
+            .clone()
+            .oneshot(prepare_request)
+            .await
+            .expect("prepare response");
+        let prepare_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_response).await;
+        let prepared = prepare_envelope.data.expect("prepared statement");
+
+        let execute_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared.statement_id,
+                    "params": ["remote", remote_key]
+                })
+                .to_string(),
+            ))
+            .expect("execute request");
+        let execute_response = app
+            .oneshot(execute_request)
+            .await
+            .expect("execute response");
+        assert_eq!(execute_response.status(), StatusCode::CONFLICT);
+        let envelope: Envelope<Vec<QueryResultJson>> = response_json(execute_response).await;
+        let error = envelope.error.expect("route conflict error");
+        assert!(error.contains("UPDATE"));
+        assert!(error.contains("owned by node 2"));
+        assert!(error.contains("local node 1"));
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_rejects_non_local_shard_owner_point_delete() {
+        let wal_path = format!("test_http_shard_owner_delete_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let config = sharded_http_test_config(4);
+        let shard_router = ShardRouter::from_config(&config).expect("shard router");
+        let remote_key = integer_primary_key_for_owner(&shard_router, "route_deletes", 2);
+        let app = test_app_with_shard_router(storage.clone(), shard_router);
+
+        let create_response = post_query(
+            &app,
+            "CREATE TABLE route_deletes (id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .await;
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let delete_response = post_query(
+            &app,
+            &format!("DELETE FROM route_deletes WHERE id = {}", remote_key),
+        )
+        .await;
+        assert_eq!(delete_response.status(), StatusCode::CONFLICT);
+        let envelope: Envelope<Vec<QueryResultJson>> = response_json(delete_response).await;
+        let error = envelope.error.expect("route conflict error");
+        assert!(error.contains("DELETE"));
+        assert!(error.contains("route_deletes"));
+        assert!(error.contains("owned by node 2"));
+        assert!(error.contains("local node 1"));
 
         let _ = std::fs::remove_file(&wal_path);
     }

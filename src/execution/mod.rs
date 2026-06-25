@@ -14,9 +14,10 @@ pub(crate) use aggregation::AggregateAccumulator;
 pub(crate) use foreign_key::ForeignKeyMeta;
 
 use crate::ai::embedding::EmbeddingRegistry;
+use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use crate::config::StorageConfig;
-use crate::distributed::sharding::ShardRouter;
+use crate::distributed::sharding::{ShardRoute, ShardRouter};
 use crate::monitor;
 use crate::parser::parse_sql;
 use crate::storage::{vector_index::VectorIndex, FusionStorage, ScanVisitor, Storage, Transaction};
@@ -42,6 +43,19 @@ pub enum QueryResult {
     Success {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlShardRoutingDecision {
+    pub operation: String,
+    pub route: ShardRoute,
+    pub local_node_id: u64,
+}
+
+impl SqlShardRoutingDecision {
+    pub(crate) fn is_local_owner(&self) -> bool {
+        self.route.owner_node_id == self.local_node_id
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -569,6 +583,155 @@ impl Executor {
             count = count.saturating_add(txn.count_prefix(prefix.as_bytes()).await?);
         }
         Ok(count)
+    }
+
+    pub(crate) async fn shard_routing_decisions_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardRoutingDecision>> {
+        let statements = self.prepare(sql)?;
+        self.shard_routing_decisions_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_routing_decisions_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardRoutingDecision>> {
+        let Some(router) = self.shard_router.clone() else {
+            return Ok(Vec::new());
+        };
+
+        let mut txn = self.storage.begin_transaction().await?;
+        let mut decisions = Vec::new();
+        for statement in statements {
+            if let Some((operation, table_name, row_id)) = self
+                .shard_point_write_target_for_statement(statement, &mut *txn, params)
+                .await?
+            {
+                decisions.push(Self::shard_routing_decision_for_row_id(
+                    &router,
+                    operation,
+                    &table_name,
+                    row_id,
+                ));
+            }
+        }
+        Ok(decisions)
+    }
+
+    async fn shard_point_write_target_for_statement(
+        &self,
+        statement: &Statement,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<Option<(&'static str, String, String)>> {
+        match statement {
+            Statement::Update(update) => self
+                .shard_point_write_target_for_update(update, txn, params)
+                .await
+                .map(|target| target.map(|(table, row_id)| ("UPDATE", table, row_id))),
+            Statement::Delete(delete) => self
+                .shard_point_write_target_for_delete(delete, txn, params)
+                .await
+                .map(|target| target.map(|(table, row_id)| ("DELETE", table, row_id))),
+            _ => Ok(None),
+        }
+    }
+
+    async fn shard_point_write_target_for_update(
+        &self,
+        update: &sqlparser::ast::Update,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<Option<(String, String)>> {
+        let sqlparser::ast::TableWithJoins { relation, .. } = &update.table;
+        let table_name = if let TableFactor::Table { name, .. } = relation {
+            name.to_string()
+        } else {
+            return Ok(None);
+        };
+
+        let schema = self
+            .load_table_schema_for_shard_routing(&table_name, txn)
+            .await?;
+        let allowed_qualifiers = Self::primary_key_qualifiers(relation);
+        Ok(self
+            .primary_key_row_id_from_eq_selection(
+                update.selection.as_ref(),
+                &schema,
+                params,
+                &allowed_qualifiers,
+            )
+            .map(|row_id| (table_name, row_id)))
+    }
+
+    async fn shard_point_write_target_for_delete(
+        &self,
+        delete: &sqlparser::ast::Delete,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<Option<(String, String)>> {
+        let Some(relation) = Self::delete_target_relation(delete) else {
+            return Ok(None);
+        };
+        let table_name = if let TableFactor::Table { name, .. } = relation {
+            name.to_string()
+        } else {
+            return Ok(None);
+        };
+
+        let schema = self
+            .load_table_schema_for_shard_routing(&table_name, txn)
+            .await?;
+        let allowed_qualifiers = Self::primary_key_qualifiers(relation);
+        Ok(self
+            .primary_key_row_id_from_eq_selection(
+                delete.selection.as_ref(),
+                &schema,
+                params,
+                &allowed_qualifiers,
+            )
+            .map(|row_id| (table_name, row_id)))
+    }
+
+    fn delete_target_relation(delete: &sqlparser::ast::Delete) -> Option<&TableFactor> {
+        match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables)
+            | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
+                tables.first().map(|table| &table.relation)
+            }
+        }
+    }
+
+    async fn load_table_schema_for_shard_routing(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<TableSchema> {
+        let schema_key = format!("schema:{}", table_name);
+        let schema_bytes = txn
+            .get(schema_key.as_bytes())
+            .await?
+            .ok_or_else(|| FusionError::Execution(format!("Table {} not found", table_name)))?;
+        bincode::deserialize(&schema_bytes)
+            .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))
+    }
+
+    fn shard_routing_decision_for_row_id(
+        router: &ShardRouter,
+        operation: &'static str,
+        table_name: &str,
+        row_id: String,
+    ) -> SqlShardRoutingDecision {
+        let route = router.route_key(table_name, &row_id);
+        SqlShardRoutingDecision {
+            operation: operation.to_string(),
+            route,
+            local_node_id: router.local_node_id(),
+        }
     }
 
     pub(crate) fn invalidate_query_result_cache(&self) {

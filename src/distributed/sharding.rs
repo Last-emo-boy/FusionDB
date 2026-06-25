@@ -112,6 +112,10 @@ impl ShardRouter {
         }
     }
 
+    pub fn local_node_id(&self) -> NodeId {
+        self.local_node_id
+    }
+
     pub fn shard_count(&self) -> u64 {
         self.shard_count
     }
