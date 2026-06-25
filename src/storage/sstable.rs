@@ -1,4 +1,5 @@
 use crate::common::Result;
+use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use moka::sync::Cache;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -10,14 +11,17 @@ use fastbloom::BloomFilter;
 
 // --- SSTable ---
 // Format:
-// [Data Block 1] [Data Block 2] ... [Index Block] [Filter Block] [Footer]
-// Data Block: [Count: 4b] [Entry 1] [Entry 2] ...
+// [Data Block 1] [Data Block 2] ... [Index Block] [Filter Block] [Meta Block] [Footer]
+// Data Block: legacy [Count: 4b] [Entry 1] ... [CRC32: 4b],
+// or compressed [Magic: 4b] [Count: 4b] [LZ4 payload] [CRC32: 4b]
 // Entry: [KeyLen: 4b] [Key] [ValLen: 4b] [Val]
 // Index Block: [Entry 1] ... (Key -> Offset)
 // Filter Block: [FilterBytes]
-// Footer: [IndexOffset: 8b] [FilterOffset: 8b] [Magic: 4b]
+// Footer: [IndexOffset: 8b] [FilterOffset: 8b] [MetaOffset: 8b] [Magic: 4b]
 
 const SST_MAGIC: u32 = 0xCAFEBABE;
+const COMPRESSED_BLOCK_MAGIC: &[u8; 4] = b"FDBL";
+const COMPRESSED_BLOCK_HEADER_LEN: usize = 8;
 
 fn block_entry_buffer() -> VecDeque<(Vec<u8>, Vec<u8>)> {
     VecDeque::with_capacity(1)
@@ -25,6 +29,14 @@ fn block_entry_buffer() -> VecDeque<(Vec<u8>, Vec<u8>)> {
 
 fn block_entry_reserve_count(count: u32, block_len: usize) -> usize {
     (count as usize).min(block_len / 8)
+}
+
+fn legacy_block_len(entry_bytes_len: usize) -> usize {
+    4 + entry_bytes_len
+}
+
+fn compressed_block_payload_capacity(compressed_len: usize) -> usize {
+    COMPRESSED_BLOCK_HEADER_LEN + compressed_len
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -158,26 +170,7 @@ impl SsTable {
 
         for i in start_idx..self.index_offsets.len() {
             let offset = self.index_offsets[i];
-
-            let next_offset = if i + 1 < self.index_offsets.len() {
-                self.index_offsets[i + 1]
-            } else {
-                self.file_len
-            };
-            let block_len = (next_offset - offset) as usize;
-
-            let block_data = if let Some(data) = self.block_cache.get(&(self.id, offset)) {
-                data
-            } else {
-                let mut file = tokio::fs::File::open(&self.path).await?;
-                file.seek(SeekFrom::Start(offset)).await?;
-                let mut buf = vec![0u8; block_len];
-                file.read_exact(&mut buf).await?;
-                self.block_cache.insert((self.id, offset), buf.clone());
-                buf
-            };
-
-            let block_data = Self::verify_block_crc(&block_data)?;
+            let block_data = self.read_block(offset).await?;
 
             let mut cursor = std::io::Cursor::new(block_data);
 
@@ -243,27 +236,89 @@ impl SsTable {
         Ok(data)
     }
 
-    pub async fn read_block(&self, offset: u64) -> Result<Vec<u8>> {
-        if let Some(data) = self.block_cache.get(&(self.id, offset)) {
+    fn encode_block_payload(count: u32, entries: &[u8]) -> Vec<u8> {
+        let compressed = compress_prepend_size(entries);
+        let compressed_len = compressed_block_payload_capacity(compressed.len());
+        let legacy_len = legacy_block_len(entries.len());
+
+        if compressed_len < legacy_len {
+            let mut encoded = Vec::with_capacity(compressed_len);
+            encoded.extend_from_slice(COMPRESSED_BLOCK_MAGIC);
+            encoded.extend_from_slice(&count.to_le_bytes());
+            encoded.extend_from_slice(&compressed);
+            encoded
+        } else {
+            let mut encoded = Vec::with_capacity(legacy_len);
+            encoded.extend_from_slice(&count.to_le_bytes());
+            encoded.extend_from_slice(entries);
+            encoded
+        }
+    }
+
+    fn decode_block_payload(block_data: &[u8]) -> Result<Vec<u8>> {
+        let data = Self::verify_block_crc(block_data)?;
+        if data.len() < COMPRESSED_BLOCK_HEADER_LEN
+            || &data[..COMPRESSED_BLOCK_MAGIC.len()] != COMPRESSED_BLOCK_MAGIC
+        {
+            return Ok(data.to_vec());
+        }
+
+        let count = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let entries =
+            decompress_size_prepended(&data[COMPRESSED_BLOCK_HEADER_LEN..]).map_err(|error| {
+                crate::common::FusionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("SSTable block decompression failed: {}", error),
+                ))
+            })?;
+
+        let mut decoded = Vec::with_capacity(legacy_block_len(entries.len()));
+        decoded.extend_from_slice(&count.to_le_bytes());
+        decoded.extend_from_slice(&entries);
+        Ok(decoded)
+    }
+
+    async fn read_block_at(
+        path: &PathBuf,
+        block_cache: &Arc<Cache<(u64, u64), Vec<u8>>>,
+        sst_id: u64,
+        index_offsets: &[u64],
+        file_len: u64,
+        offset: u64,
+    ) -> Result<Vec<u8>> {
+        if let Some(data) = block_cache.get(&(sst_id, offset)) {
             return Ok(data);
         }
 
-        let mut next_offset = self.file_len;
+        let mut next_offset = file_len;
 
-        if let Ok(idx) = self.index_offsets.binary_search(&offset) {
-            if idx + 1 < self.index_offsets.len() {
-                next_offset = self.index_offsets[idx + 1];
+        if let Ok(idx) = index_offsets.binary_search(&offset) {
+            if idx + 1 < index_offsets.len() {
+                next_offset = index_offsets[idx + 1];
             }
         }
 
         let len = (next_offset - offset) as usize;
-        let mut file = tokio::fs::File::open(&self.path).await?;
+        let mut file = tokio::fs::File::open(path).await?;
         file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; len];
         file.read_exact(&mut buf).await?;
 
-        self.block_cache.insert((self.id, offset), buf.clone());
-        Ok(buf)
+        let decoded = Self::decode_block_payload(&buf)?;
+        block_cache.insert((sst_id, offset), decoded.clone());
+        Ok(decoded)
+    }
+
+    pub async fn read_block(&self, offset: u64) -> Result<Vec<u8>> {
+        Self::read_block_at(
+            &self.path,
+            &self.block_cache,
+            self.id,
+            &self.index_offsets,
+            self.file_len,
+            offset,
+        )
+        .await
     }
 
     pub async fn new_iterator(&self, start_key: Option<&[u8]>) -> Result<SsTableIterator> {
@@ -317,29 +372,18 @@ impl SsTableIterator {
             }
 
             let offset = self.index_offsets[self.current_block_idx];
-            let next_offset = if self.current_block_idx + 1 < self.index_offsets.len() {
-                self.index_offsets[self.current_block_idx + 1]
-            } else {
-                self.file_len
-            };
-            let block_len = (next_offset - offset) as usize;
 
             self.current_block_idx += 1;
 
-            // Check Cache
-            let block_data = if let Some(data) = self.block_cache.get(&(self.sst_id, offset)) {
-                data
-            } else {
-                let mut file = tokio::fs::File::open(&self.path).await?;
-                file.seek(SeekFrom::Start(offset)).await?;
-                let mut buf = vec![0u8; block_len];
-                file.read_exact(&mut buf).await?;
-                self.block_cache.insert((self.sst_id, offset), buf.clone());
-                buf
-            };
-
-            // Verify CRC32
-            let block_data = SsTable::verify_block_crc(&block_data).unwrap_or(&block_data);
+            let block_data = SsTable::read_block_at(
+                &self.path,
+                &self.block_cache,
+                self.sst_id,
+                &self.index_offsets,
+                self.file_len,
+                offset,
+            )
+            .await?;
 
             // Parse Block
             let mut cursor = std::io::Cursor::new(block_data);
@@ -350,7 +394,7 @@ impl SsTableIterator {
             }
             let count = u32::from_le_bytes(count_buf);
             self.current_block_entries
-                .reserve(block_entry_reserve_count(count, block_len));
+                .reserve(block_entry_reserve_count(count, cursor.get_ref().len()));
 
             for _ in 0..count {
                 let mut len_buf = [0u8; 4];
@@ -385,7 +429,13 @@ impl SsTableIterator {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_entry_buffer, block_entry_reserve_count};
+    use super::{
+        block_entry_buffer, block_entry_reserve_count, Crc32Hasher, SsTable, SsTableBuilder,
+        COMPRESSED_BLOCK_MAGIC,
+    };
+    use moka::sync::Cache;
+    use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn block_entry_buffer_preallocates_first_entry() {
@@ -396,6 +446,94 @@ mod tests {
     fn block_entry_reserve_count_is_bounded_by_block_length() {
         assert_eq!(block_entry_reserve_count(3, 24), 3);
         assert_eq!(block_entry_reserve_count(100, 16), 2);
+    }
+
+    fn append_crc(mut payload: Vec<u8>) -> Vec<u8> {
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&payload);
+        let crc = hasher.finalize();
+        payload.extend_from_slice(&crc.to_le_bytes());
+        payload
+    }
+
+    #[test]
+    fn compressed_block_payload_round_trips_to_legacy_layout() {
+        let entries = vec![b'x'; 4096];
+        let encoded = SsTable::encode_block_payload(3, &entries);
+
+        assert_eq!(
+            &encoded[..COMPRESSED_BLOCK_MAGIC.len()],
+            COMPRESSED_BLOCK_MAGIC
+        );
+
+        let decoded = SsTable::decode_block_payload(&append_crc(encoded)).unwrap();
+        assert_eq!(u32::from_le_bytes(decoded[..4].try_into().unwrap()), 3);
+        assert_eq!(&decoded[4..], entries.as_slice());
+    }
+
+    #[test]
+    fn legacy_block_payload_stays_readable() {
+        let entries = b"not worth compressing".to_vec();
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&1u32.to_le_bytes());
+        legacy.extend_from_slice(&entries);
+
+        let decoded = SsTable::decode_block_payload(&append_crc(legacy.clone())).unwrap();
+
+        assert_eq!(decoded, legacy);
+    }
+
+    #[tokio::test]
+    async fn sstable_compresses_repetitive_blocks_and_reads_entries() {
+        let path = std::env::temp_dir().join(format!(
+            "fusiondb_sstable_compress_{}.sst",
+            uuid::Uuid::new_v4()
+        ));
+        let mut builder = SsTableBuilder::new(path.clone());
+        let mut block_buffer = Vec::new();
+        let mut first_key = None;
+        let mut expected_value = Vec::new();
+        expected_value.extend(std::iter::repeat(b'a').take(512));
+
+        for id in 0..64 {
+            let key = format!("k{id:03}").into_bytes();
+            if first_key.is_none() {
+                first_key = Some(key.clone());
+            }
+            builder.add_key(&key);
+            block_buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            block_buffer.extend_from_slice(&key);
+            block_buffer.extend_from_slice(&(expected_value.len() as u32).to_le_bytes());
+            block_buffer.extend_from_slice(&expected_value);
+        }
+
+        builder
+            .flush_block(first_key.unwrap(), 64, &block_buffer)
+            .await
+            .unwrap();
+        builder.finish().await.unwrap();
+
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).await.unwrap();
+        assert_eq!(&magic, COMPRESSED_BLOCK_MAGIC);
+
+        let table = SsTable::open(path.clone(), 1, Arc::new(Cache::new(16)))
+            .await
+            .unwrap();
+        let found = table.find_ge(b"k050").await.unwrap().unwrap();
+        assert_eq!(found.0, b"k050");
+        assert_eq!(found.1, expected_value);
+
+        let mut iter = table.new_iterator(None).await.unwrap();
+        let mut count = 0;
+        while let Some((_key, value)) = iter.next().await.unwrap() {
+            assert_eq!(value.len(), 512);
+            count += 1;
+        }
+        assert_eq!(count, 64);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -458,21 +596,16 @@ impl SsTableBuilder {
             self.first_key = Some(start_key.clone());
         }
 
-        // Write Block: [Count: 4b] [Data] [CRC32: 4b]
-        // CRC covers count + data
         if let Some(file) = &mut self.file {
-            let count_bytes = count.to_le_bytes();
+            let encoded = SsTable::encode_block_payload(count, buf);
 
-            // Compute CRC32 over count + data
+            // CRC covers the encoded block payload, whether compressed or legacy.
             let mut hasher = Crc32Hasher::new();
-            hasher.update(&count_bytes);
-            hasher.update(buf);
+            hasher.update(&encoded);
             let crc = hasher.finalize();
 
-            file.write_all(&count_bytes).await?;
-            self.current_offset += 4;
-            file.write_all(buf).await?;
-            self.current_offset += buf.len() as u64;
+            file.write_all(&encoded).await?;
+            self.current_offset += encoded.len() as u64;
             file.write_all(&crc.to_le_bytes()).await?;
             self.current_offset += 4;
         }

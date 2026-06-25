@@ -53,7 +53,7 @@
 | **Read Path** | MVCC Snapshot Isolation, Row Cache (Moka), Bloom Filters |
 | **Indexes** | BTree (secondary), FB+-Tree (MemTable), HNSW (vector), Inverted (FTS), Trigram |
 | **Transactions** | OCC (Optimistic Concurrency Control), Snapshot Isolation, `BEGIN`/`COMMIT`/`ROLLBACK` |
-| **Durability** | Segmented WAL (64MB rotation), CRC32 block checksums on SSTables |
+| **Durability** | Segmented WAL (64MB rotation), CRC32 block checksums and LZ4 block compression on SSTables |
 | **Compaction** | 4-way merge with MVCC key deduplication |
 | **Columnar Analytics** | Arrow RecordBatch conversion, vectorized COUNT/SUM/AVG/MIN/MAX |
 | **Performance** | Optimized merge iterator, streaming COUNT(*), pre-allocated scan buffers, hash join for equi-joins |
@@ -933,7 +933,7 @@ FusionDB/
 │       ├── memory.rs               # In-memory storage (for testing)
 │       ├── backend.rs              # Pluggable backend factory (BackendConfig)
 │       ├── wal.rs                  # Segmented WAL (64MB rotation, multi-segment replay)
-│       ├── sstable.rs              # SSTable with Bloom filters + CRC32 checksums
+│       ├── sstable.rs              # SSTable with Bloom filters + CRC32 checksums + LZ4 block compression
 │       ├── fbtree.rs               # FB+-Tree (fractal B-tree variant)
 │       ├── vector_index.rs         # HNSW vector index
 │       ├── inverted_index.rs       # BM25 inverted index for FTS
@@ -972,7 +972,7 @@ These are known gaps that should be addressed before production use:
 ### Storage & Reliability
 - No online backup / point-in-time recovery
 - No disk space reclamation after DELETE (tombstones persist until compaction)
-- No page-level compression (LZ4/Zstd)
+- No configurable compression algorithm/tuning yet; SSTable blocks use LZ4 when the encoded block is smaller
 
 ### Transactions
 - OCC may have high abort rates under write-heavy contention
@@ -1006,7 +1006,7 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 | **1. Data Integrity** | ✅ Done | Graceful shutdown, TOML config, segmented WAL, SSTable CRC32, compaction dedup |
 | **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
 | **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
-| **4. Performance** | 🔲 Planned | Connection slots, cost-based optimizer |
+| **4. Performance** | 🔲 Planned | Connection slots, LZ4 SSTable compression, cost-based optimizer |
 | **5. Distributed** | 🔲 Planned | Wire OpenRaft into main server |
 | **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
 

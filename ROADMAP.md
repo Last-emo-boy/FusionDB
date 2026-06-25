@@ -1,6 +1,6 @@
 # FusionDB Roadmap
 
-> Last updated: 2026-02-23 (night)
+> Last updated: 2026-06-26
 
 ## Phase 1: Data Integrity & Reliability ✅
 
@@ -61,7 +61,7 @@
 - [x] **P4-1: Connection pooling** — Configurable pgwire connection slots with max-connection backpressure and metrics
 - [x] **P4-2: Parallel scan** — rayon-based multi-thread table scan for aggregations (>1000 rows)
 - [ ] **P4-3: Cost-based optimizer** — Cardinality estimation, join reordering
-- [ ] **P4-4: Page compression** — LZ4/Zstd block compression for SSTables
+- [x] **P4-4: Page compression** — LZ4-compressed SSTable data blocks with CRC and legacy block compatibility
 
 ## Phase 5: Distributed
 
