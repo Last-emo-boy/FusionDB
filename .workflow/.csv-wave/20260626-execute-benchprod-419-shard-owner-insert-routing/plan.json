@@ -1,0 +1,36 @@
+{
+  "id": "BENCHPROD-419",
+  "title": "Extend shard-owner guard to deterministic INSERT VALUES writes",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-419"
+  ],
+  "scope": [
+    "src/execution/mod.rs",
+    "src/server/http_server.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Continue P5-3 by routing deterministic INSERT ... VALUES rows with explicit single-column primary keys through the shard-owner guard used by HTTP SQL endpoints.",
+  "verification": [
+    "cargo fmt --check",
+    "cargo check --bins",
+    "cargo test --lib shard_owner -- --nocapture",
+    "cargo test --lib execution::tests::sharded_executor_uses_physical_shard_data_keys_for_crud -- --nocapture",
+    "cargo test --lib",
+    "cargo test --test sql_index_cache",
+    "cargo test --test sql_expr_functions",
+    "git diff --check"
+  ],
+  "code_commit": "5195199",
+  "remaining_gaps": [
+    "P5-3 automatic cross-node SQL forwarding remains open",
+    "P5-3 distributed index ownership and maintenance remain open",
+    "P5-3 broad multi-shard query routing remains open",
+    "P5-3 INSERT routing remains conservative for generated/default primary keys, composite primary keys, INSERT ... SELECT, and partially nondeterministic VALUES rows",
+    "P5-3 HNSW/vector and trigram in-memory index shard ownership remain open",
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations"
+  ]
+}
