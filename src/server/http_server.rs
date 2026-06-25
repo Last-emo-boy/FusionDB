@@ -1568,6 +1568,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_query_rejects_non_local_shard_owner_insert_values() {
+        let wal_path = format!("test_http_shard_owner_insert_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let config = sharded_http_test_config(4);
+        let shard_router = ShardRouter::from_config(&config).expect("shard router");
+        let local_key = integer_primary_key_for_owner(
+            &shard_router,
+            "route_inserts",
+            shard_router.local_node_id(),
+        );
+        let remote_key = integer_primary_key_for_owner(&shard_router, "route_inserts", 2);
+        let app = test_app_with_shard_router(storage.clone(), shard_router);
+
+        let create_response = post_query(
+            &app,
+            "CREATE TABLE route_inserts (id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .await;
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let local_response = post_query(
+            &app,
+            &format!("INSERT INTO route_inserts VALUES ({}, 'local')", local_key),
+        )
+        .await;
+        assert_eq!(local_response.status(), StatusCode::OK);
+
+        let remote_response = post_query(
+            &app,
+            &format!(
+                "INSERT INTO route_inserts (name, id) VALUES ('remote', {})",
+                remote_key
+            ),
+        )
+        .await;
+        assert_eq!(remote_response.status(), StatusCode::CONFLICT);
+        let envelope: Envelope<Vec<QueryResultJson>> = response_json(remote_response).await;
+        let error = envelope.error.expect("route conflict error");
+        assert!(error.contains("INSERT"));
+        assert!(error.contains("route_inserts"));
+        assert!(error.contains("owned by node 2"));
+        assert!(error.contains("local node 1"));
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_execute_rejects_non_local_shard_owner_insert_values_with_params() {
+        let wal_path = format!(
+            "test_http_shard_owner_insert_execute_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let config = sharded_http_test_config(4);
+        let shard_router = ShardRouter::from_config(&config).expect("shard router");
+        let remote_key = integer_primary_key_for_owner(&shard_router, "route_insert_exec", 2);
+        let app = test_app_with_shard_router(storage.clone(), shard_router);
+
+        let create_response = post_query(
+            &app,
+            "CREATE TABLE route_insert_exec (id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .await;
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let prepare_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"INSERT INTO route_insert_exec (name, id) VALUES ($1, $2)"}"#,
+            ))
+            .expect("prepare request");
+        let prepare_response = app
+            .clone()
+            .oneshot(prepare_request)
+            .await
+            .expect("prepare response");
+        let prepare_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_response).await;
+        let prepared = prepare_envelope.data.expect("prepared statement");
+
+        let execute_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared.statement_id,
+                    "params": ["remote", remote_key]
+                })
+                .to_string(),
+            ))
+            .expect("execute request");
+        let execute_response = app
+            .oneshot(execute_request)
+            .await
+            .expect("execute response");
+        assert_eq!(execute_response.status(), StatusCode::CONFLICT);
+        let envelope: Envelope<Vec<QueryResultJson>> = response_json(execute_response).await;
+        let error = envelope.error.expect("route conflict error");
+        assert!(error.contains("INSERT"));
+        assert!(error.contains("route_insert_exec"));
+        assert!(error.contains("owned by node 2"));
+        assert!(error.contains("local node 1"));
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
     async fn http_metrics_include_pg_connection_pool_fields() {
         crate::monitor::set_pg_connection_limit(123);
 

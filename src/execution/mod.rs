@@ -607,8 +607,8 @@ impl Executor {
         let mut txn = self.storage.begin_transaction().await?;
         let mut decisions = Vec::new();
         for statement in statements {
-            if let Some((operation, table_name, row_id)) = self
-                .shard_point_write_target_for_statement(statement, &mut *txn, params)
+            for (operation, table_name, row_id) in self
+                .shard_point_write_targets_for_statement(statement, &mut *txn, params)
                 .await?
             {
                 decisions.push(Self::shard_routing_decision_for_row_id(
@@ -622,22 +622,128 @@ impl Executor {
         Ok(decisions)
     }
 
-    async fn shard_point_write_target_for_statement(
+    async fn shard_point_write_targets_for_statement(
         &self,
         statement: &Statement,
         txn: &mut dyn Transaction,
         params: &[Value],
-    ) -> Result<Option<(&'static str, String, String)>> {
+    ) -> Result<Vec<(&'static str, String, String)>> {
         match statement {
+            Statement::Insert(insert) => self
+                .shard_point_write_targets_for_insert(insert, txn, params)
+                .await
+                .map(|targets| {
+                    targets
+                        .into_iter()
+                        .map(|(table, row_id)| ("INSERT", table, row_id))
+                        .collect()
+                }),
             Statement::Update(update) => self
                 .shard_point_write_target_for_update(update, txn, params)
                 .await
-                .map(|target| target.map(|(table, row_id)| ("UPDATE", table, row_id))),
+                .map(|target| {
+                    target
+                        .map(|(table, row_id)| vec![("UPDATE", table, row_id)])
+                        .unwrap_or_default()
+                }),
             Statement::Delete(delete) => self
                 .shard_point_write_target_for_delete(delete, txn, params)
                 .await
-                .map(|target| target.map(|(table, row_id)| ("DELETE", table, row_id))),
-            _ => Ok(None),
+                .map(|target| {
+                    target
+                        .map(|(table, row_id)| vec![("DELETE", table, row_id)])
+                        .unwrap_or_default()
+                }),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn shard_point_write_targets_for_insert(
+        &self,
+        insert: &sqlparser::ast::Insert,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<Vec<(String, String)>> {
+        let table_name = insert.table.to_string();
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(&table_name, txn)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(pk_idx) = schema.get_primary_key_index() else {
+            return Ok(Vec::new());
+        };
+
+        let composite_unique_indexes = self
+            .load_composite_unique_indexes_for_table(&table_name, txn)
+            .await?;
+        if composite_unique_indexes
+            .iter()
+            .any(|index| index.name.ends_with("_pkey"))
+        {
+            return Ok(Vec::new());
+        }
+
+        let Some(query) = insert.source.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let SetExpr::Values(values) = query.body.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let Some(pk_expr_idx) = Self::insert_primary_key_expr_index(insert, &schema, pk_idx) else {
+            return Ok(Vec::new());
+        };
+
+        let mut targets = Vec::with_capacity(values.rows.len());
+        for row in &values.rows {
+            if !Self::insert_values_row_shape_can_be_routed(insert, &schema, row) {
+                return Ok(Vec::new());
+            }
+            let Some(value_expr) = row.get(pk_expr_idx) else {
+                return Ok(Vec::new());
+            };
+            if self.expr_has_column_reference(value_expr) {
+                return Ok(Vec::new());
+            }
+            let value = self.evaluate_value(value_expr, &[], &schema, params)?;
+            let value =
+                Self::coerce_value_to_column_type(value, &schema.columns[pk_idx].data_type)?;
+            let Some(row_id) = Self::value_to_primary_row_id(&value) else {
+                return Ok(Vec::new());
+            };
+            targets.push((table_name.clone(), row_id));
+        }
+
+        Ok(targets)
+    }
+
+    fn insert_primary_key_expr_index(
+        insert: &sqlparser::ast::Insert,
+        schema: &TableSchema,
+        pk_idx: usize,
+    ) -> Option<usize> {
+        if insert.columns.is_empty() {
+            return Some(pk_idx);
+        }
+
+        let pk_column = &schema.columns[pk_idx].name;
+        insert
+            .columns
+            .iter()
+            .position(|column| column.value.eq_ignore_ascii_case(pk_column))
+    }
+
+    fn insert_values_row_shape_can_be_routed(
+        insert: &sqlparser::ast::Insert,
+        schema: &TableSchema,
+        row: &[Expr],
+    ) -> bool {
+        if insert.columns.is_empty() {
+            row.len() == schema.columns.len()
+        } else {
+            row.len() == insert.columns.len()
         }
     }
 
@@ -654,9 +760,12 @@ impl Executor {
             return Ok(None);
         };
 
-        let schema = self
+        let Some(schema) = self
             .load_table_schema_for_shard_routing(&table_name, txn)
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         let allowed_qualifiers = Self::primary_key_qualifiers(relation);
         Ok(self
             .primary_key_row_id_from_eq_selection(
@@ -683,9 +792,12 @@ impl Executor {
             return Ok(None);
         };
 
-        let schema = self
+        let Some(schema) = self
             .load_table_schema_for_shard_routing(&table_name, txn)
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         let allowed_qualifiers = Self::primary_key_qualifiers(relation);
         Ok(self
             .primary_key_row_id_from_eq_selection(
@@ -710,13 +822,13 @@ impl Executor {
         &self,
         table_name: &str,
         txn: &mut dyn Transaction,
-    ) -> Result<TableSchema> {
+    ) -> Result<Option<TableSchema>> {
         let schema_key = format!("schema:{}", table_name);
-        let schema_bytes = txn
-            .get(schema_key.as_bytes())
-            .await?
-            .ok_or_else(|| FusionError::Execution(format!("Table {} not found", table_name)))?;
+        let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
+            return Ok(None);
+        };
         bincode::deserialize(&schema_bytes)
+            .map(Some)
             .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))
     }
 

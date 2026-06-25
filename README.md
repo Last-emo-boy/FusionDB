@@ -1006,7 +1006,7 @@ These are known gaps that should be addressed before production use:
 - Raft log/state metadata is currently in-memory and intended as the control-plane wiring foundation
 - Snapshot transfer serializes visible key-value state for new node bootstrap
 - Sharding has a configurable hash/range control plane, route API, local row-data shard key layout (`shard:{id}:data:{table}:{row_id}`), and local secondary-index KV shard layouts (`shard:{id}:index:*`, `shard:{id}:fts:*`)
-- HTTP SQL execution now rejects deterministic non-local shard-owner point writes (`UPDATE`/`DELETE` by primary-key equality) with a route hint instead of silently executing them on the wrong node
+- HTTP SQL execution now rejects deterministic non-local shard-owner point writes (`INSERT ... VALUES` with an explicit primary key plus `UPDATE`/`DELETE` by primary-key equality) with a route hint instead of silently executing them on the wrong node
 - Distributed index ownership/maintenance, automatic cross-node SQL forwarding, and broad multi-shard query routing are still in progress
 - No dedicated read-replica topology management
 - No distributed transactions (2PC)
