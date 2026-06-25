@@ -484,6 +484,35 @@ impl Executor {
         Ok(stmts)
     }
 
+    pub fn sql_requires_raft_write(&self, sql: &str) -> Result<bool> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+
+        if upper == "SHOW VIEWS"
+            || upper == "SHOW INDEXES"
+            || upper.starts_with("SHOW INDEXES FROM ")
+            || upper == "SHOW ALL"
+            || upper == "SHOW USERS"
+            || upper.starts_with("EXPLAIN ")
+        {
+            return Ok(false);
+        }
+
+        if upper.starts_with("CREATE USER ")
+            || upper.starts_with("DROP USER ")
+            || upper.starts_with("GRANT ")
+            || upper.starts_with("REVOKE ")
+            || upper.starts_with("VACUUM")
+        {
+            return Ok(true);
+        }
+
+        let statements = self.prepare(sql)?;
+        Ok(statements
+            .iter()
+            .any(Self::statement_may_change_query_results))
+    }
+
     pub fn register_prepared_statement(
         &self,
         sql: &str,
@@ -1338,6 +1367,16 @@ mod tests {
         Executor::statement_permissions(&statements[0])
     }
 
+    fn sql_requires_raft_write(sql: &str) -> bool {
+        let wal_path = format!("test_sql_requires_raft_write_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage);
+        let result = executor.sql_requires_raft_write(sql).unwrap();
+        let _ = std::fs::remove_file(wal_path);
+        result
+    }
+
     #[test]
     fn statement_permissions_preserve_preallocated_entries() {
         assert_eq!(
@@ -1396,6 +1435,23 @@ mod tests {
                 ("old_items".to_string(), "ALL")
             ]
         );
+    }
+
+    #[test]
+    fn sql_requires_raft_write_classifies_statement_kinds() {
+        assert!(!sql_requires_raft_write("SELECT * FROM users"));
+        assert!(!sql_requires_raft_write("SHOW USERS"));
+        assert!(!sql_requires_raft_write("EXPLAIN SELECT * FROM users"));
+
+        assert!(sql_requires_raft_write("INSERT INTO users VALUES (1)"));
+        assert!(sql_requires_raft_write("CREATE TABLE users (id INTEGER)"));
+        assert!(sql_requires_raft_write(
+            "ANALYZE TABLE users COMPUTE STATISTICS"
+        ));
+        assert!(sql_requires_raft_write(
+            "CREATE USER alice WITH PASSWORD 'secret'"
+        ));
+        assert!(sql_requires_raft_write("VACUUM"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub auth: AuthConfig,
     pub tls: TlsConfig,
+    pub distributed: DistributedConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +70,30 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistributedConfig {
+    /// Enable OpenRaft-backed distributed mode
+    pub enabled: bool,
+    /// Local Raft node id
+    pub node_id: u64,
+    /// Address advertised to peer nodes; defaults to server bind/http_port when empty
+    pub advertise_addr: String,
+    /// Initialize the configured membership on startup
+    pub bootstrap: bool,
+    /// Application-specific OpenRaft cluster name
+    pub cluster_name: String,
+    /// Initial voting members used during bootstrap
+    pub initial_members: Vec<DistributedPeerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistributedPeerConfig {
+    pub node_id: u64,
+    pub addr: String,
+}
+
 // --- Defaults ---
 
 impl Default for TlsConfig {
@@ -88,6 +113,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             auth: AuthConfig::default(),
             tls: TlsConfig::default(),
+            distributed: DistributedConfig::default(),
         }
     }
 }
@@ -163,6 +189,17 @@ impl ServerConfig {
     }
 }
 
+impl DistributedConfig {
+    /// Address this node should advertise to Raft peers.
+    pub fn effective_advertise_addr(&self, server: &ServerConfig) -> String {
+        if self.advertise_addr.trim().is_empty() {
+            server.socket_addr(server.http_port)
+        } else {
+            self.advertise_addr.clone()
+        }
+    }
+}
+
 impl Config {
     /// Load config from file path. Falls back to defaults if file doesn't exist.
     pub fn load(path: &str) -> Self {
@@ -204,6 +241,9 @@ mod tests {
         assert!(!config.server.redis_enabled);
         assert_eq!(config.server.redis_port, 6379);
         assert_eq!(config.server.max_connections, 100);
+        assert!(!config.distributed.enabled);
+        assert_eq!(config.distributed.node_id, 1);
+        assert_eq!(config.distributed.cluster_name, "fusiondb");
         assert_eq!(config.storage.data_dir, "data");
         assert_eq!(config.auth.password, "fusiondb");
     }
@@ -225,12 +265,30 @@ memtable_flush_mb = 64
 
 [auth]
 password = "secret123"
+
+[distributed]
+enabled = true
+node_id = 2
+advertise_addr = "127.0.0.1:19091"
+bootstrap = false
+cluster_name = "fusiondb-test"
+
+[[distributed.initial_members]]
+node_id = 1
+addr = "127.0.0.1:8091"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.server.http_port, 9091);
         assert!(config.server.redis_enabled);
         assert_eq!(config.server.redis_port, 6380);
         assert_eq!(config.server.max_connections, 250);
+        assert!(config.distributed.enabled);
+        assert_eq!(config.distributed.node_id, 2);
+        assert_eq!(config.distributed.advertise_addr, "127.0.0.1:19091");
+        assert!(!config.distributed.bootstrap);
+        assert_eq!(config.distributed.cluster_name, "fusiondb-test");
+        assert_eq!(config.distributed.initial_members.len(), 1);
+        assert_eq!(config.distributed.initial_members[0].node_id, 1);
         assert_eq!(config.storage.data_dir, "/var/fusiondb");
         assert_eq!(config.storage.memtable_flush_mb, 64);
         assert_eq!(config.auth.password, "secret123");
@@ -261,6 +319,45 @@ password = "secret123"
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("http_port = 8091"));
         assert!(serialized.contains("max_connections = 100"));
+        assert!(serialized.contains("[distributed]"));
+        assert!(serialized.contains("enabled = false"));
         assert!(serialized.contains("data_dir = \"data\""));
+    }
+
+    #[test]
+    fn distributed_advertise_addr_defaults_to_http_socket() {
+        let server = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            http_port: 19091,
+            ..Default::default()
+        };
+        let distributed = DistributedConfig::default();
+
+        assert_eq!(
+            distributed.effective_advertise_addr(&server),
+            "0.0.0.0:19091"
+        );
+    }
+}
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: 1,
+            advertise_addr: String::new(),
+            bootstrap: true,
+            cluster_name: "fusiondb".to_string(),
+            initial_members: Vec::new(),
+        }
+    }
+}
+
+impl Default for DistributedPeerConfig {
+    fn default() -> Self {
+        Self {
+            node_id: 1,
+            addr: "127.0.0.1:8091".to_string(),
+        }
     }
 }

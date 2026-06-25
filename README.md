@@ -825,6 +825,14 @@ slow_query_threshold_ms = 100    # Slow query log threshold (ms)
 
 [auth]
 password = "fusiondb"      # Password for PostgreSQL cleartext auth
+
+[distributed]
+enabled = false            # Enable OpenRaft-backed distributed mode
+node_id = 1                # Local Raft node id
+advertise_addr = ""        # Peer-facing address; empty uses server bind/http_port
+bootstrap = true           # Initialize configured members on startup
+cluster_name = "fusiondb"  # OpenRaft cluster name
+initial_members = []       # Optional [{ node_id = 1, addr = "127.0.0.1:8091" }]
 ```
 
 ### Ports Summary
@@ -986,9 +994,11 @@ These are known gaps that should be addressed before production use:
 - No savepoints (`SAVEPOINT` / `RELEASE`)
 
 ### Distributed
-- OpenRaft integration is structural only — not wired into the main server loop yet
+- OpenRaft can be enabled via `[distributed]`, with `/raft/*` HTTP RPCs, leader-forwarded writes, and local follower reads
+- Raft state is currently in-memory and intended as the control-plane wiring foundation
+- Snapshot transfer for node bootstrap is still placeholder-level
 - No automatic sharding / partitioning
-- No read replicas
+- No dedicated read-replica topology management
 - No distributed transactions (2PC)
 
 ### Security
@@ -1013,7 +1023,7 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 | **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
 | **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
 | **4. Performance** | ✅ Done | Connection slots, parallel scan, LZ4 SSTable compression, cost-based optimizer |
-| **5. Distributed** | 🔲 Planned | Wire OpenRaft into main server |
+| **5. Distributed** | 🔲 Planned | OpenRaft main-loop wiring, snapshot transfer, automatic sharding |
 | **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
 
 ---

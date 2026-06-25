@@ -37,6 +37,15 @@ async fn main() -> Result<()> {
     } else {
         println!("  Redis:   disabled");
     }
+    if config.distributed.enabled {
+        println!(
+            "  Raft:    node {} advertised at {}",
+            config.distributed.node_id,
+            config.distributed.effective_advertise_addr(&config.server)
+        );
+    } else {
+        println!("  Raft:    disabled");
+    }
     println!("  Data:    {}", config.storage.data_dir);
 
     // 2. Apply config to monitor

@@ -9,14 +9,18 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::BasicNode;
+use std::sync::Arc;
 
 use super::typ::{NodeId, Request, TypeConfig};
 use super::FusionRaft;
+use crate::execution::{Executor, QueryResult};
 
 /// Shared application state for Raft HTTP endpoints.
 #[derive(Clone)]
 pub struct RaftAppState {
     pub raft: FusionRaft,
+    pub executor: Arc<Executor>,
+    pub client: reqwest::Client,
 }
 
 /// Build the Raft API router.
@@ -26,6 +30,7 @@ pub fn raft_routes(state: RaftAppState) -> Router {
         .route("/raft/snapshot", post(raft_snapshot))
         .route("/raft/vote", post(raft_vote))
         .route("/raft/write", post(raft_write))
+        .route("/raft/query", post(raft_query))
         .route("/raft/add-learner", post(raft_add_learner))
         .route("/raft/change-membership", post(raft_change_membership))
         .route("/raft/metrics", post(raft_metrics))
@@ -60,30 +65,162 @@ async fn raft_vote(
 
 // --- Client-facing RPCs ---
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct WriteRequest {
     pub sql: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 pub struct WriteResponse {
     pub success: bool,
     pub message: String,
+}
+
+pub async fn submit_raft_write(
+    raft: &FusionRaft,
+    client: &reqwest::Client,
+    sql: String,
+) -> Result<super::typ::Response, String> {
+    let raft_req = Request { sql: sql.clone() };
+    match raft.client_write(raft_req).await {
+        Ok(resp) => Ok(resp.data),
+        Err(e) => {
+            if let Some(forward) = e.forward_to_leader() {
+                if let Some(node) = &forward.leader_node {
+                    return forward_write_to_leader(client, &node.addr, WriteRequest { sql }).await;
+                }
+            }
+            Err(format!("Raft write error: {}", e))
+        }
+    }
+}
+
+async fn forward_write_to_leader(
+    client: &reqwest::Client,
+    leader_addr: &str,
+    req: WriteRequest,
+) -> Result<super::typ::Response, String> {
+    let url = format!("http://{}/raft/write", leader_addr);
+    let resp = client
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| format!("Raft leader forwarding error: {}", e))?;
+    let status = resp.status();
+    let body = resp
+        .json::<WriteResponse>()
+        .await
+        .map_err(|e| format!("Raft leader response decode error: {}", e))?;
+    if status.is_success() && body.success {
+        Ok(super::typ::Response {
+            message: body.message,
+        })
+    } else {
+        Err(body.message)
+    }
 }
 
 async fn raft_write(
     State(state): State<RaftAppState>,
     Json(req): Json<WriteRequest>,
 ) -> Json<WriteResponse> {
-    let raft_req = Request { sql: req.sql };
-    match state.raft.client_write(raft_req).await {
+    match submit_raft_write(&state.raft, &state.client, req.sql).await {
         Ok(resp) => Json(WriteResponse {
             success: true,
-            message: resp.data.message,
+            message: resp.message,
         }),
         Err(e) => Json(WriteResponse {
             success: false,
-            message: format!("Raft write error: {}", e),
+            message: e,
+        }),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReadRequest {
+    pub sql: String,
+    pub linearizable: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ReadResponse {
+    pub success: bool,
+    pub message: String,
+    pub results: Vec<RaftQueryResult>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "type")]
+pub enum RaftQueryResult {
+    Select {
+        columns: Vec<String>,
+        rows: Vec<Vec<serde_json::Value>>,
+    },
+    Success {
+        message: String,
+    },
+}
+
+impl From<QueryResult> for RaftQueryResult {
+    fn from(value: QueryResult) -> Self {
+        match value {
+            QueryResult::Select { columns, rows } => RaftQueryResult::Select {
+                columns,
+                rows: rows
+                    .into_iter()
+                    .map(|row| row.iter().map(|value| value.to_json()).collect())
+                    .collect(),
+            },
+            QueryResult::Success { message } => RaftQueryResult::Success { message },
+        }
+    }
+}
+
+async fn raft_query(
+    State(state): State<RaftAppState>,
+    Json(req): Json<ReadRequest>,
+) -> Json<ReadResponse> {
+    match state.executor.sql_requires_raft_write(&req.sql) {
+        Ok(true) => {
+            return Json(ReadResponse {
+                success: false,
+                message:
+                    "Raft query endpoint only accepts read-only SQL; use /raft/write for writes"
+                        .to_string(),
+                results: Vec::new(),
+            });
+        }
+        Err(e) => {
+            return Json(ReadResponse {
+                success: false,
+                message: format!("SQL classification error: {}", e),
+                results: Vec::new(),
+            });
+        }
+        Ok(false) => {}
+    }
+
+    if req.linearizable.unwrap_or(false) {
+        if let Err(e) = state.raft.ensure_linearizable().await {
+            return Json(ReadResponse {
+                success: false,
+                message: format!("Raft linearizable read error: {}", e),
+                results: Vec::new(),
+            });
+        }
+    }
+
+    match state.executor.execute_sql(&req.sql).await {
+        Ok(results) => Json(ReadResponse {
+            success: true,
+            message: "OK".to_string(),
+            results: results.into_iter().map(RaftQueryResult::from).collect(),
+        }),
+        Err(e) => Json(ReadResponse {
+            success: false,
+            message: format!("Query error: {}", e),
+            results: Vec::new(),
         }),
     }
 }

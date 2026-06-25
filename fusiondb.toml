@@ -19,3 +19,11 @@ slow_query_threshold_ms = 100
 [auth]
 password = "fusiondb"
 scram_sha256 = false
+
+[distributed]
+enabled = false
+node_id = 1
+advertise_addr = ""
+bootstrap = true
+cluster_name = "fusiondb"
+initial_members = []

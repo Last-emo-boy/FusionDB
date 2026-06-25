@@ -13,6 +13,8 @@ use tower_http::cors::CorsLayer;
 
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Value};
+use crate::distributed::api::{raft_routes, submit_raft_write, RaftAppState};
+use crate::distributed::FusionRaft;
 use crate::execution::{Executor, PreparedStatementRecord};
 use crate::storage::Storage;
 
@@ -47,7 +49,7 @@ pub struct VectorSearchResult {
 }
 
 fn build_router(state: AppState) -> Router {
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(health_check))
         .route("/query", post(handle_query))
         .route("/prepare", post(handle_prepare).get(handle_list_prepared))
@@ -69,7 +71,17 @@ fn build_router(state: AppState) -> Router {
         .route("/hybrid_search", post(handle_hybrid_search))
         .layer(middleware::from_fn(auth_context_middleware))
         .layer(CorsLayer::permissive())
-        .with_state(state)
+        .with_state(state.clone());
+
+    if let Some(raft) = state.raft.clone() {
+        app = app.merge(raft_routes(RaftAppState {
+            raft,
+            executor: state.executor.clone(),
+            client: state.raft_client.clone(),
+        }));
+    }
+
+    app
 }
 
 #[deprecated(
@@ -81,8 +93,16 @@ pub async fn start_http_server(
     bind: &str,
     start_port: u16,
     _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    raft: Option<FusionRaft>,
+    distributed_mode: String,
 ) {
-    let state = AppState { executor, storage };
+    let state = AppState {
+        executor,
+        storage,
+        raft,
+        raft_client: reqwest::Client::new(),
+        distributed_mode,
+    };
 
     let app = build_router(state);
 
@@ -355,7 +375,7 @@ async fn handle_cdc_events(
 async fn handle_capabilities(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<Envelope<CapabilityInfo>>) {
-    json_ok(CapabilityInfo::from_storage(&state.storage))
+    json_ok(CapabilityInfo::from_state(&state))
 }
 
 async fn handle_query(
@@ -367,6 +387,22 @@ async fn handle_query(
 
     if let Err(e) = state.executor.authorize_sql(&username, &payload.sql).await {
         return json_error(StatusCode::FORBIDDEN, format!("{:?}", e));
+    }
+
+    if let Some(raft) = &state.raft {
+        match state.executor.sql_requires_raft_write(&payload.sql) {
+            Ok(true) => {
+                return match submit_raft_write(raft, &state.raft_client, payload.sql).await {
+                    Ok(resp) => json_ok(vec![QueryResultJson::Success {
+                        r#type: "success".to_string(),
+                        message: resp.message,
+                    }]),
+                    Err(e) => json_error(StatusCode::BAD_REQUEST, e),
+                };
+            }
+            Ok(false) => {}
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("{:?}", e)),
+        }
     }
 
     match state.executor.execute_sql(&payload.sql).await {
@@ -568,6 +604,9 @@ async fn handle_execute(
 pub struct AppState {
     executor: Arc<Executor>,
     storage: Arc<dyn Storage>,
+    raft: Option<FusionRaft>,
+    raft_client: reqwest::Client,
+    distributed_mode: String,
 }
 
 #[derive(Clone, Default)]
@@ -715,12 +754,21 @@ impl From<PreparedStatementRecord> for PreparedStatementInfo {
 }
 
 impl CapabilityInfo {
-    fn from_storage(storage: &Arc<dyn Storage>) -> Self {
-        let compact_supported = storage.as_any().downcast_ref::<FusionStorage>().is_some();
+    fn from_state(state: &AppState) -> Self {
+        let compact_supported = state
+            .storage
+            .as_any()
+            .downcast_ref::<FusionStorage>()
+            .is_some();
         let cdc_supported = compact_supported;
         let backend = if compact_supported {
             "FusionStorage"
-        } else if storage.as_any().downcast_ref::<MemoryStorage>().is_some() {
+        } else if state
+            .storage
+            .as_any()
+            .downcast_ref::<MemoryStorage>()
+            .is_some()
+        {
             "MemoryStorage"
         } else {
             "GenericStorage"
@@ -731,7 +779,7 @@ impl CapabilityInfo {
             compact_supported,
             cdc_supported,
             prepared_statement_ownership: true,
-            distributed_mode: "isolated".to_string(),
+            distributed_mode: state.distributed_mode.clone(),
         }
     }
 }
@@ -877,7 +925,24 @@ mod tests {
 
     fn test_app(storage: Arc<dyn Storage>) -> Router {
         let executor = Arc::new(Executor::new(storage.clone()));
-        build_router(AppState { executor, storage })
+        build_router(AppState {
+            executor,
+            storage,
+            raft: None,
+            raft_client: reqwest::Client::new(),
+            distributed_mode: "isolated".to_string(),
+        })
+    }
+
+    fn test_app_with_distributed_mode(storage: Arc<dyn Storage>, distributed_mode: &str) -> Router {
+        let executor = Arc::new(Executor::new(storage.clone()));
+        build_router(AppState {
+            executor,
+            storage,
+            raft: None,
+            raft_client: reqwest::Client::new(),
+            distributed_mode: distributed_mode.to_string(),
+        })
     }
 
     #[tokio::test]
@@ -1140,6 +1205,28 @@ mod tests {
         assert_eq!(auth_data.username.as_deref(), Some("alice"));
         assert!(auth_data.authenticated);
         assert_eq!(auth_data.mode, "explicit_user");
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_capabilities_reports_distributed_mode() {
+        let wal_path = format!("test_http_distributed_mode_{}.wal", std::process::id());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = test_app_with_distributed_mode(storage.clone(), "raft(node_id=7)");
+
+        let capabilities_request = HttpRequest::builder()
+            .method("GET")
+            .uri("/capabilities")
+            .body(Body::empty())
+            .expect("capabilities request");
+        let capabilities_response = app
+            .oneshot(capabilities_request)
+            .await
+            .expect("capabilities response");
+        let capabilities: Envelope<CapabilityInfo> = response_json(capabilities_response).await;
+        let capability_data = capabilities.data.expect("capability data");
+        assert_eq!(capability_data.distributed_mode, "raft(node_id=7)");
 
         let _ = std::fs::remove_file(&wal_path);
     }
