@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-407",
+  "title": "Add fusiondb-cli admin operations tool",
+  "status": "completed",
+  "files": [
+    "Cargo.toml",
+    "src/bin/fusiondb-cli.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "description": "Add a production operations CLI that wraps FusionDB HTTP health, query, metadata, metrics, checkpoint, and compaction endpoints.",
+  "convergence": {
+    "criteria": [
+      "A fusiondb-cli binary is registered in Cargo.toml.",
+      "The CLI supports health, query, tables, metrics, prometheus, slow-queries, checkpoint, compact/vacuum, capabilities, and auth-context commands.",
+      "CLI request construction is covered by offline unit tests.",
+      "Roadmap and README no longer list Admin CLI as missing."
+    ]
+  },
+  "tests": [
+    {
+      "command": "cargo test --bin fusiondb-cli",
+      "result": "passed"
+    },
+    {
+      "command": "cargo check --bins",
+      "result": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "notes": [
+    "The CLI is intentionally HTTP-backed so it can operate against a running server without linking to storage internals.",
+    "The vacuum command is an operator-friendly alias for the existing /compact endpoint.",
+    "The --user flag maps to x-fusiondb-user, matching the existing HTTP RBAC middleware."
+  ]
+}

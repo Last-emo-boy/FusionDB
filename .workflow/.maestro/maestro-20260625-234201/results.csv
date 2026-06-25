@@ -1,0 +1,2 @@
+id,status,skill_call,summary,artifacts,error
+"0","completed","$maestro continue production readiness","Completed BENCHPROD-407: fusiondb-cli admin operations.",".workflow/.csv-wave/20260625-execute-benchprod-407-admin-cli/context.md","spawn_agents_on_csv unavailable; used local fallback"

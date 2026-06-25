@@ -1,0 +1,24 @@
+{
+  "id": "BENCHPROD-407",
+  "title": "Add fusiondb-cli admin operations tool",
+  "status": "completed",
+  "created_at": "2026-06-25",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-407"
+  ],
+  "scope": [
+    "Cargo.toml",
+    "src/bin/fusiondb-cli.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Close the production operations gap for an admin CLI by adding a scriptable HTTP client for health, query, metadata, metrics, checkpoint, and compaction endpoints.",
+  "verification": [
+    "cargo fmt -- src/bin/fusiondb-cli.rs",
+    "cargo test --bin fusiondb-cli",
+    "cargo check --bins",
+    "cargo fmt --check",
+    "git diff --check"
+  ]
+}
