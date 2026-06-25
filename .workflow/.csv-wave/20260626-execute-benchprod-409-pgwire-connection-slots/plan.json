@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-409",
+  "title": "Add pgwire connection slots and backpressure",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-409"
+  ],
+  "scope": [
+    "src/config.rs",
+    "src/main.rs",
+    "src/monitor.rs",
+    "src/server/http_server.rs",
+    "src/server/mod.rs",
+    "src/server/pg_server.rs",
+    "fusiondb.toml",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Close the P4-1 connection management gap by adding configurable pgwire connection slots, overload rejection, and connection metrics.",
+  "verification": [
+    "cargo fmt -- src/config.rs src/monitor.rs src/server/http_server.rs src/server/mod.rs src/server/pg_server.rs src/main.rs",
+    "cargo test --lib pg_connection -- --nocapture",
+    "cargo test --lib config::tests -- --nocapture",
+    "cargo test --lib http_metrics_include_pg_connection_pool_fields -- --nocapture",
+    "cargo test --lib",
+    "cargo check --bins",
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo test --test pg_integration test_pg_protocol_simple_query -- --nocapture"
+  ]
+}

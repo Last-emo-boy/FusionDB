@@ -1,0 +1,16 @@
+{
+  "id": "BENCHPROD-409",
+  "title": "Add pgwire connection slots and backpressure",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "completed_at": "2026-06-26T00:01:19+08:00",
+  "commit": "038b230",
+  "summary": "FusionDB now enforces configurable pgwire connection slots and exposes connection metrics.",
+  "acceptance": [
+    "server.max_connections is configurable and defaults to 100",
+    "pgwire accept loop rejects connections after the configured slot limit",
+    "active, rejected, and configured limits are exported via metrics",
+    "existing start_pg_server callers keep working with the default limit",
+    "ROADMAP P4-1 is marked complete"
+  ]
+}
