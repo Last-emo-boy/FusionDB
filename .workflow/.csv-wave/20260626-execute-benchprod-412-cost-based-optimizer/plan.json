@@ -1,0 +1,28 @@
+{
+  "id": "BENCHPROD-412",
+  "title": "Complete cost-based join optimizer",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-412"
+  ],
+  "scope": [
+    "src/execution/scan/join.rs",
+    "src/execution/ddl/explain.rs",
+    "tests/sql_ddl.rs",
+    "tests/sql_join.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Close P4-3 by extending statistics-backed cardinality estimates and join reordering from comma joins to standard INNER JOIN chains while preserving user-visible wildcard column order.",
+  "verification": [
+    "cargo test --test sql_ddl -- --nocapture",
+    "cargo test --test sql_join -- --nocapture",
+    "cargo test --lib",
+    "cargo check --bins",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "code_commit": "0a4275f"
+}
