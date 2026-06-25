@@ -154,6 +154,7 @@ cargo run --bin fusiondb-cli -- tables
 cargo run --bin fusiondb-cli -- query "SELECT * FROM users LIMIT 5"
 cargo run --bin fusiondb-cli -- checkpoint
 cargo run --bin fusiondb-cli -- vacuum
+cargo run --bin fusiondb-cli -- cdc --since 0 --limit 100
 
 # Custom endpoint/user
 cargo run --bin fusiondb-cli -- --url http://127.0.0.1:8091 --user admin metrics
@@ -577,6 +578,7 @@ All endpoints are served from `http://127.0.0.1:8091`.
 | `GET` | `/slow_queries` | Recent slow queries (JSON array) |
 | `POST` | `/checkpoint` | Force SSTable flush / snapshot |
 | `POST` | `/compact` | Run manual FusionStorage compaction (`fusiondb-cli vacuum`) |
+| `GET` | `/cdc/events?since=N&limit=M` | Read committed CDC events for FusionStorage |
 | `GET` | `/capabilities` | Show backend and feature capabilities |
 | `POST` | `/vector_search` | Direct vector search (bypass SQL) |
 | `POST` | `/hybrid_search` | Combined text + vector search |
@@ -659,6 +661,29 @@ fusiondb_slow_query_count 12
 ...
 
 ```
+
+**GET /cdc/events?since=0&limit=100**
+```json
+{
+  "status": "ok",
+  "data": {
+    "events": [
+      {
+        "sequence": 1048576,
+        "commit_ts": 1,
+        "operation": "put",
+        "key": { "encoding": "utf8", "data": "data:orders:0001" },
+        "value": { "encoding": "utf8", "data": "..." }
+      }
+    ],
+    "next_since": 1048576,
+    "latest_sequence": 1048576
+  },
+  "error": null
+}
+```
+
+CDC is available on `FusionStorage` and records committed storage writes with a monotonic `sequence` for resumable polling. Registered users must be superusers to read this feed; anonymous and `postgres` remain legacy superusers for local compatibility.
 
 ---
 
@@ -964,6 +989,7 @@ These are known gaps that should be addressed before production use:
 ### Operations
 - No connection pooling
 - No automatic compaction tuning / maintenance scheduler
+- CDC is currently a resumable event feed; distributed streaming replication remains future work
 
 ---
 
@@ -978,7 +1004,7 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 | **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
 | **4. Performance** | 🔲 Planned | Connection pooling, cost-based optimizer |
 | **5. Distributed** | 🔲 Planned | Wire OpenRaft into main server |
-| **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file |
+| **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
 
 ---
 

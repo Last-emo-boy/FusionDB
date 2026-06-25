@@ -1,11 +1,13 @@
 use super::columnar::ColumnarVectorStore;
 use super::wal::{WalEntry, WalManager};
 use super::{ScanVisitor, Storage, Transaction};
-use crate::common::Result;
+use crate::common::{FusionError, Result};
 use crate::config::StorageConfig;
 use async_trait::async_trait;
+use base64::Engine as _;
 use crossbeam_skiplist::SkipMap;
 use moka::sync::Cache;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -20,6 +22,63 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 const TS_SIZE: usize = 8;
 const COMPACTION_FANIN: usize = 4;
 const SSTABLE_BLOCK_BUFFER_CAPACITY: usize = 4096;
+const CDC_KEY_PREFIX: &str = "__fusiondb_cdc:";
+const CDC_KEY_END: &str = "__fusiondb_cdc;";
+const CDC_SEQUENCE_EVENT_BITS: u32 = 20;
+const CDC_MAX_EVENT_INDEX: usize = (1usize << CDC_SEQUENCE_EVENT_BITS) - 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcBytes {
+    pub encoding: String,
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcOperation {
+    Put,
+    Delete,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CdcEvent {
+    pub sequence: u64,
+    pub commit_ts: u64,
+    pub operation: CdcOperation,
+    pub key: CdcBytes,
+    pub value: Option<CdcBytes>,
+}
+
+impl CdcBytes {
+    fn from_raw(bytes: &[u8]) -> Self {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Self {
+                encoding: "utf8".to_string(),
+                data: text.to_string(),
+            },
+            Err(_) => Self {
+                encoding: "base64".to_string(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            },
+        }
+    }
+}
+
+impl CdcEvent {
+    fn from_write(sequence: u64, commit_ts: u64, key: &[u8], value: Option<&[u8]>) -> Self {
+        Self {
+            sequence,
+            commit_ts,
+            operation: if value.is_some() {
+                CdcOperation::Put
+            } else {
+                CdcOperation::Delete
+            },
+            key: CdcBytes::from_raw(key),
+            value: value.map(CdcBytes::from_raw),
+        }
+    }
+}
 
 fn obsolete_sstable_path_buffer(capacity: usize) -> Vec<PathBuf> {
     Vec::with_capacity(capacity)
@@ -108,6 +167,43 @@ fn immutable_memtable_buffer() -> Vec<MemTable> {
 
 fn transaction_write_buffer() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     Vec::with_capacity(1)
+}
+
+fn cdc_key_for_sequence(sequence: u64) -> String {
+    let mut key = String::with_capacity(CDC_KEY_PREFIX.len() + 20);
+    key.push_str(CDC_KEY_PREFIX);
+    write!(&mut key, "{sequence:020}").expect("writing to String cannot fail");
+    key
+}
+
+fn cdc_sequence_for(commit_ts: u64, event_index: usize) -> Result<u64> {
+    if event_index > CDC_MAX_EVENT_INDEX {
+        return Err(FusionError::Storage(format!(
+            "CDC transaction event limit exceeded: {} > {}",
+            event_index, CDC_MAX_EVENT_INDEX
+        )));
+    }
+    if commit_ts > (u64::MAX >> CDC_SEQUENCE_EVENT_BITS) {
+        return Err(FusionError::Storage(format!(
+            "CDC sequence overflow for commit timestamp {}",
+            commit_ts
+        )));
+    }
+    Ok((commit_ts << CDC_SEQUENCE_EVENT_BITS) | event_index as u64)
+}
+
+fn cdc_should_capture_key(key: &[u8]) -> bool {
+    !key.starts_with(CDC_KEY_PREFIX.as_bytes())
+}
+
+fn encode_cdc_event(event: &CdcEvent) -> Result<Vec<u8>> {
+    bincode::serialize(event)
+        .map_err(|error| FusionError::Storage(format!("CDC event encode error: {}", error)))
+}
+
+fn decode_cdc_event(bytes: &[u8]) -> Result<CdcEvent> {
+    bincode::deserialize(bytes)
+        .map_err(|error| FusionError::Storage(format!("CDC event decode error: {}", error)))
 }
 
 fn vector_rebuild_data_prefix_for_table(table_name: &str) -> String {
@@ -405,6 +501,39 @@ impl FusionStorage {
         });
 
         Ok(storage)
+    }
+
+    pub async fn cdc_events_since(&self, since: u64, limit: usize) -> Result<Vec<CdcEvent>> {
+        if limit == 0 || since == u64::MAX {
+            return Ok(Vec::new());
+        }
+
+        let start_key = if since == 0 {
+            CDC_KEY_PREFIX.as_bytes().to_vec()
+        } else {
+            cdc_key_for_sequence(since + 1).into_bytes()
+        };
+        let txn = self.begin_transaction().await?;
+        let pairs = txn
+            .scan_range(&start_key, CDC_KEY_END.as_bytes(), Some(limit))
+            .await?;
+
+        let mut events = Vec::with_capacity(pairs.len());
+        for (_, value) in pairs {
+            events.push(decode_cdc_event(&value)?);
+        }
+        Ok(events)
+    }
+
+    pub async fn cdc_latest_sequence(&self) -> Result<u64> {
+        let txn = self.begin_transaction().await?;
+        match txn
+            .last(CDC_KEY_PREFIX.as_bytes(), CDC_KEY_END.as_bytes())
+            .await?
+        {
+            Some((_, value)) => Ok(decode_cdc_event(&value)?.sequence),
+            None => Ok(0),
+        }
     }
 
     pub fn update_columnar_store(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) {
@@ -1739,10 +1868,32 @@ impl Transaction for FusionTransaction {
 
         // Prepare encoded keys/values for both WAL and MemTable
         // We use Put for both Put and Delete (Delete is Put with Tombstone Flag)
-        let mut wal_entries = Vec::with_capacity(self.write_buffer.len());
-        let mut mem_entries = Vec::with_capacity(self.write_buffer.len());
+        let cdc_event_count = self
+            .write_buffer
+            .iter()
+            .filter(|(key, _)| cdc_should_capture_key(key))
+            .count();
+        let total_entries = self.write_buffer.len().saturating_add(cdc_event_count);
+        let mut wal_entries = Vec::with_capacity(total_entries);
+        let mut mem_entries = Vec::with_capacity(total_entries);
+        let mut cdc_event_index = 0usize;
 
         for (k, v) in self.write_buffer {
+            if cdc_should_capture_key(&k) {
+                let sequence = cdc_sequence_for(commit_ts, cdc_event_index)?;
+                cdc_event_index += 1;
+                let event = CdcEvent::from_write(sequence, commit_ts, &k, v.as_deref());
+                let cdc_key = cdc_key_for_sequence(sequence);
+                let cdc_value = encode_cdc_event(&event)?;
+                let encoded_cdc_key = FusionStorage::encode_key(cdc_key.as_bytes(), commit_ts);
+                let encoded_cdc_value = FusionStorage::encode_value(true, &cdc_value);
+                wal_entries.push(WalEntry::Put(
+                    encoded_cdc_key.clone(),
+                    encoded_cdc_value.clone(),
+                ));
+                mem_entries.push((encoded_cdc_key, encoded_cdc_value));
+            }
+
             let key = FusionStorage::encode_key(&k, commit_ts);
             let val = match v {
                 Some(d) => FusionStorage::encode_value(true, &d),
@@ -1823,9 +1974,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    async fn test_fusion_storage(test_name: &str) -> (FusionStorage, PathBuf) {
+        let data_dir = unique_storage_dir(test_name);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        (storage, data_dir)
+    }
+
     #[test]
     fn fusion_transaction_write_buffer_preallocates_first_write() {
         assert!(transaction_write_buffer().capacity() >= 1);
+    }
+
+    #[test]
+    fn cdc_key_for_sequence_preserves_lexical_order() {
+        assert!(cdc_key_for_sequence(9) < cdc_key_for_sequence(10));
+        assert!(cdc_key_for_sequence(10) < cdc_key_for_sequence(100));
+    }
+
+    #[tokio::test]
+    async fn fusion_commit_records_cdc_put_and_delete_events() {
+        let (storage, data_dir) = test_fusion_storage("cdc_put_delete").await;
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:cdc:001", b"one").await.unwrap();
+            txn.delete(b"data:cdc:002").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let events = storage.cdc_events_since(0, 10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].sequence < events[1].sequence);
+        assert_eq!(events[0].commit_ts, events[1].commit_ts);
+        assert_eq!(events[0].operation, CdcOperation::Put);
+        assert_eq!(events[0].key.data, "data:cdc:001");
+        assert_eq!(events[0].value.as_ref().unwrap().data, "one");
+        assert_eq!(events[1].operation, CdcOperation::Delete);
+        assert_eq!(events[1].key.data, "data:cdc:002");
+        assert!(events[1].value.is_none());
+        assert_eq!(
+            storage.cdc_latest_sequence().await.unwrap(),
+            events[1].sequence
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_cdc_since_and_limit_resume_from_sequence() {
+        let (storage, data_dir) = test_fusion_storage("cdc_since_limit").await;
+
+        for id in 0..3 {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            let key = format!("data:cdc_resume:{id}");
+            txn.put(key.as_bytes(), b"value").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let first = storage.cdc_events_since(0, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let resumed = storage
+            .cdc_events_since(first.last().unwrap().sequence, 10)
+            .await
+            .unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].key.data, "data:cdc_resume:2");
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_cdc_events_survive_snapshot_and_reopen() {
+        let data_dir = unique_storage_dir("cdc_reopen");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+
+        {
+            let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                .await
+                .unwrap();
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:cdc_persist:001", b"persisted")
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            storage.create_snapshot_now().await.unwrap();
+        }
+
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        let events = reopened.cdc_events_since(0, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].key.data, "data:cdc_persist:001");
+        assert_eq!(events[0].value.as_ref().unwrap().data, "persisted");
+
+        cleanup_storage_dir(&data_dir);
     }
 
     #[test]

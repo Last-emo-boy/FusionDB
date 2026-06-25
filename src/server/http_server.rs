@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Extension, Path, Request, State},
+    extract::{Extension, Path, Query, Request, State},
     http::{header::AUTHORIZATION, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -16,7 +16,7 @@ use crate::common::{FusionError, Value};
 use crate::execution::{Executor, PreparedStatementRecord};
 use crate::storage::Storage;
 
-use crate::storage::fusion::FusionStorage;
+use crate::storage::fusion::{CdcEvent, FusionStorage};
 use crate::storage::memory::MemoryStorage;
 
 // Zero-Copy Vector Search
@@ -62,6 +62,7 @@ fn build_router(state: AppState) -> Router {
         .route("/slow_queries", get(handle_slow_queries))
         .route("/checkpoint", post(handle_checkpoint))
         .route("/compact", post(handle_compact))
+        .route("/cdc/events", get(handle_cdc_events))
         .route("/capabilities", get(handle_capabilities))
         .route("/auth/context", get(handle_auth_context))
         .route("/vector_search", post(handle_vector_search))
@@ -295,6 +296,50 @@ async fn handle_compact(
     }
 }
 
+async fn handle_cdc_events(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Query(params): Query<CdcEventsRequest>,
+) -> (StatusCode, Json<Envelope<CdcEventsResponse>>) {
+    let username = context.username.unwrap_or_default();
+    if let Err(e) = state.executor.require_superuser(&username).await {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            format!("Authorization Error: {:?}", e),
+        );
+    }
+
+    if let Some(fusion) = state.storage.as_any().downcast_ref::<FusionStorage>() {
+        let since = params.since.unwrap_or(0);
+        let limit = params.limit.unwrap_or(100).min(1000);
+        match fusion.cdc_events_since(since, limit).await {
+            Ok(events) => {
+                let next_since = events.last().map(|event| event.sequence).unwrap_or(since);
+                match fusion.cdc_latest_sequence().await {
+                    Ok(latest_sequence) => json_ok(CdcEventsResponse {
+                        events,
+                        next_since,
+                        latest_sequence,
+                    }),
+                    Err(e) => json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("CDC latest sequence error: {:?}", e),
+                    ),
+                }
+            }
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("CDC Error: {:?}", e),
+            ),
+        }
+    } else {
+        json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "CDC is only available for FusionStorage",
+        )
+    }
+}
+
 async fn handle_capabilities(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<Envelope<CapabilityInfo>>) {
@@ -523,6 +568,12 @@ pub struct QueryRequest {
     sql: String,
 }
 
+#[derive(Deserialize)]
+pub struct CdcEventsRequest {
+    since: Option<u64>,
+    limit: Option<usize>,
+}
+
 pub type ApiResponse<T> = (StatusCode, Json<Envelope<T>>);
 pub type QueryResponse = Envelope<Vec<QueryResultJson>>;
 
@@ -575,8 +626,16 @@ pub struct CapabilityInfo {
     backend: String,
     snapshot_supported: bool,
     compact_supported: bool,
+    cdc_supported: bool,
     prepared_statement_ownership: bool,
     distributed_mode: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CdcEventsResponse {
+    events: Vec<CdcEvent>,
+    next_since: u64,
+    latest_sequence: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -643,6 +702,7 @@ impl From<PreparedStatementRecord> for PreparedStatementInfo {
 impl CapabilityInfo {
     fn from_storage(storage: &Arc<dyn Storage>) -> Self {
         let compact_supported = storage.as_any().downcast_ref::<FusionStorage>().is_some();
+        let cdc_supported = compact_supported;
         let backend = if compact_supported {
             "FusionStorage"
         } else if storage.as_any().downcast_ref::<MemoryStorage>().is_some() {
@@ -654,6 +714,7 @@ impl CapabilityInfo {
             backend: backend.to_string(),
             snapshot_supported: true,
             compact_supported,
+            cdc_supported,
             prepared_statement_ownership: true,
             distributed_mode: "isolated".to_string(),
         }
@@ -763,6 +824,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::auth::{save_user, UserRecord};
+    use crate::config::StorageConfig;
     use crate::execution::Executor;
     use crate::storage::memory::MemoryStorage;
     use crate::storage::Storage;
@@ -1028,6 +1090,7 @@ mod tests {
         let capability_data = capabilities.data.expect("capability data");
         assert_eq!(capability_data.backend, "MemoryStorage");
         assert!(!capability_data.compact_supported);
+        assert!(!capability_data.cdc_supported);
         assert_eq!(capability_data.distributed_mode, "isolated");
 
         let auth_request = HttpRequest::builder()
@@ -1046,6 +1109,90 @@ mod tests {
         assert_eq!(auth_data.username.as_deref(), Some("alice"));
         assert!(auth_data.authenticated);
         assert_eq!(auth_data.mode, "explicit_user");
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_cdc_events_returns_committed_fusion_changes() {
+        let data_dir =
+            std::env::temp_dir().join(format!("fusiondb_http_cdc_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let fusion = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .expect("fusion storage");
+
+        {
+            let mut txn = fusion.begin_transaction().await.expect("begin txn");
+            txn.put(b"data:http_cdc:001", b"one")
+                .await
+                .expect("put row");
+            txn.commit().await.expect("commit");
+        }
+
+        let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+        let app = test_app(storage);
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("/cdc/events?since=0&limit=10")
+            .body(Body::empty())
+            .expect("cdc request");
+        let response = app.clone().oneshot(request).await.expect("cdc response");
+        let envelope: Envelope<CdcEventsResponse> = response_json(response).await;
+        let data = envelope.data.expect("cdc data");
+
+        assert_eq!(data.events.len(), 1);
+        assert_eq!(data.events[0].key.data, "data:http_cdc:001");
+        assert_eq!(data.events[0].value.as_ref().unwrap().data, "one");
+        assert_eq!(data.next_since, data.events[0].sequence);
+        assert_eq!(data.latest_sequence, data.events[0].sequence);
+
+        let resume_request = HttpRequest::builder()
+            .method("GET")
+            .uri(format!("/cdc/events?since={}&limit=10", data.next_since))
+            .body(Body::empty())
+            .expect("cdc resume request");
+        let resume_response = app
+            .clone()
+            .oneshot(resume_request)
+            .await
+            .expect("cdc resume response");
+        let resume_envelope: Envelope<CdcEventsResponse> = response_json(resume_response).await;
+        let resumed = resume_envelope.data.expect("resume cdc data");
+        assert!(resumed.events.is_empty());
+        assert_eq!(resumed.next_since, data.next_since);
+        assert_eq!(resumed.latest_sequence, data.latest_sequence);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn http_cdc_events_requires_registered_superuser() {
+        let wal_path = format!("test_http_cdc_auth_{}.wal", std::process::id());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+
+        {
+            let mut txn = storage.begin_transaction().await.expect("begin txn");
+            let alice = UserRecord::new("fusiondb", false);
+            save_user(&mut *txn, "alice", &alice)
+                .await
+                .expect("save user");
+            txn.commit().await.expect("commit user txn");
+        }
+
+        let app = test_app(storage.clone());
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("/cdc/events")
+            .header("x-fusiondb-user", "alice")
+            .body(Body::empty())
+            .expect("cdc auth request");
+        let response = app.oneshot(request).await.expect("cdc auth response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let _ = std::fs::remove_file(&wal_path);
     }

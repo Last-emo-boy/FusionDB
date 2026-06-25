@@ -77,7 +77,7 @@
 - [x] **P6-4: Query timing** — Every query timed, total µs tracked in metrics
 - [x] **P6-5: VACUUM** — SQL manual compaction trigger backed by FusionStorage compaction
 - [x] **P6-6: Admin CLI** — `fusiondb-cli` health/query/tables/metrics/checkpoint/compact operations
-- [ ] **P6-7: CDC** — Change Data Capture for streaming replication
+- [x] **P6-7: CDC** — Durable committed change feed exposed via `/cdc/events` and `fusiondb-cli cdc`
 
 ## Phase 7: Dashboard UI (FusionDB Studio) ✅
 

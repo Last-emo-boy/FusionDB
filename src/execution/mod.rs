@@ -749,7 +749,7 @@ impl Executor {
         Ok(())
     }
 
-    async fn require_superuser(&self, username: &str) -> Result<()> {
+    pub async fn require_superuser(&self, username: &str) -> Result<()> {
         if Self::is_legacy_superuser(username) {
             return Ok(());
         }

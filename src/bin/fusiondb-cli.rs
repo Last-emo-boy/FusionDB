@@ -16,6 +16,10 @@ enum Command {
     Compact,
     Capabilities,
     AuthContext,
+    Cdc {
+        since: Option<u64>,
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +117,7 @@ fn parse_command(name: &str, args: &[String]) -> Result<Command> {
         "compact" | "vacuum" => no_args(name, args).map(|_| Command::Compact),
         "capabilities" => no_args(name, args).map(|_| Command::Capabilities),
         "auth-context" | "auth_context" => no_args(name, args).map(|_| Command::AuthContext),
+        "cdc" | "cdc-events" | "cdc_events" => parse_cdc_command(args),
         _ => bail!("unknown command: {name}"),
     }
 }
@@ -145,6 +150,7 @@ fn request_spec(config: &CliConfig) -> RequestSpec {
         Command::Compact => post_json(base, "/compact"),
         Command::Capabilities => get_json(base, "/capabilities"),
         Command::AuthContext => get_json(base, "/auth/context"),
+        Command::Cdc { since, limit } => get_json(base, &cdc_events_path(*since, *limit)),
     }
 }
 
@@ -214,6 +220,80 @@ fn no_args(command: &str, args: &[String]) -> Result<()> {
     }
 }
 
+fn parse_cdc_command(args: &[String]) -> Result<Command> {
+    let mut since = None;
+    let mut limit = None;
+    let mut position = 0;
+
+    while position < args.len() {
+        let arg = &args[position];
+        if arg == "--since" {
+            position += 1;
+            let Some(value) = args.get(position) else {
+                bail!("--since requires a value");
+            };
+            since = Some(parse_u64_flag("--since", value)?);
+            position += 1;
+        } else if let Some(value) = arg.strip_prefix("--since=") {
+            since = Some(parse_u64_flag("--since", value)?);
+            position += 1;
+        } else if arg == "--limit" {
+            position += 1;
+            let Some(value) = args.get(position) else {
+                bail!("--limit requires a value");
+            };
+            limit = Some(parse_usize_flag("--limit", value)?);
+            position += 1;
+        } else if let Some(value) = arg.strip_prefix("--limit=") {
+            limit = Some(parse_usize_flag("--limit", value)?);
+            position += 1;
+        } else {
+            bail!("unknown cdc argument: {arg}");
+        }
+    }
+
+    Ok(Command::Cdc { since, limit })
+}
+
+fn parse_u64_flag(flag: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|error| anyhow!("{flag} requires an unsigned integer: {error}"))
+}
+
+fn parse_usize_flag(flag: &str, value: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|error| anyhow!("{flag} requires an unsigned integer: {error}"))
+}
+
+fn cdc_events_path(since: Option<u64>, limit: Option<usize>) -> String {
+    let mut path = "/cdc/events".to_string();
+    let mut first = true;
+
+    if let Some(value) = since {
+        push_query_param(&mut path, &mut first, "since", value);
+    }
+    if let Some(value) = limit {
+        push_query_param(&mut path, &mut first, "limit", value);
+    }
+
+    path
+}
+
+fn push_query_param<T: std::fmt::Display>(
+    path: &mut String,
+    first: &mut bool,
+    name: &str,
+    value: T,
+) {
+    path.push(if *first { '?' } else { '&' });
+    *first = false;
+    path.push_str(name);
+    path.push('=');
+    path.push_str(&value.to_string());
+}
+
 fn usage() -> &'static str {
     "Usage: fusiondb-cli [--url URL] [--user USER] <command> [args]\n\
 \n\
@@ -227,6 +307,7 @@ Commands:\n\
   checkpoint                   POST /checkpoint\n\
   compact | vacuum             POST /compact\n\
   capabilities                 GET /capabilities\n\
+  cdc [--since N] [--limit N]  GET /cdc/events\n\
   auth-context                 GET /auth/context"
 }
 
@@ -296,6 +377,34 @@ mod tests {
         assert!(health.plain_text);
         assert!(prometheus.plain_text);
         assert_eq!(prometheus.url, "http://127.0.0.1:8091/metrics/prometheus");
+    }
+
+    #[test]
+    fn cdc_command_builds_since_and_limit_query() {
+        let config = parse_cli_args(&owned(&["cdc", "--since", "1048576", "--limit=25"]))
+            .unwrap()
+            .unwrap();
+        let spec = request_spec(&config);
+
+        assert_eq!(
+            config.command,
+            Command::Cdc {
+                since: Some(1048576),
+                limit: Some(25)
+            }
+        );
+        assert_eq!(spec.method, Method::GET);
+        assert_eq!(
+            spec.url,
+            "http://127.0.0.1:8091/cdc/events?since=1048576&limit=25"
+        );
+    }
+
+    #[test]
+    fn cdc_command_rejects_unknown_argument() {
+        let err = parse_cli_args(&owned(&["cdc", "--tail"])).unwrap_err();
+
+        assert!(err.to_string().contains("unknown cdc argument"));
     }
 
     #[test]
