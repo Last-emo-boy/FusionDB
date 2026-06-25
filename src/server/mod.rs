@@ -1,5 +1,7 @@
 use crate::config::Config;
-use crate::distributed::{self, network::FusionNetworkFactory, store::FusionRaftStore, FusionRaft};
+use crate::distributed::{
+    self, network::FusionNetworkFactory, sharding::ShardRouter, store::FusionRaftStore, FusionRaft,
+};
 use crate::execution::Executor;
 use crate::storage::Storage;
 use openraft::BasicNode;
@@ -68,6 +70,18 @@ pub async fn start_server(
         .as_ref()
         .map(|_| format!("raft(node_id={})", config.distributed.node_id))
         .unwrap_or_else(|| "isolated".to_string());
+    let shard_router = if config.distributed.enabled {
+        ShardRouter::from_config(config)
+    } else {
+        None
+    };
+    if let Some(router) = &shard_router {
+        println!(
+            "  Sharding: {} strategy, {} shards",
+            router.strategy_name(),
+            router.shard_count()
+        );
+    }
 
     let http_executor = executor.clone();
     let http_storage = storage.clone();
@@ -77,12 +91,13 @@ pub async fn start_server(
     let http_tls = tls_acceptor.clone();
     let http_raft = raft.clone();
     let http_distributed_mode = distributed_mode.clone();
+    let http_shard_router = shard_router.clone();
 
     // Start HTTP Server
     #[allow(deprecated)]
     tokio::spawn(async move {
         tokio::select! {
-            _ = http_server::start_http_server(http_executor, http_storage, &http_bind, http_port, http_tls, http_raft, http_distributed_mode) => {},
+            _ = http_server::start_http_server(http_executor, http_storage, &http_bind, http_port, http_tls, http_raft, http_distributed_mode, http_shard_router) => {},
             _ = http_rx.recv() => {
                 println!("[shutdown] HTTP server stopping...");
             },

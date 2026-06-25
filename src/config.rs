@@ -85,6 +85,8 @@ pub struct DistributedConfig {
     pub cluster_name: String,
     /// Initial voting members used during bootstrap
     pub initial_members: Vec<DistributedPeerConfig>,
+    /// Optional automatic sharding control-plane configuration
+    pub sharding: ShardingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +94,26 @@ pub struct DistributedConfig {
 pub struct DistributedPeerConfig {
     pub node_id: u64,
     pub addr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShardingConfig {
+    /// Enable automatic shard map and routing metadata
+    pub enabled: bool,
+    /// Partition strategy: hash or range
+    pub strategy: ShardingStrategy,
+    /// Number of shards for hash routing; range routing uses boundaries + 1 when boundaries exist
+    pub shard_count: u64,
+    /// Lexicographic upper bounds for range shards
+    pub range_boundaries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShardingStrategy {
+    Hash,
+    Range,
 }
 
 // --- Defaults ---
@@ -244,6 +266,9 @@ mod tests {
         assert!(!config.distributed.enabled);
         assert_eq!(config.distributed.node_id, 1);
         assert_eq!(config.distributed.cluster_name, "fusiondb");
+        assert!(!config.distributed.sharding.enabled);
+        assert_eq!(config.distributed.sharding.strategy, ShardingStrategy::Hash);
+        assert_eq!(config.distributed.sharding.shard_count, 16);
         assert_eq!(config.storage.data_dir, "data");
         assert_eq!(config.auth.password, "fusiondb");
     }
@@ -273,6 +298,12 @@ advertise_addr = "127.0.0.1:19091"
 bootstrap = false
 cluster_name = "fusiondb-test"
 
+[distributed.sharding]
+enabled = true
+strategy = "range"
+shard_count = 4
+range_boundaries = ["m", "t"]
+
 [[distributed.initial_members]]
 node_id = 1
 addr = "127.0.0.1:8091"
@@ -289,6 +320,13 @@ addr = "127.0.0.1:8091"
         assert_eq!(config.distributed.cluster_name, "fusiondb-test");
         assert_eq!(config.distributed.initial_members.len(), 1);
         assert_eq!(config.distributed.initial_members[0].node_id, 1);
+        assert!(config.distributed.sharding.enabled);
+        assert_eq!(
+            config.distributed.sharding.strategy,
+            ShardingStrategy::Range
+        );
+        assert_eq!(config.distributed.sharding.shard_count, 4);
+        assert_eq!(config.distributed.sharding.range_boundaries, vec!["m", "t"]);
         assert_eq!(config.storage.data_dir, "/var/fusiondb");
         assert_eq!(config.storage.memtable_flush_mb, 64);
         assert_eq!(config.auth.password, "secret123");
@@ -321,6 +359,8 @@ addr = "127.0.0.1:8091"
         assert!(serialized.contains("max_connections = 100"));
         assert!(serialized.contains("[distributed]"));
         assert!(serialized.contains("enabled = false"));
+        assert!(serialized.contains("[distributed.sharding]"));
+        assert!(serialized.contains("strategy = \"hash\""));
         assert!(serialized.contains("data_dir = \"data\""));
     }
 
@@ -349,6 +389,7 @@ impl Default for DistributedConfig {
             bootstrap: true,
             cluster_name: "fusiondb".to_string(),
             initial_members: Vec::new(),
+            sharding: ShardingConfig::default(),
         }
     }
 }
@@ -359,5 +400,22 @@ impl Default for DistributedPeerConfig {
             node_id: 1,
             addr: "127.0.0.1:8091".to_string(),
         }
+    }
+}
+
+impl Default for ShardingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strategy: ShardingStrategy::Hash,
+            shard_count: 16,
+            range_boundaries: Vec::new(),
+        }
+    }
+}
+
+impl Default for ShardingStrategy {
+    fn default() -> Self {
+        Self::Hash
     }
 }

@@ -43,6 +43,14 @@ async fn main() -> Result<()> {
             config.distributed.node_id,
             config.distributed.effective_advertise_addr(&config.server)
         );
+        if config.distributed.sharding.enabled {
+            println!(
+                "  Shards:  {:?} strategy, {} configured shards",
+                config.distributed.sharding.strategy, config.distributed.sharding.shard_count
+            );
+        } else {
+            println!("  Shards:  disabled");
+        }
     } else {
         println!("  Raft:    disabled");
     }

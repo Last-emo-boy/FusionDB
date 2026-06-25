@@ -589,6 +589,8 @@ All endpoints are served from `http://127.0.0.1:8091`.
 | `GET` | `/capabilities` | Show backend and feature capabilities |
 | `POST` | `/vector_search` | Direct vector search (bypass SQL) |
 | `POST` | `/hybrid_search` | Combined text + vector search |
+| `GET` | `/raft/shards` | Show configured shard map when distributed sharding is enabled |
+| `POST` | `/raft/shards/route` | Route a `{table,key}` pair to its shard owner |
 
 ### Request / Response Formats
 
@@ -833,6 +835,12 @@ advertise_addr = ""        # Peer-facing address; empty uses server bind/http_po
 bootstrap = true           # Initialize configured members on startup
 cluster_name = "fusiondb"  # OpenRaft cluster name
 initial_members = []       # Optional [{ node_id = 1, addr = "127.0.0.1:8091" }]
+
+[distributed.sharding]
+enabled = false            # Enable shard map and routing metadata
+strategy = "hash"          # "hash" or "range"
+shard_count = 16           # Hash shard count; range uses boundaries + 1
+range_boundaries = []      # Optional lexicographic range upper bounds
 ```
 
 ### Ports Summary
@@ -997,7 +1005,7 @@ These are known gaps that should be addressed before production use:
 - OpenRaft can be enabled via `[distributed]`, with `/raft/*` HTTP RPCs, leader-forwarded writes, and local follower reads
 - Raft log/state metadata is currently in-memory and intended as the control-plane wiring foundation
 - Snapshot transfer serializes visible key-value state for new node bootstrap
-- No automatic sharding / partitioning
+- Sharding has a configurable hash/range control plane and route API; physical table/index partitioning is still in progress
 - No dedicated read-replica topology management
 - No distributed transactions (2PC)
 

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use axum::extract::State;
 use axum::response::Json;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -11,6 +11,7 @@ use openraft::raft::{
 use openraft::BasicNode;
 use std::sync::Arc;
 
+use super::sharding::{ShardMap, ShardRoute, ShardRouter};
 use super::typ::{NodeId, Request, TypeConfig};
 use super::FusionRaft;
 use crate::execution::{Executor, QueryResult};
@@ -21,6 +22,7 @@ pub struct RaftAppState {
     pub raft: FusionRaft,
     pub executor: Arc<Executor>,
     pub client: reqwest::Client,
+    pub shard_router: Option<ShardRouter>,
 }
 
 /// Build the Raft API router.
@@ -34,6 +36,8 @@ pub fn raft_routes(state: RaftAppState) -> Router {
         .route("/raft/add-learner", post(raft_add_learner))
         .route("/raft/change-membership", post(raft_change_membership))
         .route("/raft/metrics", post(raft_metrics))
+        .route("/raft/shards", get(raft_shards))
+        .route("/raft/shards/route", post(raft_route_shard))
         .with_state(state)
 }
 
@@ -289,5 +293,59 @@ async fn raft_metrics(State(state): State<RaftAppState>) -> Json<MetricsResponse
         current_term: m.current_term,
         last_log_index: m.last_log_index,
         last_applied_index: m.last_applied.map(|id| id.index),
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct ShardMapResponse {
+    pub enabled: bool,
+    pub map: Option<ShardMap>,
+}
+
+async fn raft_shards(State(state): State<RaftAppState>) -> Json<ShardMapResponse> {
+    let map = state.shard_router.as_ref().map(ShardRouter::describe);
+    Json(ShardMapResponse {
+        enabled: map.is_some(),
+        map,
+    })
+}
+
+#[derive(serde::Deserialize)]
+pub struct RouteShardRequest {
+    pub table: String,
+    pub key: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct RouteShardResponse {
+    pub success: bool,
+    pub message: String,
+    pub route: Option<ShardRoute>,
+}
+
+async fn raft_route_shard(
+    State(state): State<RaftAppState>,
+    Json(req): Json<RouteShardRequest>,
+) -> Json<RouteShardResponse> {
+    let Some(router) = state.shard_router.as_ref() else {
+        return Json(RouteShardResponse {
+            success: false,
+            message: "sharding is disabled".to_string(),
+            route: None,
+        });
+    };
+
+    if req.table.trim().is_empty() || req.key.trim().is_empty() {
+        return Json(RouteShardResponse {
+            success: false,
+            message: "table and key are required".to_string(),
+            route: None,
+        });
+    }
+
+    Json(RouteShardResponse {
+        success: true,
+        message: "OK".to_string(),
+        route: Some(router.route_key(req.table.trim(), req.key.trim())),
     })
 }

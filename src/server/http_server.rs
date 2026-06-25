@@ -14,6 +14,7 @@ use tower_http::cors::CorsLayer;
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Value};
 use crate::distributed::api::{raft_routes, submit_raft_write, RaftAppState};
+use crate::distributed::sharding::ShardRouter;
 use crate::distributed::FusionRaft;
 use crate::execution::{Executor, PreparedStatementRecord};
 use crate::storage::Storage;
@@ -78,6 +79,7 @@ fn build_router(state: AppState) -> Router {
             raft,
             executor: state.executor.clone(),
             client: state.raft_client.clone(),
+            shard_router: state.shard_router.clone(),
         }));
     }
 
@@ -95,6 +97,7 @@ pub async fn start_http_server(
     _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     raft: Option<FusionRaft>,
     distributed_mode: String,
+    shard_router: Option<ShardRouter>,
 ) {
     let state = AppState {
         executor,
@@ -102,6 +105,7 @@ pub async fn start_http_server(
         raft,
         raft_client: reqwest::Client::new(),
         distributed_mode,
+        shard_router,
     };
 
     let app = build_router(state);
@@ -607,6 +611,7 @@ pub struct AppState {
     raft: Option<FusionRaft>,
     raft_client: reqwest::Client,
     distributed_mode: String,
+    shard_router: Option<ShardRouter>,
 }
 
 #[derive(Clone, Default)]
@@ -683,6 +688,9 @@ pub struct CapabilityInfo {
     cdc_supported: bool,
     prepared_statement_ownership: bool,
     distributed_mode: String,
+    sharding_enabled: bool,
+    sharding_strategy: Option<String>,
+    shard_count: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -780,6 +788,12 @@ impl CapabilityInfo {
             cdc_supported,
             prepared_statement_ownership: true,
             distributed_mode: state.distributed_mode.clone(),
+            sharding_enabled: state.shard_router.is_some(),
+            sharding_strategy: state
+                .shard_router
+                .as_ref()
+                .map(|router| router.strategy_name().to_string()),
+            shard_count: state.shard_router.as_ref().map(ShardRouter::shard_count),
         }
     }
 }
@@ -890,7 +904,9 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::auth::{save_user, UserRecord};
-    use crate::config::StorageConfig;
+    use crate::config::{
+        Config, DistributedPeerConfig, ShardingConfig, ShardingStrategy, StorageConfig,
+    };
     use crate::execution::Executor;
     use crate::storage::memory::MemoryStorage;
     use crate::storage::Storage;
@@ -931,6 +947,7 @@ mod tests {
             raft: None,
             raft_client: reqwest::Client::new(),
             distributed_mode: "isolated".to_string(),
+            shard_router: None,
         })
     }
 
@@ -942,6 +959,19 @@ mod tests {
             raft: None,
             raft_client: reqwest::Client::new(),
             distributed_mode: distributed_mode.to_string(),
+            shard_router: None,
+        })
+    }
+
+    fn test_app_with_shard_router(storage: Arc<dyn Storage>, shard_router: ShardRouter) -> Router {
+        let executor = Arc::new(Executor::new(storage.clone()));
+        build_router(AppState {
+            executor,
+            storage,
+            raft: None,
+            raft_client: reqwest::Client::new(),
+            distributed_mode: "raft(node_id=1)".to_string(),
+            shard_router: Some(shard_router),
         })
     }
 
@@ -1227,6 +1257,52 @@ mod tests {
         let capabilities: Envelope<CapabilityInfo> = response_json(capabilities_response).await;
         let capability_data = capabilities.data.expect("capability data");
         assert_eq!(capability_data.distributed_mode, "raft(node_id=7)");
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_capabilities_reports_sharding_control_plane() {
+        let wal_path = format!(
+            "test_http_sharding_capabilities_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.initial_members = vec![
+            DistributedPeerConfig {
+                node_id: 1,
+                addr: "127.0.0.1:8091".to_string(),
+            },
+            DistributedPeerConfig {
+                node_id: 2,
+                addr: "127.0.0.1:8093".to_string(),
+            },
+        ];
+        config.distributed.sharding = ShardingConfig {
+            enabled: true,
+            strategy: ShardingStrategy::Hash,
+            shard_count: 8,
+            range_boundaries: Vec::new(),
+        };
+        let shard_router = ShardRouter::from_config(&config).expect("shard router");
+        let app = test_app_with_shard_router(storage.clone(), shard_router);
+
+        let capabilities_request = HttpRequest::builder()
+            .method("GET")
+            .uri("/capabilities")
+            .body(Body::empty())
+            .expect("capabilities request");
+        let capabilities_response = app
+            .oneshot(capabilities_request)
+            .await
+            .expect("capabilities response");
+        let capabilities: Envelope<CapabilityInfo> = response_json(capabilities_response).await;
+        let capability_data = capabilities.data.expect("capability data");
+        assert!(capability_data.sharding_enabled);
+        assert_eq!(capability_data.sharding_strategy.as_deref(), Some("hash"));
+        assert_eq!(capability_data.shard_count, Some(8));
 
         let _ = std::fs::remove_file(&wal_path);
     }

@@ -27,3 +27,9 @@ advertise_addr = ""
 bootstrap = true
 cluster_name = "fusiondb"
 initial_members = []
+
+[distributed.sharding]
+enabled = false
+strategy = "hash"
+shard_count = 16
+range_boundaries = []
