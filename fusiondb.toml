@@ -4,6 +4,7 @@ pg_port = 8092
 redis_enabled = false
 redis_port = 6379
 bind = "127.0.0.1"
+max_connections = 100
 
 [storage]
 data_dir = "data"

@@ -4,7 +4,7 @@ use futures::{Sink, SinkExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex; // Required for client.send
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore}; // Required for client.send
 
 use pgwire::api::auth::{
     finish_authentication, protocol_negotiation, save_startup_parameters_to_metadata,
@@ -35,8 +35,58 @@ use sqlparser::ast::{
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Value}; // Import FusionError
 use crate::execution::{Executor, ForeignKeyMeta, QueryResult};
+use crate::monitor;
 use crate::parser::parse_sql;
 use crate::storage::{Storage, Transaction};
+
+const DEFAULT_MAX_CONNECTIONS: usize = 100;
+
+fn effective_max_connections(max_connections: usize) -> usize {
+    max_connections.max(1)
+}
+
+#[derive(Clone)]
+struct PgConnectionLimiter {
+    max_connections: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+struct PgConnectionSlot {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl PgConnectionLimiter {
+    fn new(max_connections: usize) -> Self {
+        let max_connections = effective_max_connections(max_connections);
+        Self {
+            max_connections,
+            semaphore: Arc::new(Semaphore::new(max_connections)),
+        }
+    }
+
+    fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    fn try_acquire(&self) -> Option<PgConnectionSlot> {
+        match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                monitor::inc_pg_active_connection();
+                Some(PgConnectionSlot { _permit: permit })
+            }
+            Err(_) => {
+                monitor::inc_pg_connection_rejected();
+                None
+            }
+        }
+    }
+}
+
+impl Drop for PgConnectionSlot {
+    fn drop(&mut self) {
+        monitor::dec_pg_active_connection();
+    }
+}
 
 struct Session {
     transaction: Option<Box<dyn Transaction>>,
@@ -6060,19 +6110,56 @@ pub async fn start_pg_server(
     password: &str,
     _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
+    start_pg_server_with_connection_limit(
+        executor,
+        storage,
+        bind,
+        port,
+        password,
+        _tls_acceptor,
+        DEFAULT_MAX_CONNECTIONS,
+    )
+    .await
+}
+
+pub async fn start_pg_server_with_connection_limit(
+    executor: Arc<Executor>,
+    storage: Arc<dyn Storage>,
+    bind: &str,
+    port: u16,
+    password: &str,
+    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    max_connections: usize,
+) {
     let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).await.unwrap();
-    println!("FusionDB Postgres Server running on {}", addr);
+    let limiter = PgConnectionLimiter::new(max_connections);
+    monitor::set_pg_connection_limit(limiter.max_connections() as u64);
+    println!(
+        "FusionDB Postgres Server running on {} (max_connections={})",
+        addr,
+        limiter.max_connections()
+    );
 
     let password = password.to_string();
 
     loop {
-        let (stream, _) = listener.accept().await.unwrap();
+        let (stream, peer_addr) = listener.accept().await.unwrap();
+        let Some(connection_slot) = limiter.try_acquire() else {
+            eprintln!(
+                "Postgres connection rejected from {:?}: max_connections={} reached",
+                peer_addr,
+                limiter.max_connections()
+            );
+            drop(stream);
+            continue;
+        };
         let executor = executor.clone();
         let storage = storage.clone();
         let password = password.clone();
 
         tokio::spawn(async move {
+            let _connection_slot = connection_slot;
             let handler = Arc::new(PgHandler::new(executor, storage.clone()));
             let auth_source = Arc::new(FusionAuthSource { password, storage });
             let startup = Arc::new(FusionStartupHandler {
@@ -6085,5 +6172,32 @@ pub async fn start_pg_server(
             // TLS for pgwire requires a TLS-terminating proxy (e.g., stunnel, HAProxy).
             let _ = pgwire::tokio::process_socket(stream, None, factory).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pg_connection_limiter_clamps_zero_to_one_slot() {
+        let limiter = PgConnectionLimiter::new(0);
+
+        assert_eq!(limiter.max_connections(), 1);
+        assert_eq!(limiter.semaphore.available_permits(), 1);
+    }
+
+    #[test]
+    fn pg_connection_limiter_releases_slot_on_drop() {
+        let limiter = PgConnectionLimiter::new(1);
+        let slot = limiter.try_acquire().expect("first connection allowed");
+
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+        assert!(limiter.try_acquire().is_none());
+
+        drop(slot);
+
+        assert_eq!(limiter.semaphore.available_permits(), 1);
+        assert!(limiter.try_acquire().is_some());
     }
 }

@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
         "  PgWire:  {}:{}",
         config.server.bind, config.server.pg_port
     );
+    println!("  MaxConn: {}", config.server.max_connections);
     if config.server.redis_enabled {
         println!(
             "  Redis:   {}:{}",

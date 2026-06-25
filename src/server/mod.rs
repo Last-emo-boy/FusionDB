@@ -67,10 +67,11 @@ pub async fn start_server(
     let pg_bind = config.server.bind.clone();
     let pg_password = config.auth.password.clone();
     let pg_tls = tls_acceptor;
+    let pg_max_connections = config.server.max_connections;
 
     tokio::spawn(async move {
         tokio::select! {
-            _ = pg_server::start_pg_server(pg_executor, pg_storage, &pg_bind, pg_port, &pg_password, pg_tls) => {},
+            _ = pg_server::start_pg_server_with_connection_limit(pg_executor, pg_storage, &pg_bind, pg_port, &pg_password, pg_tls, pg_max_connections) => {},
             _ = pg_rx.recv() => {
                 println!("[shutdown] Postgres server stopping...");
             },

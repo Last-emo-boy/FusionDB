@@ -28,6 +28,9 @@ pub struct Metrics {
     pub query_count: AtomicU64,
     pub slow_query_count: AtomicU64,
     pub query_total_us: AtomicU64,
+    pub pg_active_connection_count: AtomicU64,
+    pub pg_connection_rejected_count: AtomicU64,
+    pub pg_connection_limit: AtomicU64,
 }
 
 /// A single slow query log entry.
@@ -148,6 +151,10 @@ impl Metrics {
         self.query_count.store(0, Ordering::Relaxed);
         self.slow_query_count.store(0, Ordering::Relaxed);
         self.query_total_us.store(0, Ordering::Relaxed);
+        self.pg_active_connection_count.store(0, Ordering::Relaxed);
+        self.pg_connection_rejected_count
+            .store(0, Ordering::Relaxed);
+        self.pg_connection_limit.store(0, Ordering::Relaxed);
     }
 }
 
@@ -266,4 +273,31 @@ pub fn add_wal_bytes(n: u64) {
             m.wal_write_bytes = 0;
         }
     })
+}
+
+pub fn set_pg_connection_limit(limit: u64) {
+    GLOBAL_METRICS
+        .pg_connection_limit
+        .store(limit, Ordering::Relaxed);
+}
+
+pub fn inc_pg_active_connection() {
+    GLOBAL_METRICS
+        .pg_active_connection_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn dec_pg_active_connection() {
+    GLOBAL_METRICS
+        .pg_active_connection_count
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_sub(1))
+        })
+        .ok();
+}
+
+pub fn inc_pg_connection_rejected() {
+    GLOBAL_METRICS
+        .pg_connection_rejected_count
+        .fetch_add(1, Ordering::Relaxed);
 }

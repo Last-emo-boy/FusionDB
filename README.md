@@ -638,7 +638,10 @@ All endpoints are served from `http://127.0.0.1:8091`.
   "wal_write_bytes": 2048000,
   "query_count": 5000,
   "slow_query_count": 12,
-  "query_total_us": 320000000
+  "query_total_us": 320000000,
+  "pg_active_connection_count": 24,
+  "pg_connection_rejected_count": 3,
+  "pg_connection_limit": 100
 }
 ```
 
@@ -801,6 +804,7 @@ pg_port = 8092            # PostgreSQL wire protocol port
 redis_enabled = false     # Optional Redis-compatible RESP endpoint for native memtier probes
 redis_port = 6379         # Redis-compatible RESP endpoint port
 bind = "127.0.0.1"        # Bind address (use "0.0.0.0" for all interfaces)
+max_connections = 100     # Max concurrent PostgreSQL wire protocol connections
 
 [storage]
 data_dir = "data"          # Base data directory for all persistent files
@@ -987,7 +991,7 @@ These are known gaps that should be addressed before production use:
 - No row-level security
 
 ### Operations
-- No connection pooling
+- No client-side connection pooling library; pgwire has configurable server-side connection slots and backpressure
 - No automatic compaction tuning / maintenance scheduler
 - CDC is currently a resumable event feed; distributed streaming replication remains future work
 
@@ -1002,7 +1006,7 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 | **1. Data Integrity** | ✅ Done | Graceful shutdown, TOML config, segmented WAL, SSTable CRC32, compaction dedup |
 | **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
 | **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
-| **4. Performance** | 🔲 Planned | Connection pooling, cost-based optimizer |
+| **4. Performance** | 🔲 Planned | Connection slots, cost-based optimizer |
 | **5. Distributed** | 🔲 Planned | Wire OpenRaft into main server |
 | **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
 

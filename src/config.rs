@@ -24,6 +24,8 @@ pub struct ServerConfig {
     pub redis_port: u16,
     /// Bind address
     pub bind: String,
+    /// Maximum concurrent PostgreSQL wire protocol connections
+    pub max_connections: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +100,7 @@ impl Default for ServerConfig {
             redis_enabled: false,
             redis_port: 6379,
             bind: "127.0.0.1".to_string(),
+            max_connections: 100,
         }
     }
 }
@@ -200,6 +203,7 @@ mod tests {
         assert_eq!(config.server.pg_port, 8092);
         assert!(!config.server.redis_enabled);
         assert_eq!(config.server.redis_port, 6379);
+        assert_eq!(config.server.max_connections, 100);
         assert_eq!(config.storage.data_dir, "data");
         assert_eq!(config.auth.password, "fusiondb");
     }
@@ -213,6 +217,7 @@ pg_port = 9092
 redis_enabled = true
 redis_port = 6380
 bind = "0.0.0.0"
+max_connections = 250
 
 [storage]
 data_dir = "/var/fusiondb"
@@ -225,6 +230,7 @@ password = "secret123"
         assert_eq!(config.server.http_port, 9091);
         assert!(config.server.redis_enabled);
         assert_eq!(config.server.redis_port, 6380);
+        assert_eq!(config.server.max_connections, 250);
         assert_eq!(config.storage.data_dir, "/var/fusiondb");
         assert_eq!(config.storage.memtable_flush_mb, 64);
         assert_eq!(config.auth.password, "secret123");
@@ -254,6 +260,7 @@ password = "secret123"
         let config = Config::default();
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("http_port = 8091"));
+        assert!(serialized.contains("max_connections = 100"));
         assert!(serialized.contains("data_dir = \"data\""));
     }
 }

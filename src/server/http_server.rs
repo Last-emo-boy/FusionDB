@@ -193,7 +193,16 @@ async fn handle_prometheus() -> String {
          fusiondb_wal_write_count {}\n\
          # HELP fusiondb_wal_write_bytes WAL bytes written\n\
          # TYPE fusiondb_wal_write_bytes counter\n\
-         fusiondb_wal_write_bytes {}\n",
+         fusiondb_wal_write_bytes {}\n\
+         # HELP fusiondb_pg_active_connections Active PostgreSQL wire protocol connections\n\
+         # TYPE fusiondb_pg_active_connections gauge\n\
+         fusiondb_pg_active_connections {}\n\
+         # HELP fusiondb_pg_connection_limit Configured PostgreSQL wire protocol connection limit\n\
+         # TYPE fusiondb_pg_connection_limit gauge\n\
+         fusiondb_pg_connection_limit {}\n\
+         # HELP fusiondb_pg_connection_rejected_count PostgreSQL wire protocol connections rejected after the limit was reached\n\
+         # TYPE fusiondb_pg_connection_rejected_count counter\n\
+         fusiondb_pg_connection_rejected_count {}\n",
         m.query_count.load(Relaxed),
         m.slow_query_count.load(Relaxed),
         m.query_total_us.load(Relaxed),
@@ -202,6 +211,9 @@ async fn handle_prometheus() -> String {
         m.row_cache_hit_count.load(Relaxed),
         m.wal_write_count.load(Relaxed),
         m.wal_write_bytes.load(Relaxed),
+        m.pg_active_connection_count.load(Relaxed),
+        m.pg_connection_limit.load(Relaxed),
+        m.pg_connection_rejected_count.load(Relaxed),
     )
 }
 
@@ -598,6 +610,9 @@ pub struct MetricsSnapshot {
     query_count: u64,
     slow_query_count: u64,
     query_total_us: u64,
+    pg_active_connection_count: u64,
+    pg_connection_rejected_count: u64,
+    pg_connection_limit: u64,
 }
 
 #[derive(Deserialize)]
@@ -755,6 +770,9 @@ impl MetricsSnapshot {
             query_count: metrics.query_count.load(Relaxed),
             slow_query_count: metrics.slow_query_count.load(Relaxed),
             query_total_us: metrics.query_total_us.load(Relaxed),
+            pg_active_connection_count: metrics.pg_active_connection_count.load(Relaxed),
+            pg_connection_rejected_count: metrics.pg_connection_rejected_count.load(Relaxed),
+            pg_connection_limit: metrics.pg_connection_limit.load(Relaxed),
         }
     }
 }
@@ -842,6 +860,19 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
         serde_json::from_slice(&body).expect("decode json")
+    }
+
+    async fn response_text(response: Response) -> String {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert!(
+            status.is_success(),
+            "unexpected status: {status}, body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        String::from_utf8(body.to_vec()).expect("utf8 response")
     }
 
     fn test_app(storage: Arc<dyn Storage>) -> Router {
@@ -1109,6 +1140,47 @@ mod tests {
         assert_eq!(auth_data.username.as_deref(), Some("alice"));
         assert!(auth_data.authenticated);
         assert_eq!(auth_data.mode, "explicit_user");
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_metrics_include_pg_connection_pool_fields() {
+        crate::monitor::set_pg_connection_limit(123);
+
+        let wal_path = format!("test_http_metrics_pg_conn_{}.wal", std::process::id());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = test_app(storage.clone());
+
+        let metrics_request = HttpRequest::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .expect("metrics request");
+        let metrics_response = app
+            .clone()
+            .oneshot(metrics_request)
+            .await
+            .expect("metrics response");
+        let metrics: Envelope<serde_json::Value> = response_json(metrics_response).await;
+        let data = metrics.data.expect("metrics data");
+        assert_eq!(data["pg_connection_limit"], serde_json::json!(123));
+        assert!(data.get("pg_active_connection_count").is_some());
+        assert!(data.get("pg_connection_rejected_count").is_some());
+
+        let prometheus_request = HttpRequest::builder()
+            .method("GET")
+            .uri("/metrics/prometheus")
+            .body(Body::empty())
+            .expect("prometheus request");
+        let prometheus_response = app
+            .oneshot(prometheus_request)
+            .await
+            .expect("prometheus response");
+        let prometheus = response_text(prometheus_response).await;
+        assert!(prometheus.contains("fusiondb_pg_active_connections"));
+        assert!(prometheus.contains("fusiondb_pg_connection_limit 123"));
+        assert!(prometheus.contains("fusiondb_pg_connection_rejected_count"));
 
         let _ = std::fs::remove_file(&wal_path);
     }
