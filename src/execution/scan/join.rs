@@ -75,7 +75,8 @@ struct ExprHashJoinPlan {
 struct CommaJoinRelationPlan {
     table: TableWithJoins,
     schema: TableSchema,
-    row_count: usize,
+    stats: Option<super::super::analyze::TableStats>,
+    estimated_rows: usize,
 }
 
 impl Executor {
@@ -881,6 +882,62 @@ impl Executor {
         Self::combine_predicates(combined)
     }
 
+    pub(crate) fn inner_join_chain_as_comma_join(
+        from: &[TableWithJoins],
+        selection: &Option<Expr>,
+    ) -> Option<(Vec<TableWithJoins>, Option<Expr>)> {
+        if from.len() != 1 {
+            return None;
+        }
+
+        let table = from.first()?;
+        if table.joins.len() < 2 {
+            return None;
+        }
+        if !Self::is_reorderable_join_relation(&table.relation) {
+            return None;
+        }
+
+        let mut flattened = Vec::with_capacity(table.joins.len() + 1);
+        flattened.push(TableWithJoins {
+            relation: table.relation.clone(),
+            joins: Vec::new(),
+        });
+
+        let mut predicates =
+            Vec::with_capacity(table.joins.len() + usize::from(selection.is_some()));
+        if let Some(selection) = selection {
+            predicates.push(selection.clone());
+        }
+
+        for join in &table.joins {
+            let on_expr = match &join.join_operator {
+                sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
+                | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr)) => {
+                    expr.clone()
+                }
+                _ => return None,
+            };
+            if !Self::is_reorderable_join_relation(&join.relation) {
+                return None;
+            }
+            predicates.push(on_expr);
+            flattened.push(TableWithJoins {
+                relation: join.relation.clone(),
+                joins: Vec::new(),
+            });
+        }
+
+        Some((flattened, Self::combine_predicates(predicates)))
+    }
+
+    fn is_reorderable_join_relation(relation: &TableFactor) -> bool {
+        let TableFactor::Table { args, .. } = relation else {
+            return false;
+        };
+        args.is_none()
+    }
+
     async fn reorder_comma_join_from(
         &self,
         from: &[TableWithJoins],
@@ -915,7 +972,8 @@ impl Executor {
                 FusionError::Execution(format!("Schema deserialization error: {}", e))
             })?;
             self.prefix_schema_columns(&mut schema, &table.relation)?;
-            let row_count = if let Some(stats) = self.load_table_stats(&table_name, txn).await? {
+            let stats = self.load_table_stats(&table_name, txn).await?;
+            let estimated_rows = if let Some(stats) = &stats {
                 stats.row_count
             } else {
                 let data_prefix = join_data_prefix_for_table(&table_name);
@@ -926,7 +984,8 @@ impl Executor {
             relations.push(CommaJoinRelationPlan {
                 table: table.clone(),
                 schema,
-                row_count,
+                stats,
+                estimated_rows,
             });
         }
 
@@ -949,7 +1008,18 @@ impl Executor {
             };
 
             if members.len() == 1 {
-                local_counts[members[0]] += 1;
+                let relation_index = members[0];
+                local_counts[relation_index] += 1;
+                if let Some(stats) = &relations[relation_index].stats {
+                    if let Some(rows) = self.estimate_join_local_predicate_rows(
+                        predicate,
+                        &relations[relation_index].schema,
+                        stats,
+                    ) {
+                        relations[relation_index].estimated_rows =
+                            relations[relation_index].estimated_rows.min(rows);
+                    }
+                }
             } else if members.len() == 2 {
                 edge_counts[members[0]][members[1]] += 1;
                 edge_counts[members[1]][members[0]] += 1;
@@ -975,7 +1045,7 @@ impl Executor {
             let score = local_counts[index]
                 .saturating_mul(100)
                 .saturating_add(degree(index, &edge_counts));
-            let rows = relations[index].row_count;
+            let rows = relations[index].estimated_rows;
             if score > first_score
                 || (score == first_score && rows < first_rows)
                 || (score == first_score && rows == first_rows && index > first)
@@ -1004,7 +1074,7 @@ impl Executor {
                     .saturating_mul(1000)
                     .saturating_add(local_counts[candidate].saturating_mul(100))
                     .saturating_add(degree(candidate, &edge_counts));
-                let rows = relations[candidate].row_count;
+                let rows = relations[candidate].estimated_rows;
                 if next.is_none()
                     || score > next_score
                     || (score == next_score && rows < next_rows)
@@ -1038,6 +1108,164 @@ impl Executor {
         }
 
         Ok(Some(reordered))
+    }
+
+    fn estimate_join_local_predicate_rows(
+        &self,
+        expr: &Expr,
+        schema: &TableSchema,
+        stats: &super::super::analyze::TableStats,
+    ) -> Option<usize> {
+        match expr {
+            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
+                let column_idx = self.join_column_constant_index(left, right, schema)?;
+                let column = schema.columns.get(column_idx)?;
+                if column.is_primary || column.is_unique {
+                    return Some(usize::from(stats.row_count > 0));
+                }
+
+                let column_stats =
+                    Self::join_column_stats_for_schema_index(stats, schema, column_idx)?;
+                if column_stats.distinct_count == 0 {
+                    return None;
+                }
+
+                Some(Self::join_selectivity_to_rows(
+                    stats.row_count,
+                    1.0 / column_stats.distinct_count as f64,
+                ))
+            }
+            Expr::IsNull(expr) => {
+                let column_idx = self.resolve_schema_column_index(expr, schema)?;
+                let column_stats =
+                    Self::join_column_stats_for_schema_index(stats, schema, column_idx)?;
+                Some(column_stats.null_count.min(stats.row_count))
+            }
+            Expr::IsNotNull(expr) => {
+                let column_idx = self.resolve_schema_column_index(expr, schema)?;
+                let column_stats =
+                    Self::join_column_stats_for_schema_index(stats, schema, column_idx)?;
+                Some(stats.row_count.saturating_sub(column_stats.null_count))
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } if !*negated => {
+                let column_idx = self.resolve_schema_column_index(expr, schema)?;
+                let column = schema.columns.get(column_idx)?;
+                if column.is_primary || column.is_unique {
+                    return Some(list.len().min(stats.row_count));
+                }
+
+                let column_stats =
+                    Self::join_column_stats_for_schema_index(stats, schema, column_idx)?;
+                if column_stats.distinct_count == 0 {
+                    return None;
+                }
+
+                Some(Self::join_selectivity_to_rows(
+                    stats.row_count,
+                    (list.len() as f64 / column_stats.distinct_count as f64).clamp(0.0, 1.0),
+                ))
+            }
+            Expr::Nested(inner) => self.estimate_join_local_predicate_rows(inner, schema, stats),
+            _ => None,
+        }
+    }
+
+    fn join_column_constant_index(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        schema: &TableSchema,
+    ) -> Option<usize> {
+        let left_idx = self.resolve_schema_column_index(left, schema);
+        let right_idx = self.resolve_schema_column_index(right, schema);
+
+        if left_idx.is_some() && right_idx.is_none() && !self.expr_has_column_reference(right) {
+            left_idx
+        } else if right_idx.is_some() && left_idx.is_none() && !self.expr_has_column_reference(left)
+        {
+            right_idx
+        } else {
+            None
+        }
+    }
+
+    fn join_column_stats_for_schema_index<'a>(
+        stats: &'a super::super::analyze::TableStats,
+        schema: &TableSchema,
+        index: usize,
+    ) -> Option<&'a super::super::analyze::ColumnStats> {
+        let column_name = schema.columns.get(index)?.name.as_str();
+        let unqualified = column_name.rsplit('.').next().unwrap_or(column_name);
+        stats.columns.iter().find(|column| {
+            column.name.eq_ignore_ascii_case(column_name)
+                || column.name.eq_ignore_ascii_case(unqualified)
+        })
+    }
+
+    fn join_selectivity_to_rows(row_count: usize, selectivity: f64) -> usize {
+        if row_count == 0 {
+            return 0;
+        }
+        let rows = (row_count as f64 * selectivity.clamp(0.0, 1.0)).ceil() as usize;
+        rows.clamp(1, row_count)
+    }
+
+    async fn original_join_output_projection(
+        &self,
+        from: &[TableWithJoins],
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<Vec<String>>> {
+        let relation_count = from
+            .iter()
+            .map(|table| table.joins.len().saturating_add(1))
+            .sum::<usize>();
+        let mut columns = Vec::with_capacity(relation_count);
+
+        for table in from {
+            if !self
+                .append_relation_projection_columns(&table.relation, txn, &mut columns)
+                .await?
+            {
+                return Ok(None);
+            }
+            for join in &table.joins {
+                if !self
+                    .append_relation_projection_columns(&join.relation, txn, &mut columns)
+                    .await?
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(Some(columns))
+    }
+
+    async fn append_relation_projection_columns(
+        &self,
+        relation: &TableFactor,
+        txn: &mut dyn Transaction,
+        columns: &mut Vec<String>,
+    ) -> Result<bool> {
+        let TableFactor::Table { name, .. } = relation else {
+            return Ok(false);
+        };
+
+        let table_name = name.to_string();
+        let schema_key = join_schema_key_for_table(&table_name);
+        let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
+            return Ok(false);
+        };
+        let mut schema: TableSchema = bincode::deserialize(&schema_bytes)
+            .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
+        self.prefix_schema_columns(&mut schema, relation)?;
+        columns.reserve(schema.columns.len());
+        columns.extend(schema.columns.into_iter().map(|column| column.name));
+        Ok(true)
     }
 
     fn predicate_schema_members(&self, expr: &Expr, schemas: &[TableSchema]) -> Option<Vec<usize>> {
@@ -1876,20 +2104,42 @@ impl Executor {
         limit: Option<usize>,
         has_deferred_subquery_filter: bool,
     ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+        let mut source_from_storage = None;
+        let mut source_selection = selection.clone();
+        let mut preserve_original_join_projection = false;
+        if !has_deferred_subquery_filter {
+            if let Some((flattened, combined_selection)) =
+                Self::inner_join_chain_as_comma_join(from, selection)
+            {
+                source_from_storage = Some(flattened);
+                source_selection = combined_selection;
+                preserve_original_join_projection = true;
+            }
+        }
+        let source_from = source_from_storage.as_deref().unwrap_or(from);
+
         let reordered_from = self
             .reorder_comma_join_from(
-                from,
-                selection,
+                source_from,
+                &source_selection,
                 projection,
                 has_deferred_subquery_filter,
                 txn,
             )
             .await?;
-        let planned_from = reordered_from.as_deref().unwrap_or(from);
+        let planned_from = reordered_from.as_deref().unwrap_or(source_from);
+        let mut effective_projection = projection.clone();
+        if effective_projection.is_none()
+            && preserve_original_join_projection
+            && reordered_from.is_some()
+        {
+            effective_projection = self.original_join_output_projection(from, txn).await?;
+        }
+        let projection = &effective_projection;
 
         let first = &planned_from[0];
         let join_column_refs = self.collect_join_column_references(planned_from);
-        let mut pending_predicates = if let Some(expr) = selection {
+        let mut pending_predicates = if let Some(expr) = &source_selection {
             Self::collect_conjunctive_predicates(expr)
         } else {
             Vec::new()

@@ -56,7 +56,7 @@
 | **Durability** | Segmented WAL (64MB rotation), CRC32 block checksums and LZ4 block compression on SSTables |
 | **Compaction** | 4-way merge with MVCC key deduplication |
 | **Columnar Analytics** | Arrow RecordBatch conversion, vectorized COUNT/SUM/AVG/MIN/MAX |
-| **Performance** | Optimized merge iterator, streaming COUNT(*), pre-allocated scan buffers, hash join for equi-joins |
+| **Performance** | Optimized merge iterator, streaming COUNT(*), pre-allocated scan buffers, hash join for equi-joins, ANALYZE statistics, cost-based comma/inner join reordering |
 
 ### Infrastructure
 
@@ -523,6 +523,13 @@ SELECT UPPER('hello');
 
 -- EXPLAIN (query plan)
 EXPLAIN SELECT * FROM users WHERE id = 1;
+
+-- Statistics and cost-based join planning
+ANALYZE TABLE users COMPUTE STATISTICS;
+EXPLAIN SELECT *
+FROM users
+INNER JOIN orders ON users.id = orders.user_id
+INNER JOIN order_items ON orders.id = order_items.order_id;
 ```
 
 ### Transactions
@@ -1005,7 +1012,7 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 | **1. Data Integrity** | ✅ Done | Graceful shutdown, TOML config, segmented WAL, SSTable CRC32, compaction dedup |
 | **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
 | **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
-| **4. Performance** | 🔲 Planned | Connection slots, LZ4 SSTable compression, cost-based optimizer |
+| **4. Performance** | ✅ Done | Connection slots, parallel scan, LZ4 SSTable compression, cost-based optimizer |
 | **5. Distributed** | 🔲 Planned | Wire OpenRaft into main server |
 | **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
 

@@ -41,6 +41,91 @@ async fn test_inner_join() {
 }
 
 #[tokio::test]
+async fn test_inner_join_stats_reorder_preserves_wildcard_column_order() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE inner_reorder_big (id INTEGER PRIMARY KEY, join_key INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE inner_reorder_mid (id INTEGER PRIMARY KEY, join_key INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE inner_reorder_small (id INTEGER PRIMARY KEY, join_key INTEGER)",
+    )
+    .await;
+
+    exec_ok(
+        &executor,
+        "INSERT INTO inner_reorder_big VALUES (1, 1), (2, 1), (3, 1), (4, 1)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO inner_reorder_mid VALUES (1, 1), (2, 1)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO inner_reorder_small VALUES (1, 1)").await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE inner_reorder_big COMPUTE STATISTICS",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE inner_reorder_mid COMPUTE STATISTICS",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE inner_reorder_small COMPUTE STATISTICS",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT *
+           FROM inner_reorder_big
+           INNER JOIN inner_reorder_mid
+             ON inner_reorder_big.join_key = inner_reorder_mid.join_key
+           INNER JOIN inner_reorder_small
+             ON inner_reorder_mid.join_key = inner_reorder_small.join_key
+          WHERE inner_reorder_small.join_key = 1
+          ORDER BY inner_reorder_big.id, inner_reorder_mid.id, inner_reorder_small.id",
+    )
+    .await;
+
+    assert_eq!(
+        cols,
+        vec![
+            "inner_reorder_big.id",
+            "inner_reorder_big.join_key",
+            "inner_reorder_mid.id",
+            "inner_reorder_mid.join_key",
+            "inner_reorder_small.id",
+            "inner_reorder_small.join_key"
+        ]
+    );
+    assert_eq!(rows.len(), 8);
+    assert_eq!(
+        rows[0],
+        vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(1)
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_order_by_prefers_projected_column_over_ambiguous_join_input() {
     let (executor, wal) = setup().await;
     exec_ok(

@@ -56,11 +56,11 @@
 - [ ] **P3-3: SCRAM-SHA-256** — Replace cleartext auth (blocked by pgwire 0.37 limitations)
 - [x] **P3-4: RBAC** — CREATE/DROP USER (SHA-256 hashed passwords), GRANT/REVOKE per-table permissions, SHOW USERS, SUPERUSER flag, check_permission enforcement API
 
-## Phase 4: Performance & Scale
+## Phase 4: Performance & Scale ✅
 
 - [x] **P4-1: Connection pooling** — Configurable pgwire connection slots with max-connection backpressure and metrics
 - [x] **P4-2: Parallel scan** — rayon-based multi-thread table scan for aggregations (>1000 rows)
-- [ ] **P4-3: Cost-based optimizer** — Cardinality estimation, join reordering
+- [x] **P4-3: Cost-based optimizer** — ANALYZE/EXPLAIN cardinality estimates plus stats-guided comma and INNER JOIN chain reordering
 - [x] **P4-4: Page compression** — LZ4-compressed SSTable data blocks with CRC and legacy block compatibility
 
 ## Phase 5: Distributed

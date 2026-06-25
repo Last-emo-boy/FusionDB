@@ -243,8 +243,17 @@ impl Executor {
                 }
             }
 
+            let inner_join_order_input =
+                Self::inner_join_chain_as_comma_join(&select.from, &select.selection);
+            let (join_order_from, join_order_selection) =
+                if let Some((flattened, combined_selection)) = &inner_join_order_input {
+                    (flattened.as_slice(), combined_selection)
+                } else {
+                    (select.from.as_slice(), &select.selection)
+                };
+
             if let Some(join_order) = self
-                .explain_comma_join_order(&select.from, &select.selection, txn)
+                .explain_comma_join_order(join_order_from, join_order_selection, txn)
                 .await?
             {
                 plan.push_str(&format!(
