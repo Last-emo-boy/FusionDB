@@ -6,7 +6,7 @@ use sqlparser::ast::{
 };
 use std::io::{Cursor, Read};
 
-use super::{Executor, QueryResult};
+use super::{Executor, QueryResult, SqlShardRoutingDecision};
 
 const COPY_INSERT_BATCH_ROWS: usize = 1_000;
 
@@ -180,6 +180,54 @@ impl Executor {
         self.insert_copy_rows(table_name, columns, rows, txn).await
     }
 
+    pub(crate) async fn copy_stdin_routing_decisions_for_payload(
+        &self,
+        statement: &Statement,
+        payload: &[u8],
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<SqlShardRoutingDecision>> {
+        let Statement::Copy {
+            source,
+            to,
+            target,
+            options,
+            legacy_options,
+            ..
+        } = statement
+        else {
+            return Err(FusionError::Execution(
+                "COPY STDIN routing requires a COPY statement".to_string(),
+            ));
+        };
+
+        if *to {
+            return Err(FusionError::NotImplemented(
+                "COPY TO is not supported yet".to_string(),
+            ));
+        }
+        if !matches!(target, CopyTarget::Stdin) {
+            return Err(FusionError::Execution(
+                "COPY STDIN routing requires COPY FROM STDIN".to_string(),
+            ));
+        }
+
+        let CopySource::Table {
+            table_name,
+            columns,
+        } = source
+        else {
+            return Err(FusionError::Execution(
+                "COPY FROM STDIN requires a table target".to_string(),
+            ));
+        };
+
+        let copy_options = Self::copy_from_options(options, legacy_options)?;
+        let rows = Self::read_copy_bytes(payload, &copy_options)?;
+        let table_name = Self::copy_table_name(table_name)?;
+        self.copy_rows_routing_decisions(&table_name, columns, &rows, txn)
+            .await
+    }
+
     async fn ensure_copy_rows_owned_locally(
         &self,
         table_name: &str,
@@ -242,6 +290,61 @@ impl Executor {
             }
         }
         Ok(())
+    }
+
+    async fn copy_rows_routing_decisions(
+        &self,
+        table_name: &str,
+        columns: &[Ident],
+        rows: &[Vec<Value>],
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<SqlShardRoutingDecision>> {
+        let Some(router) = self.shard_router.clone() else {
+            return Ok(Vec::new());
+        };
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(table_name, txn)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(pk_idx) = schema.get_primary_key_index() else {
+            return Ok(Vec::new());
+        };
+        let composite_unique_indexes = self
+            .load_composite_unique_indexes_for_table(table_name, txn)
+            .await?;
+        if composite_unique_indexes
+            .iter()
+            .any(|index| index.name.ends_with("_pkey"))
+        {
+            return Ok(Vec::new());
+        }
+        let Some(pk_value_idx) = Self::copy_primary_key_value_index(columns, &schema, pk_idx)
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut decisions = Vec::with_capacity(rows.len());
+        for row in rows {
+            if !Self::copy_row_shape_can_be_routed(columns, &schema, row) {
+                return Ok(Vec::new());
+            }
+            let Some(value) = row.get(pk_value_idx) else {
+                return Ok(Vec::new());
+            };
+            let value = Self::coerce_value_to_column_type(
+                value.clone(),
+                &schema.columns[pk_idx].data_type,
+            )?;
+            let Some(row_id) = Self::value_to_primary_row_id(&value) else {
+                return Ok(Vec::new());
+            };
+            decisions.push(Self::shard_routing_decision_for_row_id(
+                &router, "COPY", table_name, row_id,
+            ));
+        }
+        Ok(decisions)
     }
 
     fn copy_primary_key_value_index(

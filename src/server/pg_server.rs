@@ -1,3 +1,4 @@
+use base64::Engine;
 use bytes::{BufMut, BytesMut};
 use chrono::Datelike;
 use futures::{Sink, SinkExt};
@@ -114,6 +115,7 @@ struct PortalData {
 
 struct CopyInState {
     statement: Statement,
+    query: String,
     data: Vec<u8>,
     simple_query: bool,
 }
@@ -155,6 +157,12 @@ struct ForwardExecuteRequest {
     statement_id: String,
     params: Vec<serde_json::Value>,
     return_results: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ForwardCopyRequest<'a> {
+    sql: &'a str,
+    payload_base64: String,
 }
 
 #[derive(Deserialize)]
@@ -594,6 +602,74 @@ impl PgHandler {
             )));
         };
         Ok(Ok(results))
+    }
+
+    async fn forward_copy_to_shard_owner(
+        &self,
+        query: &str,
+        payload: &[u8],
+        username: &str,
+        decision: &SqlShardRoutingDecision,
+    ) -> PgWireResult<std::result::Result<usize, pgwire::error::ErrorInfo>> {
+        let url = format!("http://{}/copy_stdin", decision.route.owner_addr);
+        let request = ForwardCopyRequest {
+            sql: query,
+            payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+        };
+        let response = match self
+            .apply_forwarding_headers(self.http_client.post(&url), username)
+            .json(&request)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(Err(Self::shard_route_error(
+                    Self::shard_owner_forwarding_transport_error(decision, "copy_stdin", e),
+                )));
+            }
+        };
+        let status = response.status();
+        let envelope = match response
+            .json::<ForwardEnvelope<Vec<ForwardQueryResultJson>>>()
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                return Ok(Err(Self::shard_route_error(format!(
+                    "{}; shard owner forwarding copy_stdin response from node {} at {} could not be decoded: {}",
+                    Self::shard_route_conflict_message(decision),
+                    decision.route.owner_node_id,
+                    decision.route.owner_addr,
+                    e
+                ))));
+            }
+        };
+
+        if !status.is_success() {
+            let message = envelope.error.unwrap_or_else(|| {
+                format!(
+                    "Shard owner forwarding copy_stdin error: node {} at {} returned HTTP {}",
+                    decision.route.owner_node_id, decision.route.owner_addr, status
+                )
+            });
+            return Ok(Err(Self::forwarded_owner_error(message)));
+        }
+
+        let Some(results) = envelope.data else {
+            return Ok(Err(Self::execution_error(
+                "Shard owner forwarding copy_stdin error: response did not include query results",
+            )));
+        };
+        let Some(count) = results.into_iter().find_map(|result| match result {
+            ForwardQueryResultJson::Success { message } => Self::first_i64_token(&message),
+            ForwardQueryResultJson::Select { .. } => None,
+        }) else {
+            return Ok(Err(Self::execution_error(
+                "Shard owner forwarding copy_stdin error: response did not include COPY count",
+            )));
+        };
+        Ok(Ok(count as usize))
     }
 
     fn apply_forwarding_headers(
@@ -3244,11 +3320,16 @@ impl PgHandler {
         CopyResponse::new(0, columns, vec![0; columns])
     }
 
-    async fn begin_copy_from_stdin(&self, stmt: Statement) -> PgWireResult<Response> {
+    async fn begin_copy_from_stdin(
+        &self,
+        stmt: Statement,
+        query: String,
+    ) -> PgWireResult<Response> {
         let response = Self::copy_in_response_for_statement(&stmt);
         let mut session = self.session.lock().await;
         session.copy_in = Some(CopyInState {
             statement: stmt,
+            query,
             data: Vec::new(),
             simple_query: true,
         });
@@ -5831,6 +5912,7 @@ impl SimpleQueryHandler for PgHandler {
                     let mut session = self.session.lock().await;
                     session.copy_in = Some(CopyInState {
                         statement: stmt,
+                        query: query_string.clone(),
                         data: Vec::new(),
                         simple_query: true,
                     });
@@ -5886,7 +5968,9 @@ impl SimpleQueryHandler for PgHandler {
                         e
                     ))))]);
                 }
-                return Ok(vec![self.begin_copy_from_stdin(stmt).await?]);
+                return Ok(vec![
+                    self.begin_copy_from_stdin(stmt, query.to_string()).await?,
+                ]);
             }
             Ok(None) => {}
             Err(e) => {
@@ -6352,6 +6436,7 @@ impl ExtendedQueryHandler for PgHandler {
                 let mut session = self.session.lock().await;
                 session.copy_in = Some(CopyInState {
                     statement: stmt,
+                    query: query.clone(),
                     data: Vec::new(),
                     simple_query: false,
                 });
@@ -6684,6 +6769,7 @@ impl CopyHandler for PgHandler {
             },
             ImplicitTransaction {
                 statement: Statement,
+                query: String,
                 payload: Vec<u8>,
                 simple_query: bool,
             },
@@ -6717,6 +6803,7 @@ impl CopyHandler for PgHandler {
             } else {
                 CopyDoneWork::ImplicitTransaction {
                     statement: copy_in.statement,
+                    query: copy_in.query,
                     payload: copy_in.data,
                     simple_query: copy_in.simple_query,
                 }
@@ -6739,6 +6826,7 @@ impl CopyHandler for PgHandler {
             ),
             CopyDoneWork::ImplicitTransaction {
                 statement,
+                query,
                 payload,
                 simple_query,
             } => {
@@ -6748,24 +6836,58 @@ impl CopyHandler for PgHandler {
                         e
                     ))))
                 })?;
-                match self
+                let route_action = match self
                     .executor
-                    .execute_copy_stdin_payload(&statement, &payload, &mut *txn)
+                    .copy_stdin_routing_decisions_for_payload(&statement, &payload, &mut *txn)
                     .await
                 {
-                    Ok(count) => {
-                        txn.commit().await.map_err(|e| {
-                            PgWireError::UserError(Box::new(Self::execution_error(format!(
-                                "COPY failed to commit transaction: {:?}",
-                                e
-                            ))))
-                        })?;
-                        self.executor.invalidate_query_result_cache();
-                        (count, simple_query, TransactionStatus::Idle)
-                    }
+                    Ok(decisions) => Self::shard_write_route_action(decisions),
                     Err(e) => {
                         let _ = txn.rollback().await;
                         return Err(PgWireError::UserError(Box::new(Self::copy_error(e))));
+                    }
+                };
+                match route_action {
+                    PgShardWriteRouteAction::Local => {
+                        match self
+                            .executor
+                            .execute_copy_stdin_payload(&statement, &payload, &mut *txn)
+                            .await
+                        {
+                            Ok(count) => {
+                                txn.commit().await.map_err(|e| {
+                                    PgWireError::UserError(Box::new(Self::execution_error(
+                                        format!("COPY failed to commit transaction: {:?}", e),
+                                    )))
+                                })?;
+                                self.executor.invalidate_query_result_cache();
+                                (count, simple_query, TransactionStatus::Idle)
+                            }
+                            Err(e) => {
+                                let _ = txn.rollback().await;
+                                return Err(PgWireError::UserError(Box::new(Self::copy_error(e))));
+                            }
+                        }
+                    }
+                    PgShardWriteRouteAction::Forward(decision) => {
+                        let _ = txn.rollback().await;
+                        let username = Self::username_for_client(client);
+                        let count = match self
+                            .forward_copy_to_shard_owner(&query, &payload, &username, &decision)
+                            .await?
+                        {
+                            Ok(count) => count,
+                            Err(error) => {
+                                return Err(PgWireError::UserError(Box::new(error)));
+                            }
+                        };
+                        (count, simple_query, TransactionStatus::Idle)
+                    }
+                    PgShardWriteRouteAction::Conflict(message) => {
+                        let _ = txn.rollback().await;
+                        return Err(PgWireError::UserError(Box::new(Self::shard_route_error(
+                            message,
+                        ))));
                     }
                 }
             }

@@ -6,6 +6,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -17,6 +18,7 @@ use crate::distributed::api::{raft_routes, submit_raft_write, RaftAppState};
 use crate::distributed::sharding::ShardRouter;
 use crate::distributed::FusionRaft;
 use crate::execution::{Executor, PreparedStatementRecord, SqlShardRoutingDecision};
+use crate::parser::parse_sql;
 use crate::storage::Storage;
 
 use crate::storage::fusion::{CdcEvent, FusionStorage};
@@ -56,6 +58,7 @@ fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/health", get(health_check))
         .route("/query", post(handle_query))
+        .route("/copy_stdin", post(handle_copy_stdin))
         .route("/prepare", post(handle_prepare).get(handle_list_prepared))
         .route(
             "/prepare/{statement_id}",
@@ -435,6 +438,83 @@ async fn handle_query(
     match state.executor.execute_sql(&payload.sql).await {
         Ok(results) => json_ok(results.into_iter().map(|r| r.into()).collect()),
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{:?}", e)),
+    }
+}
+
+async fn handle_copy_stdin(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Json(payload): Json<CopyStdinRequest>,
+) -> ApiResponse<Vec<QueryResultJson>> {
+    let username = context.username.clone().unwrap_or_default();
+    let copy_sql = copy_stdin_sql_for_parse(&payload.sql);
+
+    if let Err(e) = state.executor.authorize_sql(&username, &copy_sql).await {
+        return json_error(StatusCode::FORBIDDEN, format!("{:?}", e));
+    }
+
+    let copy_payload =
+        match base64::engine::general_purpose::STANDARD.decode(&payload.payload_base64) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("COPY payload decode error: {}", e),
+                );
+            }
+        };
+    let statements = match parse_sql(&copy_sql) {
+        Ok(statements) => statements,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("Parse Error: {:?}", e)),
+    };
+    let [statement] = statements.as_slice() else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "COPY STDIN forwarding requires exactly one COPY statement",
+        );
+    };
+
+    let mut txn = match state.storage.begin_transaction().await {
+        Ok(txn) => txn,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("COPY failed to begin transaction: {:?}", e),
+            );
+        }
+    };
+
+    match state
+        .executor
+        .execute_copy_stdin_payload(statement, &copy_payload, &mut *txn)
+        .await
+    {
+        Ok(count) => match txn.commit().await {
+            Ok(_) => {
+                state.executor.invalidate_query_result_cache();
+                json_ok(vec![QueryResultJson::Success {
+                    r#type: "success".to_string(),
+                    message: format!("Copied {} rows", count),
+                }])
+            }
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("COPY failed to commit transaction: {:?}", e),
+            ),
+        },
+        Err(e) => {
+            let _ = txn.rollback().await;
+            json_error(copy_stdin_error_status(&e), format!("{:?}", e))
+        }
+    }
+}
+
+fn copy_stdin_sql_for_parse(sql: &str) -> String {
+    let trimmed = sql.trim_end();
+    if trimmed.ends_with(';') {
+        trimmed.to_string()
+    } else {
+        format!("{};", trimmed)
     }
 }
 
@@ -957,6 +1037,12 @@ pub struct QueryRequest {
     sql: String,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct CopyStdinRequest {
+    sql: String,
+    payload_base64: String,
+}
+
 #[derive(Deserialize)]
 pub struct CdcEventsRequest {
     since: Option<u64>,
@@ -1176,6 +1262,13 @@ fn prepared_statement_error_status(error: &FusionError) -> StatusCode {
     match error {
         FusionError::Execution(message) if message.contains("belongs to") => StatusCode::FORBIDDEN,
         FusionError::Execution(message) if message.contains("not found") => StatusCode::NOT_FOUND,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn copy_stdin_error_status(error: &FusionError) -> StatusCode {
+    match error {
+        FusionError::ShardRouteConflict(_) => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     }
 }
