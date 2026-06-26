@@ -699,13 +699,43 @@ impl Executor {
         statements: &[Statement],
         params: &[Value],
     ) -> Result<Vec<SqlShardOwner>> {
-        let Some(router) = self.shard_router.clone() else {
-            return Ok(Vec::new());
-        };
         if !Self::simple_select_fanout_eligible(statements) {
             return Ok(Vec::new());
         }
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
+    }
 
+    pub(crate) async fn shard_count_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_count_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_count_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        if !Self::count_star_select_fanout_eligible(statements) {
+            return Ok(Vec::new());
+        }
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
+    }
+
+    async fn shard_select_fanout_owners_for_prechecked_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let Some(router) = self.shard_router.clone() else {
+            return Ok(Vec::new());
+        };
         let mut txn = self.storage.begin_transaction().await?;
         if self
             .shard_read_route_decision_for_statements_in_transaction(statements, &mut *txn, params)
@@ -771,6 +801,67 @@ impl Executor {
             .selection
             .as_ref()
             .is_none_or(Self::select_predicate_is_fanout_local)
+    }
+
+    fn count_star_select_fanout_eligible(statements: &[Statement]) -> bool {
+        let [Statement::Query(query)] = statements else {
+            return false;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return false;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return false;
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.projection.len() != 1
+        {
+            return false;
+        }
+        if !matches!(select.from[0].relation, TableFactor::Table { .. }) {
+            return false;
+        }
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return false;
+        };
+        if !group_exprs.is_empty() {
+            return false;
+        }
+        if !Self::select_projection_is_count_star(&select.projection[0]) {
+            return false;
+        }
+        select
+            .selection
+            .as_ref()
+            .is_none_or(Self::select_predicate_is_fanout_local)
+    }
+
+    fn select_projection_is_count_star(item: &SelectItem) -> bool {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return false,
+        };
+        let Expr::Function(func) = expr else {
+            return false;
+        };
+        if func.name.0.len() != 1
+            || !func.name.0[0]
+                .as_ident()
+                .is_some_and(|ident| ident.value.eq_ignore_ascii_case("COUNT"))
+        {
+            return false;
+        }
+        let FunctionArguments::List(args) = &func.args else {
+            return false;
+        };
+        args.args.len() == 1
+            && matches!(
+                args.args[0],
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+            )
     }
 
     fn select_projection_is_fanout_safe(item: &SelectItem) -> bool {

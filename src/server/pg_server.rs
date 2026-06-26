@@ -777,6 +777,79 @@ impl PgHandler {
         ])?))
     }
 
+    async fn fanout_count_select_to_shard_owners(
+        &self,
+        query: &str,
+        username: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        let owners = match self
+            .executor
+            .shard_count_select_fanout_owners_for_sql(query, &[])
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard count fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let local_results = match self.executor.execute_sql(query).await {
+            Ok(results) => Self::forward_results_from_query_results(results),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard count fan-out local execution error",
+                    &e,
+                )))]));
+            }
+        };
+        let (columns, mut total) = match Self::count_from_forward_select_results(local_results) {
+            Ok(count) => count,
+            Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_shard_owner_results(query, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            let (owner_columns, owner_count) =
+                match Self::count_from_forward_select_results(owner_results) {
+                    Ok(count) => count,
+                    Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+                };
+            if owner_columns != columns {
+                return Ok(Some(vec![Response::Error(Box::new(
+                    Self::execution_error(format!(
+                        "Shard count fan-out column mismatch: expected {:?}, got {:?}",
+                        columns, owner_columns
+                    )),
+                ))]));
+            }
+            total = match total.checked_add(owner_count) {
+                Some(total) => total,
+                None => {
+                    return Ok(Some(vec![Response::Error(Box::new(
+                        Self::execution_error("Shard count fan-out overflow"),
+                    ))]));
+                }
+            };
+        }
+
+        Ok(Some(Self::responses_from_forwarded_query_results(vec![
+            ForwardQueryResultJson::Select {
+                columns,
+                rows: vec![vec![serde_json::json!(total)]],
+            },
+        ])?))
+    }
+
     async fn fanout_extended_select_to_shard_owners(
         &self,
         query: &str,
@@ -836,6 +909,74 @@ impl PgHandler {
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns: columns.unwrap_or_default(),
             rows,
+        }])))
+    }
+
+    async fn fanout_extended_count_select_to_shard_owners(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        let owners = match self
+            .executor
+            .shard_count_select_fanout_owners_for_sql(query, params)
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard count fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+
+        let local_results = match self.execute_first_statement(query, params).await {
+            Ok(result) => Self::forward_results_from_query_results(vec![result]),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard count fan-out local execution error",
+                    &e,
+                )));
+            }
+        };
+        let (columns, mut total) = match Self::count_from_forward_select_results(local_results) {
+            Ok(count) => count,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_prepared_shard_owner_results(query, params, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Err(error)),
+            };
+            let (owner_columns, owner_count) =
+                match Self::count_from_forward_select_results(owner_results) {
+                    Ok(count) => count,
+                    Err(error) => return Ok(Err(error)),
+                };
+            if owner_columns != columns {
+                return Ok(Err(Self::execution_error(format!(
+                    "Shard count fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ))));
+            }
+            total = match total.checked_add(owner_count) {
+                Some(total) => total,
+                None => return Ok(Err(Self::execution_error("Shard count fan-out overflow"))),
+            };
+        }
+
+        Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
+            columns,
+            rows: vec![vec![serde_json::json!(total)]],
         }])))
     }
 
@@ -1054,6 +1195,37 @@ impl PgHandler {
         }
         rows.extend(result_rows.iter().cloned());
         Ok(())
+    }
+
+    fn count_from_forward_select_results(
+        results: Vec<ForwardQueryResultJson>,
+    ) -> std::result::Result<(Vec<String>, i64), pgwire::error::ErrorInfo> {
+        let [result] = results.as_slice() else {
+            return Err(Self::execution_error(
+                "Shard count fan-out expected exactly one SELECT result",
+            ));
+        };
+        let ForwardQueryResultJson::Select { columns, rows } = result else {
+            return Err(Self::execution_error(
+                "Shard count fan-out received a non-SELECT result",
+            ));
+        };
+        if columns.len() != 1 || rows.len() != 1 || rows[0].len() != 1 {
+            return Err(Self::execution_error(
+                "Shard count fan-out expected one row with one count column",
+            ));
+        }
+        let value = &rows[0][0];
+        let count = value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|count| i64::try_from(count).ok()));
+        let Some(count) = count else {
+            return Err(Self::execution_error(format!(
+                "Shard count fan-out received a non-integer count value: {}",
+                value
+            )));
+        };
+        Ok((columns.clone(), count))
     }
 
     fn apply_forwarding_headers(
@@ -6616,6 +6788,13 @@ impl SimpleQueryHandler for PgHandler {
                 let fanout_query = stmt.to_string();
                 drop(session);
                 if let Some(mut fanout_responses) = self
+                    .fanout_count_select_to_shard_owners(&fanout_query, &username)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                if let Some(mut fanout_responses) = self
                     .fanout_simple_select_to_shard_owners(&fanout_query, &username)
                     .await?
                 {
@@ -7089,6 +7268,31 @@ impl ExtendedQueryHandler for PgHandler {
                                 .send(PgWireBackendMessage::ErrorResponse(
                                     Self::fusion_error("Shard read routing error", &e).into(),
                                 ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_count_select_to_shard_owners(&query, &params, &username)
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
                                 .await
                                 .map_err(|_| Self::sink_error())?;
                             return Ok(());

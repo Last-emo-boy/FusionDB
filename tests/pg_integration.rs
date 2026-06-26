@@ -2622,6 +2622,21 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         ]
     );
 
+    let count_messages = client
+        .simple_query("SELECT COUNT(*) FROM pg_route_forward")
+        .await
+        .expect("fanout COUNT failed");
+    let count_value = count_messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(row.get("COUNT(*)").expect("count").to_string())
+            }
+            _ => None,
+        })
+        .expect("count row");
+    assert_eq!(count_value, "2");
+
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
 }
@@ -2947,6 +2962,12 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
     ];
     expected_fanout_rows.sort_by_key(|row| row.0);
     assert_eq!(fanout_rows, expected_fanout_rows);
+
+    let count_rows = client
+        .query("SELECT COUNT(*) FROM pg_route_extended_forward", &[])
+        .await
+        .expect("extended fanout COUNT failed");
+    assert_eq!(count_rows[0].get::<_, i64>(0), 2);
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
