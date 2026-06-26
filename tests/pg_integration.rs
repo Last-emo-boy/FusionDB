@@ -2778,6 +2778,11 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
     let owner_config = sharded_pg_test_config_with_owner_addr(4, owner_addr.clone(), 2);
     let local_router = ShardRouter::from_config(&local_config).expect("local shard router");
     let owner_router = ShardRouter::from_config(&owner_config).expect("owner shard router");
+    let local_key = i64::from(integer_primary_key_for_owner(
+        &local_router,
+        "pg_route_extended_forward",
+        1,
+    ));
     let remote_key = i64::from(integer_primary_key_for_owner(
         &local_router,
         "pg_route_extended_forward",
@@ -2860,6 +2865,14 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
         .simple_query("CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT)")
         .await
         .expect("local CREATE TABLE failed");
+    let local_inserted = client
+        .execute(
+            "INSERT INTO pg_route_extended_forward (name, id) VALUES ($1, $2)",
+            &[&"local", &local_key],
+        )
+        .await
+        .expect("local owner extended insert should succeed");
+    assert_eq!(local_inserted, 1);
     let inserted = client
         .execute(
             "INSERT INTO pg_route_extended_forward (name, id) VALUES ($1, $2)",
@@ -2919,6 +2932,21 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
         }
         fusiondb::execution::QueryResult::Success { .. } => panic!("expected raw local select"),
     }
+
+    let mut fanout_rows = client
+        .query("SELECT id, name FROM pg_route_extended_forward", &[])
+        .await
+        .expect("extended fanout SELECT failed")
+        .into_iter()
+        .map(|row| (row.get::<_, i64>("id"), row.get::<_, String>("name")))
+        .collect::<Vec<_>>();
+    fanout_rows.sort_by_key(|row| row.0);
+    let mut expected_fanout_rows = vec![
+        (local_key, "local".to_string()),
+        (remote_key, "remote".to_string()),
+    ];
+    expected_fanout_rows.sort_by_key(|row| row.0);
+    assert_eq!(fanout_rows, expected_fanout_rows);
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);

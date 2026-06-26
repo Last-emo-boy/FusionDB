@@ -1009,7 +1009,7 @@ These are known gaps that should be addressed before production use:
 - HTTP and pgwire SQL execution now reject deterministic non-local shard-owner point writes (`INSERT ... VALUES` with an explicit primary key, pgwire `COPY FROM STDIN` rows with an explicit primary key, plus `UPDATE`/`DELETE` by primary-key equality) with a route hint instead of silently executing them on the wrong node, including pgwire writes against schemas created earlier in the same session transaction
 - HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query plus `COPY FROM STDIN` can forward deterministic point writes whose routed rows all target one non-local shard owner to that owner's HTTP endpoint
 - HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query can forward deterministic primary-key point reads to a non-local shard owner
-- HTTP `/query` and pgwire simple query can fan out simple single-table SELECT scans across shard owners and merge row results; aggregates, DISTINCT, ORDER BY/LIMIT, joins, subqueries, HTTP prepared fan-out, and pgwire extended fan-out are still conservative
+- HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query can fan out simple single-table SELECT scans across shard owners and merge row results; aggregates, DISTINCT, ORDER BY/LIMIT, joins, subqueries, and broader distributed planning are still conservative
 - Mixed local/remote writes, multi-owner writes, distributed index ownership/maintenance, and broader cross-node query planning remain in progress
 - No dedicated read-replica topology management
 - No distributed transactions (2PC)

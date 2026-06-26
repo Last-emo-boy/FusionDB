@@ -1055,6 +1055,19 @@ async fn handle_execute(
                 Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
             }
 
+            if let Some(response) = try_fanout_execute_to_shard_owners(
+                &state,
+                &context,
+                &record,
+                &payload,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
             let mut may_change_query_results = false;
             match state.storage.begin_transaction().await {
                 Ok(mut txn) => {
@@ -1104,6 +1117,221 @@ async fn handle_execute(
             format!("Statement Error: {:?}", e),
         ),
     }
+}
+
+async fn try_fanout_execute_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    let owners = match state
+        .executor
+        .shard_select_fanout_owners_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard select fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match state.storage.begin_transaction().await {
+        Ok(mut txn) => {
+            let mut results = Vec::new();
+            for stmt in record.statements.iter() {
+                match state
+                    .executor
+                    .execute_in_transaction_with_params(stmt, &mut *txn, params)
+                    .await
+                {
+                    Ok(result) => results.push(result.into()),
+                    Err(e) => {
+                        let _ = txn.rollback().await;
+                        return Some(json_error(
+                            StatusCode::BAD_REQUEST,
+                            format!("Execution Error: {:?}", e),
+                        ));
+                    }
+                }
+            }
+            if let Err(e) = txn.commit().await {
+                return Some(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Commit Error: {:?}", e),
+                ));
+            }
+            results
+        }
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Transaction Error: {:?}", e),
+            ));
+        }
+    };
+
+    let mut columns = None;
+    let mut rows = Vec::new();
+    if let Err(message) = append_fanout_select_results(&mut columns, &mut rows, local_results) {
+        return Some(json_error(StatusCode::BAD_GATEWAY, message));
+    }
+
+    for owner in owners {
+        let owner_results = match query_remote_prepared_shard_owner(
+            state, context, record, payload, &owner,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        if let Err(message) = append_fanout_select_results(&mut columns, &mut rows, owner_results) {
+            return Some(json_error(StatusCode::BAD_GATEWAY, message));
+        }
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: columns.unwrap_or_default(),
+        rows,
+    }]))
+}
+
+async fn query_remote_prepared_shard_owner(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    owner: &SqlShardOwner,
+) -> std::result::Result<Vec<QueryResultJson>, (StatusCode, String)> {
+    let prepare_url = format!("http://{}/prepare", owner.addr);
+    let prepare_payload = PrepareRequest {
+        sql: record.sql.clone(),
+    };
+    let prepare_response = apply_forwarding_headers(state.raft_client.post(&prepare_url), context)
+        .json(&prepare_payload)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard select fan-out prepare error: forwarding to node {} at {} failed: {}",
+                    owner.node_id, owner.addr, e
+                ),
+            )
+        })?;
+    let prepare_status = prepare_response.status();
+    let prepare_envelope = prepare_response
+        .json::<Envelope<PreparedStatementInfo>>()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard select fan-out prepare error: response from node {} at {} could not be decoded: {}",
+                    owner.node_id, owner.addr, e
+                ),
+            )
+        })?;
+    if !prepare_status.is_success() || prepare_envelope.status != "ok" {
+        return Err((
+            prepare_status,
+            format!(
+                "Shard select fan-out prepare error: node {} at {} rejected query: {}",
+                owner.node_id,
+                owner.addr,
+                prepare_envelope
+                    .error
+                    .unwrap_or_else(|| "owner node rejected prepare".to_string())
+            ),
+        ));
+    }
+    let prepared = prepare_envelope.data.ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Shard select fan-out prepare error: node {} at {} returned no prepared statement",
+                owner.node_id, owner.addr
+            ),
+        )
+    })?;
+
+    let execute_url = format!("http://{}/execute", owner.addr);
+    let execute_payload = ExecuteRequest {
+        statement_id: prepared.statement_id.clone(),
+        params: payload.params.clone(),
+        return_results: Some(true),
+    };
+    let execute_response =
+        match apply_forwarding_headers(state.raft_client.post(&execute_url), context)
+            .json(&execute_payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                best_effort_deallocate_statement_on_owner(state, context, owner, &prepared).await;
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                    "Shard select fan-out execute error: forwarding to node {} at {} failed: {}",
+                    owner.node_id, owner.addr, e
+                ),
+                ));
+            }
+        };
+    let execute_status = execute_response.status();
+    let execute_envelope = match execute_response
+        .json::<Envelope<Vec<QueryResultJson>>>()
+        .await
+    {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            best_effort_deallocate_statement_on_owner(state, context, owner, &prepared).await;
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard select fan-out execute error: response from node {} at {} could not be decoded: {}",
+                    owner.node_id, owner.addr, e
+                ),
+            ));
+        }
+    };
+    best_effort_deallocate_statement_on_owner(state, context, owner, &prepared).await;
+
+    if !execute_status.is_success() || execute_envelope.status != "ok" {
+        return Err((
+            execute_status,
+            format!(
+                "Shard select fan-out execute error: node {} at {} rejected query: {}",
+                owner.node_id,
+                owner.addr,
+                execute_envelope
+                    .error
+                    .unwrap_or_else(|| "owner node rejected execute".to_string())
+            ),
+        ));
+    }
+    execute_envelope.data.ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Shard select fan-out execute error: node {} at {} returned no query data",
+                owner.node_id, owner.addr
+            ),
+        )
+    })
 }
 
 async fn forward_execute_to_shard_owner(
@@ -1246,6 +1474,18 @@ async fn best_effort_deallocate_forwarded_statement(
         "http://{}/prepare/{}",
         decision.route.owner_addr, prepared.statement_id
     );
+    let _ = apply_forwarding_headers(state.raft_client.delete(url), context)
+        .send()
+        .await;
+}
+
+async fn best_effort_deallocate_statement_on_owner(
+    state: &AppState,
+    context: &RequestContext,
+    owner: &SqlShardOwner,
+    prepared: &PreparedStatementInfo,
+) {
+    let url = format!("http://{}/prepare/{}", owner.addr, prepared.statement_id);
     let _ = apply_forwarding_headers(state.raft_client.delete(url), context)
         .send()
         .await;
@@ -2275,6 +2515,7 @@ mod tests {
         let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
         let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
         let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_key = integer_primary_key_for_owner(&local_shard_router, "forward_exec_users", 1);
         let remote_key =
             integer_primary_key_for_owner(&local_shard_router, "forward_exec_users", 2);
 
@@ -2299,6 +2540,18 @@ mod tests {
             .await
             .expect("owner create response");
         assert_eq!(owner_create.status(), StatusCode::OK);
+        assert_eq!(
+            post_query(
+                &local_app,
+                &format!(
+                    "INSERT INTO forward_exec_users (id, name) VALUES ({}, 'local-exec')",
+                    local_key
+                ),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
 
         let prepare_request = HttpRequest::builder()
             .method("POST")
@@ -2411,6 +2664,67 @@ mod tests {
                 assert_eq!(rows, &vec![vec![serde_json::json!("remote-exec")]]);
             }
             QueryResultJson::Success { .. } => panic!("expected forwarded select"),
+        }
+
+        let prepare_fanout_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "sql": "SELECT id, name FROM forward_exec_users"
+                })
+                .to_string(),
+            ))
+            .expect("prepare fanout request");
+        let prepare_fanout_response = local_app
+            .clone()
+            .oneshot(prepare_fanout_request)
+            .await
+            .expect("prepare fanout response");
+        let prepare_fanout_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_fanout_response).await;
+        let prepared_fanout = prepare_fanout_envelope
+            .data
+            .expect("prepared fanout statement");
+        let execute_fanout_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared_fanout.statement_id,
+                    "params": []
+                })
+                .to_string(),
+            ))
+            .expect("execute fanout request");
+        let execute_fanout_response = local_app
+            .clone()
+            .oneshot(execute_fanout_request)
+            .await
+            .expect("execute fanout response");
+        assert_eq!(execute_fanout_response.status(), StatusCode::OK);
+        let execute_fanout_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_fanout_response).await;
+        match &execute_fanout_envelope.data.expect("execute fanout data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                let mut rows = rows.clone();
+                rows.sort_by_key(|row| row[0].as_i64().unwrap());
+                let mut expected = vec![
+                    vec![
+                        serde_json::json!(local_key),
+                        serde_json::json!("local-exec"),
+                    ],
+                    vec![
+                        serde_json::json!(remote_key),
+                        serde_json::json!("remote-exec"),
+                    ],
+                ];
+                expected.sort_by_key(|row| row[0].as_i64().unwrap());
+                assert_eq!(rows, expected);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout select"),
         }
 
         let local_storage_probe = Executor::new(local_storage.clone())

@@ -777,6 +777,68 @@ impl PgHandler {
         ])?))
     }
 
+    async fn fanout_extended_select_to_shard_owners(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        let owners = match self
+            .executor
+            .shard_select_fanout_owners_for_sql(query, params)
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard select fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+
+        let local_results = match self.execute_first_statement(query, params).await {
+            Ok(result) => Self::forward_results_from_query_results(vec![result]),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard select fan-out local execution error",
+                    &e,
+                )));
+            }
+        };
+
+        let mut columns = None;
+        let mut rows = Vec::new();
+        if let Err(error) =
+            Self::append_forward_select_results(&mut columns, &mut rows, local_results)
+        {
+            return Ok(Err(error));
+        }
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_prepared_shard_owner_results(query, params, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Err(error)),
+            };
+            if let Err(error) =
+                Self::append_forward_select_results(&mut columns, &mut rows, owner_results)
+            {
+                return Ok(Err(error));
+            }
+        }
+
+        Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
+            columns: columns.unwrap_or_default(),
+            rows,
+        }])))
+    }
+
     async fn query_remote_shard_owner_results(
         &self,
         query: &str,
@@ -825,6 +887,118 @@ impl PgHandler {
         let Some(results) = envelope.data else {
             return Ok(Err(Self::execution_error(format!(
                 "Shard select fan-out error: node {} at {} returned no query results",
+                owner.node_id, owner.addr
+            ))));
+        };
+        Ok(Ok(results))
+    }
+
+    async fn query_remote_prepared_shard_owner_results(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+        owner: &SqlShardOwner,
+    ) -> PgWireResult<std::result::Result<Vec<ForwardQueryResultJson>, pgwire::error::ErrorInfo>>
+    {
+        let prepare_url = format!("http://{}/prepare", owner.addr);
+        let prepare_response = match self
+            .apply_forwarding_headers(self.http_client.post(&prepare_url), username)
+            .json(&ForwardPrepareRequest { sql: query })
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(Err(Self::shard_route_error(format!(
+                    "Shard select fan-out prepare error: forwarding to node {} at {} failed: {}",
+                    owner.node_id, owner.addr, e
+                ))));
+            }
+        };
+        let prepare_status = prepare_response.status();
+        let prepare_envelope = match prepare_response
+            .json::<ForwardEnvelope<ForwardPreparedStatementInfo>>()
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                return Ok(Err(Self::shard_route_error(format!(
+                    "Shard select fan-out prepare error: response from node {} at {} could not be decoded: {}",
+                    owner.node_id, owner.addr, e
+                ))));
+            }
+        };
+        if !prepare_status.is_success() {
+            return Ok(Err(Self::forwarded_owner_error(
+                prepare_envelope.error.unwrap_or_else(|| {
+                    format!(
+                        "Shard select fan-out prepare error: node {} at {} returned HTTP {}",
+                        owner.node_id, owner.addr, prepare_status
+                    )
+                }),
+            )));
+        }
+        let Some(prepared) = prepare_envelope.data else {
+            return Ok(Err(Self::execution_error(format!(
+                "Shard select fan-out prepare error: node {} at {} returned no prepared statement",
+                owner.node_id, owner.addr
+            ))));
+        };
+
+        let execute_url = format!("http://{}/execute", owner.addr);
+        let execute_payload = ForwardExecuteRequest {
+            statement_id: prepared.statement_id.clone(),
+            params: params.iter().map(Value::to_json).collect(),
+            return_results: Some(true),
+        };
+        let execute_response = match self
+            .apply_forwarding_headers(self.http_client.post(&execute_url), username)
+            .json(&execute_payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                self.best_effort_deallocate_prepared_on_owner(username, owner, &prepared)
+                    .await;
+                return Ok(Err(Self::shard_route_error(format!(
+                    "Shard select fan-out execute error: forwarding to node {} at {} failed: {}",
+                    owner.node_id, owner.addr, e
+                ))));
+            }
+        };
+        let execute_status = execute_response.status();
+        let execute_envelope = match execute_response
+            .json::<ForwardEnvelope<Vec<ForwardQueryResultJson>>>()
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                self.best_effort_deallocate_prepared_on_owner(username, owner, &prepared)
+                    .await;
+                return Ok(Err(Self::shard_route_error(format!(
+                    "Shard select fan-out execute error: response from node {} at {} could not be decoded: {}",
+                    owner.node_id, owner.addr, e
+                ))));
+            }
+        };
+        self.best_effort_deallocate_prepared_on_owner(username, owner, &prepared)
+            .await;
+
+        if !execute_status.is_success() {
+            return Ok(Err(Self::forwarded_owner_error(
+                execute_envelope.error.unwrap_or_else(|| {
+                    format!(
+                        "Shard select fan-out execute error: node {} at {} returned HTTP {}",
+                        owner.node_id, owner.addr, execute_status
+                    )
+                }),
+            )));
+        }
+        let Some(results) = execute_envelope.data else {
+            return Ok(Err(Self::execution_error(format!(
+                "Shard select fan-out execute error: node {} at {} returned no query results",
                 owner.node_id, owner.addr
             ))));
         };
@@ -905,6 +1079,19 @@ impl PgHandler {
             "http://{}/prepare/{}",
             decision.route.owner_addr, prepared.statement_id
         );
+        let _ = self
+            .apply_forwarding_headers(self.http_client.delete(url), username)
+            .send()
+            .await;
+    }
+
+    async fn best_effort_deallocate_prepared_on_owner(
+        &self,
+        username: &str,
+        owner: &SqlShardOwner,
+        prepared: &ForwardPreparedStatementInfo,
+    ) {
+        let url = format!("http://{}/prepare/{}", owner.addr, prepared.statement_id);
         let _ = self
             .apply_forwarding_headers(self.http_client.delete(url), username)
             .send()
@@ -6902,6 +7089,31 @@ impl ExtendedQueryHandler for PgHandler {
                                 .send(PgWireBackendMessage::ErrorResponse(
                                     Self::fusion_error("Shard read routing error", &e).into(),
                                 ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_select_to_shard_owners(&query, &params, &username)
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
                                 .await
                                 .map_err(|_| Self::sink_error())?;
                             return Ok(());
