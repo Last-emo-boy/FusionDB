@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-434",
+  "title": "Distributed AVG shard-owner fan-out",
+  "phase": "P5-3 Automatic sharding",
+  "status": "completed",
+  "tasks": [
+    {
+      "id": "BENCHPROD-434-1",
+      "title": "Detect safe single-table AVG fan-out plans",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-434-2",
+      "title": "Rewrite AVG as SUM plus COUNT and merge across shard owners",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-434-3",
+      "title": "Cover HTTP query, HTTP prepared, pgwire simple, and pgwire extended AVG fan-out",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-434-4",
+      "title": "Update production gap documentation",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo check --bins",
+    "cargo test http_query_fanouts_simple_select_across_shard_owners -- --nocapture",
+    "cargo test http_execute_forwards_non_local_shard_owner_insert_to_owner -- --nocapture",
+    "cargo test --test pg_integration test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert -- --nocapture",
+    "cargo test --test pg_integration test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert -- --nocapture",
+    "cargo test shard_owner -- --nocapture",
+    "cargo test --lib"
+  ]
+}
