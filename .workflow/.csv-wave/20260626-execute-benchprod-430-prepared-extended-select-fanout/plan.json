@@ -1,0 +1,37 @@
+{
+  "id": "BENCHPROD-430",
+  "title": "Prepared and extended simple SELECT shard-owner fan-out",
+  "phase": "P5-3 Automatic sharding",
+  "status": "completed",
+  "tasks": [
+    {
+      "id": "BENCHPROD-430-1",
+      "title": "Route HTTP prepared broad SELECT through shard-owner fan-out",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-430-2",
+      "title": "Route pgwire extended broad SELECT through shard-owner fan-out",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-430-3",
+      "title": "Cover HTTP prepared and pgwire extended fan-out in integration tests",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-430-4",
+      "title": "Update documentation and production gap tracking",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo check --bins",
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo test http_execute_forwards_non_local_shard_owner_insert_to_owner -- --nocapture",
+    "cargo test --test pg_integration test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert -- --nocapture",
+    "cargo test shard_owner -- --nocapture",
+    "cargo test --lib"
+  ]
+}
