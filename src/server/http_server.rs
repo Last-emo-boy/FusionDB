@@ -22,6 +22,9 @@ use crate::storage::Storage;
 use crate::storage::fusion::{CdcEvent, FusionStorage};
 use crate::storage::memory::MemoryStorage;
 
+const SHARD_OWNER_FORWARD_HEADER: &str = "x-fusiondb-forwarded";
+const SHARD_OWNER_FORWARD_VALUE: &str = "shard-owner";
+
 // Zero-Copy Vector Search
 // Bypass SQL parser and plan, call FusionStorage::vector_search directly
 
@@ -106,6 +109,7 @@ pub async fn start_http_server(
         raft_client: reqwest::Client::new(),
         distributed_mode,
         shard_router,
+        shard_owner_forwarding_enabled: true,
     };
 
     let app = build_router(state);
@@ -145,21 +149,28 @@ pub async fn start_http_server(
 }
 
 async fn auth_context_middleware(mut request: Request, next: Next) -> Response {
-    let username = request
-        .headers()
+    let headers = request.headers();
+    let username = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(extract_bearer_username)
         .or_else(|| {
-            request
-                .headers()
+            headers
                 .get("x-fusiondb-user")
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         });
+    let shard_forwarded = headers
+        .get(SHARD_OWNER_FORWARD_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case(SHARD_OWNER_FORWARD_VALUE))
+        .unwrap_or(false);
 
-    request.extensions_mut().insert(RequestContext { username });
+    request.extensions_mut().insert(RequestContext {
+        username,
+        shard_forwarded,
+    });
     next.run(request).await
 }
 
@@ -387,14 +398,22 @@ async fn handle_query(
     Extension(context): Extension<RequestContext>,
     Json(payload): Json<QueryRequest>,
 ) -> ApiResponse<Vec<QueryResultJson>> {
-    let username = context.username.unwrap_or_default();
+    let username = context.username.clone().unwrap_or_default();
 
     if let Err(e) = state.executor.authorize_sql(&username, &payload.sql).await {
         return json_error(StatusCode::FORBIDDEN, format!("{:?}", e));
     }
 
-    if let Err(message) = ensure_local_shard_write_routes_for_sql(&state, &payload.sql, &[]).await {
-        return json_error(StatusCode::CONFLICT, message);
+    match shard_write_route_action_for_sql(&state, &payload.sql, &[], context.shard_forwarded).await
+    {
+        Ok(ShardWriteRouteAction::Local) => {}
+        Ok(ShardWriteRouteAction::Forward(decision)) => {
+            return forward_query_to_shard_owner(&state, &context, &payload, &decision).await;
+        }
+        Ok(ShardWriteRouteAction::Conflict(message)) => {
+            return json_error(StatusCode::CONFLICT, message);
+        }
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     }
 
     if let Some(raft) = &state.raft {
@@ -419,17 +438,24 @@ async fn handle_query(
     }
 }
 
-async fn ensure_local_shard_write_routes_for_sql(
+enum ShardWriteRouteAction {
+    Local,
+    Forward(SqlShardRoutingDecision),
+    Conflict(String),
+}
+
+async fn shard_write_route_action_for_sql(
     state: &AppState,
     sql: &str,
     params: &[Value],
-) -> std::result::Result<(), String> {
+    shard_forwarded: bool,
+) -> std::result::Result<ShardWriteRouteAction, String> {
     let decisions = state
         .executor
         .shard_routing_decisions_for_sql(sql, params)
         .await
         .map_err(|e| format!("Shard routing error: {:?}", e))?;
-    ensure_local_shard_write_routes(decisions)
+    Ok(shard_write_route_action(state, decisions, shard_forwarded))
 }
 
 async fn ensure_local_shard_write_routes_for_statements(
@@ -456,6 +482,52 @@ fn ensure_local_shard_write_routes(
     Ok(())
 }
 
+fn shard_write_route_action(
+    state: &AppState,
+    decisions: Vec<SqlShardRoutingDecision>,
+    shard_forwarded: bool,
+) -> ShardWriteRouteAction {
+    let mut local_decisions = Vec::new();
+    let mut non_local_decisions = Vec::new();
+    for decision in decisions {
+        if decision.is_local_owner() {
+            local_decisions.push(decision);
+        } else {
+            non_local_decisions.push(decision);
+        }
+    }
+
+    if non_local_decisions.is_empty() {
+        return ShardWriteRouteAction::Local;
+    }
+
+    if shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return ShardWriteRouteAction::Conflict(non_local_shard_write_message(
+            &non_local_decisions[0],
+        ));
+    }
+
+    if !local_decisions.is_empty() {
+        return ShardWriteRouteAction::Conflict(multi_shard_forwarding_message(
+            &non_local_decisions[0],
+            "automatic forwarding currently supports SQL requests whose routed point writes all target one non-local owner",
+        ));
+    }
+
+    let first = &non_local_decisions[0];
+    if non_local_decisions.iter().any(|decision| {
+        decision.route.owner_node_id != first.route.owner_node_id
+            || decision.route.owner_addr != first.route.owner_addr
+    }) {
+        return ShardWriteRouteAction::Conflict(multi_shard_forwarding_message(
+            first,
+            "automatic forwarding currently supports one non-local owner per SQL request",
+        ));
+    }
+
+    ShardWriteRouteAction::Forward(first.clone())
+}
+
 fn non_local_shard_write_message(decision: &SqlShardRoutingDecision) -> String {
     format!(
         "Shard route conflict: {} on table {} with shard key {} routes to shard {} owned by node {} at {}; local node {} must not execute this write",
@@ -467,6 +539,55 @@ fn non_local_shard_write_message(decision: &SqlShardRoutingDecision) -> String {
         decision.route.owner_addr,
         decision.local_node_id
     )
+}
+
+fn multi_shard_forwarding_message(decision: &SqlShardRoutingDecision, reason: &str) -> String {
+    format!("{}; {}", non_local_shard_write_message(decision), reason)
+}
+
+async fn forward_query_to_shard_owner(
+    state: &AppState,
+    context: &RequestContext,
+    payload: &QueryRequest,
+    decision: &SqlShardRoutingDecision,
+) -> ApiResponse<Vec<QueryResultJson>> {
+    let url = format!("http://{}/query", decision.route.owner_addr);
+    let mut request = state
+        .raft_client
+        .post(&url)
+        .header(SHARD_OWNER_FORWARD_HEADER, SHARD_OWNER_FORWARD_VALUE)
+        .json(payload);
+    if let Some(username) = context.username.as_deref() {
+        request = request.header("x-fusiondb-user", username);
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard owner forwarding error: {} on table {} to node {} at {} failed: {}",
+                    decision.operation,
+                    decision.route.table,
+                    decision.route.owner_node_id,
+                    decision.route.owner_addr,
+                    e
+                ),
+            );
+        }
+    };
+    let status = response.status();
+    match response.json::<Envelope<Vec<QueryResultJson>>>().await {
+        Ok(envelope) => (status, Json(envelope)),
+        Err(e) => json_error(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Shard owner forwarding error: response from node {} at {} could not be decoded: {}",
+                decision.route.owner_node_id, decision.route.owner_addr, e
+            ),
+        ),
+    }
 }
 
 async fn handle_tables(
@@ -673,14 +794,16 @@ pub struct AppState {
     raft_client: reqwest::Client,
     distributed_mode: String,
     shard_router: Option<ShardRouter>,
+    shard_owner_forwarding_enabled: bool,
 }
 
 #[derive(Clone, Default)]
 struct RequestContext {
     username: Option<String>,
+    shard_forwarded: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct QueryRequest {
     sql: String,
 }
@@ -1010,6 +1133,7 @@ mod tests {
             raft_client: reqwest::Client::new(),
             distributed_mode: "isolated".to_string(),
             shard_router: None,
+            shard_owner_forwarding_enabled: false,
         })
     }
 
@@ -1022,10 +1146,19 @@ mod tests {
             raft_client: reqwest::Client::new(),
             distributed_mode: distributed_mode.to_string(),
             shard_router: None,
+            shard_owner_forwarding_enabled: false,
         })
     }
 
     fn test_app_with_shard_router(storage: Arc<dyn Storage>, shard_router: ShardRouter) -> Router {
+        test_app_with_shard_router_forwarding(storage, shard_router, false)
+    }
+
+    fn test_app_with_shard_router_forwarding(
+        storage: Arc<dyn Storage>,
+        shard_router: ShardRouter,
+        shard_owner_forwarding_enabled: bool,
+    ) -> Router {
         let executor = Arc::new(Executor::with_config_and_shard_router(
             storage.clone(),
             &StorageConfig::default(),
@@ -1038,21 +1171,36 @@ mod tests {
             raft_client: reqwest::Client::new(),
             distributed_mode: "raft(node_id=1)".to_string(),
             shard_router: Some(shard_router),
+            shard_owner_forwarding_enabled,
         })
     }
 
     fn sharded_http_test_config(shard_count: u64) -> Config {
+        sharded_http_test_config_for_node(
+            shard_count,
+            1,
+            "127.0.0.1:8091".to_string(),
+            "127.0.0.1:8093".to_string(),
+        )
+    }
+
+    fn sharded_http_test_config_for_node(
+        shard_count: u64,
+        node_id: u64,
+        node1_addr: String,
+        node2_addr: String,
+    ) -> Config {
         let mut config = Config::default();
         config.distributed.enabled = true;
-        config.distributed.node_id = 1;
+        config.distributed.node_id = node_id;
         config.distributed.initial_members = vec![
             DistributedPeerConfig {
                 node_id: 1,
-                addr: "127.0.0.1:8091".to_string(),
+                addr: node1_addr,
             },
             DistributedPeerConfig {
                 node_id: 2,
-                addr: "127.0.0.1:8093".to_string(),
+                addr: node2_addr,
             },
         ];
         config.distributed.sharding = ShardingConfig {
@@ -1062,6 +1210,14 @@ mod tests {
             range_boundaries: Vec::new(),
         };
         config
+    }
+
+    async fn bind_test_http_listener() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test http listener");
+        let addr = listener.local_addr().expect("test http addr");
+        (listener, format!("127.0.0.1:{}", addr.port()))
     }
 
     fn integer_primary_key_for_owner(
@@ -1418,6 +1574,99 @@ mod tests {
         assert_eq!(capability_data.shard_count, Some(8));
 
         let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_forwards_non_local_shard_owner_insert_to_owner() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_forward_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_forward_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let remote_key = integer_primary_key_for_owner(&local_shard_router, "forward_users", 2);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let client = reqwest::Client::new();
+        let create_sql = "CREATE TABLE forward_users (id INTEGER PRIMARY KEY, name TEXT)";
+        let local_create = post_query(&local_app, create_sql).await;
+        assert_eq!(local_create.status(), StatusCode::OK);
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        let forwarded_insert = post_query(
+            &local_app,
+            &format!(
+                "INSERT INTO forward_users (id, name) VALUES ({}, 'remote')",
+                remote_key
+            ),
+        )
+        .await;
+        assert_eq!(forwarded_insert.status(), StatusCode::OK);
+        let forwarded_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(forwarded_insert).await;
+        assert_eq!(forwarded_envelope.status, "ok");
+
+        let local_select = post_query(
+            &local_app,
+            &format!("SELECT name FROM forward_users WHERE id = {}", remote_key),
+        )
+        .await;
+        let local_envelope: Envelope<Vec<QueryResultJson>> = response_json(local_select).await;
+        match &local_envelope.data.expect("local select data")[0] {
+            QueryResultJson::Select { rows, .. } => assert!(rows.is_empty()),
+            QueryResultJson::Success { .. } => panic!("expected local select"),
+        }
+
+        let owner_select = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({
+                "sql": format!("SELECT name FROM forward_users WHERE id = {}", remote_key)
+            }))
+            .send()
+            .await
+            .expect("owner select response");
+        assert_eq!(owner_select.status(), StatusCode::OK);
+        let owner_envelope = owner_select
+            .json::<Envelope<Vec<QueryResultJson>>>()
+            .await
+            .expect("owner select envelope");
+        match &owner_envelope.data.expect("owner select data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!("remote")]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected owner select"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
     }
 
     #[tokio::test]
