@@ -17,7 +17,7 @@ use crate::common::{FusionError, Value};
 use crate::distributed::api::{raft_routes, submit_raft_write, RaftAppState};
 use crate::distributed::sharding::ShardRouter;
 use crate::distributed::FusionRaft;
-use crate::execution::{Executor, PreparedStatementRecord, SqlShardRoutingDecision};
+use crate::execution::{Executor, PreparedStatementRecord, SqlShardOwner, SqlShardRoutingDecision};
 use crate::parser::parse_sql;
 use crate::storage::Storage;
 
@@ -431,6 +431,10 @@ async fn handle_query(
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     }
 
+    if let Some(response) = try_fanout_query_to_shard_owners(&state, &context, &payload.sql).await {
+        return response;
+    }
+
     if let Some(raft) = &state.raft {
         match state.executor.sql_requires_raft_write(&payload.sql) {
             Ok(true) => {
@@ -721,6 +725,154 @@ async fn forward_query_to_shard_owner(
             ),
         ),
     }
+}
+
+async fn try_fanout_query_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    let owners = match state
+        .executor
+        .shard_select_fanout_owners_for_sql(sql, &[])
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard select fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match state.executor.execute_sql(sql).await {
+        Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Execution Error: {:?}", e),
+            ));
+        }
+    };
+
+    let mut columns = None;
+    let mut rows = Vec::new();
+    if let Err(message) = append_fanout_select_results(&mut columns, &mut rows, local_results) {
+        return Some(json_error(StatusCode::BAD_GATEWAY, message));
+    }
+
+    for owner in owners {
+        let owner_results = match query_remote_shard_owner(state, context, sql, &owner).await {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        if let Err(message) = append_fanout_select_results(&mut columns, &mut rows, owner_results) {
+            return Some(json_error(StatusCode::BAD_GATEWAY, message));
+        }
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: columns.unwrap_or_default(),
+        rows,
+    }]))
+}
+
+async fn query_remote_shard_owner(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+    owner: &SqlShardOwner,
+) -> std::result::Result<Vec<QueryResultJson>, (StatusCode, String)> {
+    let url = format!("http://{}/query", owner.addr);
+    let payload = QueryRequest {
+        sql: sql.to_string(),
+    };
+    let response = apply_forwarding_headers(state.raft_client.post(&url), context)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard select fan-out error: forwarding to node {} at {} failed: {}",
+                    owner.node_id, owner.addr, e
+                ),
+            )
+        })?;
+    let status = response.status();
+    let envelope = response
+        .json::<Envelope<Vec<QueryResultJson>>>()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard select fan-out error: response from node {} at {} could not be decoded: {}",
+                    owner.node_id, owner.addr, e
+                ),
+            )
+        })?;
+
+    if !status.is_success() || envelope.status != "ok" {
+        return Err((
+            status,
+            format!(
+                "Shard select fan-out error: node {} at {} rejected query: {}",
+                owner.node_id,
+                owner.addr,
+                envelope
+                    .error
+                    .unwrap_or_else(|| "owner node returned no error message".to_string())
+            ),
+        ));
+    }
+    envelope.data.ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Shard select fan-out error: node {} at {} returned no query data",
+                owner.node_id, owner.addr
+            ),
+        )
+    })
+}
+
+fn append_fanout_select_results(
+    columns: &mut Option<Vec<String>>,
+    rows: &mut Vec<Vec<serde_json::Value>>,
+    results: Vec<QueryResultJson>,
+) -> std::result::Result<(), String> {
+    let [result] = results.as_slice() else {
+        return Err("Shard select fan-out expected exactly one SELECT result".to_string());
+    };
+    let QueryResultJson::Select {
+        columns: result_columns,
+        rows: result_rows,
+        ..
+    } = result
+    else {
+        return Err("Shard select fan-out received a non-SELECT result".to_string());
+    };
+
+    if let Some(columns) = columns.as_ref() {
+        if columns != result_columns {
+            return Err(format!(
+                "Shard select fan-out column mismatch: expected {:?}, got {:?}",
+                columns, result_columns
+            ));
+        }
+    } else {
+        *columns = Some(result_columns.clone());
+    }
+    rows.extend(result_rows.iter().cloned());
+    Ok(())
 }
 
 async fn handle_tables(
@@ -2002,6 +2154,100 @@ mod tests {
                 assert_eq!(rows, &vec![vec![serde_json::json!("remote")]]);
             }
             QueryResultJson::Success { .. } => panic!("expected owner select"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_fanouts_simple_select_across_shard_owners() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_select_fanout_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_select_fanout_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_key = integer_primary_key_for_owner(&local_shard_router, "fanout_users", 1);
+        let remote_key = integer_primary_key_for_owner(&local_shard_router, "fanout_users", 2);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let client = reqwest::Client::new();
+        let create_sql = "CREATE TABLE fanout_users (id INTEGER PRIMARY KEY, name TEXT)";
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        assert_eq!(
+            post_query(
+                &local_app,
+                &format!(
+                    "INSERT INTO fanout_users (id, name) VALUES ({}, 'local')",
+                    local_key
+                ),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_query(
+                &local_app,
+                &format!(
+                    "INSERT INTO fanout_users (id, name) VALUES ({}, 'remote')",
+                    remote_key
+                ),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let fanout_select = post_query(&local_app, "SELECT id, name FROM fanout_users").await;
+        assert_eq!(fanout_select.status(), StatusCode::OK);
+        let envelope: Envelope<Vec<QueryResultJson>> = response_json(fanout_select).await;
+        match &envelope.data.expect("fanout data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                let mut rows = rows.clone();
+                rows.sort_by_key(|row| row[0].as_i64().unwrap());
+                let mut expected = vec![
+                    vec![serde_json::json!(local_key), serde_json::json!("local")],
+                    vec![serde_json::json!(remote_key), serde_json::json!("remote")],
+                ];
+                expected.sort_by_key(|row| row[0].as_i64().unwrap());
+                assert_eq!(rows, expected);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout select"),
         }
 
         let _ = std::fs::remove_file(&local_wal_path);

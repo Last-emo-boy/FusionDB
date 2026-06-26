@@ -58,6 +58,12 @@ impl SqlShardRoutingDecision {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlShardOwner {
+    pub node_id: u64,
+    pub addr: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStatementRecord {
     pub id: String,
@@ -676,6 +682,133 @@ impl Executor {
             &table_name,
             row_id,
         )))
+    }
+
+    pub(crate) async fn shard_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let Some(router) = self.shard_router.clone() else {
+            return Ok(Vec::new());
+        };
+        if !Self::simple_select_fanout_eligible(statements) {
+            return Ok(Vec::new());
+        }
+
+        let mut txn = self.storage.begin_transaction().await?;
+        if self
+            .shard_read_route_decision_for_statements_in_transaction(statements, &mut *txn, params)
+            .await?
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
+
+        let map = router.describe();
+        let mut owners = Vec::new();
+        for assignment in map.assignments {
+            if assignment.owner_node_id == map.local_node_id {
+                continue;
+            }
+            if owners.iter().any(|owner: &SqlShardOwner| {
+                owner.node_id == assignment.owner_node_id && owner.addr == assignment.owner_addr
+            }) {
+                continue;
+            }
+            owners.push(SqlShardOwner {
+                node_id: assignment.owner_node_id,
+                addr: assignment.owner_addr,
+            });
+        }
+        Ok(owners)
+    }
+
+    fn simple_select_fanout_eligible(statements: &[Statement]) -> bool {
+        let [Statement::Query(query)] = statements else {
+            return false;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return false;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return false;
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+        {
+            return false;
+        }
+        if !matches!(select.from[0].relation, TableFactor::Table { .. }) {
+            return false;
+        }
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return false;
+        };
+        if !group_exprs.is_empty() {
+            return false;
+        }
+        if !select
+            .projection
+            .iter()
+            .all(Self::select_projection_is_fanout_safe)
+        {
+            return false;
+        }
+        select
+            .selection
+            .as_ref()
+            .is_none_or(Self::select_predicate_is_fanout_local)
+    }
+
+    fn select_projection_is_fanout_safe(item: &SelectItem) -> bool {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+            }
+        }
+    }
+
+    fn select_predicate_is_fanout_local(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::Value(_)
+            | Expr::TypedString { .. } => true,
+            Expr::Nested(expr)
+            | Expr::UnaryOp { expr, .. }
+            | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr) => Self::select_predicate_is_fanout_local(expr),
+            Expr::BinaryOp { left, right, .. } => {
+                Self::select_predicate_is_fanout_local(left)
+                    && Self::select_predicate_is_fanout_local(right)
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                Self::select_predicate_is_fanout_local(expr)
+                    && Self::select_predicate_is_fanout_local(low)
+                    && Self::select_predicate_is_fanout_local(high)
+            }
+            Expr::InList { expr, list, .. } => {
+                Self::select_predicate_is_fanout_local(expr)
+                    && list.iter().all(Self::select_predicate_is_fanout_local)
+            }
+            _ => false,
+        }
     }
 
     async fn shard_point_write_targets_for_statement(

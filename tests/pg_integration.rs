@@ -2452,6 +2452,7 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
     let owner_config = sharded_pg_test_config_with_owner_addr(4, owner_addr.clone(), 2);
     let local_router = ShardRouter::from_config(&local_config).expect("local shard router");
     let owner_router = ShardRouter::from_config(&owner_config).expect("owner shard router");
+    let local_key = integer_primary_key_for_owner(&local_router, "pg_route_forward", 1);
     let remote_key = integer_primary_key_for_owner(&local_router, "pg_route_forward", 2);
 
     let owner_executor = Arc::new(Executor::with_config_and_shard_router(
@@ -2532,6 +2533,13 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         .expect("local CREATE TABLE failed");
     client
         .simple_query(&format!(
+            "INSERT INTO pg_route_forward VALUES ({}, 'local')",
+            local_key
+        ))
+        .await
+        .expect("local owner insert should succeed");
+    client
+        .simple_query(&format!(
             "INSERT INTO pg_route_forward VALUES ({}, 'remote')",
             remote_key
         ))
@@ -2587,6 +2595,32 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         }
         fusiondb::execution::QueryResult::Success { .. } => panic!("expected raw local select"),
     }
+
+    let fanout_messages = client
+        .simple_query("SELECT id, name FROM pg_route_forward")
+        .await
+        .expect("fanout SELECT failed");
+    let mut fanout_rows = fanout_messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get("id")
+                    .expect("id")
+                    .parse::<i32>()
+                    .expect("integer id"),
+                row.get("name").expect("name").to_string(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    fanout_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        fanout_rows,
+        vec![
+            (local_key, "local".to_string()),
+            (remote_key, "remote".to_string()),
+        ]
+    );
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);

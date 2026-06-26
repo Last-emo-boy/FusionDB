@@ -36,7 +36,9 @@ use sqlparser::ast::{
 
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Value}; // Import FusionError
-use crate::execution::{Executor, ForeignKeyMeta, QueryResult, SqlShardRoutingDecision};
+use crate::execution::{
+    Executor, ForeignKeyMeta, QueryResult, SqlShardOwner, SqlShardRoutingDecision,
+};
 use crate::monitor;
 use crate::parser::parse_sql;
 use crate::storage::{Storage, Transaction};
@@ -712,6 +714,172 @@ impl PgHandler {
             )));
         };
         Ok(Ok(count as usize))
+    }
+
+    async fn fanout_simple_select_to_shard_owners(
+        &self,
+        query: &str,
+        username: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        let owners = match self
+            .executor
+            .shard_select_fanout_owners_for_sql(query, &[])
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard select fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let local_results = match self.executor.execute_sql(query).await {
+            Ok(results) => Self::forward_results_from_query_results(results),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard select fan-out local execution error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let mut columns = None;
+        let mut rows = Vec::new();
+        if let Err(error) =
+            Self::append_forward_select_results(&mut columns, &mut rows, local_results)
+        {
+            return Ok(Some(vec![Response::Error(Box::new(error))]));
+        }
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_shard_owner_results(query, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            if let Err(error) =
+                Self::append_forward_select_results(&mut columns, &mut rows, owner_results)
+            {
+                return Ok(Some(vec![Response::Error(Box::new(error))]));
+            }
+        }
+
+        Ok(Some(Self::responses_from_forwarded_query_results(vec![
+            ForwardQueryResultJson::Select {
+                columns: columns.unwrap_or_default(),
+                rows,
+            },
+        ])?))
+    }
+
+    async fn query_remote_shard_owner_results(
+        &self,
+        query: &str,
+        username: &str,
+        owner: &SqlShardOwner,
+    ) -> PgWireResult<std::result::Result<Vec<ForwardQueryResultJson>, pgwire::error::ErrorInfo>>
+    {
+        let url = format!("http://{}/query", owner.addr);
+        let response = match self
+            .apply_forwarding_headers(self.http_client.post(&url), username)
+            .json(&ForwardQueryRequest { sql: query })
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(Err(Self::shard_route_error(format!(
+                    "Shard select fan-out error: forwarding to node {} at {} failed: {}",
+                    owner.node_id, owner.addr, e
+                ))));
+            }
+        };
+        let status = response.status();
+        let envelope = match response
+            .json::<ForwardEnvelope<Vec<ForwardQueryResultJson>>>()
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                return Ok(Err(Self::shard_route_error(format!(
+                    "Shard select fan-out error: response from node {} at {} could not be decoded: {}",
+                    owner.node_id, owner.addr, e
+                ))));
+            }
+        };
+        if !status.is_success() {
+            return Ok(Err(Self::forwarded_owner_error(
+                envelope.error.unwrap_or_else(|| {
+                    format!(
+                        "Shard select fan-out error: node {} at {} returned HTTP {}",
+                        owner.node_id, owner.addr, status
+                    )
+                }),
+            )));
+        }
+        let Some(results) = envelope.data else {
+            return Ok(Err(Self::execution_error(format!(
+                "Shard select fan-out error: node {} at {} returned no query results",
+                owner.node_id, owner.addr
+            ))));
+        };
+        Ok(Ok(results))
+    }
+
+    fn forward_results_from_query_results(
+        results: Vec<QueryResult>,
+    ) -> Vec<ForwardQueryResultJson> {
+        results
+            .into_iter()
+            .map(|result| match result {
+                QueryResult::Select { columns, rows } => ForwardQueryResultJson::Select {
+                    columns,
+                    rows: rows
+                        .into_iter()
+                        .map(|row| row.iter().map(Value::to_json).collect())
+                        .collect(),
+                },
+                QueryResult::Success { message } => ForwardQueryResultJson::Success { message },
+            })
+            .collect()
+    }
+
+    fn append_forward_select_results(
+        columns: &mut Option<Vec<String>>,
+        rows: &mut Vec<Vec<serde_json::Value>>,
+        results: Vec<ForwardQueryResultJson>,
+    ) -> std::result::Result<(), pgwire::error::ErrorInfo> {
+        let [result] = results.as_slice() else {
+            return Err(Self::execution_error(
+                "Shard select fan-out expected exactly one SELECT result",
+            ));
+        };
+        let ForwardQueryResultJson::Select {
+            columns: result_columns,
+            rows: result_rows,
+        } = result
+        else {
+            return Err(Self::execution_error(
+                "Shard select fan-out received a non-SELECT result",
+            ));
+        };
+        if let Some(columns) = columns.as_ref() {
+            if columns != result_columns {
+                return Err(Self::execution_error(format!(
+                    "Shard select fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, result_columns
+                )));
+            }
+        } else {
+            *columns = Some(result_columns.clone());
+        }
+        rows.extend(result_rows.iter().cloned());
+        Ok(())
     }
 
     fn apply_forwarding_headers(
@@ -6258,6 +6426,16 @@ impl SimpleQueryHandler for PgHandler {
                         )))]);
                     }
                 }
+                let fanout_query = stmt.to_string();
+                drop(session);
+                if let Some(mut fanout_responses) = self
+                    .fanout_simple_select_to_shard_owners(&fanout_query, &username)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                session = self.session.lock().await;
             }
             // Execute Normal Statements
             let result = if session.transaction.is_some() {
