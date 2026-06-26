@@ -1005,6 +1005,93 @@ impl PgHandler {
         ])?))
     }
 
+    async fn fanout_avg_select_to_shard_owners(
+        &self,
+        query: &str,
+        username: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        let plan = match self.executor.shard_avg_select_fanout_plan_for_sql(query) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard avg fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_avg_select_fanout_owners_for_sql(query, &[])
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard avg fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let local_results = match self.executor.execute_sql(&plan.rewritten_sql).await {
+            Ok(results) => Self::forward_results_from_query_results(results),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard avg fan-out local execution error",
+                    &e,
+                )))]));
+            }
+        };
+        let (rewrite_columns, mut total_sum, mut total_count) =
+            match Self::avg_parts_from_forward_select_results(local_results) {
+                Ok(parts) => parts,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_shard_owner_results(&plan.rewritten_sql, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            let (owner_columns, owner_sum, owner_count) =
+                match Self::avg_parts_from_forward_select_results(owner_results) {
+                    Ok(parts) => parts,
+                    Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+                };
+            if owner_columns != rewrite_columns {
+                return Ok(Some(vec![Response::Error(Box::new(
+                    Self::execution_error(format!(
+                        "Shard avg fan-out column mismatch: expected {:?}, got {:?}",
+                        rewrite_columns, owner_columns
+                    )),
+                ))]));
+            }
+            if let Err(error) = Self::add_forward_sum(&mut total_sum, owner_sum) {
+                return Ok(Some(vec![Response::Error(Box::new(error))]));
+            }
+            total_count = match total_count.checked_add(owner_count) {
+                Some(total) => total,
+                None => {
+                    return Ok(Some(vec![Response::Error(Box::new(
+                        Self::execution_error("Shard avg fan-out count overflow"),
+                    ))]));
+                }
+            };
+        }
+
+        Ok(Some(Self::responses_from_forwarded_query_results(vec![
+            ForwardQueryResultJson::Select {
+                columns: vec![plan.output_column],
+                rows: vec![vec![Self::forward_avg_to_json(total_sum, total_count)]],
+            },
+        ])?))
+    }
+
     async fn fanout_extended_select_to_shard_owners(
         &self,
         query: &str,
@@ -1279,6 +1366,100 @@ impl PgHandler {
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns,
             rows: vec![vec![total.unwrap_or(serde_json::Value::Null)]],
+        }])))
+    }
+
+    async fn fanout_extended_avg_select_to_shard_owners(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        let plan = match self.executor.shard_avg_select_fanout_plan_for_sql(query) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard avg fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_avg_select_fanout_owners_for_sql(query, params)
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard avg fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+
+        let local_results = match self
+            .execute_first_statement(&plan.rewritten_sql, params)
+            .await
+        {
+            Ok(result) => Self::forward_results_from_query_results(vec![result]),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard avg fan-out local execution error",
+                    &e,
+                )));
+            }
+        };
+        let (rewrite_columns, mut total_sum, mut total_count) =
+            match Self::avg_parts_from_forward_select_results(local_results) {
+                Ok(parts) => parts,
+                Err(error) => return Ok(Err(error)),
+            };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_prepared_shard_owner_results(
+                    &plan.rewritten_sql,
+                    params,
+                    username,
+                    &owner,
+                )
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Err(error)),
+            };
+            let (owner_columns, owner_sum, owner_count) =
+                match Self::avg_parts_from_forward_select_results(owner_results) {
+                    Ok(parts) => parts,
+                    Err(error) => return Ok(Err(error)),
+                };
+            if owner_columns != rewrite_columns {
+                return Ok(Err(Self::execution_error(format!(
+                    "Shard avg fan-out column mismatch: expected {:?}, got {:?}",
+                    rewrite_columns, owner_columns
+                ))));
+            }
+            if let Err(error) = Self::add_forward_sum(&mut total_sum, owner_sum) {
+                return Ok(Err(error));
+            }
+            total_count = match total_count.checked_add(owner_count) {
+                Some(total) => total,
+                None => {
+                    return Ok(Err(Self::execution_error(
+                        "Shard avg fan-out count overflow",
+                    )))
+                }
+            };
+        }
+
+        Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
+            columns: vec![plan.output_column],
+            rows: vec![vec![Self::forward_avg_to_json(total_sum, total_count)]],
         }])))
     }
 
@@ -1612,6 +1793,53 @@ impl PgHandler {
             Some(ForwardSum::Integer(value)) => serde_json::json!(value),
             Some(ForwardSum::Float(value)) => serde_json::json!(value),
         }
+    }
+
+    fn avg_parts_from_forward_select_results(
+        results: Vec<ForwardQueryResultJson>,
+    ) -> std::result::Result<(Vec<String>, Option<ForwardSum>, i64), pgwire::error::ErrorInfo> {
+        let [result] = results.as_slice() else {
+            return Err(Self::execution_error(
+                "Shard avg fan-out expected exactly one SELECT result",
+            ));
+        };
+        let ForwardQueryResultJson::Select { columns, rows } = result else {
+            return Err(Self::execution_error(
+                "Shard avg fan-out received a non-SELECT result",
+            ));
+        };
+        if columns.len() != 2 || rows.len() != 1 || rows[0].len() != 2 {
+            return Err(Self::execution_error(
+                "Shard avg fan-out expected one row with sum and count columns",
+            ));
+        }
+        let sum = Self::forward_sum_json_value(&rows[0][0])?;
+        let count = rows[0][1].as_i64().or_else(|| {
+            rows[0][1]
+                .as_u64()
+                .and_then(|count| i64::try_from(count).ok())
+        });
+        let Some(count) = count else {
+            return Err(Self::execution_error(format!(
+                "Shard avg fan-out received a non-integer count value: {}",
+                rows[0][1]
+            )));
+        };
+        Ok((columns.clone(), sum, count))
+    }
+
+    fn forward_avg_to_json(total_sum: Option<ForwardSum>, total_count: i64) -> serde_json::Value {
+        if total_count <= 0 {
+            return serde_json::Value::Null;
+        }
+        let Some(total_sum) = total_sum else {
+            return serde_json::Value::Null;
+        };
+        let sum = match total_sum {
+            ForwardSum::Integer(value) => value as f64,
+            ForwardSum::Float(value) => value,
+        };
+        serde_json::json!(sum / total_count as f64)
     }
 
     fn extremum_from_forward_select_results(
@@ -7281,6 +7509,13 @@ impl SimpleQueryHandler for PgHandler {
                     return Ok(responses);
                 }
                 if let Some(mut fanout_responses) = self
+                    .fanout_avg_select_to_shard_owners(&fanout_query, &username)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                if let Some(mut fanout_responses) = self
                     .fanout_simple_select_to_shard_owners(&fanout_query, &username)
                     .await?
                 {
@@ -7811,6 +8046,31 @@ impl ExtendedQueryHandler for PgHandler {
                     }
                     match self
                         .fanout_extended_min_max_select_to_shard_owners(&query, &params, &username)
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_avg_select_to_shard_owners(&query, &params, &username)
                         .await?
                     {
                         Ok(Some(results)) => {

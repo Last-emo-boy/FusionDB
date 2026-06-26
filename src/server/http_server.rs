@@ -451,6 +451,12 @@ async fn handle_query(
         return response;
     }
 
+    if let Some(response) =
+        try_fanout_avg_query_to_shard_owners(&state, &context, &payload.sql).await
+    {
+        return response;
+    }
+
     if let Some(response) = try_fanout_query_to_shard_owners(&state, &context, &payload.sql).await {
         return response;
     }
@@ -1024,6 +1030,95 @@ async fn try_fanout_min_max_query_to_shard_owners(
     }]))
 }
 
+async fn try_fanout_avg_query_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    let plan = match state.executor.shard_avg_select_fanout_plan_for_sql(sql) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard avg fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+    let owners = match state
+        .executor
+        .shard_avg_select_fanout_owners_for_sql(sql, &[])
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard avg fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match state.executor.execute_sql(&plan.rewritten_sql).await {
+        Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Execution Error: {:?}", e),
+            ));
+        }
+    };
+    let (rewrite_columns, mut total_sum, mut total_count) =
+        match fanout_avg_parts_from_select_results(local_results) {
+            Ok(parts) => parts,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+
+    for owner in owners {
+        let owner_results =
+            match query_remote_shard_owner(state, context, &plan.rewritten_sql, &owner).await {
+                Ok(results) => results,
+                Err((status, message)) => return Some(json_error(status, message)),
+            };
+        let (owner_columns, owner_sum, owner_count) =
+            match fanout_avg_parts_from_select_results(owner_results) {
+                Ok(parts) => parts,
+                Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+            };
+        if owner_columns != rewrite_columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard avg fan-out column mismatch: expected {:?}, got {:?}",
+                    rewrite_columns, owner_columns
+                ),
+            ));
+        }
+        if let Err(message) = add_fanout_sum(&mut total_sum, owner_sum) {
+            return Some(json_error(StatusCode::BAD_GATEWAY, message));
+        }
+        total_count = match total_count.checked_add(owner_count) {
+            Some(total) => total,
+            None => {
+                return Some(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Shard avg fan-out count overflow",
+                ));
+            }
+        };
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: vec![plan.output_column],
+        rows: vec![vec![fanout_avg_to_json(total_sum, total_count)]],
+    }]))
+}
+
 async fn query_remote_shard_owner(
     state: &AppState,
     context: &RequestContext,
@@ -1221,6 +1316,47 @@ fn fanout_sum_to_json(total: Option<FanoutSum>) -> serde_json::Value {
         Some(FanoutSum::Integer(value)) => serde_json::json!(value),
         Some(FanoutSum::Float(value)) => serde_json::json!(value),
     }
+}
+
+fn fanout_avg_parts_from_select_results(
+    results: Vec<QueryResultJson>,
+) -> std::result::Result<(Vec<String>, Option<FanoutSum>, i64), String> {
+    let [result] = results.as_slice() else {
+        return Err("Shard avg fan-out expected exactly one SELECT result".to_string());
+    };
+    let QueryResultJson::Select { columns, rows, .. } = result else {
+        return Err("Shard avg fan-out received a non-SELECT result".to_string());
+    };
+    if columns.len() != 2 || rows.len() != 1 || rows[0].len() != 2 {
+        return Err("Shard avg fan-out expected one row with sum and count columns".to_string());
+    }
+    let sum = fanout_sum_json_value(&rows[0][0])?;
+    let count = rows[0][1].as_i64().or_else(|| {
+        rows[0][1]
+            .as_u64()
+            .and_then(|count| i64::try_from(count).ok())
+    });
+    let Some(count) = count else {
+        return Err(format!(
+            "Shard avg fan-out received a non-integer count value: {}",
+            rows[0][1]
+        ));
+    };
+    Ok((columns.clone(), sum, count))
+}
+
+fn fanout_avg_to_json(total_sum: Option<FanoutSum>, total_count: i64) -> serde_json::Value {
+    if total_count <= 0 {
+        return serde_json::Value::Null;
+    }
+    let Some(total_sum) = total_sum else {
+        return serde_json::Value::Null;
+    };
+    let sum = match total_sum {
+        FanoutSum::Integer(value) => value as f64,
+        FanoutSum::Float(value) => value,
+    };
+    serde_json::json!(sum / total_count as f64)
 }
 
 fn fanout_extremum_from_select_results(
@@ -1479,6 +1615,19 @@ async fn handle_execute(
             }
 
             if let Some(response) = try_fanout_min_max_execute_to_shard_owners(
+                &state,
+                &context,
+                &record,
+                &payload,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
+            if let Some(response) = try_fanout_avg_execute_to_shard_owners(
                 &state,
                 &context,
                 &record,
@@ -1773,6 +1922,95 @@ async fn try_fanout_min_max_execute_to_shard_owners(
     }]))
 }
 
+async fn try_fanout_avg_execute_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    let Some(plan) = Executor::shard_avg_select_fanout_plan_for_statements(&record.statements)
+    else {
+        return None;
+    };
+    let owners = match state
+        .executor
+        .shard_avg_select_fanout_owners_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard avg fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results =
+        match execute_sql_locally_for_fanout(state, &plan.rewritten_sql, params).await {
+            Ok(results) => results,
+            Err(response) => return Some(response),
+        };
+    let (rewrite_columns, mut total_sum, mut total_count) =
+        match fanout_avg_parts_from_select_results(local_results) {
+            Ok(parts) => parts,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+
+    for owner in owners {
+        let owner_results = match query_remote_prepared_sql_shard_owner(
+            state,
+            context,
+            &plan.rewritten_sql,
+            payload,
+            &owner,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let (owner_columns, owner_sum, owner_count) =
+            match fanout_avg_parts_from_select_results(owner_results) {
+                Ok(parts) => parts,
+                Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+            };
+        if owner_columns != rewrite_columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard avg fan-out column mismatch: expected {:?}, got {:?}",
+                    rewrite_columns, owner_columns
+                ),
+            ));
+        }
+        if let Err(message) = add_fanout_sum(&mut total_sum, owner_sum) {
+            return Some(json_error(StatusCode::BAD_GATEWAY, message));
+        }
+        total_count = match total_count.checked_add(owner_count) {
+            Some(total) => total,
+            None => {
+                return Some(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Shard avg fan-out count overflow",
+                ));
+            }
+        };
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: vec![plan.output_column],
+        rows: vec![vec![fanout_avg_to_json(total_sum, total_count)]],
+    }]))
+}
+
 async fn try_fanout_execute_to_shard_owners(
     state: &AppState,
     context: &RequestContext,
@@ -1836,10 +2074,32 @@ async fn execute_prepared_locally_for_fanout(
     record: &PreparedStatementRecord,
     params: &[Value],
 ) -> std::result::Result<Vec<QueryResultJson>, ApiResponse<Vec<QueryResultJson>>> {
+    execute_statements_locally_for_fanout(state, &record.statements, params).await
+}
+
+async fn execute_sql_locally_for_fanout(
+    state: &AppState,
+    sql: &str,
+    params: &[Value],
+) -> std::result::Result<Vec<QueryResultJson>, ApiResponse<Vec<QueryResultJson>>> {
+    match state.executor.prepare(sql) {
+        Ok(statements) => execute_statements_locally_for_fanout(state, &statements, params).await,
+        Err(e) => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!("Statement Error: {:?}", e),
+        )),
+    }
+}
+
+async fn execute_statements_locally_for_fanout(
+    state: &AppState,
+    statements: &[sqlparser::ast::Statement],
+    params: &[Value],
+) -> std::result::Result<Vec<QueryResultJson>, ApiResponse<Vec<QueryResultJson>>> {
     match state.storage.begin_transaction().await {
         Ok(mut txn) => {
             let mut results = Vec::new();
-            for stmt in record.statements.iter() {
+            for stmt in statements {
                 match state
                     .executor
                     .execute_in_transaction_with_params(stmt, &mut *txn, params)
@@ -1877,9 +2137,19 @@ async fn query_remote_prepared_shard_owner(
     payload: &ExecuteRequest,
     owner: &SqlShardOwner,
 ) -> std::result::Result<Vec<QueryResultJson>, (StatusCode, String)> {
+    query_remote_prepared_sql_shard_owner(state, context, &record.sql, payload, owner).await
+}
+
+async fn query_remote_prepared_sql_shard_owner(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+    payload: &ExecuteRequest,
+    owner: &SqlShardOwner,
+) -> std::result::Result<Vec<QueryResultJson>, (StatusCode, String)> {
     let prepare_url = format!("http://{}/prepare", owner.addr);
     let prepare_payload = PrepareRequest {
-        sql: record.sql.clone(),
+        sql: sql.to_string(),
     };
     let prepare_response = apply_forwarding_headers(state.raft_client.post(&prepare_url), context)
         .json(&prepare_payload)
@@ -3194,6 +3464,16 @@ mod tests {
             QueryResultJson::Success { .. } => panic!("expected fanout max"),
         }
 
+        let avg_select = post_query(&local_app, "SELECT AVG(amount) FROM fanout_users").await;
+        assert_eq!(avg_select.status(), StatusCode::OK);
+        let avg_envelope: Envelope<Vec<QueryResultJson>> = response_json(avg_select).await;
+        match &avg_envelope.data.expect("avg data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(15.0)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout avg"),
+        }
+
         let _ = std::fs::remove_file(&local_wal_path);
         let _ = std::fs::remove_file(&owner_wal_path);
     }
@@ -3616,6 +3896,52 @@ mod tests {
                 assert_eq!(rows, &vec![vec![serde_json::json!(20)]]);
             }
             QueryResultJson::Success { .. } => panic!("expected fanout max"),
+        }
+
+        let prepare_avg_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "sql": "SELECT AVG(amount) FROM forward_exec_users"
+                })
+                .to_string(),
+            ))
+            .expect("prepare avg request");
+        let prepare_avg_response = local_app
+            .clone()
+            .oneshot(prepare_avg_request)
+            .await
+            .expect("prepare avg response");
+        let prepare_avg_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_avg_response).await;
+        let prepared_avg = prepare_avg_envelope.data.expect("prepared avg statement");
+        let execute_avg_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared_avg.statement_id,
+                    "params": []
+                })
+                .to_string(),
+            ))
+            .expect("execute avg request");
+        let execute_avg_response = local_app
+            .clone()
+            .oneshot(execute_avg_request)
+            .await
+            .expect("execute avg response");
+        assert_eq!(execute_avg_response.status(), StatusCode::OK);
+        let execute_avg_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_avg_response).await;
+        match &execute_avg_envelope.data.expect("execute avg data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(15.0)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout avg"),
         }
 
         let local_storage_probe = Executor::new(local_storage.clone())

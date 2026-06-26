@@ -70,6 +70,12 @@ pub(crate) enum SqlShardExtremum {
     Max,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlShardAvgFanoutPlan {
+    pub rewritten_sql: String,
+    pub output_column: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStatementRecord {
     pub id: String,
@@ -766,6 +772,62 @@ impl Executor {
             .await
     }
 
+    pub(crate) async fn shard_avg_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_avg_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) fn shard_avg_select_fanout_plan_for_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Option<SqlShardAvgFanoutPlan>> {
+        let statements = self.prepare(sql)?;
+        Ok(Self::avg_select_fanout_target(&statements).map(|(_, _, plan)| plan))
+    }
+
+    pub(crate) fn shard_avg_select_fanout_plan_for_statements(
+        statements: &[Statement],
+    ) -> Option<SqlShardAvgFanoutPlan> {
+        Self::avg_select_fanout_target(statements).map(|(_, _, plan)| plan)
+    }
+
+    pub(crate) async fn shard_avg_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let Some((table_name, column_name, _)) = Self::avg_select_fanout_target(statements) else {
+            return Ok(Vec::new());
+        };
+        let mut txn = self.storage.begin_transaction().await?;
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(&table_name, &mut *txn)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(column) = schema
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&column_name))
+        else {
+            return Ok(Vec::new());
+        };
+        if !Self::is_integer_type_name(&column.data_type)
+            && !Self::is_float_type_name(&column.data_type)
+        {
+            return Ok(Vec::new());
+        }
+        drop(txn);
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
+    }
+
     pub(crate) fn shard_min_max_select_fanout_kind_for_sql(
         &self,
         sql: &str,
@@ -985,6 +1047,63 @@ impl Executor {
             .is_none_or(Self::select_predicate_is_fanout_local)
     }
 
+    fn avg_select_fanout_target(
+        statements: &[Statement],
+    ) -> Option<(String, String, SqlShardAvgFanoutPlan)> {
+        let [Statement::Query(query)] = statements else {
+            return None;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.projection.len() != 1
+        {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return None;
+        };
+        if !group_exprs.is_empty()
+            || !select
+                .selection
+                .as_ref()
+                .is_none_or(Self::select_predicate_is_fanout_local)
+        {
+            return None;
+        }
+        let (column_name, column_sql) =
+            Self::select_projection_column_function_arg(&select.projection[0], &["AVG"])?;
+        let output_column = Self::select_projection_output_name(&select.projection[0])?;
+        let relation_sql = select.from[0].relation.to_string();
+        let selection_sql = select
+            .selection
+            .as_ref()
+            .map(|expr| format!(" WHERE {}", expr))
+            .unwrap_or_default();
+        let rewritten_sql = format!(
+            "SELECT SUM({}), COUNT({}) FROM {}{}",
+            column_sql, column_sql, relation_sql, selection_sql
+        );
+        Some((
+            name.to_string(),
+            column_name,
+            SqlShardAvgFanoutPlan {
+                rewritten_sql,
+                output_column,
+            },
+        ))
+    }
+
     fn min_max_select_fanout_target(
         statements: &[Statement],
     ) -> Option<(SqlShardExtremum, String, String)> {
@@ -1054,6 +1173,14 @@ impl Executor {
         item: &SelectItem,
         function_names: &[&str],
     ) -> Option<String> {
+        Self::select_projection_column_function_arg(item, function_names)
+            .map(|(column_name, _)| column_name)
+    }
+
+    fn select_projection_column_function_arg(
+        item: &SelectItem,
+        function_names: &[&str],
+    ) -> Option<(String, String)> {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
@@ -1080,9 +1207,19 @@ impl Executor {
             return None;
         };
         match expr {
-            Expr::Identifier(ident) => Some(ident.value.clone()),
-            Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.clone()),
+            Expr::Identifier(ident) => Some((ident.value.clone(), expr.to_string())),
+            Expr::CompoundIdentifier(idents) => idents
+                .last()
+                .map(|ident| (ident.value.clone(), expr.to_string())),
             _ => None,
+        }
+    }
+
+    fn select_projection_output_name(item: &SelectItem) -> Option<String> {
+        match item {
+            SelectItem::UnnamedExpr(expr) => Some(expr.to_string()),
+            SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
         }
     }
 
