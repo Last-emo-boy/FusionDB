@@ -17,7 +17,9 @@ use crate::common::{FusionError, Value};
 use crate::distributed::api::{raft_routes, submit_raft_write, RaftAppState};
 use crate::distributed::sharding::ShardRouter;
 use crate::distributed::FusionRaft;
-use crate::execution::{Executor, PreparedStatementRecord, SqlShardOwner, SqlShardRoutingDecision};
+use crate::execution::{
+    Executor, PreparedStatementRecord, SqlShardExtremum, SqlShardOwner, SqlShardRoutingDecision,
+};
 use crate::parser::parse_sql;
 use crate::storage::Storage;
 
@@ -439,6 +441,12 @@ async fn handle_query(
 
     if let Some(response) =
         try_fanout_sum_query_to_shard_owners(&state, &context, &payload.sql).await
+    {
+        return response;
+    }
+
+    if let Some(response) =
+        try_fanout_min_max_query_to_shard_owners(&state, &context, &payload.sql).await
     {
         return response;
     }
@@ -937,6 +945,85 @@ async fn try_fanout_sum_query_to_shard_owners(
     }]))
 }
 
+async fn try_fanout_min_max_query_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    let kind = match state.executor.shard_min_max_select_fanout_kind_for_sql(sql) {
+        Ok(Some(kind)) => kind,
+        Ok(None) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard min/max fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+    let owners = match state
+        .executor
+        .shard_min_max_select_fanout_owners_for_sql(sql, &[])
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard min/max fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match state.executor.execute_sql(sql).await {
+        Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Execution Error: {:?}", e),
+            ));
+        }
+    };
+
+    let (columns, mut total) = match fanout_extremum_from_select_results(local_results) {
+        Ok(extremum) => extremum,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+
+    for owner in owners {
+        let owner_results = match query_remote_shard_owner(state, context, sql, &owner).await {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let (owner_columns, owner_extremum) =
+            match fanout_extremum_from_select_results(owner_results) {
+                Ok(extremum) => extremum,
+                Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+            };
+        if owner_columns != columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard min/max fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ),
+            ));
+        }
+        if let Err(message) = merge_fanout_extremum(&mut total, owner_extremum, kind) {
+            return Some(json_error(StatusCode::BAD_GATEWAY, message));
+        }
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns,
+        rows: vec![vec![total.unwrap_or(serde_json::Value::Null)]],
+    }]))
+}
+
 async fn query_remote_shard_owner(
     state: &AppState,
     context: &RequestContext,
@@ -1136,6 +1223,55 @@ fn fanout_sum_to_json(total: Option<FanoutSum>) -> serde_json::Value {
     }
 }
 
+fn fanout_extremum_from_select_results(
+    results: Vec<QueryResultJson>,
+) -> std::result::Result<(Vec<String>, Option<serde_json::Value>), String> {
+    let [result] = results.as_slice() else {
+        return Err("Shard min/max fan-out expected exactly one SELECT result".to_string());
+    };
+    let QueryResultJson::Select { columns, rows, .. } = result else {
+        return Err("Shard min/max fan-out received a non-SELECT result".to_string());
+    };
+    if columns.len() != 1 || rows.len() != 1 || rows[0].len() != 1 {
+        return Err("Shard min/max fan-out expected one row with one min/max column".to_string());
+    }
+    let value = &rows[0][0];
+    if value.is_null() {
+        return Ok((columns.clone(), None));
+    }
+    if value.as_f64().is_some_and(|value| value.is_finite()) {
+        return Ok((columns.clone(), Some(value.clone())));
+    }
+    Err(format!(
+        "Shard min/max fan-out received a non-numeric min/max value: {}",
+        value
+    ))
+}
+
+fn merge_fanout_extremum(
+    total: &mut Option<serde_json::Value>,
+    value: Option<serde_json::Value>,
+    kind: SqlShardExtremum,
+) -> std::result::Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(current) = total.as_ref() else {
+        *total = Some(value);
+        return Ok(());
+    };
+    let candidate_value = Value::from_json(&value);
+    let current_value = Value::from_json(current);
+    let should_replace = match kind {
+        SqlShardExtremum::Min => candidate_value.compare(&current_value).is_lt(),
+        SqlShardExtremum::Max => candidate_value.compare(&current_value).is_gt(),
+    };
+    if should_replace {
+        *total = Some(value);
+    }
+    Ok(())
+}
+
 async fn handle_tables(
     State(state): State<AppState>,
     Extension(context): Extension<RequestContext>,
@@ -1330,6 +1466,19 @@ async fn handle_execute(
             }
 
             if let Some(response) = try_fanout_sum_execute_to_shard_owners(
+                &state,
+                &context,
+                &record,
+                &payload,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
+            if let Some(response) = try_fanout_min_max_execute_to_shard_owners(
                 &state,
                 &context,
                 &record,
@@ -1547,6 +1696,80 @@ async fn try_fanout_sum_execute_to_shard_owners(
         r#type: "select".to_string(),
         columns,
         rows: vec![vec![fanout_sum_to_json(total)]],
+    }]))
+}
+
+async fn try_fanout_min_max_execute_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    let Some(kind) = Executor::shard_min_max_select_fanout_kind_for_statements(&record.statements)
+    else {
+        return None;
+    };
+    let owners = match state
+        .executor
+        .shard_min_max_select_fanout_owners_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard min/max fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match execute_prepared_locally_for_fanout(state, record, params).await {
+        Ok(results) => results,
+        Err(response) => return Some(response),
+    };
+    let (columns, mut total) = match fanout_extremum_from_select_results(local_results) {
+        Ok(extremum) => extremum,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+
+    for owner in owners {
+        let owner_results = match query_remote_prepared_shard_owner(
+            state, context, record, payload, &owner,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let (owner_columns, owner_extremum) =
+            match fanout_extremum_from_select_results(owner_results) {
+                Ok(extremum) => extremum,
+                Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+            };
+        if owner_columns != columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard min/max fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ),
+            ));
+        }
+        if let Err(message) = merge_fanout_extremum(&mut total, owner_extremum, kind) {
+            return Some(json_error(StatusCode::BAD_GATEWAY, message));
+        }
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns,
+        rows: vec![vec![total.unwrap_or(serde_json::Value::Null)]],
     }]))
 }
 
@@ -2951,6 +3174,26 @@ mod tests {
             QueryResultJson::Success { .. } => panic!("expected fanout sum"),
         }
 
+        let min_select = post_query(&local_app, "SELECT MIN(amount) FROM fanout_users").await;
+        assert_eq!(min_select.status(), StatusCode::OK);
+        let min_envelope: Envelope<Vec<QueryResultJson>> = response_json(min_select).await;
+        match &min_envelope.data.expect("min data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(10)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout min"),
+        }
+
+        let max_select = post_query(&local_app, "SELECT MAX(amount) FROM fanout_users").await;
+        assert_eq!(max_select.status(), StatusCode::OK);
+        let max_envelope: Envelope<Vec<QueryResultJson>> = response_json(max_select).await;
+        match &max_envelope.data.expect("max data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(20)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout max"),
+        }
+
         let _ = std::fs::remove_file(&local_wal_path);
         let _ = std::fs::remove_file(&owner_wal_path);
     }
@@ -3281,6 +3524,98 @@ mod tests {
                 assert_eq!(rows, &vec![vec![serde_json::json!(30)]]);
             }
             QueryResultJson::Success { .. } => panic!("expected fanout sum"),
+        }
+
+        let prepare_min_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "sql": "SELECT MIN(amount) FROM forward_exec_users"
+                })
+                .to_string(),
+            ))
+            .expect("prepare min request");
+        let prepare_min_response = local_app
+            .clone()
+            .oneshot(prepare_min_request)
+            .await
+            .expect("prepare min response");
+        let prepare_min_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_min_response).await;
+        let prepared_min = prepare_min_envelope.data.expect("prepared min statement");
+        let execute_min_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared_min.statement_id,
+                    "params": []
+                })
+                .to_string(),
+            ))
+            .expect("execute min request");
+        let execute_min_response = local_app
+            .clone()
+            .oneshot(execute_min_request)
+            .await
+            .expect("execute min response");
+        assert_eq!(execute_min_response.status(), StatusCode::OK);
+        let execute_min_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_min_response).await;
+        match &execute_min_envelope.data.expect("execute min data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(10)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout min"),
+        }
+
+        let prepare_max_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "sql": "SELECT MAX(amount) FROM forward_exec_users"
+                })
+                .to_string(),
+            ))
+            .expect("prepare max request");
+        let prepare_max_response = local_app
+            .clone()
+            .oneshot(prepare_max_request)
+            .await
+            .expect("prepare max response");
+        let prepare_max_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_max_response).await;
+        let prepared_max = prepare_max_envelope.data.expect("prepared max statement");
+        let execute_max_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared_max.statement_id,
+                    "params": []
+                })
+                .to_string(),
+            ))
+            .expect("execute max request");
+        let execute_max_response = local_app
+            .clone()
+            .oneshot(execute_max_request)
+            .await
+            .expect("execute max response");
+        assert_eq!(execute_max_response.status(), StatusCode::OK);
+        let execute_max_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_max_response).await;
+        match &execute_max_envelope.data.expect("execute max data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(20)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout max"),
         }
 
         let local_storage_probe = Executor::new(local_storage.clone())

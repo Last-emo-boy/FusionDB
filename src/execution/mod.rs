@@ -64,6 +64,12 @@ pub(crate) struct SqlShardOwner {
     pub addr: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlShardExtremum {
+    Min,
+    Max,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStatementRecord {
     pub id: String,
@@ -750,6 +756,63 @@ impl Executor {
             .await
     }
 
+    pub(crate) async fn shard_min_max_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_min_max_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) fn shard_min_max_select_fanout_kind_for_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Option<SqlShardExtremum>> {
+        let statements = self.prepare(sql)?;
+        Ok(Self::min_max_select_fanout_target(&statements).map(|(kind, _, _)| kind))
+    }
+
+    pub(crate) fn shard_min_max_select_fanout_kind_for_statements(
+        statements: &[Statement],
+    ) -> Option<SqlShardExtremum> {
+        Self::min_max_select_fanout_target(statements).map(|(kind, _, _)| kind)
+    }
+
+    pub(crate) async fn shard_min_max_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let Some((_, table_name, column_name)) = Self::min_max_select_fanout_target(statements)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut txn = self.storage.begin_transaction().await?;
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(&table_name, &mut *txn)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(column) = schema
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&column_name))
+        else {
+            return Ok(Vec::new());
+        };
+        if !Self::is_integer_type_name(&column.data_type)
+            && !Self::is_float_type_name(&column.data_type)
+        {
+            return Ok(Vec::new());
+        }
+        drop(txn);
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
+    }
+
     async fn shard_select_fanout_owners_for_prechecked_statements(
         &self,
         statements: &[Statement],
@@ -913,7 +976,7 @@ impl Executor {
         if !group_exprs.is_empty() {
             return false;
         }
-        if !Self::select_projection_is_sum_column(&select.projection[0]) {
+        if Self::select_projection_is_column_function(&select.projection[0], &["SUM"]).is_none() {
             return false;
         }
         select
@@ -922,32 +985,105 @@ impl Executor {
             .is_none_or(Self::select_predicate_is_fanout_local)
     }
 
-    fn select_projection_is_sum_column(item: &SelectItem) -> bool {
+    fn min_max_select_fanout_target(
+        statements: &[Statement],
+    ) -> Option<(SqlShardExtremum, String, String)> {
+        let [Statement::Query(query)] = statements else {
+            return None;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.projection.len() != 1
+        {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return None;
+        };
+        if !group_exprs.is_empty() {
+            return None;
+        }
+        if !select
+            .selection
+            .as_ref()
+            .is_none_or(Self::select_predicate_is_fanout_local)
+        {
+            return None;
+        }
+        let column_name =
+            Self::select_projection_is_column_function(&select.projection[0], &["MIN", "MAX"])?;
+        let kind =
+            Self::select_projection_function_name(&select.projection[0]).and_then(|name| {
+                if name.eq_ignore_ascii_case("MIN") {
+                    Some(SqlShardExtremum::Min)
+                } else if name.eq_ignore_ascii_case("MAX") {
+                    Some(SqlShardExtremum::Max)
+                } else {
+                    None
+                }
+            })?;
+        Some((kind, name.to_string(), column_name))
+    }
+
+    fn select_projection_function_name(item: &SelectItem) -> Option<&str> {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return false,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
         };
         let Expr::Function(func) = expr else {
-            return false;
+            return None;
+        };
+        if func.name.0.len() != 1 {
+            return None;
+        }
+        func.name.0[0].as_ident().map(|ident| ident.value.as_str())
+    }
+
+    fn select_projection_is_column_function(
+        item: &SelectItem,
+        function_names: &[&str],
+    ) -> Option<String> {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+        };
+        let Expr::Function(func) = expr else {
+            return None;
         };
         if func.name.0.len() != 1
-            || !func.name.0[0]
-                .as_ident()
-                .is_some_and(|ident| ident.value.eq_ignore_ascii_case("SUM"))
+            || !func.name.0[0].as_ident().is_some_and(|ident| {
+                function_names
+                    .iter()
+                    .any(|name| ident.value.eq_ignore_ascii_case(name))
+            })
         {
-            return false;
+            return None;
         }
         let FunctionArguments::List(args) = &func.args else {
-            return false;
+            return None;
         };
         if args.duplicate_treatment.is_some() || args.args.len() != 1 {
-            return false;
+            return None;
         }
-        matches!(
-            args.args[0],
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(_)))
-                | FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(_)))
-        )
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = &args.args[0] else {
+            return None;
+        };
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.clone()),
+            _ => None,
+        }
     }
 
     fn select_projection_is_fanout_safe(item: &SelectItem) -> bool {

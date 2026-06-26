@@ -2654,6 +2654,36 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         .expect("sum row");
     assert_eq!(sum_value, "30");
 
+    let min_messages = client
+        .simple_query("SELECT MIN(amount) FROM pg_route_forward")
+        .await
+        .expect("fanout MIN failed");
+    let min_value = min_messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(row.get("MIN(amount)").expect("min").to_string())
+            }
+            _ => None,
+        })
+        .expect("min row");
+    assert_eq!(min_value, "10");
+
+    let max_messages = client
+        .simple_query("SELECT MAX(amount) FROM pg_route_forward")
+        .await
+        .expect("fanout MAX failed");
+    let max_value = max_messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(row.get("MAX(amount)").expect("max").to_string())
+            }
+            _ => None,
+        })
+        .expect("max row");
+    assert_eq!(max_value, "20");
+
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
 }
@@ -2993,6 +3023,18 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
         .await
         .expect("extended fanout SUM failed");
     assert_eq!(sum_rows[0].get::<_, i64>(0), 30);
+
+    let min_rows = client
+        .query("SELECT MIN(amount) FROM pg_route_extended_forward", &[])
+        .await
+        .expect("extended fanout MIN failed");
+    assert_eq!(min_rows[0].get::<_, i64>(0), 10);
+
+    let max_rows = client
+        .query("SELECT MAX(amount) FROM pg_route_extended_forward", &[])
+        .await
+        .expect("extended fanout MAX failed");
+    assert_eq!(max_rows[0].get::<_, i64>(0), 20);
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
