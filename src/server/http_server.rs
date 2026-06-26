@@ -458,28 +458,18 @@ async fn shard_write_route_action_for_sql(
     Ok(shard_write_route_action(state, decisions, shard_forwarded))
 }
 
-async fn ensure_local_shard_write_routes_for_statements(
+async fn shard_write_route_action_for_statements(
     state: &AppState,
     statements: &[sqlparser::ast::Statement],
     params: &[Value],
-) -> std::result::Result<(), String> {
+    shard_forwarded: bool,
+) -> std::result::Result<ShardWriteRouteAction, String> {
     let decisions = state
         .executor
         .shard_routing_decisions_for_statements(statements, params)
         .await
         .map_err(|e| format!("Shard routing error: {:?}", e))?;
-    ensure_local_shard_write_routes(decisions)
-}
-
-fn ensure_local_shard_write_routes(
-    decisions: Vec<SqlShardRoutingDecision>,
-) -> std::result::Result<(), String> {
-    for decision in decisions {
-        if !decision.is_local_owner() {
-            return Err(non_local_shard_write_message(&decision));
-        }
-    }
-    Ok(())
+    Ok(shard_write_route_action(state, decisions, shard_forwarded))
 }
 
 fn shard_write_route_action(
@@ -704,7 +694,7 @@ async fn handle_execute(
     Extension(context): Extension<RequestContext>,
     Json(payload): Json<ExecuteRequest>,
 ) -> ApiResponse<Vec<QueryResultJson>> {
-    let username = context.username.unwrap_or_default();
+    let username = context.username.clone().unwrap_or_default();
 
     match state
         .executor
@@ -728,11 +718,25 @@ async fn handle_execute(
             let params: Vec<Value> = payload.params.iter().map(Value::from_json).collect();
             let return_results = payload.return_results.unwrap_or(true);
 
-            if let Err(message) =
-                ensure_local_shard_write_routes_for_statements(&state, &record.statements, &params)
-                    .await
+            match shard_write_route_action_for_statements(
+                &state,
+                &record.statements,
+                &params,
+                context.shard_forwarded,
+            )
+            .await
             {
-                return json_error(StatusCode::CONFLICT, message);
+                Ok(ShardWriteRouteAction::Local) => {}
+                Ok(ShardWriteRouteAction::Forward(decision)) => {
+                    return forward_execute_to_shard_owner(
+                        &state, &context, &record, &payload, &decision,
+                    )
+                    .await;
+                }
+                Ok(ShardWriteRouteAction::Conflict(message)) => {
+                    return json_error(StatusCode::CONFLICT, message);
+                }
+                Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
             }
 
             let mut may_change_query_results = false;
@@ -784,6 +788,151 @@ async fn handle_execute(
             format!("Statement Error: {:?}", e),
         ),
     }
+}
+
+async fn forward_execute_to_shard_owner(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    decision: &SqlShardRoutingDecision,
+) -> ApiResponse<Vec<QueryResultJson>> {
+    let prepare_url = format!("http://{}/prepare", decision.route.owner_addr);
+    let prepare_payload = PrepareRequest {
+        sql: record.sql.clone(),
+    };
+    let prepare_response =
+        match apply_forwarding_headers(state.raft_client.post(&prepare_url), context)
+            .json(&prepare_payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    shard_forwarding_transport_error(decision, "prepare", e),
+                );
+            }
+        };
+    let prepare_status = prepare_response.status();
+    let prepare_envelope = match prepare_response
+        .json::<Envelope<PreparedStatementInfo>>()
+        .await
+    {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard owner forwarding error: prepare response from node {} at {} could not be decoded: {}",
+                    decision.route.owner_node_id, decision.route.owner_addr, e
+                ),
+            );
+        }
+    };
+    if !prepare_status.is_success() || prepare_envelope.status != "ok" {
+        return json_error(
+            prepare_status,
+            format!(
+                "Shard owner forwarding prepare error: {}",
+                prepare_envelope
+                    .error
+                    .unwrap_or_else(|| "owner node rejected prepare".to_string())
+            ),
+        );
+    }
+    let Some(prepared) = prepare_envelope.data else {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "Shard owner forwarding prepare error: owner node returned no prepared statement",
+        );
+    };
+
+    let execute_url = format!("http://{}/execute", decision.route.owner_addr);
+    let execute_payload = ExecuteRequest {
+        statement_id: prepared.statement_id.clone(),
+        params: payload.params.clone(),
+        return_results: payload.return_results,
+    };
+    let execute_response =
+        match apply_forwarding_headers(state.raft_client.post(&execute_url), context)
+            .json(&execute_payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                best_effort_deallocate_forwarded_statement(state, context, decision, &prepared)
+                    .await;
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    shard_forwarding_transport_error(decision, "execute", e),
+                );
+            }
+        };
+    let execute_status = execute_response.status();
+    let execute_envelope = match execute_response
+        .json::<Envelope<Vec<QueryResultJson>>>()
+        .await
+    {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            best_effort_deallocate_forwarded_statement(state, context, decision, &prepared).await;
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard owner forwarding error: execute response from node {} at {} could not be decoded: {}",
+                    decision.route.owner_node_id, decision.route.owner_addr, e
+                ),
+            );
+        }
+    };
+    best_effort_deallocate_forwarded_statement(state, context, decision, &prepared).await;
+    (execute_status, Json(execute_envelope))
+}
+
+fn apply_forwarding_headers(
+    request: reqwest::RequestBuilder,
+    context: &RequestContext,
+) -> reqwest::RequestBuilder {
+    let request = request.header(SHARD_OWNER_FORWARD_HEADER, SHARD_OWNER_FORWARD_VALUE);
+    if let Some(username) = context.username.as_deref() {
+        request.header("x-fusiondb-user", username)
+    } else {
+        request
+    }
+}
+
+fn shard_forwarding_transport_error(
+    decision: &SqlShardRoutingDecision,
+    phase: &str,
+    error: reqwest::Error,
+) -> String {
+    format!(
+        "Shard owner forwarding error: {} on table {} to node {} at {} failed during {}: {}",
+        decision.operation,
+        decision.route.table,
+        decision.route.owner_node_id,
+        decision.route.owner_addr,
+        phase,
+        error
+    )
+}
+
+async fn best_effort_deallocate_forwarded_statement(
+    state: &AppState,
+    context: &RequestContext,
+    decision: &SqlShardRoutingDecision,
+    prepared: &PreparedStatementInfo,
+) {
+    let url = format!(
+        "http://{}/prepare/{}",
+        decision.route.owner_addr, prepared.statement_id
+    );
+    let _ = apply_forwarding_headers(state.raft_client.delete(url), context)
+        .send()
+        .await;
 }
 
 #[derive(Clone)]
@@ -843,7 +992,7 @@ pub struct MetricsSnapshot {
     pg_connection_limit: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct PrepareRequest {
     sql: String,
 }
@@ -891,7 +1040,7 @@ pub struct AuthContextInfo {
     mode: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct ExecuteRequest {
     statement_id: String,
     params: Vec<serde_json::Value>,
@@ -1664,6 +1813,134 @@ mod tests {
             }
             QueryResultJson::Success { .. } => panic!("expected owner select"),
         }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_execute_forwards_non_local_shard_owner_insert_to_owner() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_execute_forward_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_execute_forward_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let remote_key =
+            integer_primary_key_for_owner(&local_shard_router, "forward_exec_users", 2);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let client = reqwest::Client::new();
+        let create_sql = "CREATE TABLE forward_exec_users (id INTEGER PRIMARY KEY, name TEXT)";
+        let local_create = post_query(&local_app, create_sql).await;
+        assert_eq!(local_create.status(), StatusCode::OK);
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        let prepare_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "sql": "INSERT INTO forward_exec_users (id, name) VALUES ($1, $2); SELECT name FROM forward_exec_users WHERE id = $1"
+                })
+                .to_string(),
+            ))
+            .expect("prepare request");
+        let prepare_response = local_app
+            .clone()
+            .oneshot(prepare_request)
+            .await
+            .expect("prepare response");
+        let prepare_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_response).await;
+        let prepared = prepare_envelope.data.expect("prepared statement");
+
+        let execute_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared.statement_id,
+                    "params": [remote_key, "remote-exec"]
+                })
+                .to_string(),
+            ))
+            .expect("execute request");
+        let execute_response = local_app
+            .clone()
+            .oneshot(execute_request)
+            .await
+            .expect("execute response");
+        assert_eq!(execute_response.status(), StatusCode::OK);
+        let execute_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_response).await;
+        let execute_results = execute_envelope.data.expect("execute data");
+        assert_eq!(execute_results.len(), 2);
+        match &execute_results[1] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!("remote-exec")]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected forwarded select"),
+        }
+
+        let local_select = post_query(
+            &local_app,
+            &format!(
+                "SELECT name FROM forward_exec_users WHERE id = {}",
+                remote_key
+            ),
+        )
+        .await;
+        let local_envelope: Envelope<Vec<QueryResultJson>> = response_json(local_select).await;
+        match &local_envelope.data.expect("local select data")[0] {
+            QueryResultJson::Select { rows, .. } => assert!(rows.is_empty()),
+            QueryResultJson::Success { .. } => panic!("expected local select"),
+        }
+
+        let owner_prepared = client
+            .get(format!("http://{}/prepare", owner_addr))
+            .send()
+            .await
+            .expect("owner prepared list response");
+        assert_eq!(owner_prepared.status(), StatusCode::OK);
+        let owner_prepared_envelope = owner_prepared
+            .json::<Envelope<Vec<PreparedStatementInfo>>>()
+            .await
+            .expect("owner prepared list envelope");
+        assert!(owner_prepared_envelope
+            .data
+            .expect("owner prepared list data")
+            .is_empty());
 
         let _ = std::fs::remove_file(&local_wal_path);
         let _ = std::fs::remove_file(&owner_wal_path);
