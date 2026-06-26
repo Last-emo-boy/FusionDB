@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-428",
+  "title": "Forward primary-key point reads to non-local shard owners",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-428"
+  ],
+  "scope": [
+    "src/execution/mod.rs",
+    "src/server/http_server.rs",
+    "src/server/pg_server.rs",
+    "tests/pg_integration.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Continue P5-3 by extending shard-owner routing from deterministic point writes to deterministic primary-key point reads on HTTP /query, HTTP prepared /execute, pgwire simple query, and pgwire extended query.",
+  "verification": [
+    "cargo test shard_owner -- --nocapture",
+    "cargo test --lib",
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo check --bins",
+    "cargo test --test pg_integration shard_owner -- --nocapture"
+  ],
+  "code_commit": "a5a5d86",
+  "cleanup": [
+    "Measured target/ at approximately 11.06 GiB after verification",
+    "cargo clean removed 7537 files, 11.1 GiB total"
+  ],
+  "remaining_gaps": [
+    "P5-3 mixed local/non-local point writes and multi-owner point writes remain conservative",
+    "P5-3 distributed index ownership and maintenance remain open",
+    "P5-3 broad multi-shard query routing and cross-node query planning beyond primary-key point reads remain open",
+    "P5-3 INSERT/COPY routing remains conservative for generated/default primary keys, composite primary keys, INSERT ... SELECT, partially nondeterministic VALUES rows, and COPY column lists that omit the primary key",
+    "P5-3 HNSW/vector and trigram in-memory index shard ownership remain open",
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations"
+  ]
+}
