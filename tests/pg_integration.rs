@@ -2481,7 +2481,7 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
     let owner_create_response = http_client
         .post(&owner_query_url)
         .json(&serde_json::json!({
-            "sql": "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER)"
+            "sql": "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER, bucket TEXT)"
         }))
         .send()
         .await
@@ -2529,20 +2529,20 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
 
     client
         .simple_query(
-            "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER)",
+            "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER, bucket TEXT)",
         )
         .await
         .expect("local CREATE TABLE failed");
     client
         .simple_query(&format!(
-            "INSERT INTO pg_route_forward VALUES ({}, 'local', 10)",
+            "INSERT INTO pg_route_forward VALUES ({}, 'local', 10, 'shared')",
             local_key
         ))
         .await
         .expect("local owner insert should succeed");
     client
         .simple_query(&format!(
-            "INSERT INTO pg_route_forward VALUES ({}, 'remote', 20)",
+            "INSERT INTO pg_route_forward VALUES ({}, 'remote', 20, 'shared')",
             remote_key
         ))
         .await
@@ -2638,6 +2638,23 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         })
         .expect("count row");
     assert_eq!(count_value, "2");
+
+    let count_distinct_messages = client
+        .simple_query("SELECT COUNT(DISTINCT bucket) FROM pg_route_forward")
+        .await
+        .expect("fanout COUNT DISTINCT failed");
+    let count_distinct_value = count_distinct_messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                row.get("COUNT(DISTINCT bucket)")
+                    .expect("count distinct")
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .expect("count distinct row");
+    assert_eq!(count_distinct_value, "1");
 
     let sum_messages = client
         .simple_query("SELECT SUM(amount) FROM pg_route_forward")
@@ -2892,7 +2909,7 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
     let owner_create_response = http_client
         .post(&owner_query_url)
         .json(&serde_json::json!({
-            "sql": "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT, amount BIGINT)"
+            "sql": "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT, amount BIGINT, bucket TEXT)"
         }))
         .send()
         .await
@@ -2940,22 +2957,22 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
 
     client
         .simple_query(
-            "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT, amount BIGINT)",
+            "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT, amount BIGINT, bucket TEXT)",
         )
         .await
         .expect("local CREATE TABLE failed");
     let local_inserted = client
         .execute(
-            "INSERT INTO pg_route_extended_forward (name, id, amount) VALUES ($1, $2, $3)",
-            &[&"local", &local_key, &10_i64],
+            "INSERT INTO pg_route_extended_forward (name, id, amount, bucket) VALUES ($1, $2, $3, $4)",
+            &[&"local", &local_key, &10_i64, &"shared"],
         )
         .await
         .expect("local owner extended insert should succeed");
     assert_eq!(local_inserted, 1);
     let inserted = client
         .execute(
-            "INSERT INTO pg_route_extended_forward (name, id, amount) VALUES ($1, $2, $3)",
-            &[&"remote", &remote_key, &20_i64],
+            "INSERT INTO pg_route_extended_forward (name, id, amount, bucket) VALUES ($1, $2, $3, $4)",
+            &[&"remote", &remote_key, &20_i64, &"shared"],
         )
         .await
         .expect("remote owner extended insert should forward");
@@ -3032,6 +3049,15 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
         .await
         .expect("extended fanout COUNT failed");
     assert_eq!(count_rows[0].get::<_, i64>(0), 2);
+
+    let count_distinct_rows = client
+        .query(
+            "SELECT COUNT(DISTINCT bucket) FROM pg_route_extended_forward",
+            &[],
+        )
+        .await
+        .expect("extended fanout COUNT DISTINCT failed");
+    assert_eq!(count_distinct_rows[0].get::<_, i64>(0), 1);
 
     let sum_rows = client
         .query("SELECT SUM(amount) FROM pg_route_extended_forward", &[])

@@ -3,7 +3,7 @@ use bytes::{BufMut, BytesMut};
 use chrono::Datelike;
 use futures::{Sink, SinkExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore}; // Required for client.send
@@ -856,6 +856,102 @@ impl PgHandler {
         ])?))
     }
 
+    async fn fanout_count_distinct_select_to_shard_owners(
+        &self,
+        query: &str,
+        username: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        let plan = match self
+            .executor
+            .shard_count_distinct_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard count distinct fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_count_distinct_select_fanout_owners_for_sql(query, &[])
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard count distinct fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let local_results = match self.executor.execute_sql(&plan.rewritten_sql).await {
+            Ok(results) => Self::forward_results_from_query_results(results),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard count distinct fan-out local execution error",
+                    &e,
+                )))]));
+            }
+        };
+        let (rewrite_columns, local_values) =
+            match Self::distinct_values_from_forward_select_results(local_results) {
+                Ok(values) => values,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+        let mut distinct_values = BTreeSet::new();
+        if let Err(error) = Self::add_forward_distinct_values(&mut distinct_values, local_values) {
+            return Ok(Some(vec![Response::Error(Box::new(error))]));
+        }
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_shard_owner_results(&plan.rewritten_sql, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            let (owner_columns, owner_values) =
+                match Self::distinct_values_from_forward_select_results(owner_results) {
+                    Ok(values) => values,
+                    Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+                };
+            if owner_columns != rewrite_columns {
+                return Ok(Some(vec![Response::Error(Box::new(
+                    Self::execution_error(format!(
+                        "Shard count distinct fan-out column mismatch: expected {:?}, got {:?}",
+                        rewrite_columns, owner_columns
+                    )),
+                ))]));
+            }
+            if let Err(error) =
+                Self::add_forward_distinct_values(&mut distinct_values, owner_values)
+            {
+                return Ok(Some(vec![Response::Error(Box::new(error))]));
+            }
+        }
+
+        let count = match i64::try_from(distinct_values.len()) {
+            Ok(count) => count,
+            Err(_) => {
+                return Ok(Some(vec![Response::Error(Box::new(
+                    Self::execution_error("Shard count distinct fan-out overflow"),
+                ))]));
+            }
+        };
+        Ok(Some(Self::responses_from_forwarded_query_results(vec![
+            ForwardQueryResultJson::Select {
+                columns: vec![plan.output_column],
+                rows: vec![vec![serde_json::json!(count)]],
+            },
+        ])?))
+    }
+
     async fn fanout_sum_select_to_shard_owners(
         &self,
         query: &str,
@@ -1219,6 +1315,109 @@ impl PgHandler {
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns,
             rows: vec![vec![serde_json::json!(total)]],
+        }])))
+    }
+
+    async fn fanout_extended_count_distinct_select_to_shard_owners(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        let plan = match self
+            .executor
+            .shard_count_distinct_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard count distinct fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_count_distinct_select_fanout_owners_for_sql(query, params)
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard count distinct fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+
+        let local_results = match self
+            .execute_first_statement(&plan.rewritten_sql, params)
+            .await
+        {
+            Ok(result) => Self::forward_results_from_query_results(vec![result]),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard count distinct fan-out local execution error",
+                    &e,
+                )));
+            }
+        };
+        let (rewrite_columns, local_values) =
+            match Self::distinct_values_from_forward_select_results(local_results) {
+                Ok(values) => values,
+                Err(error) => return Ok(Err(error)),
+            };
+        let mut distinct_values = BTreeSet::new();
+        if let Err(error) = Self::add_forward_distinct_values(&mut distinct_values, local_values) {
+            return Ok(Err(error));
+        }
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_prepared_shard_owner_results(
+                    &plan.rewritten_sql,
+                    params,
+                    username,
+                    &owner,
+                )
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Err(error)),
+            };
+            let (owner_columns, owner_values) =
+                match Self::distinct_values_from_forward_select_results(owner_results) {
+                    Ok(values) => values,
+                    Err(error) => return Ok(Err(error)),
+                };
+            if owner_columns != rewrite_columns {
+                return Ok(Err(Self::execution_error(format!(
+                    "Shard count distinct fan-out column mismatch: expected {:?}, got {:?}",
+                    rewrite_columns, owner_columns
+                ))));
+            }
+            if let Err(error) =
+                Self::add_forward_distinct_values(&mut distinct_values, owner_values)
+            {
+                return Ok(Err(error));
+            }
+        }
+
+        let count = match i64::try_from(distinct_values.len()) {
+            Ok(count) => count,
+            Err(_) => {
+                return Ok(Err(Self::execution_error(
+                    "Shard count distinct fan-out overflow",
+                )))
+            }
+        };
+        Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
+            columns: vec![plan.output_column],
+            rows: vec![vec![serde_json::json!(count)]],
         }])))
     }
 
@@ -1709,6 +1908,55 @@ impl PgHandler {
             )));
         };
         Ok((columns.clone(), count))
+    }
+
+    fn distinct_values_from_forward_select_results(
+        results: Vec<ForwardQueryResultJson>,
+    ) -> std::result::Result<(Vec<String>, Vec<serde_json::Value>), pgwire::error::ErrorInfo> {
+        let [result] = results.as_slice() else {
+            return Err(Self::execution_error(
+                "Shard count distinct fan-out expected exactly one SELECT result",
+            ));
+        };
+        let ForwardQueryResultJson::Select { columns, rows } = result else {
+            return Err(Self::execution_error(
+                "Shard count distinct fan-out received a non-SELECT result",
+            ));
+        };
+        if columns.len() != 1 {
+            return Err(Self::execution_error(
+                "Shard count distinct fan-out expected one distinct value column",
+            ));
+        }
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            let [value] = row.as_slice() else {
+                return Err(Self::execution_error(
+                    "Shard count distinct fan-out expected one value per distinct row",
+                ));
+            };
+            values.push(value.clone());
+        }
+        Ok((columns.clone(), values))
+    }
+
+    fn add_forward_distinct_values(
+        distinct_values: &mut BTreeSet<String>,
+        values: Vec<serde_json::Value>,
+    ) -> std::result::Result<(), pgwire::error::ErrorInfo> {
+        for value in values {
+            if value.is_null() {
+                continue;
+            }
+            let key = serde_json::to_string(&value).map_err(|e| {
+                Self::execution_error(format!(
+                    "Shard count distinct fan-out could not encode distinct value {}: {}",
+                    value, e
+                ))
+            })?;
+            distinct_values.insert(key);
+        }
+        Ok(())
     }
 
     fn sum_from_forward_select_results(
@@ -7495,6 +7743,13 @@ impl SimpleQueryHandler for PgHandler {
                     return Ok(responses);
                 }
                 if let Some(mut fanout_responses) = self
+                    .fanout_count_distinct_select_to_shard_owners(&fanout_query, &username)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                if let Some(mut fanout_responses) = self
                     .fanout_sum_select_to_shard_owners(&fanout_query, &username)
                     .await?
                 {
@@ -7996,6 +8251,33 @@ impl ExtendedQueryHandler for PgHandler {
                     }
                     match self
                         .fanout_extended_count_select_to_shard_owners(&query, &params, &username)
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_count_distinct_select_to_shard_owners(
+                            &query, &params, &username,
+                        )
                         .await?
                     {
                         Ok(Some(results)) => {
