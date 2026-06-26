@@ -419,6 +419,18 @@ async fn handle_query(
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     }
 
+    match shard_read_route_action_for_sql(&state, &payload.sql, &[], context.shard_forwarded).await
+    {
+        Ok(ShardReadRouteAction::Local) => {}
+        Ok(ShardReadRouteAction::Forward(decision)) => {
+            return forward_query_to_shard_owner(&state, &context, &payload, &decision).await;
+        }
+        Ok(ShardReadRouteAction::Conflict(message)) => {
+            return json_error(StatusCode::CONFLICT, message);
+        }
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    }
+
     if let Some(raft) = &state.raft {
         match state.executor.sql_requires_raft_write(&payload.sql) {
             Ok(true) => {
@@ -524,6 +536,12 @@ enum ShardWriteRouteAction {
     Conflict(String),
 }
 
+enum ShardReadRouteAction {
+    Local,
+    Forward(SqlShardRoutingDecision),
+    Conflict(String),
+}
+
 async fn shard_write_route_action_for_sql(
     state: &AppState,
     sql: &str,
@@ -550,6 +568,34 @@ async fn shard_write_route_action_for_statements(
         .await
         .map_err(|e| format!("Shard routing error: {:?}", e))?;
     Ok(shard_write_route_action(state, decisions, shard_forwarded))
+}
+
+async fn shard_read_route_action_for_sql(
+    state: &AppState,
+    sql: &str,
+    params: &[Value],
+    shard_forwarded: bool,
+) -> std::result::Result<ShardReadRouteAction, String> {
+    let decision = state
+        .executor
+        .shard_read_route_decision_for_sql(sql, params)
+        .await
+        .map_err(|e| format!("Shard read routing error: {:?}", e))?;
+    Ok(shard_read_route_action(state, decision, shard_forwarded))
+}
+
+async fn shard_read_route_action_for_statements(
+    state: &AppState,
+    statements: &[sqlparser::ast::Statement],
+    params: &[Value],
+    shard_forwarded: bool,
+) -> std::result::Result<ShardReadRouteAction, String> {
+    let decision = state
+        .executor
+        .shard_read_route_decision_for_statements(statements, params)
+        .await
+        .map_err(|e| format!("Shard read routing error: {:?}", e))?;
+    Ok(shard_read_route_action(state, decision, shard_forwarded))
 }
 
 fn shard_write_route_action(
@@ -598,9 +644,26 @@ fn shard_write_route_action(
     ShardWriteRouteAction::Forward(first.clone())
 }
 
+fn shard_read_route_action(
+    state: &AppState,
+    decision: Option<SqlShardRoutingDecision>,
+    shard_forwarded: bool,
+) -> ShardReadRouteAction {
+    let Some(decision) = decision else {
+        return ShardReadRouteAction::Local;
+    };
+    if decision.is_local_owner() {
+        return ShardReadRouteAction::Local;
+    }
+    if shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return ShardReadRouteAction::Conflict(non_local_shard_write_message(&decision));
+    }
+    ShardReadRouteAction::Forward(decision)
+}
+
 fn non_local_shard_write_message(decision: &SqlShardRoutingDecision) -> String {
     format!(
-        "Shard route conflict: {} on table {} with shard key {} routes to shard {} owned by node {} at {}; local node {} must not execute this write",
+        "Shard route conflict: {} on table {} with shard key {} routes to shard {} owned by node {} at {}; local node {} is not the owner for this routed operation",
         decision.operation,
         decision.route.table,
         decision.route.shard_key,
@@ -814,6 +877,27 @@ async fn handle_execute(
                     .await;
                 }
                 Ok(ShardWriteRouteAction::Conflict(message)) => {
+                    return json_error(StatusCode::CONFLICT, message);
+                }
+                Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+            }
+
+            match shard_read_route_action_for_statements(
+                &state,
+                &record.statements,
+                &params,
+                context.shard_forwarded,
+            )
+            .await
+            {
+                Ok(ShardReadRouteAction::Local) => {}
+                Ok(ShardReadRouteAction::Forward(decision)) => {
+                    return forward_execute_to_shard_owner(
+                        &state, &context, &record, &payload, &decision,
+                    )
+                    .await;
+                }
+                Ok(ShardReadRouteAction::Conflict(message)) => {
                     return json_error(StatusCode::CONFLICT, message);
                 }
                 Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
@@ -1883,8 +1967,21 @@ mod tests {
         .await;
         let local_envelope: Envelope<Vec<QueryResultJson>> = response_json(local_select).await;
         match &local_envelope.data.expect("local select data")[0] {
-            QueryResultJson::Select { rows, .. } => assert!(rows.is_empty()),
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!("remote")]]);
+            }
             QueryResultJson::Success { .. } => panic!("expected local select"),
+        }
+        let local_storage_probe = Executor::new(local_storage.clone())
+            .execute_sql(&format!(
+                "SELECT name FROM forward_users WHERE id = {}",
+                remote_key
+            ))
+            .await
+            .expect("raw local storage select");
+        match &local_storage_probe[0] {
+            crate::execution::QueryResult::Select { rows, .. } => assert!(rows.is_empty()),
+            crate::execution::QueryResult::Success { .. } => panic!("expected raw local select"),
         }
 
         let owner_select = client
@@ -2016,8 +2113,70 @@ mod tests {
         .await;
         let local_envelope: Envelope<Vec<QueryResultJson>> = response_json(local_select).await;
         match &local_envelope.data.expect("local select data")[0] {
-            QueryResultJson::Select { rows, .. } => assert!(rows.is_empty()),
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!("remote-exec")]]);
+            }
             QueryResultJson::Success { .. } => panic!("expected local select"),
+        }
+
+        let prepare_select_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "sql": "SELECT name FROM forward_exec_users WHERE id = $1"
+                })
+                .to_string(),
+            ))
+            .expect("prepare select request");
+        let prepare_select_response = local_app
+            .clone()
+            .oneshot(prepare_select_request)
+            .await
+            .expect("prepare select response");
+        let prepare_select_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_select_response).await;
+        let prepared_select = prepare_select_envelope
+            .data
+            .expect("prepared select statement");
+        let execute_select_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared_select.statement_id,
+                    "params": [remote_key]
+                })
+                .to_string(),
+            ))
+            .expect("execute select request");
+        let execute_select_response = local_app
+            .clone()
+            .oneshot(execute_select_request)
+            .await
+            .expect("execute select response");
+        assert_eq!(execute_select_response.status(), StatusCode::OK);
+        let execute_select_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_select_response).await;
+        match &execute_select_envelope.data.expect("execute select data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!("remote-exec")]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected forwarded select"),
+        }
+
+        let local_storage_probe = Executor::new(local_storage.clone())
+            .execute_sql(&format!(
+                "SELECT name FROM forward_exec_users WHERE id = {}",
+                remote_key
+            ))
+            .await
+            .expect("raw local storage select");
+        match &local_storage_probe[0] {
+            crate::execution::QueryResult::Select { rows, .. } => assert!(rows.is_empty()),
+            crate::execution::QueryResult::Success { .. } => panic!("expected raw local select"),
         }
 
         let owner_prepared = client

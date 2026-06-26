@@ -632,6 +632,52 @@ impl Executor {
         Ok(decisions)
     }
 
+    pub(crate) async fn shard_read_route_decision_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<SqlShardRoutingDecision>> {
+        let statements = self.prepare(sql)?;
+        self.shard_read_route_decision_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_read_route_decision_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Option<SqlShardRoutingDecision>> {
+        let mut txn = self.storage.begin_transaction().await?;
+        self.shard_read_route_decision_for_statements_in_transaction(statements, &mut *txn, params)
+            .await
+    }
+
+    pub(crate) async fn shard_read_route_decision_for_statements_in_transaction(
+        &self,
+        statements: &[Statement],
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<Option<SqlShardRoutingDecision>> {
+        let Some(router) = self.shard_router.clone() else {
+            return Ok(None);
+        };
+        let [statement] = statements else {
+            return Ok(None);
+        };
+        let Some((table_name, row_id)) = self
+            .shard_point_read_target_for_statement(statement, txn, params)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self::shard_routing_decision_for_row_id(
+            &router,
+            "SELECT",
+            &table_name,
+            row_id,
+        )))
+    }
+
     async fn shard_point_write_targets_for_statement(
         &self,
         statement: &Statement,
@@ -666,6 +712,45 @@ impl Executor {
                 }),
             _ => Ok(Vec::new()),
         }
+    }
+
+    async fn shard_point_read_target_for_statement(
+        &self,
+        statement: &Statement,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<Option<(String, String)>> {
+        let Statement::Query(query) = statement else {
+            return Ok(None);
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Ok(None);
+        };
+        if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+            return Ok(None);
+        }
+        let relation = &select.from[0].relation;
+        let table_name = if let TableFactor::Table { name, .. } = relation {
+            name.to_string()
+        } else {
+            return Ok(None);
+        };
+
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(&table_name, txn)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let allowed_qualifiers = Self::primary_key_qualifiers(relation);
+        Ok(self
+            .primary_key_row_id_from_eq_selection(
+                select.selection.as_ref(),
+                &schema,
+                params,
+                &allowed_qualifiers,
+            )
+            .map(|row_id| (table_name, row_id)))
     }
 
     async fn shard_point_write_targets_for_insert(

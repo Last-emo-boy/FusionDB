@@ -317,6 +317,17 @@ impl PgHandler {
             .await
     }
 
+    async fn shard_read_route_decision_for_sql(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<Option<SqlShardRoutingDecision>, FusionError> {
+        let statements = parse_sql(query)
+            .map_err(|e| FusionError::Execution(format!("Parse Error: {:?}", e)))?;
+        self.shard_read_route_decision_for_statements(&statements, params)
+            .await
+    }
+
     async fn shard_route_conflict_message_for_statements(
         &self,
         statements: &[Statement],
@@ -342,6 +353,19 @@ impl PgHandler {
         Ok(Self::non_local_shard_route_message(decisions))
     }
 
+    async fn shard_read_route_conflict_message_for_statements_in_transaction(
+        &self,
+        statements: &[Statement],
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> std::result::Result<Option<String>, FusionError> {
+        let decision = self
+            .executor
+            .shard_read_route_decision_for_statements_in_transaction(statements, txn, params)
+            .await?;
+        Ok(Self::non_local_shard_read_route_message(decision))
+    }
+
     fn non_local_shard_route_message(decisions: Vec<SqlShardRoutingDecision>) -> Option<String> {
         decisions
             .into_iter()
@@ -349,9 +373,17 @@ impl PgHandler {
             .map(|decision| Self::shard_route_conflict_message(&decision))
     }
 
+    fn non_local_shard_read_route_message(
+        decision: Option<SqlShardRoutingDecision>,
+    ) -> Option<String> {
+        decision
+            .filter(|decision| !decision.is_local_owner())
+            .map(|decision| Self::shard_route_conflict_message(&decision))
+    }
+
     fn shard_route_conflict_message(decision: &SqlShardRoutingDecision) -> String {
         format!(
-            "Shard route conflict: {} on table {} with shard key {} routes to shard {} owned by node {} at {}; local node {} must not execute this write",
+            "Shard route conflict: {} on table {} with shard key {} routes to shard {} owned by node {} at {}; local node {} is not the owner for this routed operation",
             decision.operation,
             decision.route.table,
             decision.route.shard_key,
@@ -372,6 +404,16 @@ impl PgHandler {
             .shard_routing_decisions_for_statements(statements, params)
             .await?;
         Ok(Self::shard_write_route_action(decisions))
+    }
+
+    async fn shard_read_route_decision_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> std::result::Result<Option<SqlShardRoutingDecision>, FusionError> {
+        self.executor
+            .shard_read_route_decision_for_statements(statements, params)
+            .await
     }
 
     fn shard_write_route_action(
@@ -6139,6 +6181,27 @@ impl SimpleQueryHandler for PgHandler {
                         )))]);
                     }
                 }
+                match self
+                    .shard_read_route_conflict_message_for_statements_in_transaction(
+                        std::slice::from_ref(&stmt),
+                        &mut **txn,
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(Some(message)) => {
+                        return Ok(vec![Response::Error(Box::new(Self::shard_route_error(
+                            message,
+                        )))]);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Ok(vec![Response::Error(Box::new(Self::fusion_error(
+                            "Shard read routing error",
+                            &e,
+                        )))]);
+                    }
+                }
             } else {
                 match self
                     .shard_write_route_action_for_statements(std::slice::from_ref(&stmt), &[])
@@ -6166,6 +6229,31 @@ impl SimpleQueryHandler for PgHandler {
                     Err(e) => {
                         return Ok(vec![Response::Error(Box::new(Self::fusion_error(
                             "Shard routing error",
+                            &e,
+                        )))]);
+                    }
+                }
+                match self
+                    .shard_read_route_decision_for_statements(std::slice::from_ref(&stmt), &[])
+                    .await
+                {
+                    Ok(Some(decision)) if !decision.is_local_owner() => {
+                        let forwarded_query = stmt.to_string();
+                        drop(session);
+                        let mut forwarded_responses = self
+                            .forward_simple_query_to_shard_owner(
+                                &forwarded_query,
+                                &username,
+                                &decision,
+                            )
+                            .await?;
+                        responses.append(&mut forwarded_responses);
+                        return Ok(responses);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Ok(vec![Response::Error(Box::new(Self::fusion_error(
+                            "Shard read routing error",
                             &e,
                         )))]);
                     }
@@ -6466,93 +6554,186 @@ impl ExtendedQueryHandler for PgHandler {
         }
 
         let jdbc_client = Self::is_postgresql_jdbc_client(client);
-        let (result, is_metadata_result) =
-            match self.try_execute_pg_metadata_query(&query, &params).await {
-                Ok(Some(result)) => (Ok(result), true),
-                Ok(None) => {
-                    let in_transaction = {
-                        let session = self.session.lock().await;
-                        session.transaction.is_some()
-                    };
-                    if in_transaction {
-                        match self
-                            .shard_route_conflict_message_for_sql(&query, &params)
-                            .await
-                        {
-                            Ok(Some(message)) => {
-                                client
-                                    .send(PgWireBackendMessage::ErrorResponse(
-                                        Self::shard_route_error(message).into(),
-                                    ))
-                                    .await
-                                    .map_err(|_| Self::sink_error())?;
-                                return Ok(());
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                client
-                                    .send(PgWireBackendMessage::ErrorResponse(
-                                        Self::fusion_error("Shard routing error", &e).into(),
-                                    ))
-                                    .await
-                                    .map_err(|_| Self::sink_error())?;
-                                return Ok(());
-                            }
+        let (result, is_metadata_result) = match self
+            .try_execute_pg_metadata_query(&query, &params)
+            .await
+        {
+            Ok(Some(result)) => (Ok(result), true),
+            Ok(None) => {
+                let in_transaction = {
+                    let session = self.session.lock().await;
+                    session.transaction.is_some()
+                };
+                if in_transaction {
+                    match self
+                        .shard_route_conflict_message_for_sql(&query, &params)
+                        .await
+                    {
+                        Ok(Some(message)) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::shard_route_error(message).into(),
+                                ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
                         }
-                    } else {
-                        match self.shard_write_route_action_for_sql(&query, &params).await {
-                            Ok(PgShardWriteRouteAction::Local) => {}
-                            Ok(PgShardWriteRouteAction::Forward(decision)) => {
-                                match self
-                                    .forward_extended_query_to_shard_owner(
-                                        &query, &params, &username, &decision,
-                                    )
-                                    .await?
-                                {
-                                    Ok(results) => {
-                                        self.send_forwarded_extended_query_results(
-                                            client,
-                                            &query,
-                                            &params,
-                                            &result_format_codes,
-                                            jdbc_client,
-                                            results,
-                                        )
-                                        .await?;
-                                    }
-                                    Err(error) => {
-                                        client
-                                            .send(PgWireBackendMessage::ErrorResponse(error.into()))
-                                            .await
-                                            .map_err(|_| Self::sink_error())?;
-                                    }
-                                }
-                                return Ok(());
-                            }
-                            Ok(PgShardWriteRouteAction::Conflict(message)) => {
-                                client
-                                    .send(PgWireBackendMessage::ErrorResponse(
-                                        Self::shard_route_error(message).into(),
-                                    ))
-                                    .await
-                                    .map_err(|_| Self::sink_error())?;
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                client
-                                    .send(PgWireBackendMessage::ErrorResponse(
-                                        Self::fusion_error("Shard routing error", &e).into(),
-                                    ))
-                                    .await
-                                    .map_err(|_| Self::sink_error())?;
-                                return Ok(());
-                            }
+                        Ok(None) => {}
+                        Err(e) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::fusion_error("Shard routing error", &e).into(),
+                                ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
                         }
                     }
-                    (self.execute_first_statement(&query, &params).await, false)
+                    let statements = match parse_sql(&query) {
+                        Ok(statements) => statements,
+                        Err(e) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::fusion_error(
+                                        "Shard read routing error",
+                                        &FusionError::Execution(format!("Parse Error: {:?}", e)),
+                                    )
+                                    .into(),
+                                ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    };
+                    let mut session = self.session.lock().await;
+                    let Some(txn) = session.transaction.as_mut() else {
+                        drop(session);
+                        return Ok(());
+                    };
+                    match self
+                        .shard_read_route_conflict_message_for_statements_in_transaction(
+                            &statements,
+                            &mut **txn,
+                            &params,
+                        )
+                        .await
+                    {
+                        Ok(Some(message)) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::shard_route_error(message).into(),
+                                ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::fusion_error("Shard read routing error", &e).into(),
+                                ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    match self.shard_write_route_action_for_sql(&query, &params).await {
+                        Ok(PgShardWriteRouteAction::Local) => {}
+                        Ok(PgShardWriteRouteAction::Forward(decision)) => {
+                            match self
+                                .forward_extended_query_to_shard_owner(
+                                    &query, &params, &username, &decision,
+                                )
+                                .await?
+                            {
+                                Ok(results) => {
+                                    self.send_forwarded_extended_query_results(
+                                        client,
+                                        &query,
+                                        &params,
+                                        &result_format_codes,
+                                        jdbc_client,
+                                        results,
+                                    )
+                                    .await?;
+                                }
+                                Err(error) => {
+                                    client
+                                        .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                        .await
+                                        .map_err(|_| Self::sink_error())?;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Ok(PgShardWriteRouteAction::Conflict(message)) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::shard_route_error(message).into(),
+                                ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::fusion_error("Shard routing error", &e).into(),
+                                ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .shard_read_route_decision_for_sql(&query, &params)
+                        .await
+                    {
+                        Ok(Some(decision)) if !decision.is_local_owner() => {
+                            match self
+                                .forward_extended_query_to_shard_owner(
+                                    &query, &params, &username, &decision,
+                                )
+                                .await?
+                            {
+                                Ok(results) => {
+                                    self.send_forwarded_extended_query_results(
+                                        client,
+                                        &query,
+                                        &params,
+                                        &result_format_codes,
+                                        jdbc_client,
+                                        results,
+                                    )
+                                    .await?;
+                                }
+                                Err(error) => {
+                                    client
+                                        .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                        .await
+                                        .map_err(|_| Self::sink_error())?;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(
+                                    Self::fusion_error("Shard read routing error", &e).into(),
+                                ))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
                 }
-                Err(e) => (Err(e), false),
-            };
+                (self.execute_first_statement(&query, &params).await, false)
+            }
+            Err(e) => (Err(e), false),
+        };
 
         match result {
             Ok(res) => match res {

@@ -1698,6 +1698,7 @@ async fn test_pg_protocol_copy_from_stdin_forwards_non_local_shard_owner_rows() 
         &StorageConfig::default(),
         Some(local_router),
     ));
+    let local_storage_probe = local_storage.clone();
     let pg_port = next_pg_test_port();
     tokio::spawn(async move {
         pg_server::start_pg_server(
@@ -1778,7 +1779,22 @@ async fn test_pg_protocol_copy_from_stdin_forwards_non_local_shard_owner_rows() 
         )
         .await
         .expect("local SELECT failed");
-    assert!(local_rows.is_empty(), "forwarded row should not be local");
+    assert_eq!(local_rows.len(), 1, "local pgwire SELECT should forward");
+    assert_eq!(local_rows[0].get::<_, i32>("id"), remote_key);
+    assert_eq!(local_rows[0].get::<_, String>("name"), "remote");
+    let raw_local_rows = Executor::new(local_storage_probe)
+        .execute_sql(&format!(
+            "SELECT * FROM pg_route_copy_forward WHERE id = {}",
+            remote_key
+        ))
+        .await
+        .expect("raw local storage SELECT failed");
+    match &raw_local_rows[0] {
+        fusiondb::execution::QueryResult::Select { rows, .. } => {
+            assert!(rows.is_empty(), "forwarded row should not be local")
+        }
+        fusiondb::execution::QueryResult::Success { .. } => panic!("expected raw local select"),
+    }
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
@@ -2480,6 +2496,7 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         &StorageConfig::default(),
         Some(local_router),
     ));
+    let local_storage_probe = local_storage.clone();
     let pg_port = next_pg_test_port();
     tokio::spawn(async move {
         pg_server::start_pg_server(
@@ -2556,7 +2573,20 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         .iter()
         .filter(|message| matches!(message, tokio_postgres::SimpleQueryMessage::Row(_)))
         .count();
-    assert_eq!(local_row_count, 0, "forwarded row should not be local");
+    assert_eq!(local_row_count, 1, "local pgwire SELECT should forward");
+    let raw_local_rows = Executor::new(local_storage_probe)
+        .execute_sql(&format!(
+            "SELECT * FROM pg_route_forward WHERE id = {}",
+            remote_key
+        ))
+        .await
+        .expect("raw local storage SELECT failed");
+    match &raw_local_rows[0] {
+        fusiondb::execution::QueryResult::Select { rows, .. } => {
+            assert!(rows.is_empty(), "forwarded row should not be local")
+        }
+        fusiondb::execution::QueryResult::Success { .. } => panic!("expected raw local select"),
+    }
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
@@ -2762,6 +2792,7 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
         &StorageConfig::default(),
         Some(local_router),
     ));
+    let local_storage_probe = local_storage.clone();
     let pg_port = next_pg_test_port();
     tokio::spawn(async move {
         pg_server::start_pg_server(
@@ -2838,7 +2869,22 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
         )
         .await
         .expect("local SELECT failed");
-    assert!(local_rows.is_empty(), "forwarded row should not be local");
+    assert_eq!(local_rows.len(), 1, "local pgwire SELECT should forward");
+    assert_eq!(local_rows[0].get::<_, i64>("id"), remote_key);
+    assert_eq!(local_rows[0].get::<_, String>("name"), "remote");
+    let raw_local_rows = Executor::new(local_storage_probe)
+        .execute_sql(&format!(
+            "SELECT * FROM pg_route_extended_forward WHERE id = {}",
+            remote_key
+        ))
+        .await
+        .expect("raw local storage SELECT failed");
+    match &raw_local_rows[0] {
+        fusiondb::execution::QueryResult::Select { rows, .. } => {
+            assert!(rows.is_empty(), "forwarded row should not be local")
+        }
+        fusiondb::execution::QueryResult::Success { .. } => panic!("expected raw local select"),
+    }
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
