@@ -6,7 +6,7 @@ use fusiondb::config::{
 };
 use fusiondb::distributed::sharding::ShardRouter;
 use fusiondb::execution::Executor;
-use fusiondb::server::pg_server;
+use fusiondb::server::{http_server, pg_server};
 use fusiondb::storage::memory::MemoryStorage;
 use fusiondb::storage::FusionStorage;
 use fusiondb::storage::Storage;
@@ -18,15 +18,24 @@ use tokio_postgres::types::Type;
 use tokio_postgres::NoTls;
 
 static NEXT_PG_TEST_PORT: AtomicU16 = AtomicU16::new(20000);
+static NEXT_HTTP_TEST_PORT: AtomicU16 = AtomicU16::new(21000);
 
 fn next_pg_test_port() -> u16 {
+    next_test_port(&NEXT_PG_TEST_PORT)
+}
+
+fn next_http_test_port() -> u16 {
+    next_test_port(&NEXT_HTTP_TEST_PORT)
+}
+
+fn next_test_port(counter: &AtomicU16) -> u16 {
     for _ in 0..10_000 {
-        let port = NEXT_PG_TEST_PORT.fetch_add(1, Ordering::Relaxed);
+        let port = counter.fetch_add(1, Ordering::Relaxed);
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
-    panic!("failed to allocate a free PgWire test port");
+    panic!("failed to allocate a free test port");
 }
 
 fn unique_pg_storage_dir(test_name: &str) -> std::path::PathBuf {
@@ -38,9 +47,17 @@ fn cleanup_storage_dir(path: &std::path::Path) {
 }
 
 fn sharded_pg_test_config(shard_count: u64) -> Config {
+    sharded_pg_test_config_with_owner_addr(shard_count, "127.0.0.1:8093".to_string(), 1)
+}
+
+fn sharded_pg_test_config_with_owner_addr(
+    shard_count: u64,
+    owner_addr: String,
+    local_node_id: u64,
+) -> Config {
     let mut config = Config::default();
     config.distributed.enabled = true;
-    config.distributed.node_id = 1;
+    config.distributed.node_id = local_node_id;
     config.distributed.initial_members = vec![
         DistributedPeerConfig {
             node_id: 1,
@@ -48,7 +65,7 @@ fn sharded_pg_test_config(shard_count: u64) -> Config {
         },
         DistributedPeerConfig {
             node_id: 2,
-            addr: "127.0.0.1:8093".to_string(),
+            addr: owner_addr,
         },
     ];
     config.distributed.sharding = ShardingConfig {
@@ -2245,6 +2262,153 @@ async fn test_pg_protocol_extended_tpcc_payment_district_update_count() {
     assert_eq!(rows[0].get::<_, String>("d_ytd_text"), "32849.77001953125");
 
     let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
+async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
+    let owner_wal_path = format!(
+        "test_pg_shard_owner_forward_owner_{}.wal",
+        uuid::Uuid::new_v4()
+    );
+    let local_wal_path = format!(
+        "test_pg_shard_owner_forward_local_{}.wal",
+        uuid::Uuid::new_v4()
+    );
+    let owner_storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&owner_wal_path).expect("Failed to create owner storage"));
+    let local_storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&local_wal_path).expect("Failed to create local storage"));
+
+    let owner_http_port = next_http_test_port();
+    let owner_addr = format!("127.0.0.1:{}", owner_http_port);
+    let local_config = sharded_pg_test_config_with_owner_addr(4, owner_addr.clone(), 1);
+    let owner_config = sharded_pg_test_config_with_owner_addr(4, owner_addr.clone(), 2);
+    let local_router = ShardRouter::from_config(&local_config).expect("local shard router");
+    let owner_router = ShardRouter::from_config(&owner_config).expect("owner shard router");
+    let remote_key = integer_primary_key_for_owner(&local_router, "pg_route_forward", 2);
+
+    let owner_executor = Arc::new(Executor::with_config_and_shard_router(
+        owner_storage.clone(),
+        &StorageConfig::default(),
+        Some(owner_router.clone()),
+    ));
+    tokio::spawn(async move {
+        #[allow(deprecated)]
+        http_server::start_http_server(
+            owner_executor,
+            owner_storage,
+            "127.0.0.1",
+            owner_http_port,
+            None,
+            None,
+            "raft(node_id=2)".to_string(),
+            Some(owner_router),
+        )
+        .await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let http_client = reqwest::Client::new();
+    let owner_query_url = format!("http://{}/query", owner_addr);
+    let owner_create_response = http_client
+        .post(&owner_query_url)
+        .json(&serde_json::json!({
+            "sql": "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT)"
+        }))
+        .send()
+        .await
+        .expect("owner CREATE TABLE request failed");
+    assert!(
+        owner_create_response.status().is_success(),
+        "owner CREATE TABLE failed with HTTP {}",
+        owner_create_response.status()
+    );
+
+    let local_executor = Arc::new(Executor::with_config_and_shard_router(
+        local_storage.clone(),
+        &StorageConfig::default(),
+        Some(local_router),
+    ));
+    let pg_port = next_pg_test_port();
+    tokio::spawn(async move {
+        pg_server::start_pg_server(
+            local_executor,
+            local_storage,
+            "127.0.0.1",
+            pg_port,
+            "fusiondb",
+            None,
+        )
+        .await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            pg_port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query("CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT)")
+        .await
+        .expect("local CREATE TABLE failed");
+    client
+        .simple_query(&format!(
+            "INSERT INTO pg_route_forward VALUES ({}, 'remote')",
+            remote_key
+        ))
+        .await
+        .expect("remote owner insert should forward");
+
+    let owner_select_response = http_client
+        .post(&owner_query_url)
+        .json(&serde_json::json!({
+            "sql": format!("SELECT * FROM pg_route_forward WHERE id = {}", remote_key)
+        }))
+        .send()
+        .await
+        .expect("owner SELECT request failed");
+    assert!(
+        owner_select_response.status().is_success(),
+        "owner SELECT failed with HTTP {}",
+        owner_select_response.status()
+    );
+    let owner_select_json: serde_json::Value = owner_select_response
+        .json()
+        .await
+        .expect("owner SELECT response should be JSON");
+    let rows = owner_select_json["data"][0]["Select"]["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("owner SELECT rows missing: {}", owner_select_json));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], serde_json::json!(remote_key));
+    assert_eq!(rows[0][1], serde_json::json!("remote"));
+
+    let local_messages = client
+        .simple_query(&format!(
+            "SELECT * FROM pg_route_forward WHERE id = {}",
+            remote_key
+        ))
+        .await
+        .expect("local SELECT failed");
+    let local_row_count = local_messages
+        .iter()
+        .filter(|message| matches!(message, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(local_row_count, 0, "forwarded row should not be local");
+
+    let _ = std::fs::remove_file(&owner_wal_path);
+    let _ = std::fs::remove_file(&local_wal_path);
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 use bytes::{BufMut, BytesMut};
 use chrono::Datelike;
 use futures::{Sink, SinkExt};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -40,6 +41,8 @@ use crate::parser::parse_sql;
 use crate::storage::{Storage, Transaction};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 100;
+const SHARD_OWNER_FORWARD_HEADER: &str = "x-fusiondb-forwarded";
+const SHARD_OWNER_FORWARD_VALUE: &str = "shard-owner";
 
 fn effective_max_connections(max_connections: usize) -> usize {
     max_connections.max(1)
@@ -128,6 +131,35 @@ pub struct PgHandler {
     storage: Arc<dyn Storage>,
     query_parser: Arc<NoopQueryParser>,
     session: Arc<Mutex<Session>>,
+    http_client: reqwest::Client,
+}
+
+enum PgShardWriteRouteAction {
+    Local,
+    Forward(SqlShardRoutingDecision),
+    Conflict(String),
+}
+
+#[derive(Serialize)]
+struct ForwardQueryRequest<'a> {
+    sql: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ForwardEnvelope<T> {
+    data: Option<T>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+enum ForwardQueryResultJson {
+    Select {
+        columns: Vec<String>,
+        rows: Vec<Vec<serde_json::Value>>,
+    },
+    Success {
+        message: String,
+    },
 }
 
 impl PgHandler {
@@ -145,6 +177,7 @@ impl PgHandler {
                 portals: HashMap::new(),
                 copy_in: None,
             })),
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -291,6 +324,166 @@ impl PgHandler {
             decision.route.owner_addr,
             decision.local_node_id
         )
+    }
+
+    async fn shard_write_route_action_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> std::result::Result<PgShardWriteRouteAction, FusionError> {
+        let decisions = self
+            .executor
+            .shard_routing_decisions_for_statements(statements, params)
+            .await?;
+        Ok(Self::shard_write_route_action(decisions))
+    }
+
+    fn shard_write_route_action(
+        decisions: Vec<SqlShardRoutingDecision>,
+    ) -> PgShardWriteRouteAction {
+        let non_local: Vec<_> = decisions
+            .iter()
+            .filter(|decision| !decision.is_local_owner())
+            .collect();
+        if non_local.is_empty() {
+            return PgShardWriteRouteAction::Local;
+        }
+
+        let first = non_local[0];
+        if decisions
+            .iter()
+            .any(SqlShardRoutingDecision::is_local_owner)
+        {
+            return PgShardWriteRouteAction::Conflict(Self::multi_shard_route_conflict_message(
+                first,
+                "mixed local and non-local shard-owner writes require distributed transactions and are not yet supported",
+            ));
+        }
+
+        if non_local.iter().any(|decision| {
+            decision.route.owner_node_id != first.route.owner_node_id
+                || decision.route.owner_addr != first.route.owner_addr
+        }) {
+            return PgShardWriteRouteAction::Conflict(Self::multi_shard_route_conflict_message(
+                first,
+                "multi-owner shard writes require distributed transactions and are not yet supported",
+            ));
+        }
+
+        PgShardWriteRouteAction::Forward((*first).clone())
+    }
+
+    fn multi_shard_route_conflict_message(
+        decision: &SqlShardRoutingDecision,
+        reason: &str,
+    ) -> String {
+        format!(
+            "{}; {}",
+            Self::shard_route_conflict_message(decision),
+            reason
+        )
+    }
+
+    async fn forward_simple_query_to_shard_owner(
+        &self,
+        query: &str,
+        username: &str,
+        decision: &SqlShardRoutingDecision,
+    ) -> PgWireResult<Vec<Response>> {
+        let route_conflict = Self::shard_route_conflict_message(decision);
+        let url = format!("http://{}/query", decision.route.owner_addr);
+        let mut request = self
+            .http_client
+            .post(&url)
+            .header(SHARD_OWNER_FORWARD_HEADER, SHARD_OWNER_FORWARD_VALUE)
+            .json(&ForwardQueryRequest { sql: query });
+        if !username.is_empty() {
+            request = request.header("x-fusiondb-user", username);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(vec![Response::Error(Box::new(Self::shard_route_error(
+                    format!(
+                        "{}; shard owner forwarding to node {} at {} failed: {}",
+                        route_conflict, decision.route.owner_node_id, decision.route.owner_addr, e
+                    ),
+                )))]);
+            }
+        };
+        let status = response.status();
+        let envelope = match response
+            .json::<ForwardEnvelope<Vec<ForwardQueryResultJson>>>()
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                return Ok(vec![Response::Error(Box::new(Self::shard_route_error(
+                    format!(
+                        "{}; shard owner forwarding response from node {} at {} could not be decoded: {}",
+                        route_conflict,
+                        decision.route.owner_node_id,
+                        decision.route.owner_addr,
+                        e
+                    ),
+                )))]);
+            }
+        };
+
+        if !status.is_success() {
+            let message = envelope.error.unwrap_or_else(|| {
+                format!(
+                    "Shard owner forwarding error: node {} at {} returned HTTP {}",
+                    decision.route.owner_node_id, decision.route.owner_addr, status
+                )
+            });
+            let error = if message.contains("Shard route conflict") {
+                Self::shard_route_error(message)
+            } else {
+                Self::execution_error(message)
+            };
+            return Ok(vec![Response::Error(Box::new(error))]);
+        }
+
+        let Some(results) = envelope.data else {
+            return Ok(vec![Response::Error(Box::new(Self::execution_error(
+                "Shard owner forwarding error: response did not include query results",
+            )))]);
+        };
+
+        Self::responses_from_forwarded_query_results(results)
+    }
+
+    fn responses_from_forwarded_query_results(
+        results: Vec<ForwardQueryResultJson>,
+    ) -> PgWireResult<Vec<Response>> {
+        let mut responses = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                ForwardQueryResultJson::Select { columns, rows } => {
+                    let rows = rows
+                        .into_iter()
+                        .map(|row| row.iter().map(Value::from_json).collect::<Vec<_>>())
+                        .collect::<Vec<_>>();
+                    let fields = Self::infer_text_fields(&columns, &rows);
+                    let mut data_rows = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        data_rows.push(Self::encode_row(fields.clone(), row)?);
+                    }
+                    responses.push(Response::Query(QueryResponse::new(
+                        fields,
+                        futures::stream::iter(data_rows.into_iter().map(Ok)),
+                    )));
+                }
+                ForwardQueryResultJson::Success { message } => {
+                    responses.push(Response::Execution(Tag::new(&Self::pg_command_tag(
+                        &message,
+                    ))));
+                }
+            }
+        }
+        Ok(responses)
     }
 
     fn is_pg_metadata_query(query: &str) -> bool {
@@ -5571,32 +5764,60 @@ impl SimpleQueryHandler for PgHandler {
                 _ => {}
             }
 
-            let shard_route_conflict = if let Some(txn) = session.transaction.as_mut() {
-                self.shard_route_conflict_message_for_statements_in_transaction(
-                    std::slice::from_ref(&stmt),
-                    &mut **txn,
-                    &[],
-                )
-                .await
-            } else {
-                self.shard_route_conflict_message_for_statements(std::slice::from_ref(&stmt), &[])
+            if let Some(txn) = session.transaction.as_mut() {
+                match self
+                    .shard_route_conflict_message_for_statements_in_transaction(
+                        std::slice::from_ref(&stmt),
+                        &mut **txn,
+                        &[],
+                    )
                     .await
-            };
-            match shard_route_conflict {
-                Ok(Some(message)) => {
-                    return Ok(vec![Response::Error(Box::new(Self::shard_route_error(
-                        message,
-                    )))]);
+                {
+                    Ok(Some(message)) => {
+                        return Ok(vec![Response::Error(Box::new(Self::shard_route_error(
+                            message,
+                        )))]);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Ok(vec![Response::Error(Box::new(Self::fusion_error(
+                            "Shard routing error",
+                            &e,
+                        )))]);
+                    }
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    return Ok(vec![Response::Error(Box::new(Self::fusion_error(
-                        "Shard routing error",
-                        &e,
-                    )))]);
+            } else {
+                match self
+                    .shard_write_route_action_for_statements(std::slice::from_ref(&stmt), &[])
+                    .await
+                {
+                    Ok(PgShardWriteRouteAction::Local) => {}
+                    Ok(PgShardWriteRouteAction::Forward(decision)) => {
+                        let forwarded_query = stmt.to_string();
+                        drop(session);
+                        let mut forwarded_responses = self
+                            .forward_simple_query_to_shard_owner(
+                                &forwarded_query,
+                                &username,
+                                &decision,
+                            )
+                            .await?;
+                        responses.append(&mut forwarded_responses);
+                        return Ok(responses);
+                    }
+                    Ok(PgShardWriteRouteAction::Conflict(message)) => {
+                        return Ok(vec![Response::Error(Box::new(Self::shard_route_error(
+                            message,
+                        )))]);
+                    }
+                    Err(e) => {
+                        return Ok(vec![Response::Error(Box::new(Self::fusion_error(
+                            "Shard routing error",
+                            &e,
+                        )))]);
+                    }
                 }
             }
-
             // Execute Normal Statements
             let result = if session.transaction.is_some() {
                 // Execute in current transaction

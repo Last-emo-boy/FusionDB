@@ -1007,7 +1007,7 @@ These are known gaps that should be addressed before production use:
 - Snapshot transfer serializes visible key-value state for new node bootstrap
 - Sharding has a configurable hash/range control plane, route API, local row-data shard key layout (`shard:{id}:data:{table}:{row_id}`), and local secondary-index KV shard layouts (`shard:{id}:index:*`, `shard:{id}:fts:*`)
 - HTTP and pgwire SQL execution now reject deterministic non-local shard-owner point writes (`INSERT ... VALUES` with an explicit primary key, pgwire `COPY FROM STDIN` rows with an explicit primary key, plus `UPDATE`/`DELETE` by primary-key equality) with a route hint instead of silently executing them on the wrong node, including pgwire writes against schemas created earlier in the same session transaction
-- HTTP `/query` and prepared `/execute` can forward deterministic point writes whose routed rows all target one non-local shard owner to that owner's HTTP endpoint; mixed local/remote writes, multi-owner writes, pgwire, and broad multi-shard query routing are still conservative
+- HTTP `/query`, HTTP prepared `/execute`, and pgwire simple query can forward deterministic point writes whose routed rows all target one non-local shard owner to that owner's HTTP endpoint; mixed local/remote writes, multi-owner writes, pgwire extended query/COPY, and broad multi-shard query routing are still conservative
 - Distributed index ownership/maintenance and broad cross-node query planning are still in progress
 - No dedicated read-replica topology management
 - No distributed transactions (2PC)
