@@ -1,0 +1,43 @@
+{
+  "id": "BENCHPROD-429",
+  "title": "Fan out simple single-table SELECT scans across shard owners",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-429"
+  ],
+  "scope": [
+    "src/execution/mod.rs",
+    "src/server/http_server.rs",
+    "src/server/pg_server.rs",
+    "tests/pg_integration.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Continue P5-3 by starting broad cross-node query planning with conservative fan-out for simple single-table SELECT scans over HTTP /query and pgwire simple query.",
+  "verification": [
+    "cargo check --bins",
+    "cargo test http_query_fanouts_simple_select_across_shard_owners -- --nocapture",
+    "cargo test --test pg_integration test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert -- --nocapture",
+    "cargo test shard_owner -- --nocapture",
+    "cargo test --lib",
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo test --test pg_integration shard_owner -- --nocapture"
+  ],
+  "code_commit": "3aac6f3",
+  "cleanup": [
+    "Measured target/ at approximately 14.71 GiB after verification",
+    "cargo clean removed 9374 files, 14.7 GiB total"
+  ],
+  "remaining_gaps": [
+    "P5-3 HTTP prepared /execute and pgwire extended-query broad SELECT fan-out remain open",
+    "P5-3 aggregate, DISTINCT, ORDER BY/LIMIT, join, subquery, and set-operation distributed planning remain open",
+    "P5-3 mixed local/non-local point writes and multi-owner point writes remain conservative",
+    "P5-3 distributed index ownership and maintenance remain open",
+    "P5-3 INSERT/COPY routing remains conservative for generated/default primary keys, composite primary keys, INSERT ... SELECT, partially nondeterministic VALUES rows, and COPY column lists that omit the primary key",
+    "P5-3 HNSW/vector and trigram in-memory index shard ownership remain open",
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations"
+  ]
+}
