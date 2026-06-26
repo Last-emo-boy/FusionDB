@@ -437,6 +437,12 @@ async fn handle_query(
         return response;
     }
 
+    if let Some(response) =
+        try_fanout_sum_query_to_shard_owners(&state, &context, &payload.sql).await
+    {
+        return response;
+    }
+
     if let Some(response) = try_fanout_query_to_shard_owners(&state, &context, &payload.sql).await {
         return response;
     }
@@ -863,6 +869,74 @@ async fn try_fanout_count_query_to_shard_owners(
     }]))
 }
 
+async fn try_fanout_sum_query_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    let owners = match state
+        .executor
+        .shard_sum_select_fanout_owners_for_sql(sql, &[])
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard sum fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match state.executor.execute_sql(sql).await {
+        Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Execution Error: {:?}", e),
+            ));
+        }
+    };
+
+    let (columns, mut total) = match fanout_sum_from_select_results(local_results) {
+        Ok(sum) => sum,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+
+    for owner in owners {
+        let owner_results = match query_remote_shard_owner(state, context, sql, &owner).await {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let (owner_columns, owner_sum) = match fanout_sum_from_select_results(owner_results) {
+            Ok(sum) => sum,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+        if owner_columns != columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard sum fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ),
+            ));
+        }
+        if let Err(message) = add_fanout_sum(&mut total, owner_sum) {
+            return Some(json_error(StatusCode::BAD_GATEWAY, message));
+        }
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns,
+        rows: vec![vec![fanout_sum_to_json(total)]],
+    }]))
+}
+
 async fn query_remote_shard_owner(
     state: &AppState,
     context: &RequestContext,
@@ -978,6 +1052,88 @@ fn fanout_count_from_select_results(
         ));
     };
     Ok((columns.clone(), count))
+}
+
+#[derive(Clone, Copy)]
+enum FanoutSum {
+    Integer(i64),
+    Float(f64),
+}
+
+fn fanout_sum_from_select_results(
+    results: Vec<QueryResultJson>,
+) -> std::result::Result<(Vec<String>, Option<FanoutSum>), String> {
+    let [result] = results.as_slice() else {
+        return Err("Shard sum fan-out expected exactly one SELECT result".to_string());
+    };
+    let QueryResultJson::Select { columns, rows, .. } = result else {
+        return Err("Shard sum fan-out received a non-SELECT result".to_string());
+    };
+    if columns.len() != 1 || rows.len() != 1 || rows[0].len() != 1 {
+        return Err("Shard sum fan-out expected one row with one sum column".to_string());
+    }
+    Ok((columns.clone(), fanout_sum_json_value(&rows[0][0])?))
+}
+
+fn fanout_sum_json_value(
+    value: &serde_json::Value,
+) -> std::result::Result<Option<FanoutSum>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(value) = value.as_i64() {
+        return Ok(Some(FanoutSum::Integer(value)));
+    }
+    if let Some(value) = value.as_u64() {
+        let value = i64::try_from(value).map_err(|_| {
+            format!(
+                "Shard sum fan-out received an out-of-range integer sum value: {}",
+                value
+            )
+        })?;
+        return Ok(Some(FanoutSum::Integer(value)));
+    }
+    if let Some(value) = value.as_f64() {
+        if value.is_finite() {
+            return Ok(Some(FanoutSum::Float(value)));
+        }
+    }
+    Err(format!(
+        "Shard sum fan-out received a non-numeric sum value: {}",
+        value
+    ))
+}
+
+fn add_fanout_sum(
+    total: &mut Option<FanoutSum>,
+    value: Option<FanoutSum>,
+) -> std::result::Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    *total = Some(match (*total, value) {
+        (None, value) => value,
+        (Some(FanoutSum::Integer(left)), FanoutSum::Integer(right)) => FanoutSum::Integer(
+            left.checked_add(right)
+                .ok_or("Shard sum fan-out overflow")?,
+        ),
+        (Some(FanoutSum::Integer(left)), FanoutSum::Float(right)) => {
+            FanoutSum::Float(left as f64 + right)
+        }
+        (Some(FanoutSum::Float(left)), FanoutSum::Integer(right)) => {
+            FanoutSum::Float(left + right as f64)
+        }
+        (Some(FanoutSum::Float(left)), FanoutSum::Float(right)) => FanoutSum::Float(left + right),
+    });
+    Ok(())
+}
+
+fn fanout_sum_to_json(total: Option<FanoutSum>) -> serde_json::Value {
+    match total {
+        None => serde_json::Value::Null,
+        Some(FanoutSum::Integer(value)) => serde_json::json!(value),
+        Some(FanoutSum::Float(value)) => serde_json::json!(value),
+    }
 }
 
 async fn handle_tables(
@@ -1173,6 +1329,19 @@ async fn handle_execute(
                 return response;
             }
 
+            if let Some(response) = try_fanout_sum_execute_to_shard_owners(
+                &state,
+                &context,
+                &record,
+                &payload,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
             if let Some(response) = try_fanout_execute_to_shard_owners(
                 &state,
                 &context,
@@ -1309,6 +1478,75 @@ async fn try_fanout_count_execute_to_shard_owners(
         r#type: "select".to_string(),
         columns,
         rows: vec![vec![serde_json::json!(total)]],
+    }]))
+}
+
+async fn try_fanout_sum_execute_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    let owners = match state
+        .executor
+        .shard_sum_select_fanout_owners_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard sum fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match execute_prepared_locally_for_fanout(state, record, params).await {
+        Ok(results) => results,
+        Err(response) => return Some(response),
+    };
+    let (columns, mut total) = match fanout_sum_from_select_results(local_results) {
+        Ok(sum) => sum,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+
+    for owner in owners {
+        let owner_results = match query_remote_prepared_shard_owner(
+            state, context, record, payload, &owner,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let (owner_columns, owner_sum) = match fanout_sum_from_select_results(owner_results) {
+            Ok(sum) => sum,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+        if owner_columns != columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard sum fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ),
+            ));
+        }
+        if let Err(message) = add_fanout_sum(&mut total, owner_sum) {
+            return Some(json_error(StatusCode::BAD_GATEWAY, message));
+        }
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns,
+        rows: vec![vec![fanout_sum_to_json(total)]],
     }]))
 }
 
@@ -2637,7 +2875,8 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let create_sql = "CREATE TABLE fanout_users (id INTEGER PRIMARY KEY, name TEXT)";
+        let create_sql =
+            "CREATE TABLE fanout_users (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER)";
         assert_eq!(
             post_query(&local_app, create_sql).await.status(),
             StatusCode::OK
@@ -2654,7 +2893,7 @@ mod tests {
             post_query(
                 &local_app,
                 &format!(
-                    "INSERT INTO fanout_users (id, name) VALUES ({}, 'local')",
+                    "INSERT INTO fanout_users (id, name, amount) VALUES ({}, 'local', 10)",
                     local_key
                 ),
             )
@@ -2666,7 +2905,7 @@ mod tests {
             post_query(
                 &local_app,
                 &format!(
-                    "INSERT INTO fanout_users (id, name) VALUES ({}, 'remote')",
+                    "INSERT INTO fanout_users (id, name, amount) VALUES ({}, 'remote', 20)",
                     remote_key
                 ),
             )
@@ -2700,6 +2939,16 @@ mod tests {
                 assert_eq!(rows, &vec![vec![serde_json::json!(2)]]);
             }
             QueryResultJson::Success { .. } => panic!("expected fanout count"),
+        }
+
+        let sum_select = post_query(&local_app, "SELECT SUM(amount) FROM fanout_users").await;
+        assert_eq!(sum_select.status(), StatusCode::OK);
+        let sum_envelope: Envelope<Vec<QueryResultJson>> = response_json(sum_select).await;
+        match &sum_envelope.data.expect("sum data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(30)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout sum"),
         }
 
         let _ = std::fs::remove_file(&local_wal_path);
@@ -2742,7 +2991,8 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let create_sql = "CREATE TABLE forward_exec_users (id INTEGER PRIMARY KEY, name TEXT)";
+        let create_sql =
+            "CREATE TABLE forward_exec_users (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER)";
         let local_create = post_query(&local_app, create_sql).await;
         assert_eq!(local_create.status(), StatusCode::OK);
         let owner_create = client
@@ -2756,7 +3006,7 @@ mod tests {
             post_query(
                 &local_app,
                 &format!(
-                    "INSERT INTO forward_exec_users (id, name) VALUES ({}, 'local-exec')",
+                    "INSERT INTO forward_exec_users (id, name, amount) VALUES ({}, 'local-exec', 10)",
                     local_key
                 ),
             )
@@ -2771,7 +3021,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "sql": "INSERT INTO forward_exec_users (id, name) VALUES ($1, $2); SELECT name FROM forward_exec_users WHERE id = $1"
+                    "sql": "INSERT INTO forward_exec_users (id, name, amount) VALUES ($1, $2, $3); SELECT name FROM forward_exec_users WHERE id = $1"
                 })
                 .to_string(),
             ))
@@ -2792,7 +3042,7 @@ mod tests {
             .body(Body::from(
                 serde_json::json!({
                     "statement_id": prepared.statement_id,
-                    "params": [remote_key, "remote-exec"]
+                    "params": [remote_key, "remote-exec", 20]
                 })
                 .to_string(),
             ))
@@ -2985,6 +3235,52 @@ mod tests {
                 assert_eq!(rows, &vec![vec![serde_json::json!(2)]]);
             }
             QueryResultJson::Success { .. } => panic!("expected fanout count"),
+        }
+
+        let prepare_sum_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "sql": "SELECT SUM(amount) FROM forward_exec_users"
+                })
+                .to_string(),
+            ))
+            .expect("prepare sum request");
+        let prepare_sum_response = local_app
+            .clone()
+            .oneshot(prepare_sum_request)
+            .await
+            .expect("prepare sum response");
+        let prepare_sum_envelope: Envelope<PreparedStatementInfo> =
+            response_json(prepare_sum_response).await;
+        let prepared_sum = prepare_sum_envelope.data.expect("prepared sum statement");
+        let execute_sum_request = HttpRequest::builder()
+            .method("POST")
+            .uri("/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "statement_id": prepared_sum.statement_id,
+                    "params": []
+                })
+                .to_string(),
+            ))
+            .expect("execute sum request");
+        let execute_sum_response = local_app
+            .clone()
+            .oneshot(execute_sum_request)
+            .await
+            .expect("execute sum response");
+        assert_eq!(execute_sum_response.status(), StatusCode::OK);
+        let execute_sum_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(execute_sum_response).await;
+        match &execute_sum_envelope.data.expect("execute sum data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(30)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout sum"),
         }
 
         let local_storage_probe = Executor::new(local_storage.clone())

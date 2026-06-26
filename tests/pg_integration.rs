@@ -2481,7 +2481,7 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
     let owner_create_response = http_client
         .post(&owner_query_url)
         .json(&serde_json::json!({
-            "sql": "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT)"
+            "sql": "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER)"
         }))
         .send()
         .await
@@ -2528,19 +2528,21 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
     });
 
     client
-        .simple_query("CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT)")
+        .simple_query(
+            "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER)",
+        )
         .await
         .expect("local CREATE TABLE failed");
     client
         .simple_query(&format!(
-            "INSERT INTO pg_route_forward VALUES ({}, 'local')",
+            "INSERT INTO pg_route_forward VALUES ({}, 'local', 10)",
             local_key
         ))
         .await
         .expect("local owner insert should succeed");
     client
         .simple_query(&format!(
-            "INSERT INTO pg_route_forward VALUES ({}, 'remote')",
+            "INSERT INTO pg_route_forward VALUES ({}, 'remote', 20)",
             remote_key
         ))
         .await
@@ -2636,6 +2638,21 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         })
         .expect("count row");
     assert_eq!(count_value, "2");
+
+    let sum_messages = client
+        .simple_query("SELECT SUM(amount) FROM pg_route_forward")
+        .await
+        .expect("fanout SUM failed");
+    let sum_value = sum_messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(row.get("SUM(amount)").expect("sum").to_string())
+            }
+            _ => None,
+        })
+        .expect("sum row");
+    assert_eq!(sum_value, "30");
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
@@ -2830,7 +2847,7 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
     let owner_create_response = http_client
         .post(&owner_query_url)
         .json(&serde_json::json!({
-            "sql": "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT)"
+            "sql": "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT, amount BIGINT)"
         }))
         .send()
         .await
@@ -2877,21 +2894,23 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
     });
 
     client
-        .simple_query("CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT)")
+        .simple_query(
+            "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT, amount BIGINT)",
+        )
         .await
         .expect("local CREATE TABLE failed");
     let local_inserted = client
         .execute(
-            "INSERT INTO pg_route_extended_forward (name, id) VALUES ($1, $2)",
-            &[&"local", &local_key],
+            "INSERT INTO pg_route_extended_forward (name, id, amount) VALUES ($1, $2, $3)",
+            &[&"local", &local_key, &10_i64],
         )
         .await
         .expect("local owner extended insert should succeed");
     assert_eq!(local_inserted, 1);
     let inserted = client
         .execute(
-            "INSERT INTO pg_route_extended_forward (name, id) VALUES ($1, $2)",
-            &[&"remote", &remote_key],
+            "INSERT INTO pg_route_extended_forward (name, id, amount) VALUES ($1, $2, $3)",
+            &[&"remote", &remote_key, &20_i64],
         )
         .await
         .expect("remote owner extended insert should forward");
@@ -2968,6 +2987,12 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
         .await
         .expect("extended fanout COUNT failed");
     assert_eq!(count_rows[0].get::<_, i64>(0), 2);
+
+    let sum_rows = client
+        .query("SELECT SUM(amount) FROM pg_route_extended_forward", &[])
+        .await
+        .expect("extended fanout SUM failed");
+    assert_eq!(sum_rows[0].get::<_, i64>(0), 30);
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
