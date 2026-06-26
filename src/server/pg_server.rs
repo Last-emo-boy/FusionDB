@@ -145,10 +145,27 @@ struct ForwardQueryRequest<'a> {
     sql: &'a str,
 }
 
+#[derive(Serialize)]
+struct ForwardPrepareRequest<'a> {
+    sql: &'a str,
+}
+
+#[derive(Serialize)]
+struct ForwardExecuteRequest {
+    statement_id: String,
+    params: Vec<serde_json::Value>,
+    return_results: Option<bool>,
+}
+
 #[derive(Deserialize)]
 struct ForwardEnvelope<T> {
     data: Option<T>,
     error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ForwardPreparedStatementInfo {
+    statement_id: String,
 }
 
 #[derive(Deserialize)]
@@ -278,6 +295,17 @@ impl PgHandler {
         }
         drop(session);
         self.shard_route_conflict_message_for_statements(&statements, params)
+            .await
+    }
+
+    async fn shard_write_route_action_for_sql(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> std::result::Result<PgShardWriteRouteAction, FusionError> {
+        let statements = parse_sql(query)
+            .map_err(|e| FusionError::Execution(format!("Parse Error: {:?}", e)))?;
+        self.shard_write_route_action_for_statements(&statements, params)
             .await
     }
 
@@ -453,6 +481,247 @@ impl PgHandler {
         };
 
         Self::responses_from_forwarded_query_results(results)
+    }
+
+    async fn forward_extended_query_to_shard_owner(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+        decision: &SqlShardRoutingDecision,
+    ) -> PgWireResult<std::result::Result<Vec<ForwardQueryResultJson>, pgwire::error::ErrorInfo>>
+    {
+        let prepare_url = format!("http://{}/prepare", decision.route.owner_addr);
+        let prepare_response = match self
+            .apply_forwarding_headers(self.http_client.post(&prepare_url), username)
+            .json(&ForwardPrepareRequest { sql: query })
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(Err(Self::shard_route_error(
+                    Self::shard_owner_forwarding_transport_error(decision, "prepare", e),
+                )));
+            }
+        };
+        let prepare_status = prepare_response.status();
+        let prepare_envelope = match prepare_response
+            .json::<ForwardEnvelope<ForwardPreparedStatementInfo>>()
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                return Ok(Err(Self::shard_route_error(format!(
+                    "{}; shard owner forwarding prepare response from node {} at {} could not be decoded: {}",
+                    Self::shard_route_conflict_message(decision),
+                    decision.route.owner_node_id,
+                    decision.route.owner_addr,
+                    e
+                ))));
+            }
+        };
+        if !prepare_status.is_success() {
+            let message = prepare_envelope.error.unwrap_or_else(|| {
+                format!(
+                    "Shard owner forwarding prepare error: node {} at {} returned HTTP {}",
+                    decision.route.owner_node_id, decision.route.owner_addr, prepare_status
+                )
+            });
+            return Ok(Err(Self::forwarded_owner_error(message)));
+        }
+        let Some(prepared) = prepare_envelope.data else {
+            return Ok(Err(Self::execution_error(
+                "Shard owner forwarding prepare error: owner node returned no prepared statement",
+            )));
+        };
+
+        let execute_url = format!("http://{}/execute", decision.route.owner_addr);
+        let execute_payload = ForwardExecuteRequest {
+            statement_id: prepared.statement_id.clone(),
+            params: params.iter().map(Value::to_json).collect(),
+            return_results: Some(true),
+        };
+        let execute_response = match self
+            .apply_forwarding_headers(self.http_client.post(&execute_url), username)
+            .json(&execute_payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                self.best_effort_deallocate_forwarded_statement(username, decision, &prepared)
+                    .await;
+                return Ok(Err(Self::shard_route_error(
+                    Self::shard_owner_forwarding_transport_error(decision, "execute", e),
+                )));
+            }
+        };
+        let execute_status = execute_response.status();
+        let execute_envelope = match execute_response
+            .json::<ForwardEnvelope<Vec<ForwardQueryResultJson>>>()
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                self.best_effort_deallocate_forwarded_statement(username, decision, &prepared)
+                    .await;
+                return Ok(Err(Self::shard_route_error(format!(
+                    "{}; shard owner forwarding execute response from node {} at {} could not be decoded: {}",
+                    Self::shard_route_conflict_message(decision),
+                    decision.route.owner_node_id,
+                    decision.route.owner_addr,
+                    e
+                ))));
+            }
+        };
+        self.best_effort_deallocate_forwarded_statement(username, decision, &prepared)
+            .await;
+
+        if !execute_status.is_success() {
+            let message = execute_envelope.error.unwrap_or_else(|| {
+                format!(
+                    "Shard owner forwarding execute error: node {} at {} returned HTTP {}",
+                    decision.route.owner_node_id, decision.route.owner_addr, execute_status
+                )
+            });
+            return Ok(Err(Self::forwarded_owner_error(message)));
+        }
+
+        let Some(results) = execute_envelope.data else {
+            return Ok(Err(Self::execution_error(
+                "Shard owner forwarding execute error: response did not include query results",
+            )));
+        };
+        Ok(Ok(results))
+    }
+
+    fn apply_forwarding_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        username: &str,
+    ) -> reqwest::RequestBuilder {
+        let request = request.header(SHARD_OWNER_FORWARD_HEADER, SHARD_OWNER_FORWARD_VALUE);
+        if username.is_empty() {
+            request
+        } else {
+            request.header("x-fusiondb-user", username)
+        }
+    }
+
+    async fn best_effort_deallocate_forwarded_statement(
+        &self,
+        username: &str,
+        decision: &SqlShardRoutingDecision,
+        prepared: &ForwardPreparedStatementInfo,
+    ) {
+        let url = format!(
+            "http://{}/prepare/{}",
+            decision.route.owner_addr, prepared.statement_id
+        );
+        let _ = self
+            .apply_forwarding_headers(self.http_client.delete(url), username)
+            .send()
+            .await;
+    }
+
+    fn shard_owner_forwarding_transport_error(
+        decision: &SqlShardRoutingDecision,
+        phase: &str,
+        error: reqwest::Error,
+    ) -> String {
+        format!(
+            "{}; shard owner forwarding to node {} at {} failed during {}: {}",
+            Self::shard_route_conflict_message(decision),
+            decision.route.owner_node_id,
+            decision.route.owner_addr,
+            phase,
+            error
+        )
+    }
+
+    fn forwarded_owner_error(message: String) -> pgwire::error::ErrorInfo {
+        if message.contains("Shard route conflict") {
+            Self::shard_route_error(message)
+        } else {
+            Self::execution_error(message)
+        }
+    }
+
+    async fn send_forwarded_extended_query_results<C>(
+        &self,
+        client: &mut C,
+        query: &str,
+        params: &[Value],
+        result_format_codes: &[i16],
+        jdbc_client: bool,
+        results: Vec<ForwardQueryResultJson>,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Unpin + Send + Sync + Sink<PgWireBackendMessage>,
+    {
+        for result in results {
+            match result {
+                ForwardQueryResultJson::Select { columns, rows } => {
+                    let rows = rows
+                        .into_iter()
+                        .map(|row| row.iter().map(Value::from_json).collect::<Vec<_>>())
+                        .collect::<Vec<_>>();
+                    let effective_result_format_codes =
+                        if result_format_codes.is_empty() && !jdbc_client {
+                            vec![1]
+                        } else {
+                            result_format_codes.to_vec()
+                        };
+                    let described_fields = self
+                        .describe_query_fields(query, params, &effective_result_format_codes)
+                        .await?;
+                    let fields = if described_fields.is_empty() {
+                        Self::fields_with_format(&columns, &rows, &effective_result_format_codes)
+                    } else {
+                        Arc::new(
+                            described_fields
+                                .into_iter()
+                                .map(|field| {
+                                    FieldInfo::new(
+                                        field.name().to_string(),
+                                        None,
+                                        None,
+                                        field.datatype().clone(),
+                                        field.format(),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+
+                    for row in rows {
+                        client
+                            .send(PgWireBackendMessage::DataRow(Self::encode_row_for_fields(
+                                fields.clone(),
+                                row,
+                            )?))
+                            .await
+                            .map_err(|_| Self::sink_error())?;
+                    }
+                    client
+                        .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                            "SELECT".to_string(),
+                        )))
+                        .await
+                        .map_err(|_| Self::sink_error())?;
+                }
+                ForwardQueryResultJson::Success { message } => {
+                    client
+                        .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                            Self::pg_command_tag(&message),
+                        )))
+                        .await
+                        .map_err(|_| Self::sink_error())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn responses_from_forwarded_query_results(
@@ -6116,32 +6385,83 @@ impl ExtendedQueryHandler for PgHandler {
             match self.try_execute_pg_metadata_query(&query, &params).await {
                 Ok(Some(result)) => (Ok(result), true),
                 Ok(None) => {
-                    match self
-                        .shard_route_conflict_message_for_sql(&query, &params)
-                        .await
-                    {
-                        Ok(Some(message)) => {
-                            client
-                                .send(PgWireBackendMessage::ErrorResponse(
-                                    Self::shard_route_error(message).into(),
-                                ))
-                                .await
-                                .map_err(|_| {
-                                    PgWireError::IoError(std::io::Error::other("Sink Error"))
-                                })?;
-                            return Ok(());
+                    let in_transaction = {
+                        let session = self.session.lock().await;
+                        session.transaction.is_some()
+                    };
+                    if in_transaction {
+                        match self
+                            .shard_route_conflict_message_for_sql(&query, &params)
+                            .await
+                        {
+                            Ok(Some(message)) => {
+                                client
+                                    .send(PgWireBackendMessage::ErrorResponse(
+                                        Self::shard_route_error(message).into(),
+                                    ))
+                                    .await
+                                    .map_err(|_| Self::sink_error())?;
+                                return Ok(());
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                client
+                                    .send(PgWireBackendMessage::ErrorResponse(
+                                        Self::fusion_error("Shard routing error", &e).into(),
+                                    ))
+                                    .await
+                                    .map_err(|_| Self::sink_error())?;
+                                return Ok(());
+                            }
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            client
-                                .send(PgWireBackendMessage::ErrorResponse(
-                                    Self::fusion_error("Shard routing error", &e).into(),
-                                ))
-                                .await
-                                .map_err(|_| {
-                                    PgWireError::IoError(std::io::Error::other("Sink Error"))
-                                })?;
-                            return Ok(());
+                    } else {
+                        match self.shard_write_route_action_for_sql(&query, &params).await {
+                            Ok(PgShardWriteRouteAction::Local) => {}
+                            Ok(PgShardWriteRouteAction::Forward(decision)) => {
+                                match self
+                                    .forward_extended_query_to_shard_owner(
+                                        &query, &params, &username, &decision,
+                                    )
+                                    .await?
+                                {
+                                    Ok(results) => {
+                                        self.send_forwarded_extended_query_results(
+                                            client,
+                                            &query,
+                                            &params,
+                                            &result_format_codes,
+                                            jdbc_client,
+                                            results,
+                                        )
+                                        .await?;
+                                    }
+                                    Err(error) => {
+                                        client
+                                            .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                            .await
+                                            .map_err(|_| Self::sink_error())?;
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            Ok(PgShardWriteRouteAction::Conflict(message)) => {
+                                client
+                                    .send(PgWireBackendMessage::ErrorResponse(
+                                        Self::shard_route_error(message).into(),
+                                    ))
+                                    .await
+                                    .map_err(|_| Self::sink_error())?;
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                client
+                                    .send(PgWireBackendMessage::ErrorResponse(
+                                        Self::fusion_error("Shard routing error", &e).into(),
+                                    ))
+                                    .await
+                                    .map_err(|_| Self::sink_error())?;
+                                return Ok(());
+                            }
                         }
                     }
                     (self.execute_first_statement(&query, &params).await, false)

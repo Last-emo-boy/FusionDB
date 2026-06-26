@@ -2543,6 +2543,157 @@ async fn test_pg_protocol_simple_query_rejects_non_local_shard_owner_insert() {
 }
 
 #[tokio::test]
+async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert() {
+    let owner_wal_path = format!(
+        "test_pg_shard_owner_extended_forward_owner_{}.wal",
+        uuid::Uuid::new_v4()
+    );
+    let local_wal_path = format!(
+        "test_pg_shard_owner_extended_forward_local_{}.wal",
+        uuid::Uuid::new_v4()
+    );
+    let owner_storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&owner_wal_path).expect("Failed to create owner storage"));
+    let local_storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&local_wal_path).expect("Failed to create local storage"));
+
+    let owner_http_port = next_http_test_port();
+    let owner_addr = format!("127.0.0.1:{}", owner_http_port);
+    let local_config = sharded_pg_test_config_with_owner_addr(4, owner_addr.clone(), 1);
+    let owner_config = sharded_pg_test_config_with_owner_addr(4, owner_addr.clone(), 2);
+    let local_router = ShardRouter::from_config(&local_config).expect("local shard router");
+    let owner_router = ShardRouter::from_config(&owner_config).expect("owner shard router");
+    let remote_key = i64::from(integer_primary_key_for_owner(
+        &local_router,
+        "pg_route_extended_forward",
+        2,
+    ));
+
+    let owner_executor = Arc::new(Executor::with_config_and_shard_router(
+        owner_storage.clone(),
+        &StorageConfig::default(),
+        Some(owner_router.clone()),
+    ));
+    tokio::spawn(async move {
+        #[allow(deprecated)]
+        http_server::start_http_server(
+            owner_executor,
+            owner_storage,
+            "127.0.0.1",
+            owner_http_port,
+            None,
+            None,
+            "raft(node_id=2)".to_string(),
+            Some(owner_router),
+        )
+        .await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let http_client = reqwest::Client::new();
+    let owner_query_url = format!("http://{}/query", owner_addr);
+    let owner_create_response = http_client
+        .post(&owner_query_url)
+        .json(&serde_json::json!({
+            "sql": "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT)"
+        }))
+        .send()
+        .await
+        .expect("owner CREATE TABLE request failed");
+    assert!(
+        owner_create_response.status().is_success(),
+        "owner CREATE TABLE failed with HTTP {}",
+        owner_create_response.status()
+    );
+
+    let local_executor = Arc::new(Executor::with_config_and_shard_router(
+        local_storage.clone(),
+        &StorageConfig::default(),
+        Some(local_router),
+    ));
+    let pg_port = next_pg_test_port();
+    tokio::spawn(async move {
+        pg_server::start_pg_server(
+            local_executor,
+            local_storage,
+            "127.0.0.1",
+            pg_port,
+            "fusiondb",
+            None,
+        )
+        .await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            pg_port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query("CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT)")
+        .await
+        .expect("local CREATE TABLE failed");
+    let inserted = client
+        .execute(
+            "INSERT INTO pg_route_extended_forward (name, id) VALUES ($1, $2)",
+            &[&"remote", &remote_key],
+        )
+        .await
+        .expect("remote owner extended insert should forward");
+    assert_eq!(inserted, 1);
+
+    let owner_select_response = http_client
+        .post(&owner_query_url)
+        .json(&serde_json::json!({
+            "sql": format!(
+                "SELECT * FROM pg_route_extended_forward WHERE id = {}",
+                remote_key
+            )
+        }))
+        .send()
+        .await
+        .expect("owner SELECT request failed");
+    assert!(
+        owner_select_response.status().is_success(),
+        "owner SELECT failed with HTTP {}",
+        owner_select_response.status()
+    );
+    let owner_select_json: serde_json::Value = owner_select_response
+        .json()
+        .await
+        .expect("owner SELECT response should be JSON");
+    let rows = owner_select_json["data"][0]["Select"]["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("owner SELECT rows missing: {}", owner_select_json));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], serde_json::json!(remote_key));
+    assert_eq!(rows[0][1], serde_json::json!("remote"));
+
+    let local_rows = client
+        .query(
+            "SELECT * FROM pg_route_extended_forward WHERE id = $1",
+            &[&remote_key],
+        )
+        .await
+        .expect("local SELECT failed");
+    assert!(local_rows.is_empty(), "forwarded row should not be local");
+
+    let _ = std::fs::remove_file(&owner_wal_path);
+    let _ = std::fs::remove_file(&local_wal_path);
+}
+
+#[tokio::test]
 async fn test_pg_protocol_extended_query_rejects_non_local_shard_owner_insert() {
     let wal_path = format!("test_pg_shard_owner_extended_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> =
