@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-426",
+  "title": "Forward pgwire extended query point writes to non-local shard owners",
+  "status": "completed",
+  "created_at": "2026-06-26",
+  "wave": 1,
+  "tasks": [
+    "BENCHPROD-426"
+  ],
+  "scope": [
+    "src/server/pg_server.rs",
+    "tests/pg_integration.rs",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "goal": "Continue P5-3 by extending automatic cross-node SQL forwarding from pgwire simple query to pgwire extended query deterministic point writes whose routed rows all target one non-local shard owner.",
+  "verification": [
+    "cargo test --test pg_integration test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert -- --nocapture",
+    "cargo test --test pg_integration shard_owner -- --nocapture",
+    "cargo fmt --check",
+    "cargo check --bins",
+    "cargo test --lib",
+    "cargo test shard_owner -- --nocapture",
+    "git diff --check"
+  ],
+  "code_commit": "fba23e6",
+  "cleanup": [
+    "Measured target/ at approximately 10.94 GiB after verification",
+    "cargo clean removed 7516 files, 10.9 GiB total"
+  ],
+  "remaining_gaps": [
+    "P5-3 pgwire COPY shard-owner forwarding remains open",
+    "P5-3 mixed local/non-local point writes and multi-owner point writes remain conservative",
+    "P5-3 distributed index ownership and maintenance remain open",
+    "P5-3 broad multi-shard query routing and cross-node query planning remain open",
+    "P5-3 INSERT/COPY routing remains conservative for generated/default primary keys, composite primary keys, INSERT ... SELECT, partially nondeterministic VALUES rows, and COPY column lists that omit the primary key",
+    "P5-3 HNSW/vector and trigram in-memory index shard ownership remain open",
+    "P3-3 SCRAM-SHA-256 remains blocked by pgwire 0.37 limitations"
+  ]
+}
