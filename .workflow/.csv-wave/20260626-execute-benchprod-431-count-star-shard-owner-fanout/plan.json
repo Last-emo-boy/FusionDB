@@ -1,0 +1,39 @@
+{
+  "id": "BENCHPROD-431",
+  "title": "Distributed COUNT(*) shard-owner fan-out",
+  "phase": "P5-3 Automatic sharding",
+  "status": "completed",
+  "tasks": [
+    {
+      "id": "BENCHPROD-431-1",
+      "title": "Detect safe single-table COUNT(*) fan-out plans",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-431-2",
+      "title": "Merge COUNT(*) results across shard owners for HTTP and pgwire",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-431-3",
+      "title": "Cover HTTP query, HTTP prepared, pgwire simple, and pgwire extended count fan-out",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-431-4",
+      "title": "Update production gap documentation",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo check --bins",
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo test http_query_fanouts_simple_select_across_shard_owners -- --nocapture",
+    "cargo test http_execute_forwards_non_local_shard_owner_insert_to_owner -- --nocapture",
+    "cargo test --test pg_integration test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert -- --nocapture",
+    "cargo test --test pg_integration test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert -- --nocapture",
+    "cargo test shard_owner -- --nocapture",
+    "cargo test --lib"
+  ]
+}
