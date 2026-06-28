@@ -1,0 +1,12 @@
+{
+  "id": "BENCHPROD-440",
+  "title": "Parallelize unindexed full-table-scan decode+filter",
+  "phase": "P9 Performance Optimization",
+  "status": "completed",
+  "tasks": [
+    {"id": "BENCHPROD-440-1", "title": "Decode+filter the full-scan KV pairs in parallel via rayon (reuse parallel_filter_rows pattern) when no limit is pushed and row count is large", "status": "completed"},
+    {"id": "BENCHPROD-440-2", "title": "Preserve result ordering; keep serial early-break path when a limit is pushed (do not regress BENCHPROD-437)", "status": "completed"},
+    {"id": "BENCHPROD-440-3", "title": "Add parallel-vs-serial equivalence tests (>1000 rows)", "status": "completed"}
+  ],
+  "verification": ["cargo fmt --check", "git diff --check", "cargo check --bins", "cargo test --test sql_full_scan_parallel", "cargo test --lib"]
+}
