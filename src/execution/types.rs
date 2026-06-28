@@ -155,7 +155,11 @@ impl Executor {
         Ok((left_value, right_value))
     }
 
-    fn comparison_column_type<'a>(&self, expr: &Expr, schema: &'a TableSchema) -> Option<&'a str> {
+    pub(crate) fn comparison_column_type<'a>(
+        &self,
+        expr: &Expr,
+        schema: &'a TableSchema,
+    ) -> Option<&'a str> {
         match expr {
             Expr::Identifier(ident) => self
                 .resolve_column_index(&ident.value, schema)

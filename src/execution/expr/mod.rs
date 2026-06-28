@@ -205,11 +205,29 @@ impl Executor {
                 negated,
             } => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
+                // Resolve the comparison column's data type once per row instead of
+                // re-running the full alignment (column-index resolution) for every list
+                // item. The original `val` is what gets compared, so coercing only the
+                // list item to the column type is semantics-preserving.
+                let column_type = self.comparison_column_type(expr, schema);
                 let mut found = false;
                 for item in list {
                     let item_val = self.evaluate_value(item, row, schema, params)?;
-                    let (_, item_val) =
-                        self.align_comparison_values(expr, val.clone(), item, item_val, schema)?;
+                    let item_val = match column_type {
+                        Some(data_type) => Self::coerce_value_to_column_type(item_val, data_type)?,
+                        None => {
+                            // No column type on the left-hand expr: fall back to the full
+                            // alignment so the right-hand item's column type is honored.
+                            let (_, item_val) = self.align_comparison_values(
+                                expr,
+                                val.clone(),
+                                item,
+                                item_val,
+                                schema,
+                            )?;
+                            item_val
+                        }
+                    };
                     if val.compare(&item_val) == std::cmp::Ordering::Equal {
                         found = true;
                         break;

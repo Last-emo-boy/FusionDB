@@ -98,8 +98,7 @@ impl Executor {
     ) -> Result<Value> {
         match expr {
             Expr::Identifier(ident) => {
-                let col_name = ident.value.clone();
-                let idx = self.resolve_column_index(&col_name, schema)?;
+                let idx = self.resolve_column_index(&ident.value, schema)?;
                 Ok(row[idx].clone())
             }
             Expr::CompoundIdentifier(idents) => {
