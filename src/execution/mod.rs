@@ -83,6 +83,12 @@ pub(crate) struct SqlShardCountDistinctFanoutPlan {
     pub output_column: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlShardDistinctAggregateFanoutPlan {
+    pub rewritten_sql: String,
+    pub output_column: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStatementRecord {
     pub id: String,
@@ -871,6 +877,113 @@ impl Executor {
             .await
     }
 
+    pub(crate) fn shard_sum_distinct_select_fanout_plan_for_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Option<SqlShardDistinctAggregateFanoutPlan>> {
+        let statements = self.prepare(sql)?;
+        Ok(
+            Self::distinct_aggregate_select_fanout_target(&statements, "SUM")
+                .map(|(_, _, plan)| plan),
+        )
+    }
+
+    pub(crate) fn shard_sum_distinct_select_fanout_plan_for_statements(
+        statements: &[Statement],
+    ) -> Option<SqlShardDistinctAggregateFanoutPlan> {
+        Self::distinct_aggregate_select_fanout_target(statements, "SUM").map(|(_, _, plan)| plan)
+    }
+
+    pub(crate) async fn shard_sum_distinct_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_sum_distinct_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_sum_distinct_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        self.shard_distinct_aggregate_select_fanout_owners(statements, params, "SUM")
+            .await
+    }
+
+    pub(crate) fn shard_avg_distinct_select_fanout_plan_for_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Option<SqlShardDistinctAggregateFanoutPlan>> {
+        let statements = self.prepare(sql)?;
+        Ok(
+            Self::distinct_aggregate_select_fanout_target(&statements, "AVG")
+                .map(|(_, _, plan)| plan),
+        )
+    }
+
+    pub(crate) fn shard_avg_distinct_select_fanout_plan_for_statements(
+        statements: &[Statement],
+    ) -> Option<SqlShardDistinctAggregateFanoutPlan> {
+        Self::distinct_aggregate_select_fanout_target(statements, "AVG").map(|(_, _, plan)| plan)
+    }
+
+    pub(crate) async fn shard_avg_distinct_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_avg_distinct_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_avg_distinct_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        self.shard_distinct_aggregate_select_fanout_owners(statements, params, "AVG")
+            .await
+    }
+
+    async fn shard_distinct_aggregate_select_fanout_owners(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+        function_name: &str,
+    ) -> Result<Vec<SqlShardOwner>> {
+        let Some((table_name, column_name, _)) =
+            Self::distinct_aggregate_select_fanout_target(statements, function_name)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut txn = self.storage.begin_transaction().await?;
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(&table_name, &mut *txn)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(column) = schema
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&column_name))
+        else {
+            return Ok(Vec::new());
+        };
+        if !Self::is_integer_type_name(&column.data_type)
+            && !Self::is_float_type_name(&column.data_type)
+        {
+            return Ok(Vec::new());
+        }
+        drop(txn);
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
+    }
+
     pub(crate) fn shard_min_max_select_fanout_kind_for_sql(
         &self,
         sql: &str,
@@ -1196,6 +1309,65 @@ impl Executor {
             column_name,
             SqlShardAvgFanoutPlan {
                 rewritten_sql,
+                output_column,
+            },
+        ))
+    }
+
+    fn distinct_aggregate_select_fanout_target(
+        statements: &[Statement],
+        function_name: &str,
+    ) -> Option<(String, String, SqlShardDistinctAggregateFanoutPlan)> {
+        let [Statement::Query(query)] = statements else {
+            return None;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.projection.len() != 1
+        {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return None;
+        };
+        if !group_exprs.is_empty()
+            || !select
+                .selection
+                .as_ref()
+                .is_none_or(Self::select_predicate_is_fanout_local)
+        {
+            return None;
+        }
+        let (column_name, column_sql) = Self::select_projection_distinct_column_function_arg(
+            &select.projection[0],
+            std::slice::from_ref(&function_name),
+        )?;
+        let output_column = Self::select_projection_output_name(&select.projection[0])?;
+        let relation_sql = select.from[0].relation.to_string();
+        let selection_sql = select
+            .selection
+            .as_ref()
+            .map(|expr| format!(" WHERE {}", expr))
+            .unwrap_or_default();
+        Some((
+            name.to_string(),
+            column_name,
+            SqlShardDistinctAggregateFanoutPlan {
+                rewritten_sql: format!(
+                    "SELECT DISTINCT {} FROM {}{}",
+                    column_sql, relation_sql, selection_sql
+                ),
                 output_column,
             },
         ))
@@ -2887,6 +3059,46 @@ mod tests {
             range_boundaries: Vec::new(),
         };
         config
+    }
+
+    #[test]
+    fn distinct_aggregate_select_fanout_plans_match_sum_and_avg() {
+        let sum_plan = Executor::shard_sum_distinct_select_fanout_plan_for_statements(
+            &parse_sql("SELECT SUM(DISTINCT amount) FROM orders").unwrap(),
+        )
+        .expect("sum distinct plan");
+        assert_eq!(sum_plan.rewritten_sql, "SELECT DISTINCT amount FROM orders");
+        assert_eq!(sum_plan.output_column, "SUM(DISTINCT amount)");
+
+        let avg_plan = Executor::shard_avg_distinct_select_fanout_plan_for_statements(
+            &parse_sql("SELECT AVG(DISTINCT amount) AS a FROM orders WHERE amount > 5").unwrap(),
+        )
+        .expect("avg distinct plan");
+        assert_eq!(
+            avg_plan.rewritten_sql,
+            "SELECT DISTINCT amount FROM orders WHERE amount > 5"
+        );
+        assert_eq!(avg_plan.output_column, "a");
+
+        // Non-distinct aggregates and grouped queries are not eligible for distinct fan-out.
+        assert!(
+            Executor::shard_sum_distinct_select_fanout_plan_for_statements(
+                &parse_sql("SELECT SUM(amount) FROM orders").unwrap()
+            )
+            .is_none()
+        );
+        assert!(
+            Executor::shard_sum_distinct_select_fanout_plan_for_statements(
+                &parse_sql("SELECT SUM(DISTINCT amount) FROM orders GROUP BY region").unwrap()
+            )
+            .is_none()
+        );
+        assert!(
+            Executor::shard_avg_distinct_select_fanout_plan_for_statements(
+                &parse_sql("SELECT AVG(amount) FROM orders").unwrap()
+            )
+            .is_none()
+        );
     }
 
     #[test]

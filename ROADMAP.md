@@ -67,7 +67,7 @@
 
 - [x] **P5-1: Wire OpenRaft into main loop** — Configurable Raft startup, `/raft/*` routes, leader-forwarded writes, local follower reads
 - [x] **P5-2: Snapshot transfer** — Serialized visible key-value state for new node bootstrap
-- [ ] **P5-3: Automatic sharding** — Hash/range control plane, local row/index KV shard layouts, HTTP/pgwire INSERT/UPDATE/DELETE/COPY point-write owner guard, pgwire transaction-visible schema routing, HTTP `/query`, HTTP prepared `/execute`, plus pgwire simple/extended-query and COPY single-owner point-write shard forwarding, primary-key point-read forwarding, simple single-table SELECT fan-out, and distributed `COUNT(*)`/`COUNT(DISTINCT column)`/`SUM(column)`/`MIN(column)`/`MAX(column)`/`AVG(column)` aggregation across HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query; mixed/multi-owner writes, distributed index ownership, and broader cross-node query planning remain
+- [ ] **P5-3: Automatic sharding** — Hash/range control plane, local row/index KV shard layouts, HTTP/pgwire INSERT/UPDATE/DELETE/COPY point-write owner guard, pgwire transaction-visible schema routing, HTTP `/query`, HTTP prepared `/execute`, plus pgwire simple/extended-query and COPY single-owner point-write shard forwarding, primary-key point-read forwarding, simple single-table SELECT fan-out, and distributed `COUNT(*)`/`COUNT(DISTINCT column)`/`SUM(column)`/`SUM(DISTINCT column)`/`MIN(column)`/`MAX(column)`/`AVG(column)`/`AVG(DISTINCT column)` aggregation across HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query; mixed/multi-owner writes, distributed index ownership, and broader cross-node query planning remain
 
 ## Phase 6: Operations & Ecosystem ✅
 

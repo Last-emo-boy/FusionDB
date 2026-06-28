@@ -8,7 +8,10 @@ use axum::{
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 
@@ -441,6 +444,18 @@ async fn handle_query(
 
     if let Some(response) =
         try_fanout_count_distinct_query_to_shard_owners(&state, &context, &payload.sql).await
+    {
+        return response;
+    }
+
+    if let Some(response) =
+        try_fanout_sum_distinct_query_to_shard_owners(&state, &context, &payload.sql).await
+    {
+        return response;
+    }
+
+    if let Some(response) =
+        try_fanout_avg_distinct_query_to_shard_owners(&state, &context, &payload.sql).await
     {
         return response;
     }
@@ -1221,6 +1236,194 @@ async fn try_fanout_avg_query_to_shard_owners(
     }]))
 }
 
+async fn try_fanout_sum_distinct_query_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    let plan = match state
+        .executor
+        .shard_sum_distinct_select_fanout_plan_for_sql(sql)
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard sum distinct fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+    let owners = match state
+        .executor
+        .shard_sum_distinct_select_fanout_owners_for_sql(sql, &[])
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard sum distinct fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match state.executor.execute_sql(&plan.rewritten_sql).await {
+        Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Execution Error: {:?}", e),
+            ));
+        }
+    };
+    let mut distinct_values = BTreeMap::new();
+    let rewrite_columns =
+        match collect_fanout_distinct_value_map(&mut distinct_values, local_results) {
+            Ok(columns) => columns,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+
+    for owner in owners {
+        let owner_results =
+            match query_remote_shard_owner(state, context, &plan.rewritten_sql, &owner).await {
+                Ok(results) => results,
+                Err((status, message)) => return Some(json_error(status, message)),
+            };
+        let owner_columns =
+            match collect_fanout_distinct_value_map(&mut distinct_values, owner_results) {
+                Ok(columns) => columns,
+                Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+            };
+        if owner_columns != rewrite_columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard sum distinct fan-out column mismatch: expected {:?}, got {:?}",
+                    rewrite_columns, owner_columns
+                ),
+            ));
+        }
+    }
+
+    let total = match fanout_sum_over_distinct_values(&distinct_values) {
+        Ok(total) => total,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: vec![plan.output_column],
+        rows: vec![vec![fanout_sum_to_json(total)]],
+    }]))
+}
+
+async fn try_fanout_avg_distinct_query_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    let plan = match state
+        .executor
+        .shard_avg_distinct_select_fanout_plan_for_sql(sql)
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard avg distinct fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+    let owners = match state
+        .executor
+        .shard_avg_distinct_select_fanout_owners_for_sql(sql, &[])
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard avg distinct fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match state.executor.execute_sql(&plan.rewritten_sql).await {
+        Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Execution Error: {:?}", e),
+            ));
+        }
+    };
+    let mut distinct_values = BTreeMap::new();
+    let rewrite_columns =
+        match collect_fanout_distinct_value_map(&mut distinct_values, local_results) {
+            Ok(columns) => columns,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+
+    for owner in owners {
+        let owner_results =
+            match query_remote_shard_owner(state, context, &plan.rewritten_sql, &owner).await {
+                Ok(results) => results,
+                Err((status, message)) => return Some(json_error(status, message)),
+            };
+        let owner_columns =
+            match collect_fanout_distinct_value_map(&mut distinct_values, owner_results) {
+                Ok(columns) => columns,
+                Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+            };
+        if owner_columns != rewrite_columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard avg distinct fan-out column mismatch: expected {:?}, got {:?}",
+                    rewrite_columns, owner_columns
+                ),
+            ));
+        }
+    }
+
+    let total_sum = match fanout_sum_over_distinct_values(&distinct_values) {
+        Ok(total) => total,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+    let total_count = match i64::try_from(distinct_values.len()) {
+        Ok(count) => count,
+        Err(_) => {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                "Shard avg distinct fan-out overflow",
+            ));
+        }
+    };
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: vec![plan.output_column],
+        rows: vec![vec![fanout_avg_to_json(total_sum, total_count)]],
+    }]))
+}
+
+fn collect_fanout_distinct_value_map(
+    distinct_values: &mut BTreeMap<String, serde_json::Value>,
+    results: Vec<QueryResultJson>,
+) -> std::result::Result<Vec<String>, String> {
+    let (columns, values) = fanout_distinct_values_from_select_results(results)?;
+    add_fanout_distinct_value_map(distinct_values, values)?;
+    Ok(columns)
+}
+
 async fn query_remote_shard_owner(
     state: &AppState,
     context: &RequestContext,
@@ -1381,6 +1584,25 @@ fn add_fanout_distinct_values(
     Ok(())
 }
 
+fn add_fanout_distinct_value_map(
+    distinct_values: &mut BTreeMap<String, serde_json::Value>,
+    values: Vec<serde_json::Value>,
+) -> std::result::Result<(), String> {
+    for value in values {
+        if value.is_null() {
+            continue;
+        }
+        let key = serde_json::to_string(&value).map_err(|e| {
+            format!(
+                "Shard distinct aggregate fan-out could not encode distinct value {}: {}",
+                value, e
+            )
+        })?;
+        distinct_values.insert(key, value);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum FanoutSum {
     Integer(i64),
@@ -1461,6 +1683,17 @@ fn fanout_sum_to_json(total: Option<FanoutSum>) -> serde_json::Value {
         Some(FanoutSum::Integer(value)) => serde_json::json!(value),
         Some(FanoutSum::Float(value)) => serde_json::json!(value),
     }
+}
+
+fn fanout_sum_over_distinct_values(
+    distinct_values: &BTreeMap<String, serde_json::Value>,
+) -> std::result::Result<Option<FanoutSum>, String> {
+    let mut total = None;
+    for value in distinct_values.values() {
+        let parsed = fanout_sum_json_value(value)?;
+        add_fanout_sum(&mut total, parsed)?;
+    }
+    Ok(total)
 }
 
 fn fanout_avg_parts_from_select_results(
@@ -1747,6 +1980,32 @@ async fn handle_execute(
             }
 
             if let Some(response) = try_fanout_count_distinct_execute_to_shard_owners(
+                &state,
+                &context,
+                &record,
+                &payload,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
+            if let Some(response) = try_fanout_sum_distinct_execute_to_shard_owners(
+                &state,
+                &context,
+                &record,
+                &payload,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
+            if let Some(response) = try_fanout_avg_distinct_execute_to_shard_owners(
                 &state,
                 &context,
                 &record,
@@ -2256,6 +2515,181 @@ async fn try_fanout_avg_execute_to_shard_owners(
         };
     }
 
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: vec![plan.output_column],
+        rows: vec![vec![fanout_avg_to_json(total_sum, total_count)]],
+    }]))
+}
+
+async fn try_fanout_sum_distinct_execute_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    let Some(plan) =
+        Executor::shard_sum_distinct_select_fanout_plan_for_statements(&record.statements)
+    else {
+        return None;
+    };
+    let owners = match state
+        .executor
+        .shard_sum_distinct_select_fanout_owners_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard sum distinct fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results =
+        match execute_sql_locally_for_fanout(state, &plan.rewritten_sql, params).await {
+            Ok(results) => results,
+            Err(response) => return Some(response),
+        };
+    let mut distinct_values = BTreeMap::new();
+    let rewrite_columns =
+        match collect_fanout_distinct_value_map(&mut distinct_values, local_results) {
+            Ok(columns) => columns,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+
+    for owner in owners {
+        let owner_results = match query_remote_prepared_sql_shard_owner(
+            state,
+            context,
+            &plan.rewritten_sql,
+            payload,
+            &owner,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let owner_columns =
+            match collect_fanout_distinct_value_map(&mut distinct_values, owner_results) {
+                Ok(columns) => columns,
+                Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+            };
+        if owner_columns != rewrite_columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard sum distinct fan-out column mismatch: expected {:?}, got {:?}",
+                    rewrite_columns, owner_columns
+                ),
+            ));
+        }
+    }
+
+    let total = match fanout_sum_over_distinct_values(&distinct_values) {
+        Ok(total) => total,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: vec![plan.output_column],
+        rows: vec![vec![fanout_sum_to_json(total)]],
+    }]))
+}
+
+async fn try_fanout_avg_distinct_execute_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    let Some(plan) =
+        Executor::shard_avg_distinct_select_fanout_plan_for_statements(&record.statements)
+    else {
+        return None;
+    };
+    let owners = match state
+        .executor
+        .shard_avg_distinct_select_fanout_owners_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard avg distinct fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results =
+        match execute_sql_locally_for_fanout(state, &plan.rewritten_sql, params).await {
+            Ok(results) => results,
+            Err(response) => return Some(response),
+        };
+    let mut distinct_values = BTreeMap::new();
+    let rewrite_columns =
+        match collect_fanout_distinct_value_map(&mut distinct_values, local_results) {
+            Ok(columns) => columns,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+
+    for owner in owners {
+        let owner_results = match query_remote_prepared_sql_shard_owner(
+            state,
+            context,
+            &plan.rewritten_sql,
+            payload,
+            &owner,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let owner_columns =
+            match collect_fanout_distinct_value_map(&mut distinct_values, owner_results) {
+                Ok(columns) => columns,
+                Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+            };
+        if owner_columns != rewrite_columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard avg distinct fan-out column mismatch: expected {:?}, got {:?}",
+                    rewrite_columns, owner_columns
+                ),
+            ));
+        }
+    }
+
+    let total_sum = match fanout_sum_over_distinct_values(&distinct_values) {
+        Ok(total) => total,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+    let total_count = match i64::try_from(distinct_values.len()) {
+        Ok(count) => count,
+        Err(_) => {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                "Shard avg distinct fan-out overflow",
+            ));
+        }
+    };
     Some(json_ok(vec![QueryResultJson::Select {
         r#type: "select".to_string(),
         columns: vec![plan.output_column],
@@ -3137,6 +3571,28 @@ mod tests {
         panic!("no integer key routed to owner node {}", owner_node_id);
     }
 
+    fn integer_primary_keys_for_owner(
+        router: &ShardRouter,
+        table_name: &str,
+        owner_node_id: u64,
+        count: usize,
+    ) -> Vec<i64> {
+        let mut keys = Vec::with_capacity(count);
+        for value in 1_i64..100_000 {
+            let row_id = crate::common::encoding::encode_i64_comparable(value);
+            if router.route_key(table_name, &row_id).owner_node_id == owner_node_id {
+                keys.push(value);
+                if keys.len() == count {
+                    return keys;
+                }
+            }
+        }
+        panic!(
+            "not enough integer keys routed to owner node {}",
+            owner_node_id
+        );
+    }
+
     async fn post_query(app: &Router, sql: &str) -> Response {
         let request = HttpRequest::builder()
             .method("POST")
@@ -3739,6 +4195,174 @@ mod tests {
                 assert_eq!(rows, &vec![vec![serde_json::json!(15.0)]]);
             }
             QueryResultJson::Success { .. } => panic!("expected fanout avg"),
+        }
+
+        let sum_distinct_select =
+            post_query(&local_app, "SELECT SUM(DISTINCT amount) FROM fanout_users").await;
+        assert_eq!(sum_distinct_select.status(), StatusCode::OK);
+        let sum_distinct_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(sum_distinct_select).await;
+        match &sum_distinct_envelope.data.expect("sum distinct data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(30)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout sum distinct"),
+        }
+
+        let avg_distinct_select =
+            post_query(&local_app, "SELECT AVG(DISTINCT amount) FROM fanout_users").await;
+        assert_eq!(avg_distinct_select.status(), StatusCode::OK);
+        let avg_distinct_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(avg_distinct_select).await;
+        match &avg_distinct_envelope.data.expect("avg distinct data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(15.0)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout avg distinct"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_fanouts_distinct_numeric_aggregates_across_shard_owners() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_distinct_agg_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_distinct_agg_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_keys =
+            integer_primary_keys_for_owner(&local_shard_router, "distinct_fanout", 1, 2);
+        let remote_keys =
+            integer_primary_keys_for_owner(&local_shard_router, "distinct_fanout", 2, 2);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let client = reqwest::Client::new();
+        let create_sql = "CREATE TABLE distinct_fanout (id INTEGER PRIMARY KEY, score INTEGER)";
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        // Local owner holds scores {10, 20}; remote owner holds scores {20, 20}.
+        // The value 20 appears on both owners, so the distinct union is {10, 20}.
+        for (key, score) in [(local_keys[0], 10), (local_keys[1], 20)] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO distinct_fanout (id, score) VALUES ({}, {})",
+                        key, score
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        for (key, score) in [(remote_keys[0], 20), (remote_keys[1], 20)] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO distinct_fanout (id, score) VALUES ({}, {})",
+                        key, score
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+
+        // Plain SUM counts every row: 10 + 20 + 20 + 20 = 70.
+        let sum_select = post_query(&local_app, "SELECT SUM(score) FROM distinct_fanout").await;
+        assert_eq!(sum_select.status(), StatusCode::OK);
+        let sum_envelope: Envelope<Vec<QueryResultJson>> = response_json(sum_select).await;
+        match &sum_envelope.data.expect("sum data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(70)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout sum"),
+        }
+
+        // SUM(DISTINCT) deduplicates the cross-owner union {10, 20} = 30.
+        let sum_distinct_select = post_query(
+            &local_app,
+            "SELECT SUM(DISTINCT score) FROM distinct_fanout",
+        )
+        .await;
+        assert_eq!(sum_distinct_select.status(), StatusCode::OK);
+        let sum_distinct_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(sum_distinct_select).await;
+        match &sum_distinct_envelope.data.expect("sum distinct data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(30)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout sum distinct"),
+        }
+
+        // COUNT(DISTINCT) over the union {10, 20} = 2.
+        let count_distinct_select = post_query(
+            &local_app,
+            "SELECT COUNT(DISTINCT score) FROM distinct_fanout",
+        )
+        .await;
+        assert_eq!(count_distinct_select.status(), StatusCode::OK);
+        let count_distinct_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(count_distinct_select).await;
+        match &count_distinct_envelope.data.expect("count distinct data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(2)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout count distinct"),
+        }
+
+        // AVG(DISTINCT) = sum(union)/count(union) = 30 / 2 = 15.0 (plain AVG would be 70/4 = 17.5).
+        let avg_distinct_select = post_query(
+            &local_app,
+            "SELECT AVG(DISTINCT score) FROM distinct_fanout",
+        )
+        .await;
+        assert_eq!(avg_distinct_select.status(), StatusCode::OK);
+        let avg_distinct_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(avg_distinct_select).await;
+        match &avg_distinct_envelope.data.expect("avg distinct data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(15.0)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout avg distinct"),
         }
 
         let _ = std::fs::remove_file(&local_wal_path);
