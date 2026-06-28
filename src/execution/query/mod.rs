@@ -762,6 +762,56 @@ impl Executor {
             .saturating_add(projection_expr_count)
     }
 
+    /// Whether any projection item contains an aggregate or window function. Used to decide
+    /// whether a LIMIT may be pushed into a filtered scan as an early-break: aggregates and
+    /// window functions must observe the full row set, so the limit must NOT short-circuit them.
+    fn projection_contains_aggregate_or_window(&self, projection: &[SelectItem]) -> bool {
+        for item in projection {
+            let expr = match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                _ => continue,
+            };
+            let mut aggregates = Vec::new();
+            self.extract_aggregates_from_expr(expr, &mut aggregates);
+            if !aggregates.is_empty() {
+                return true;
+            }
+            if Self::expr_contains_window_function(expr) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn expr_contains_window_function(expr: &Expr) -> bool {
+        match expr {
+            Expr::Function(func) => {
+                if func.over.is_some() {
+                    return true;
+                }
+                if let FunctionArguments::List(args) = &func.args {
+                    for arg in &args.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = arg {
+                            if Self::expr_contains_window_function(inner) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::expr_contains_window_function(left)
+                    || Self::expr_contains_window_function(right)
+            }
+            Expr::Nested(inner)
+            | Expr::UnaryOp { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Extract { expr: inner, .. } => Self::expr_contains_window_function(inner),
+            _ => false,
+        }
+    }
+
     fn compile_group_aggregate_plans<'a>(
         &'a self,
         aggregates: &'a [(Expr, String)],
@@ -2438,6 +2488,18 @@ impl Executor {
                 None
             } else if is_group_by_none && query.order_by.is_none() && selection_for_scan.is_none() {
                 limit.map(|l| l + offset)
+            } else if is_group_by_none
+                && query.order_by.is_none()
+                && select.distinct.is_none()
+                && selection_for_scan.is_some()
+                && !self.projection_contains_aggregate_or_window(&select.projection)
+            {
+                // Filtered, unordered, non-aggregate row projection: LIMIT returns "the first N
+                // matching rows in an unspecified order". Pushing the limit lets the full-table
+                // scan early-break after collecting offset+limit matches (scan/mod.rs) instead of
+                // decoding and evaluating every row. Aggregates / window functions / DISTINCT are
+                // excluded because they consume the full row set before the limit is applied.
+                limit.map(|l| l + offset)
             } else {
                 primary_key_order_limit
             };
@@ -2954,13 +3016,16 @@ impl Executor {
                 }
             }
 
-            Self::trim_query_rows_in_place(&mut rows, offset, limit);
-
+            // COUNT(*) and bare aggregates consume ALL matching rows; the LIMIT/OFFSET applies to
+            // their single-row result, not to the rows being aggregated. (The row-trimming for
+            // plain row projections happens further down, just before window-function handling.)
             if is_count_star {
                 let count = rows.len();
+                let mut result = vec![vec![Value::Integer(count as i64)]];
+                Self::trim_query_rows_in_place(&mut result, offset, limit);
                 return Ok(QueryResult::Select {
                     columns,
-                    rows: vec![vec![Value::Integer(count as i64)]],
+                    rows: result,
                 });
             }
 
@@ -3021,12 +3086,18 @@ impl Executor {
                         };
                         result_row.push(value);
                     }
+                    let mut result = vec![result_row];
+                    Self::trim_query_rows_in_place(&mut result, offset, limit);
                     return Ok(QueryResult::Select {
                         columns,
-                        rows: vec![result_row],
+                        rows: result,
                     });
                 }
             }
+
+            // Plain row projections (and window queries) apply LIMIT/OFFSET to the output rows
+            // here, after the aggregate fast-returns above have been ruled out.
+            Self::trim_query_rows_in_place(&mut rows, offset, limit);
 
             // Pre-compute window functions for each projection column
             // window_results[col_idx] = Some(vec_of_values_per_row) if that column is a window fn

@@ -103,6 +103,7 @@
 - [x] **P9-2: count_prefix rewrite** — Replaced HashMap-based counting with streaming merge via scan_range (3-10x faster for COUNT(*))
 - [x] **P9-3: Pre-allocate vectors** — scan_table_base, nested loop join, CROSS JOIN, hash join HashMap all pre-allocated with capacity
 - [x] **P9-4: Benchmark results (LARGE, 228K rows)** — Load 1.8x faster (24K rows/s), index speedup fixed (3.2x), event queries 4-5x faster, subquery 6.3x faster, concurrent throughput 1.3x (1,261 ops/s)
+- [x] **P9-5: Filtered-scan LIMIT pushdown + aggregate LIMIT fix** — Push `LIMIT` into filtered, unordered, non-aggregate single-table scans so the full-table scan early-breaks after `offset+limit` matches instead of decoding/evaluating every row (guarded to exclude aggregates / window functions / DISTINCT). Also fixes a correctness bug where the outer `LIMIT`/`OFFSET` truncated the scanned rows before `COUNT(*)`/bare-aggregate computation, so `SELECT COUNT(*)/SUM(...) ... WHERE ... LIMIT n` returned an aggregate over only `n` rows
 
 ## Test Coverage
 

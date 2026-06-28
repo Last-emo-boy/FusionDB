@@ -655,3 +655,93 @@ async fn test_multi_column_order_by() {
     assert_eq!(rows[2][1], fusiondb::common::Value::Integer(30));
     cleanup(&wal);
 }
+
+// --- BENCHPROD-437: LIMIT pushdown into filtered (unordered) scans ---
+
+async fn seed_limit_table(executor: &Executor) {
+    exec_ok(
+        executor,
+        "CREATE TABLE lp (id INTEGER PRIMARY KEY, v INTEGER, cat TEXT)",
+    )
+    .await;
+    // 50 rows: v == id (1..=50), cat alternates 'a'/'b'. No secondary index -> full scan path.
+    for i in 1..=50 {
+        let cat = if i % 2 == 0 { "a" } else { "b" };
+        exec_ok(
+            executor,
+            &format!("INSERT INTO lp VALUES ({}, {}, '{}')", i, i, cat),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn test_filtered_limit_returns_exactly_n_matching_rows() {
+    let (executor, wal) = setup().await;
+    seed_limit_table(&executor).await;
+    // 41 rows match (v >= 10); LIMIT 5 must return exactly 5, all satisfying the predicate.
+    let (_, rows) = query(&executor, "SELECT * FROM lp WHERE v >= 10 LIMIT 5").await;
+    assert_eq!(rows.len(), 5, "filtered LIMIT must return exactly N rows");
+    for row in &rows {
+        match &row[1] {
+            Value::Integer(v) => assert!(*v >= 10, "row violates predicate: {}", v),
+            other => panic!("unexpected v: {:?}", other),
+        }
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_filtered_limit_offset_returns_exactly_n_rows() {
+    let (executor, wal) = setup().await;
+    seed_limit_table(&executor).await;
+    let (_, rows) = query(&executor, "SELECT * FROM lp WHERE v >= 10 LIMIT 5 OFFSET 3").await;
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        if let Value::Integer(v) = &row[1] {
+            assert!(*v >= 10);
+        }
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_filtered_limit_does_not_truncate_bare_aggregate() {
+    // Critical guard: a bare aggregate with WHERE + LIMIT must aggregate over ALL matching
+    // rows, not be early-broken by the pushed scan limit.
+    let (executor, wal) = setup().await;
+    seed_limit_table(&executor).await;
+    let (_, rows) = query(&executor, "SELECT COUNT(*) FROM lp WHERE v >= 10 LIMIT 1").await;
+    assert_eq!(
+        rows[0][0],
+        Value::Integer(41),
+        "COUNT must see all matching rows"
+    );
+
+    let (_, sum_rows) = query(&executor, "SELECT SUM(v) FROM lp WHERE v >= 10 LIMIT 1").await;
+    // sum of 10..=50 = (10+50)*41/2 = 1230
+    assert_eq!(
+        sum_rows[0][0],
+        Value::Integer(1230),
+        "SUM must see all matching rows"
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_filtered_limit_distinct_not_truncated_before_dedup() {
+    // DISTINCT with WHERE + LIMIT must dedup over all matching rows first; only 2 distinct cats.
+    let (executor, wal) = setup().await;
+    seed_limit_table(&executor).await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT DISTINCT cat FROM lp WHERE v >= 10 LIMIT 5",
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "DISTINCT must yield all distinct values, not be early-broken"
+    );
+    cleanup(&wal);
+}
