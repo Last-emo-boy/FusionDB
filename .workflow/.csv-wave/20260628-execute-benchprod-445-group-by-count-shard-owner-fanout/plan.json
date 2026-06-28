@@ -1,0 +1,13 @@
+{
+  "id": "BENCHPROD-445",
+  "title": "Distributed GROUP BY <col>, COUNT(*) shard-owner fan-out",
+  "phase": "P5-3 Automatic sharding",
+  "status": "completed",
+  "tasks": [
+    {"id": "BENCHPROD-445-1", "title": "Detect safe single-table single-column GROUP BY col, COUNT(*) fan-out plans (either projection order)", "status": "completed"},
+    {"id": "BENCHPROD-445-2", "title": "Run the query per owner (no rewrite) and merge by re-grouping on the group key, summing counts; preserve NULL groups", "status": "completed"},
+    {"id": "BENCHPROD-445-3", "title": "Cover HTTP query, HTTP prepared, pgwire simple, and pgwire extended group-count fan-out", "status": "completed"},
+    {"id": "BENCHPROD-445-4", "title": "Add planner unit test + cross-owner re-grouping integration test", "status": "completed"}
+  ],
+  "verification": ["cargo fmt --check", "git diff --check", "cargo check --bins", "cargo test --lib", "cargo test --test sql_group_aggregate", "cargo test --test pg_integration shard_owner"]
+}
