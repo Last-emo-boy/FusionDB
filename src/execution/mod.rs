@@ -100,6 +100,24 @@ pub(crate) struct SqlShardGroupCountFanoutPlan {
     pub output_columns: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlShardGroupAggregateKind {
+    Sum,
+    Min,
+    Max,
+}
+
+/// Plan for `SELECT g1[, ...], AGG(x) FROM t [WHERE ...] GROUP BY g1[, ...]` shard-owner fan-out for
+/// AGG in {SUM, MIN, MAX}. Each owner runs the original query; results are merged by re-grouping on
+/// the composite key (`group_indices`) and reducing the aggregate value at `agg_index` per `kind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlShardGroupAggregateFanoutPlan {
+    pub group_indices: Vec<usize>,
+    pub agg_index: usize,
+    pub kind: SqlShardGroupAggregateKind,
+    pub output_columns: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStatementRecord {
     pub id: String,
@@ -800,6 +818,64 @@ impl Executor {
             .await
     }
 
+    pub(crate) fn shard_group_aggregate_select_fanout_plan_for_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Option<SqlShardGroupAggregateFanoutPlan>> {
+        let statements = self.prepare(sql)?;
+        Ok(Self::group_aggregate_select_fanout_target(&statements).map(|(_, _, plan)| plan))
+    }
+
+    pub(crate) fn shard_group_aggregate_select_fanout_plan_for_statements(
+        statements: &[Statement],
+    ) -> Option<SqlShardGroupAggregateFanoutPlan> {
+        Self::group_aggregate_select_fanout_target(statements).map(|(_, _, plan)| plan)
+    }
+
+    pub(crate) async fn shard_group_aggregate_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_group_aggregate_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_group_aggregate_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let Some((table_name, column_name, _)) =
+            Self::group_aggregate_select_fanout_target(statements)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut txn = self.storage.begin_transaction().await?;
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(&table_name, &mut *txn)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(column) = schema
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&column_name))
+        else {
+            return Ok(Vec::new());
+        };
+        if !Self::is_integer_type_name(&column.data_type)
+            && !Self::is_float_type_name(&column.data_type)
+        {
+            return Ok(Vec::new());
+        }
+        drop(txn);
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
+    }
+
     pub(crate) async fn shard_count_distinct_select_fanout_owners_for_sql(
         &self,
         sql: &str,
@@ -1355,6 +1431,107 @@ impl Executor {
             count_index,
             output_columns,
         })
+    }
+
+    fn group_aggregate_select_fanout_target(
+        statements: &[Statement],
+    ) -> Option<(String, String, SqlShardGroupAggregateFanoutPlan)> {
+        let [Statement::Query(query)] = statements else {
+            return None;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+        {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, group_modifiers) =
+            &select.group_by
+        else {
+            return None;
+        };
+        if group_exprs.is_empty() || !group_modifiers.is_empty() {
+            return None;
+        }
+        if select.projection.len() != group_exprs.len() + 1 {
+            return None;
+        }
+        let mut group_set = Vec::with_capacity(group_exprs.len());
+        for group_expr in group_exprs {
+            let n = Self::fanout_group_column_name(group_expr)?;
+            if group_set
+                .iter()
+                .any(|e: &String| e.eq_ignore_ascii_case(&n))
+            {
+                return None;
+            }
+            group_set.push(n);
+        }
+        if !select
+            .selection
+            .as_ref()
+            .is_none_or(Self::select_predicate_is_fanout_local)
+        {
+            return None;
+        }
+        let mut agg: Option<(usize, String, SqlShardGroupAggregateKind)> = None;
+        let mut group_indices = Vec::with_capacity(group_exprs.len());
+        let mut matched: Vec<String> = Vec::with_capacity(group_exprs.len());
+        for (index, item) in select.projection.iter().enumerate() {
+            if let Some((col_name, _)) =
+                Self::select_projection_column_function_arg(item, &["SUM", "MIN", "MAX"])
+            {
+                if agg.is_some() {
+                    return None;
+                }
+                let kind = match Self::select_projection_function_name(item) {
+                    Some(n) if n.eq_ignore_ascii_case("SUM") => SqlShardGroupAggregateKind::Sum,
+                    Some(n) if n.eq_ignore_ascii_case("MIN") => SqlShardGroupAggregateKind::Min,
+                    Some(n) if n.eq_ignore_ascii_case("MAX") => SqlShardGroupAggregateKind::Max,
+                    _ => return None,
+                };
+                agg = Some((index, col_name, kind));
+            } else if let Some(name) = Self::fanout_projection_column_name(item) {
+                if !group_set.iter().any(|g| g.eq_ignore_ascii_case(&name))
+                    || matched.iter().any(|m| m.eq_ignore_ascii_case(&name))
+                {
+                    return None;
+                }
+                matched.push(name);
+                group_indices.push(index);
+            } else {
+                return None;
+            }
+        }
+        let (agg_index, agg_column, kind) = agg?;
+        if group_indices.len() != group_exprs.len() {
+            return None;
+        }
+        let output_columns = select
+            .projection
+            .iter()
+            .map(Self::select_projection_output_name)
+            .collect::<Option<Vec<_>>>()?;
+        Some((
+            name.to_string(),
+            agg_column,
+            SqlShardGroupAggregateFanoutPlan {
+                group_indices,
+                agg_index,
+                kind,
+                output_columns,
+            },
+        ))
     }
 
     fn fanout_group_column_name(expr: &Expr) -> Option<String> {
@@ -3303,6 +3480,59 @@ mod tests {
         ] {
             assert!(
                 Executor::shard_group_count_select_fanout_plan_for_statements(
+                    &parse_sql(sql).unwrap()
+                )
+                .is_none(),
+                "should be ineligible: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_aggregate_select_fanout_plan_matches_sum_min_max() {
+        use super::SqlShardGroupAggregateKind::{Max, Min, Sum};
+        for (sql, kind, gidx, aidx) in [
+            (
+                "SELECT region, SUM(amount) FROM orders GROUP BY region",
+                Sum,
+                vec![0],
+                1,
+            ),
+            (
+                "SELECT MIN(amount), region FROM orders GROUP BY region",
+                Min,
+                vec![1],
+                0,
+            ),
+            (
+                "SELECT region, country, MAX(amount) FROM orders GROUP BY region, country",
+                Max,
+                vec![0, 1],
+                2,
+            ),
+        ] {
+            let plan = Executor::shard_group_aggregate_select_fanout_plan_for_statements(
+                &parse_sql(sql).unwrap(),
+            )
+            .unwrap_or_else(|| panic!("expected group aggregate plan: {sql}"));
+            assert_eq!(plan.kind, kind, "kind for {sql}");
+            assert_eq!(plan.group_indices, gidx, "group_indices for {sql}");
+            assert_eq!(plan.agg_index, aidx, "agg_index for {sql}");
+        }
+
+        // Ineligible: COUNT(*) (group-count path), AVG (separate ticket), no GROUP BY,
+        // HAVING / ORDER BY / LIMIT, projection arity mismatch.
+        for sql in [
+            "SELECT region, COUNT(*) FROM orders GROUP BY region",
+            "SELECT region, AVG(amount) FROM orders GROUP BY region",
+            "SELECT region, SUM(amount) FROM orders",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > 1",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY region",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region LIMIT 5",
+            "SELECT region, country, SUM(amount) FROM orders GROUP BY region",
+        ] {
+            assert!(
+                Executor::shard_group_aggregate_select_fanout_plan_for_statements(
                     &parse_sql(sql).unwrap()
                 )
                 .is_none(),

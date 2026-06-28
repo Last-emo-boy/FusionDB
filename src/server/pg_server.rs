@@ -37,7 +37,8 @@ use sqlparser::ast::{
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Value}; // Import FusionError
 use crate::execution::{
-    Executor, ForeignKeyMeta, QueryResult, SqlShardExtremum, SqlShardOwner, SqlShardRoutingDecision,
+    Executor, ForeignKeyMeta, QueryResult, SqlShardExtremum, SqlShardGroupAggregateKind,
+    SqlShardOwner, SqlShardRoutingDecision,
 };
 use crate::monitor;
 use crate::parser::parse_sql;
@@ -193,6 +194,12 @@ enum ForwardQueryResultJson {
 enum ForwardSum {
     Integer(i64),
     Float(f64),
+}
+
+/// Per-group running accumulator for grouped SUM/MIN/MAX fan-out (pgwire forward path).
+enum ForwardGroupAcc {
+    Sum(Option<ForwardSum>),
+    Extremum(Option<serde_json::Value>),
 }
 
 impl PgHandler {
@@ -944,6 +951,100 @@ impl PgHandler {
         ])?))
     }
 
+    async fn fanout_group_aggregate_select_to_shard_owners(
+        &self,
+        query: &str,
+        username: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        let plan = match self
+            .executor
+            .shard_group_aggregate_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group aggregate fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_group_aggregate_select_fanout_owners_for_sql(query, &[])
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group aggregate fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let local_results = match self.executor.execute_sql(query).await {
+            Ok(results) => Self::forward_results_from_query_results(results),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group aggregate fan-out local execution error",
+                    &e,
+                )))]));
+            }
+        };
+        let mut groups = BTreeMap::new();
+        let columns = match Self::accumulate_forward_group_aggregates(
+            &mut groups,
+            local_results,
+            &plan.group_indices,
+            plan.agg_index,
+            plan.kind,
+        ) {
+            Ok(columns) => columns,
+            Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_shard_owner_results(query, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            let owner_columns = match Self::accumulate_forward_group_aggregates(
+                &mut groups,
+                owner_results,
+                &plan.group_indices,
+                plan.agg_index,
+                plan.kind,
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            if owner_columns != columns {
+                return Ok(Some(vec![Response::Error(Box::new(
+                    Self::execution_error(format!(
+                        "Shard group aggregate fan-out column mismatch: expected {:?}, got {:?}",
+                        columns, owner_columns
+                    )),
+                ))]));
+            }
+        }
+
+        Ok(Some(Self::responses_from_forwarded_query_results(vec![
+            ForwardQueryResultJson::Select {
+                columns,
+                rows: Self::forward_group_aggregate_rows(
+                    groups,
+                    &plan.group_indices,
+                    plan.agg_index,
+                ),
+            },
+        ])?))
+    }
+
     async fn fanout_count_distinct_select_to_shard_owners(
         &self,
         query: &str,
@@ -1668,6 +1769,95 @@ impl PgHandler {
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns,
             rows: Self::forward_group_count_rows(groups, &plan.group_indices, plan.count_index),
+        }])))
+    }
+
+    async fn fanout_extended_group_aggregate_select_to_shard_owners(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        let plan = match self
+            .executor
+            .shard_group_aggregate_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group aggregate fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_group_aggregate_select_fanout_owners_for_sql(query, params)
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group aggregate fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+
+        let local_results = match self.execute_first_statement(query, params).await {
+            Ok(result) => Self::forward_results_from_query_results(vec![result]),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group aggregate fan-out local execution error",
+                    &e,
+                )));
+            }
+        };
+        let mut groups = BTreeMap::new();
+        let columns = match Self::accumulate_forward_group_aggregates(
+            &mut groups,
+            local_results,
+            &plan.group_indices,
+            plan.agg_index,
+            plan.kind,
+        ) {
+            Ok(columns) => columns,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_prepared_shard_owner_results(query, params, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Err(error)),
+            };
+            let owner_columns = match Self::accumulate_forward_group_aggregates(
+                &mut groups,
+                owner_results,
+                &plan.group_indices,
+                plan.agg_index,
+                plan.kind,
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return Ok(Err(error)),
+            };
+            if owner_columns != columns {
+                return Ok(Err(Self::execution_error(format!(
+                    "Shard group aggregate fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ))));
+            }
+        }
+
+        Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
+            columns,
+            rows: Self::forward_group_aggregate_rows(groups, &plan.group_indices, plan.agg_index),
         }])))
     }
 
@@ -2527,6 +2717,102 @@ impl PgHandler {
                 row[gi] = group_values[k].clone();
             }
             row[count_index] = serde_json::json!(count);
+            rows.push(row);
+        }
+        rows
+    }
+
+    fn accumulate_forward_group_aggregates(
+        groups: &mut BTreeMap<String, (Vec<serde_json::Value>, ForwardGroupAcc)>,
+        results: Vec<ForwardQueryResultJson>,
+        group_indices: &[usize],
+        agg_index: usize,
+        kind: SqlShardGroupAggregateKind,
+    ) -> std::result::Result<Vec<String>, pgwire::error::ErrorInfo> {
+        let [result] = results.as_slice() else {
+            return Err(Self::execution_error(
+                "Shard group aggregate fan-out expected exactly one SELECT result",
+            ));
+        };
+        let ForwardQueryResultJson::Select { columns, rows } = result else {
+            return Err(Self::execution_error(
+                "Shard group aggregate fan-out received a non-SELECT result",
+            ));
+        };
+        let expected = group_indices.len() + 1;
+        if columns.len() != expected {
+            return Err(Self::execution_error(format!(
+                "Shard group aggregate fan-out expected {} output columns",
+                expected
+            )));
+        }
+        for row in rows {
+            if row.len() != expected {
+                return Err(Self::execution_error(format!(
+                    "Shard group aggregate fan-out expected {} values per row",
+                    expected
+                )));
+            }
+            let group_values: Vec<serde_json::Value> =
+                group_indices.iter().map(|&i| row[i].clone()).collect();
+            let key = serde_json::to_string(&group_values).map_err(|e| {
+                Self::execution_error(format!(
+                    "Shard group aggregate fan-out could not encode group key {:?}: {}",
+                    group_values, e
+                ))
+            })?;
+            let entry = groups.entry(key).or_insert_with(|| {
+                let acc = match kind {
+                    SqlShardGroupAggregateKind::Sum => ForwardGroupAcc::Sum(None),
+                    SqlShardGroupAggregateKind::Min | SqlShardGroupAggregateKind::Max => {
+                        ForwardGroupAcc::Extremum(None)
+                    }
+                };
+                (group_values, acc)
+            });
+            let value = &row[agg_index];
+            match &mut entry.1 {
+                ForwardGroupAcc::Sum(total) => {
+                    Self::add_forward_sum(total, Self::forward_sum_json_value(value)?)?;
+                }
+                ForwardGroupAcc::Extremum(total) => {
+                    let ext_kind = match kind {
+                        SqlShardGroupAggregateKind::Min => SqlShardExtremum::Min,
+                        _ => SqlShardExtremum::Max,
+                    };
+                    let candidate = if value.is_null() {
+                        None
+                    } else if value.as_f64().is_some_and(|v| v.is_finite()) {
+                        Some(value.clone())
+                    } else {
+                        return Err(Self::execution_error(format!(
+                            "Shard group min/max fan-out received a non-numeric value: {}",
+                            value
+                        )));
+                    };
+                    Self::merge_forward_extremum(total, candidate, ext_kind)?;
+                }
+            }
+        }
+        Ok(columns.clone())
+    }
+
+    fn forward_group_aggregate_rows(
+        groups: BTreeMap<String, (Vec<serde_json::Value>, ForwardGroupAcc)>,
+        group_indices: &[usize],
+        agg_index: usize,
+    ) -> Vec<Vec<serde_json::Value>> {
+        let width = group_indices.len() + 1;
+        let mut rows = Vec::with_capacity(groups.len());
+        for (_, (group_values, acc)) in groups {
+            let mut row = vec![serde_json::Value::Null; width];
+            for (k, &gi) in group_indices.iter().enumerate() {
+                row[gi] = group_values[k].clone();
+            }
+            row[agg_index] = match acc {
+                ForwardGroupAcc::Sum(total) => Self::forward_sum_to_json(total),
+                ForwardGroupAcc::Extremum(total) => total.unwrap_or(serde_json::Value::Null),
+            };
             rows.push(row);
         }
         rows
@@ -8411,6 +8697,13 @@ impl SimpleQueryHandler for PgHandler {
                     return Ok(responses);
                 }
                 if let Some(mut fanout_responses) = self
+                    .fanout_group_aggregate_select_to_shard_owners(&fanout_query, &username)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                if let Some(mut fanout_responses) = self
                     .fanout_count_distinct_select_to_shard_owners(&fanout_query, &username)
                     .await?
                 {
@@ -8958,6 +9251,33 @@ impl ExtendedQueryHandler for PgHandler {
                     }
                     match self
                         .fanout_extended_group_count_select_to_shard_owners(
+                            &query, &params, &username,
+                        )
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_group_aggregate_select_to_shard_owners(
                             &query, &params, &username,
                         )
                         .await?
