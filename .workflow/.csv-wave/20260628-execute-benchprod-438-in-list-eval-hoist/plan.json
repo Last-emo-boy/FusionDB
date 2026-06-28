@@ -1,0 +1,12 @@
+{
+  "id": "BENCHPROD-438",
+  "title": "Reduce per-row IN-list predicate-eval overhead",
+  "phase": "P9 Performance Optimization",
+  "status": "completed",
+  "tasks": [
+    {"id": "BENCHPROD-438-1", "title": "Resolve the comparison column data type once per row and coerce each IN-list item to it, instead of re-running full alignment per item", "status": "completed"},
+    {"id": "BENCHPROD-438-2", "title": "Drop the per-row identifier String clone in resolve_column_index path", "status": "completed"},
+    {"id": "BENCHPROD-438-3", "title": "Add IN-list correctness tests vs OR-expansion (mixed numeric + string + NOT IN)", "status": "completed"}
+  ],
+  "verification": ["cargo fmt --check", "git diff --check", "cargo check --bins", "cargo test --test sql_in_list", "cargo test --lib"]
+}
