@@ -1,0 +1,13 @@
+{
+  "id": "BENCHPROD-443",
+  "title": "Implement FULL OUTER JOIN (was executing with inner semantics)",
+  "phase": "P2 SQL Completeness (correctness)",
+  "status": "completed",
+  "tasks": [
+    {"id": "BENCHPROD-443-1", "title": "Emit matched pairs once + unmatched-left (right NULL) + unmatched-right (left NULL) for FULL OUTER JOIN", "status": "completed"},
+    {"id": "BENCHPROD-443-2", "title": "Cover both the equi hash-join path (force build-right + track right matches + post-pass) and the non-equi nested-loop fallback", "status": "completed"},
+    {"id": "BENCHPROD-443-3", "title": "Disable the expr-hash path for FULL (cannot emit unmatched-left); keep LEFT/RIGHT/INNER/CROSS unchanged", "status": "completed"},
+    {"id": "BENCHPROD-443-4", "title": "Add FULL OUTER tests (mixed equi, all-match==inner, non-equi)", "status": "completed"}
+  ],
+  "verification": ["cargo fmt --check", "git diff --check", "cargo check --bins", "cargo test --test sql_join", "cargo test --lib"]
+}
