@@ -1,0 +1,37 @@
+{
+  "id": "BENCHPROD-437",
+  "title": "Filtered-scan LIMIT pushdown + aggregate LIMIT truncation fix",
+  "phase": "P9 Performance Optimization",
+  "status": "completed",
+  "tasks": [
+    {
+      "id": "BENCHPROD-437-1",
+      "title": "Push LIMIT into filtered, unordered, non-aggregate single-table scans so the full scan early-breaks after offset+limit matches",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-437-2",
+      "title": "Guard the pushdown against aggregates, window functions, and DISTINCT (which must observe the full row set)",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-437-3",
+      "title": "Fix pre-existing bug: outer LIMIT/OFFSET truncated scanned rows before COUNT(*)/bare-aggregate computation",
+      "status": "completed"
+    },
+    {
+      "id": "BENCHPROD-437-4",
+      "title": "Add focused tests (filtered LIMIT count, OFFSET, DISTINCT guard, bare-aggregate not truncated) and update ROADMAP",
+      "status": "completed"
+    }
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "git diff --check",
+    "cargo check --bins",
+    "cargo test --test sql_select",
+    "cargo test --lib",
+    "cargo test --test pg_integration shard_owner",
+    "benchmark.py (medium) before/after comparison"
+  ]
+}
