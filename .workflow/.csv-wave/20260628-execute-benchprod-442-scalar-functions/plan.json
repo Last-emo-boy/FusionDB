@@ -1,0 +1,14 @@
+{
+  "id": "BENCHPROD-442",
+  "title": "Add scalar functions TRIM / POSITION / GREATEST / LEAST / EXTRACT QUARTER|WEEK",
+  "phase": "P2 SQL Completeness",
+  "status": "completed",
+  "tasks": [
+    {"id": "BENCHPROD-442-1", "title": "Implement TRIM (BOTH/LEADING/TRAILING, optional FROM <chars>) — parser emitted Expr::Trim with no handler", "status": "completed"},
+    {"id": "BENCHPROD-442-2", "title": "Implement POSITION(sub IN str) -> 1-based index or 0", "status": "completed"},
+    {"id": "BENCHPROD-442-3", "title": "Implement GREATEST/LEAST with SQL NULL semantics", "status": "completed"},
+    {"id": "BENCHPROD-442-4", "title": "Extend EXTRACT with QUARTER and WEEK (ISO)", "status": "completed"},
+    {"id": "BENCHPROD-442-5", "title": "Add per-function tests", "status": "completed"}
+  ],
+  "verification": ["cargo fmt --check", "git diff --check", "cargo check --bins", "cargo test --test sql_expr_functions", "cargo test --lib"]
+}
