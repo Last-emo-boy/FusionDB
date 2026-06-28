@@ -1346,6 +1346,63 @@ impl Executor {
                         .scan_routed_data_prefixes_for_table(&table_name, txn, scan_limit)
                         .await?;
 
+                    // BENCHPROD-440: For a large unindexed full scan WITH a selection and
+                    // no pushed limit (so the serial early-break isn't in play), decode and
+                    // filter rows in parallel via rayon. `par_iter().filter_map().collect()`
+                    // preserves input order, so this yields the same rows in the same order
+                    // as the serial path below. Skip the key-only / zero-column projections,
+                    // which take cheaper decode paths, and only engage above a threshold.
+                    let parallel_full_scan = selection.is_some()
+                        && limit.is_none()
+                        && !key_only_scan
+                        && !zero_column_projection
+                        && kv_pairs.len() > 1000;
+
+                    if parallel_full_scan {
+                        use rayon::iter::IntoParallelIterator;
+                        use rayon::iter::ParallelIterator;
+
+                        let sel = selection.as_ref().unwrap();
+                        let projection_indices = projection_indices.as_deref();
+                        rows = kv_pairs
+                            .into_par_iter()
+                            .filter_map(|(k, v)| {
+                                let row = match std::str::from_utf8(&k) {
+                                    Ok(key_str) => {
+                                        if let Some(row) = self.row_cache.get(key_str) {
+                                            monitor::inc_row_cache_hit();
+                                            Some(row)
+                                        } else if projection_indices.is_none() {
+                                            Self::decode_row_for_projection(&v, None).ok().map(
+                                                |row| {
+                                                    self.row_cache
+                                                        .insert(key_str.to_string(), row.clone());
+                                                    row
+                                                },
+                                            )
+                                        } else {
+                                            Self::decode_row_for_projection(&v, projection_indices)
+                                                .ok()
+                                        }
+                                    }
+                                    Err(_) => {
+                                        Self::decode_row_for_projection(&v, projection_indices).ok()
+                                    }
+                                }?;
+                                if self
+                                    .evaluate_expr(sel, &row, &schema, params)
+                                    .unwrap_or(false)
+                                {
+                                    Some(row)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        return Ok((schema, rows, rows_satisfy_order_by));
+                    }
+
                     for (k, v) in kv_pairs {
                         let row_res = if key_only_scan {
                             if let Some(pk_str) = Self::row_id_from_key(&k) {
