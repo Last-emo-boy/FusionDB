@@ -89,6 +89,16 @@ pub(crate) struct SqlShardDistinctAggregateFanoutPlan {
     pub output_column: String,
 }
 
+/// Plan for `SELECT col, COUNT(*) FROM t [WHERE ...] GROUP BY col` shard-owner fan-out. Each owner
+/// runs the original query (no rewrite); results are merged by re-grouping on `group_index` and
+/// summing the counts at `count_index`. The output preserves the projection column order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlShardGroupCountFanoutPlan {
+    pub group_index: usize,
+    pub count_index: usize,
+    pub output_columns: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStatementRecord {
     pub id: String,
@@ -753,6 +763,42 @@ impl Executor {
             .await
     }
 
+    pub(crate) fn shard_group_count_select_fanout_plan_for_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Option<SqlShardGroupCountFanoutPlan>> {
+        let statements = self.prepare(sql)?;
+        Ok(Self::group_count_select_fanout_plan(&statements))
+    }
+
+    pub(crate) fn shard_group_count_select_fanout_plan_for_statements(
+        statements: &[Statement],
+    ) -> Option<SqlShardGroupCountFanoutPlan> {
+        Self::group_count_select_fanout_plan(statements)
+    }
+
+    pub(crate) async fn shard_group_count_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_group_count_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_group_count_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        if Self::group_count_select_fanout_plan(statements).is_none() {
+            return Ok(Vec::new());
+        }
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
+    }
+
     pub(crate) async fn shard_count_distinct_select_fanout_owners_for_sql(
         &self,
         sql: &str,
@@ -1219,6 +1265,98 @@ impl Executor {
             ),
             output_column,
         })
+    }
+
+    fn group_count_select_fanout_plan(
+        statements: &[Statement],
+    ) -> Option<SqlShardGroupCountFanoutPlan> {
+        let [Statement::Query(query)] = statements else {
+            return None;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.projection.len() != 2
+        {
+            return None;
+        }
+        if !matches!(select.from[0].relation, TableFactor::Table { .. }) {
+            return None;
+        }
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, group_modifiers) =
+            &select.group_by
+        else {
+            return None;
+        };
+        if group_exprs.len() != 1 || !group_modifiers.is_empty() {
+            return None;
+        }
+        let group_column = Self::fanout_group_column_name(&group_exprs[0])?;
+        if !select
+            .selection
+            .as_ref()
+            .is_none_or(Self::select_predicate_is_fanout_local)
+        {
+            return None;
+        }
+        // Exactly one projection item must be COUNT(*), the other the (identifier) group column.
+        let mut count_index = None;
+        let mut group_index = None;
+        for (index, item) in select.projection.iter().enumerate() {
+            if Self::select_projection_is_count_star(item) {
+                if count_index.is_some() {
+                    return None;
+                }
+                count_index = Some(index);
+            } else if Self::select_projection_matches_column(item, &group_column) {
+                if group_index.is_some() {
+                    return None;
+                }
+                group_index = Some(index);
+            } else {
+                return None;
+            }
+        }
+        let count_index = count_index?;
+        let group_index = group_index?;
+        let output_columns = vec![
+            Self::select_projection_output_name(&select.projection[0])?,
+            Self::select_projection_output_name(&select.projection[1])?,
+        ];
+        Some(SqlShardGroupCountFanoutPlan {
+            group_index,
+            count_index,
+            output_columns,
+        })
+    }
+
+    fn fanout_group_column_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.clone()),
+            _ => None,
+        }
+    }
+
+    fn select_projection_matches_column(item: &SelectItem, column_name: &str) -> bool {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return false,
+        };
+        match expr {
+            Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column_name),
+            Expr::CompoundIdentifier(idents) => idents
+                .last()
+                .is_some_and(|ident| ident.value.eq_ignore_ascii_case(column_name)),
+            _ => false,
+        }
     }
 
     fn sum_select_fanout_eligible(statements: &[Statement]) -> bool {
@@ -3099,6 +3237,43 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn group_count_select_fanout_plan_matches_group_count_shapes() {
+        // col, COUNT(*) and COUNT(*), col both eligible; indices track the projection order.
+        let p1 = Executor::shard_group_count_select_fanout_plan_for_statements(
+            &parse_sql("SELECT region, COUNT(*) FROM orders GROUP BY region").unwrap(),
+        )
+        .expect("group count plan");
+        assert_eq!(p1.group_index, 0);
+        assert_eq!(p1.count_index, 1);
+
+        let p2 = Executor::shard_group_count_select_fanout_plan_for_statements(
+            &parse_sql("SELECT COUNT(*), region FROM orders WHERE region <> 'x' GROUP BY region")
+                .unwrap(),
+        )
+        .expect("group count plan reversed");
+        assert_eq!(p2.count_index, 0);
+        assert_eq!(p2.group_index, 1);
+
+        // Not eligible: no GROUP BY, HAVING, multiple group cols, ORDER BY/LIMIT, non-count aggregate.
+        for sql in [
+            "SELECT region, COUNT(*) FROM orders",
+            "SELECT region, COUNT(*) FROM orders GROUP BY region HAVING COUNT(*) > 1",
+            "SELECT region, COUNT(*) FROM orders GROUP BY region, country",
+            "SELECT region, COUNT(*) FROM orders GROUP BY region ORDER BY region",
+            "SELECT region, COUNT(*) FROM orders GROUP BY region LIMIT 5",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region",
+        ] {
+            assert!(
+                Executor::shard_group_count_select_fanout_plan_for_statements(
+                    &parse_sql(sql).unwrap()
+                )
+                .is_none(),
+                "should be ineligible: {sql}"
+            );
+        }
     }
 
     #[test]

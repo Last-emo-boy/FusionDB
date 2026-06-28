@@ -856,6 +856,94 @@ impl PgHandler {
         ])?))
     }
 
+    async fn fanout_group_count_select_to_shard_owners(
+        &self,
+        query: &str,
+        username: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        let plan = match self
+            .executor
+            .shard_group_count_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group count fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_group_count_select_fanout_owners_for_sql(query, &[])
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group count fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let local_results = match self.executor.execute_sql(query).await {
+            Ok(results) => Self::forward_results_from_query_results(results),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group count fan-out local execution error",
+                    &e,
+                )))]));
+            }
+        };
+        let mut groups = BTreeMap::new();
+        let columns = match Self::accumulate_forward_group_counts(
+            &mut groups,
+            local_results,
+            plan.group_index,
+            plan.count_index,
+        ) {
+            Ok(columns) => columns,
+            Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_shard_owner_results(query, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            let owner_columns = match Self::accumulate_forward_group_counts(
+                &mut groups,
+                owner_results,
+                plan.group_index,
+                plan.count_index,
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            if owner_columns != columns {
+                return Ok(Some(vec![Response::Error(Box::new(
+                    Self::execution_error(format!(
+                        "Shard group count fan-out column mismatch: expected {:?}, got {:?}",
+                        columns, owner_columns
+                    )),
+                ))]));
+            }
+        }
+
+        Ok(Some(Self::responses_from_forwarded_query_results(vec![
+            ForwardQueryResultJson::Select {
+                columns,
+                rows: Self::forward_group_count_rows(groups, plan.group_index, plan.count_index),
+            },
+        ])?))
+    }
+
     async fn fanout_count_distinct_select_to_shard_owners(
         &self,
         query: &str,
@@ -1493,6 +1581,93 @@ impl PgHandler {
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns,
             rows: vec![vec![serde_json::json!(total)]],
+        }])))
+    }
+
+    async fn fanout_extended_group_count_select_to_shard_owners(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        let plan = match self
+            .executor
+            .shard_group_count_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group count fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_group_count_select_fanout_owners_for_sql(query, params)
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group count fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+
+        let local_results = match self.execute_first_statement(query, params).await {
+            Ok(result) => Self::forward_results_from_query_results(vec![result]),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group count fan-out local execution error",
+                    &e,
+                )));
+            }
+        };
+        let mut groups = BTreeMap::new();
+        let columns = match Self::accumulate_forward_group_counts(
+            &mut groups,
+            local_results,
+            plan.group_index,
+            plan.count_index,
+        ) {
+            Ok(columns) => columns,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_prepared_shard_owner_results(query, params, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Err(error)),
+            };
+            let owner_columns = match Self::accumulate_forward_group_counts(
+                &mut groups,
+                owner_results,
+                plan.group_index,
+                plan.count_index,
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return Ok(Err(error)),
+            };
+            if owner_columns != columns {
+                return Ok(Err(Self::execution_error(format!(
+                    "Shard group count fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ))));
+            }
+        }
+
+        Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
+            columns,
+            rows: Self::forward_group_count_rows(groups, plan.group_index, plan.count_index),
         }])))
     }
 
@@ -2278,6 +2453,78 @@ impl PgHandler {
             )));
         };
         Ok((columns.clone(), count))
+    }
+
+    fn accumulate_forward_group_counts(
+        groups: &mut BTreeMap<String, (serde_json::Value, i64)>,
+        results: Vec<ForwardQueryResultJson>,
+        group_index: usize,
+        count_index: usize,
+    ) -> std::result::Result<Vec<String>, pgwire::error::ErrorInfo> {
+        let [result] = results.as_slice() else {
+            return Err(Self::execution_error(
+                "Shard group count fan-out expected exactly one SELECT result",
+            ));
+        };
+        let ForwardQueryResultJson::Select { columns, rows } = result else {
+            return Err(Self::execution_error(
+                "Shard group count fan-out received a non-SELECT result",
+            ));
+        };
+        if columns.len() != 2 {
+            return Err(Self::execution_error(
+                "Shard group count fan-out expected two output columns",
+            ));
+        }
+        for row in rows {
+            if row.len() != 2 {
+                return Err(Self::execution_error(
+                    "Shard group count fan-out expected two values per row",
+                ));
+            }
+            let group_value = &row[group_index];
+            let count_value = &row[count_index];
+            let count = count_value.as_i64().or_else(|| {
+                count_value
+                    .as_u64()
+                    .and_then(|count| i64::try_from(count).ok())
+            });
+            let Some(count) = count else {
+                return Err(Self::execution_error(format!(
+                    "Shard group count fan-out received a non-integer count value: {}",
+                    count_value
+                )));
+            };
+            let key = serde_json::to_string(group_value).map_err(|e| {
+                Self::execution_error(format!(
+                    "Shard group count fan-out could not encode group key {}: {}",
+                    group_value, e
+                ))
+            })?;
+            let entry = groups
+                .entry(key)
+                .or_insert_with(|| (group_value.clone(), 0));
+            entry.1 = entry
+                .1
+                .checked_add(count)
+                .ok_or_else(|| Self::execution_error("Shard group count fan-out overflow"))?;
+        }
+        Ok(columns.clone())
+    }
+
+    fn forward_group_count_rows(
+        groups: BTreeMap<String, (serde_json::Value, i64)>,
+        group_index: usize,
+        count_index: usize,
+    ) -> Vec<Vec<serde_json::Value>> {
+        let mut rows = Vec::with_capacity(groups.len());
+        for (_, (group_value, count)) in groups {
+            let mut row = vec![serde_json::Value::Null, serde_json::Value::Null];
+            row[group_index] = group_value;
+            row[count_index] = serde_json::json!(count);
+            rows.push(row);
+        }
+        rows
     }
 
     fn distinct_values_from_forward_select_results(
@@ -8152,6 +8399,13 @@ impl SimpleQueryHandler for PgHandler {
                     return Ok(responses);
                 }
                 if let Some(mut fanout_responses) = self
+                    .fanout_group_count_select_to_shard_owners(&fanout_query, &username)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                if let Some(mut fanout_responses) = self
                     .fanout_count_distinct_select_to_shard_owners(&fanout_query, &username)
                     .await?
                 {
@@ -8674,6 +8928,33 @@ impl ExtendedQueryHandler for PgHandler {
                     }
                     match self
                         .fanout_extended_count_select_to_shard_owners(&query, &params, &username)
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_group_count_select_to_shard_owners(
+                            &query, &params, &username,
+                        )
                         .await?
                     {
                         Ok(Some(results)) => {
