@@ -1,0 +1,13 @@
+{
+  "id": "BENCHPROD-444",
+  "title": "Stream filtered + LIMIT full scans via ScanVisitor (avoid materializing all KV pairs)",
+  "phase": "P9 Performance Optimization",
+  "status": "completed",
+  "tasks": [
+    {"id": "BENCHPROD-444-1", "title": "Stream the !index_used + selection + pushed-limit case through scan_routed_data_prefixes_for_each + a FilteredLimitScanVisitor that stops at limit matches", "status": "completed"},
+    {"id": "BENCHPROD-444-2", "title": "Mirror the serial decode sub-cases exactly (key-only / zero-column / projected / full-row+cache); propagate evaluate errors via visitor.error", "status": "completed"},
+    {"id": "BENCHPROD-444-3", "title": "Leave 440 parallel-unlimited and no-selection storage-limit paths untouched (mutually exclusive on limit)", "status": "completed"},
+    {"id": "BENCHPROD-444-4", "title": "Add streaming tests (PK-order, fewer-than-limit, equivalence vs non-streamed, projected, offset)", "status": "completed"}
+  ],
+  "verification": ["cargo fmt --check", "git diff --check", "cargo check --bins", "cargo test --test sql_stream_scan", "cargo test --test sql_select", "cargo test --lib", "large benchmark"]
+}
