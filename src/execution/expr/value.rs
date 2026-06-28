@@ -2,7 +2,7 @@ use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use chrono::{Datelike, Timelike};
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, DateTimeField, Expr, Subscript, Value as SqlValue,
+    AccessExpr, BinaryOperator, DateTimeField, Expr, Subscript, TrimWhereField, Value as SqlValue,
 };
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -86,6 +86,38 @@ fn column_matches_fallback_name(column_name: &str, fallback_name: &str, suffix: 
         || column_name.ends_with(suffix)
         || column_name.eq_ignore_ascii_case(fallback_name)
         || ascii_case_insensitive_ends_with(column_name, suffix)
+}
+
+fn trim_string_value(
+    value: &str,
+    trim_where: Option<&TrimWhereField>,
+    trim_chars: Option<&str>,
+) -> String {
+    match trim_chars {
+        Some(chars) => {
+            let predicate = |c: char| chars.contains(c);
+            match trim_where {
+                Some(TrimWhereField::Leading) => value.trim_start_matches(predicate).to_string(),
+                Some(TrimWhereField::Trailing) => value.trim_end_matches(predicate).to_string(),
+                _ => value.trim_matches(predicate).to_string(),
+            }
+        }
+        None => match trim_where {
+            Some(TrimWhereField::Leading) => value.trim_start().to_string(),
+            Some(TrimWhereField::Trailing) => value.trim_end().to_string(),
+            _ => value.trim().to_string(),
+        },
+    }
+}
+
+fn position_of_substring(haystack: &str, needle: &str) -> i64 {
+    if needle.is_empty() {
+        return 1;
+    }
+    match haystack.find(needle) {
+        Some(byte_index) => haystack[..byte_index].chars().count() as i64 + 1,
+        None => 0,
+    }
 }
 
 impl Executor {
@@ -214,6 +246,52 @@ impl Executor {
             Expr::Extract { field, expr, .. } => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
                 Self::extract_datetime_field(field, val)
+            }
+            Expr::Trim {
+                expr,
+                trim_where,
+                trim_what,
+                trim_characters,
+            } => {
+                let val = self.evaluate_value(expr, row, schema, params)?;
+                let s = match val {
+                    Value::String(s) => s,
+                    _ => return Ok(Value::Null),
+                };
+                let trim_chars = if let Some(what) = trim_what {
+                    match self.evaluate_value(what, row, schema, params)? {
+                        Value::String(chars) => Some(chars),
+                        Value::Null => return Ok(Value::Null),
+                        _ => None,
+                    }
+                } else if let Some(char_exprs) = trim_characters {
+                    let mut chars = String::new();
+                    for char_expr in char_exprs {
+                        match self.evaluate_value(char_expr, row, schema, params)? {
+                            Value::String(part) => chars.push_str(&part),
+                            Value::Null => return Ok(Value::Null),
+                            _ => {}
+                        }
+                    }
+                    Some(chars)
+                } else {
+                    None
+                };
+                Ok(Value::String(trim_string_value(
+                    &s,
+                    trim_where.as_ref(),
+                    trim_chars.as_deref(),
+                )))
+            }
+            Expr::Position { expr, r#in } => {
+                let needle = self.evaluate_value(expr, row, schema, params)?;
+                let haystack = self.evaluate_value(r#in, row, schema, params)?;
+                match (needle, haystack) {
+                    (Value::String(needle), Value::String(haystack)) => {
+                        Ok(Value::Integer(position_of_substring(&haystack, &needle)))
+                    }
+                    _ => Ok(Value::Null),
+                }
             }
             Expr::Value(v) => {
                 if let SqlValue::Placeholder(p) = &v.value {
@@ -905,7 +983,10 @@ impl Executor {
             }
             DateTimeField::Isodow => Value::Integer(dt.weekday().number_from_monday() as i64),
             DateTimeField::Isoyear => Value::Integer(dt.iso_week().year() as i64),
-            DateTimeField::IsoWeek => Value::Integer(dt.iso_week().week() as i64),
+            DateTimeField::IsoWeek | DateTimeField::Week(_) => {
+                Value::Integer(dt.iso_week().week() as i64)
+            }
+            DateTimeField::Quarter => Value::Integer((dt.month0() / 3 + 1) as i64),
             _ => {
                 return Err(FusionError::Execution(format!(
                     "Unsupported EXTRACT field: {}",
@@ -965,8 +1046,10 @@ mod tests {
     use super::{
         ascii_case_insensitive_ends_with, column_matches_fallback_name, column_suffix_for_fallback,
         concat_operator_values, concat_string_values, decimal_index_string_for_value,
+        position_of_substring, trim_string_value,
     };
     use crate::common::Value;
+    use sqlparser::ast::TrimWhereField;
 
     #[test]
     fn decimal_index_string_for_value_preallocates_exact_value() {
@@ -1035,6 +1118,35 @@ mod tests {
             ".orderid_Ä"
         ));
         assert!(!ascii_case_insensitive_ends_with("id", ".customerid"));
+    }
+
+    #[test]
+    fn trim_string_value_handles_where_and_character_set() {
+        assert_eq!(trim_string_value("  hi  ", None, None), "hi");
+        assert_eq!(
+            trim_string_value("  hi  ", Some(&TrimWhereField::Leading), None),
+            "hi  "
+        );
+        assert_eq!(
+            trim_string_value("  hi  ", Some(&TrimWhereField::Trailing), None),
+            "  hi"
+        );
+        assert_eq!(
+            trim_string_value("xxhixx", Some(&TrimWhereField::Both), Some("x")),
+            "hi"
+        );
+        assert_eq!(
+            trim_string_value("xyhixy", Some(&TrimWhereField::Leading), Some("xy")),
+            "hixy"
+        );
+    }
+
+    #[test]
+    fn position_of_substring_returns_one_based_index_or_zero() {
+        assert_eq!(position_of_substring("abc", "b"), 2);
+        assert_eq!(position_of_substring("abc", "z"), 0);
+        assert_eq!(position_of_substring("abc", ""), 1);
+        assert_eq!(position_of_substring("a\u{e9}bc", "b"), 3);
     }
 
     #[test]

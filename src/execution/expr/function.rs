@@ -2,6 +2,7 @@ use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName};
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::fmt::Write as _;
 
 use super::{function_name_eq_ascii, Executor};
@@ -22,6 +23,8 @@ enum EvaluatedFunction {
     Substring,
     Replace,
     Trim,
+    Greatest,
+    Least,
     Abs,
     Round,
     Ceil,
@@ -66,6 +69,10 @@ fn evaluated_function_kind(name: &ObjectName) -> Option<EvaluatedFunction> {
         Some(EvaluatedFunction::Replace)
     } else if function_name_eq_ascii(name, "TRIM") {
         Some(EvaluatedFunction::Trim)
+    } else if function_name_eq_ascii(name, "GREATEST") {
+        Some(EvaluatedFunction::Greatest)
+    } else if function_name_eq_ascii(name, "LEAST") {
+        Some(EvaluatedFunction::Least)
     } else if function_name_eq_ascii(name, "ABS") {
         Some(EvaluatedFunction::Abs)
     } else if function_name_eq_ascii(name, "ROUND") {
@@ -353,6 +360,12 @@ impl Executor {
                     _ => Ok(Value::Null),
                 }
             }
+            Some(EvaluatedFunction::Greatest) => {
+                self.evaluate_greatest_or_least(args, true, row, schema, params)
+            }
+            Some(EvaluatedFunction::Least) => {
+                self.evaluate_greatest_or_least(args, false, row, schema, params)
+            }
             Some(EvaluatedFunction::Abs) => {
                 let val = self.evaluate_arg(&args[0], row, schema, params)?;
                 match val {
@@ -501,6 +514,45 @@ impl Executor {
                 func.name.to_string().to_uppercase()
             ))),
         }
+    }
+
+    fn evaluate_greatest_or_least(
+        &self,
+        args: &[FunctionArg],
+        want_greatest: bool,
+        row: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Result<Value> {
+        if args.is_empty() {
+            return Err(FusionError::Execution(
+                "GREATEST/LEAST requires at least 1 argument".to_string(),
+            ));
+        }
+        let mut result: Option<Value> = None;
+        for arg in args {
+            let val = self.evaluate_arg(arg, row, schema, params)?;
+            if val == Value::Null {
+                continue;
+            }
+            result = Some(match result {
+                None => val,
+                Some(current) => {
+                    let ordering = val.compare(&current);
+                    let take_new = if want_greatest {
+                        ordering == Ordering::Greater
+                    } else {
+                        ordering == Ordering::Less
+                    };
+                    if take_new {
+                        val
+                    } else {
+                        current
+                    }
+                }
+            });
+        }
+        Ok(result.unwrap_or(Value::Null))
     }
 
     pub(crate) fn evaluate_arg(

@@ -580,6 +580,71 @@ async fn test_math_functions() {
 }
 
 #[tokio::test]
+async fn test_trim_variants() {
+    let (executor, wal) = setup().await;
+    // Default TRIM removes leading and trailing whitespace.
+    let (_, rows) = query(&executor, "SELECT TRIM('  hello  ')").await;
+    assert_eq!(rows[0][0], Value::String("hello".to_string()));
+    // BOTH / LEADING / TRAILING with an explicit character set.
+    let (_, rows) = query(&executor, "SELECT TRIM(BOTH 'x' FROM 'xxhixx')").await;
+    assert_eq!(rows[0][0], Value::String("hi".to_string()));
+    let (_, rows) = query(&executor, "SELECT TRIM(LEADING 'x' FROM 'xxhixx')").await;
+    assert_eq!(rows[0][0], Value::String("hixx".to_string()));
+    let (_, rows) = query(&executor, "SELECT TRIM(TRAILING 'x' FROM 'xxhixx')").await;
+    assert_eq!(rows[0][0], Value::String("xxhi".to_string()));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_position_function() {
+    let (executor, wal) = setup().await;
+    // Hit: 1-based index of the first match.
+    let (_, rows) = query(&executor, "SELECT POSITION('cd' IN 'abcdef')").await;
+    assert_eq!(rows[0][0], Value::Integer(3));
+    // Miss: returns 0.
+    let (_, rows) = query(&executor, "SELECT POSITION('zz' IN 'abcdef')").await;
+    assert_eq!(rows[0][0], Value::Integer(0));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_greatest_least() {
+    let (executor, wal) = setup().await;
+    let (_, rows) = query(&executor, "SELECT GREATEST(3, 7, 1, 5)").await;
+    assert_eq!(rows[0][0], Value::Integer(7));
+    let (_, rows) = query(&executor, "SELECT LEAST(3, 7, 1, 5)").await;
+    assert_eq!(rows[0][0], Value::Integer(1));
+    // NULL arguments are ignored.
+    let (_, rows) = query(&executor, "SELECT GREATEST(3, NULL, 9, NULL)").await;
+    assert_eq!(rows[0][0], Value::Integer(9));
+    let (_, rows) = query(&executor, "SELECT LEAST(NULL, 4, 2)").await;
+    assert_eq!(rows[0][0], Value::Integer(2));
+    // All-NULL arguments yield NULL.
+    let (_, rows) = query(&executor, "SELECT GREATEST(NULL, NULL)").await;
+    assert_eq!(rows[0][0], Value::Null);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_extract_quarter_and_week() {
+    let (executor, wal) = setup().await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT EXTRACT(QUARTER FROM TIMESTAMP '2024-08-15 00:00:00')",
+    )
+    .await;
+    assert_eq!(rows[0][0], Value::Integer(3));
+    // 2024-01-01 is a Monday, so it falls in ISO week 1.
+    let (_, rows) = query(
+        &executor,
+        "SELECT EXTRACT(WEEK FROM TIMESTAMP '2024-01-01 00:00:00')",
+    )
+    .await;
+    assert_eq!(rows[0][0], Value::Integer(1));
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_now_function() {
     let (executor, wal) = setup().await;
     let (_, rows) = query(&executor, "SELECT NOW()").await;
