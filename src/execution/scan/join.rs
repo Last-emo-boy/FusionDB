@@ -1552,6 +1552,13 @@ impl Executor {
                 sqlparser::ast::JoinOperator::LeftOuter(_) | sqlparser::ast::JoinOperator::Left(_)
             )
         );
+        let is_right_outer = matches!(
+            join_operator,
+            Some(
+                sqlparser::ast::JoinOperator::RightOuter(_)
+                    | sqlparser::ast::JoinOperator::Right(_)
+            )
+        );
         let supports_left_driven_probe = matches!(
             join_operator,
             None | Some(
@@ -1894,6 +1901,8 @@ impl Executor {
         let row_width = left_schema.columns.len() + right_schema.columns.len();
         let expected_rows = if is_left_outer {
             left_rows.len()
+        } else if is_right_outer {
+            right_rows.len()
         } else {
             left_rows.len().min(right_rows.len())
         };
@@ -1914,7 +1923,8 @@ impl Executor {
                     hash_join_executed = true;
                     monitor::inc_plan();
 
-                    let build_right = is_left_outer || right_rows.len() <= left_rows.len();
+                    let build_right =
+                        is_left_outer || (!is_right_outer && right_rows.len() <= left_rows.len());
                     if build_right {
                         let mut hash_map: HashMap<Vec<Value>, Vec<&Vec<Value>>> =
                             HashMap::with_capacity(right_rows.len());
@@ -1978,6 +1988,7 @@ impl Executor {
 
                         for right_row in &right_rows {
                             let key = Self::row_key(right_row, &right_key_indices);
+                            let mut matched = false;
                             if let Some(matches) = hash_map.get(&key) {
                                 for left_row in matches {
                                     let mut joined_row = Vec::with_capacity(row_width);
@@ -1993,11 +2004,21 @@ impl Executor {
                                             continue;
                                         }
                                     }
+                                    matched = true;
                                     new_rows.push(joined_row);
                                     if limit.is_some_and(|value| new_rows.len() >= value) {
                                         break;
                                     }
                                 }
+                            }
+
+                            if !matched && is_right_outer {
+                                let mut joined_row = Vec::with_capacity(row_width);
+                                for _ in 0..left_schema.columns.len() {
+                                    joined_row.push(Value::Null);
+                                }
+                                joined_row.extend_from_slice(right_row);
+                                new_rows.push(joined_row);
                             }
 
                             if limit.is_some_and(|value| new_rows.len() >= value) {
@@ -2027,29 +2048,39 @@ impl Executor {
                             &right_schema,
                             params,
                         )?;
-                        if matches!(right_key, Value::Null) {
-                            continue;
-                        }
-                        if let Some(matches) = hash_map.get(&right_key) {
-                            for left_row in matches {
-                                let mut joined_row = Vec::with_capacity(row_width);
-                                joined_row.extend_from_slice(left_row);
-                                joined_row.extend_from_slice(right_row);
-                                if let Some(residual) = &expr_plan.residual_expr {
-                                    if !self.evaluate_expr(
-                                        residual,
-                                        &joined_row,
-                                        &new_schema,
-                                        params,
-                                    )? {
-                                        continue;
+                        let mut matched = false;
+                        if !matches!(right_key, Value::Null) {
+                            if let Some(matches) = hash_map.get(&right_key) {
+                                for left_row in matches {
+                                    let mut joined_row = Vec::with_capacity(row_width);
+                                    joined_row.extend_from_slice(left_row);
+                                    joined_row.extend_from_slice(right_row);
+                                    if let Some(residual) = &expr_plan.residual_expr {
+                                        if !self.evaluate_expr(
+                                            residual,
+                                            &joined_row,
+                                            &new_schema,
+                                            params,
+                                        )? {
+                                            continue;
+                                        }
+                                    }
+                                    matched = true;
+                                    new_rows.push(joined_row);
+                                    if limit.is_some_and(|value| new_rows.len() >= value) {
+                                        break;
                                     }
                                 }
-                                new_rows.push(joined_row);
-                                if limit.is_some_and(|value| new_rows.len() >= value) {
-                                    break;
-                                }
                             }
+                        }
+
+                        if !matched && is_right_outer {
+                            let mut joined_row = Vec::with_capacity(row_width);
+                            for _ in 0..left_schema.columns.len() {
+                                joined_row.push(Value::Null);
+                            }
+                            joined_row.extend_from_slice(right_row);
+                            new_rows.push(joined_row);
                         }
 
                         if limit.is_some_and(|value| new_rows.len() >= value) {
@@ -2061,39 +2092,77 @@ impl Executor {
         }
 
         if !hash_join_executed {
-            for left_row in &left_rows {
-                let mut matched = false;
+            if is_right_outer {
                 for right_row in &right_rows {
-                    let mut joined_row = Vec::with_capacity(row_width);
-                    joined_row.extend_from_slice(left_row);
-                    joined_row.extend_from_slice(right_row);
+                    let mut matched = false;
+                    for left_row in &left_rows {
+                        let mut joined_row = Vec::with_capacity(row_width);
+                        joined_row.extend_from_slice(left_row);
+                        joined_row.extend_from_slice(right_row);
 
-                    let match_join = if let Some(expr) = &join_expr {
-                        self.evaluate_expr(expr, &joined_row, &new_schema, params)?
-                    } else {
-                        true
-                    };
+                        let match_join = if let Some(expr) = &join_expr {
+                            self.evaluate_expr(expr, &joined_row, &new_schema, params)?
+                        } else {
+                            true
+                        };
 
-                    if match_join {
-                        new_rows.push(joined_row);
-                        matched = true;
-                        if limit.is_some_and(|value| new_rows.len() >= value) {
-                            break;
+                        if match_join {
+                            new_rows.push(joined_row);
+                            matched = true;
+                            if limit.is_some_and(|value| new_rows.len() >= value) {
+                                break;
+                            }
                         }
                     }
-                }
 
-                if !matched && is_left_outer {
-                    let mut joined_row = Vec::with_capacity(row_width);
-                    joined_row.extend_from_slice(left_row);
-                    for _ in 0..right_schema.columns.len() {
-                        joined_row.push(Value::Null);
+                    if !matched {
+                        let mut joined_row = Vec::with_capacity(row_width);
+                        for _ in 0..left_schema.columns.len() {
+                            joined_row.push(Value::Null);
+                        }
+                        joined_row.extend_from_slice(right_row);
+                        new_rows.push(joined_row);
                     }
-                    new_rows.push(joined_row);
-                }
 
-                if limit.is_some_and(|value| new_rows.len() >= value) {
-                    break;
+                    if limit.is_some_and(|value| new_rows.len() >= value) {
+                        break;
+                    }
+                }
+            } else {
+                for left_row in &left_rows {
+                    let mut matched = false;
+                    for right_row in &right_rows {
+                        let mut joined_row = Vec::with_capacity(row_width);
+                        joined_row.extend_from_slice(left_row);
+                        joined_row.extend_from_slice(right_row);
+
+                        let match_join = if let Some(expr) = &join_expr {
+                            self.evaluate_expr(expr, &joined_row, &new_schema, params)?
+                        } else {
+                            true
+                        };
+
+                        if match_join {
+                            new_rows.push(joined_row);
+                            matched = true;
+                            if limit.is_some_and(|value| new_rows.len() >= value) {
+                                break;
+                            }
+                        }
+                    }
+
+                    if !matched && is_left_outer {
+                        let mut joined_row = Vec::with_capacity(row_width);
+                        joined_row.extend_from_slice(left_row);
+                        for _ in 0..right_schema.columns.len() {
+                            joined_row.push(Value::Null);
+                        }
+                        new_rows.push(joined_row);
+                    }
+
+                    if limit.is_some_and(|value| new_rows.len() >= value) {
+                        break;
+                    }
                 }
             }
         }

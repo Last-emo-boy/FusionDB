@@ -2010,6 +2010,154 @@ async fn test_left_join() {
 }
 
 #[tokio::test]
+async fn test_right_join_null_pads_unmatched_right_rows() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE rj_a (id INTEGER PRIMARY KEY, label TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE rj_b (id INTEGER PRIMARY KEY, aid INTEGER, tag TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO rj_a VALUES (1, 'A1'), (2, 'A2')").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO rj_b VALUES (10, 1, 'B10'), (11, 2, 'B11'), (12, 99, 'B12'), (13, NULL, 'B13')",
+    )
+    .await;
+
+    // RIGHT JOIN must preserve every rj_b row; unmatched rows get NULL rj_a columns.
+    // Output column order is (rj_a.*, rj_b.*).
+    let (cols, rows) = query(
+        &executor,
+        "SELECT * FROM rj_a RIGHT JOIN rj_b ON rj_a.id = rj_b.aid ORDER BY rj_b.id",
+    )
+    .await;
+
+    assert_eq!(
+        cols,
+        vec!["rj_a.id", "rj_a.label", "rj_b.id", "rj_b.aid", "rj_b.tag"]
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::String("A1".to_string()),
+                Value::Integer(10),
+                Value::Integer(1),
+                Value::String("B10".to_string()),
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("A2".to_string()),
+                Value::Integer(11),
+                Value::Integer(2),
+                Value::String("B11".to_string()),
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Integer(12),
+                Value::Integer(99),
+                Value::String("B12".to_string()),
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Integer(13),
+                Value::Null,
+                Value::String("B13".to_string()),
+            ],
+        ]
+    );
+
+    // Result preservation: the matched portion of the RIGHT JOIN equals the INNER JOIN.
+    let (_, inner_rows) = query(
+        &executor,
+        "SELECT * FROM rj_a INNER JOIN rj_b ON rj_a.id = rj_b.aid ORDER BY rj_b.id",
+    )
+    .await;
+    let right_matched: Vec<Vec<Value>> = rows
+        .into_iter()
+        .filter(|row| row[0] != Value::Null)
+        .collect();
+    assert_eq!(right_matched, inner_rows);
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_right_join_non_equi_null_pads_unmatched_right_rows() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE rj2_a (id INTEGER PRIMARY KEY, label TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE rj2_b (id INTEGER PRIMARY KEY, aid INTEGER, tag TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO rj2_a VALUES (5, 'A5'), (6, 'A6')").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO rj2_b VALUES (10, 1, 'B10'), (11, 7, 'B11')",
+    )
+    .await;
+
+    // Non-equi ON exercises the nested-loop fallback; b row 11 (aid=7) matches no rj2_a row.
+    let (cols, rows) = query(
+        &executor,
+        "SELECT * FROM rj2_a RIGHT JOIN rj2_b ON rj2_a.id > rj2_b.aid ORDER BY rj2_b.id, rj2_a.id",
+    )
+    .await;
+
+    assert_eq!(
+        cols,
+        vec![
+            "rj2_a.id",
+            "rj2_a.label",
+            "rj2_b.id",
+            "rj2_b.aid",
+            "rj2_b.tag"
+        ]
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(5),
+                Value::String("A5".to_string()),
+                Value::Integer(10),
+                Value::Integer(1),
+                Value::String("B10".to_string()),
+            ],
+            vec![
+                Value::Integer(6),
+                Value::String("A6".to_string()),
+                Value::Integer(10),
+                Value::Integer(1),
+                Value::String("B10".to_string()),
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Integer(11),
+                Value::Integer(7),
+                Value::String("B11".to_string()),
+            ],
+        ]
+    );
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_left_join_nested_on_group_by_matches_chbenchmark_q13_shape() {
     let (executor, wal) = setup().await;
     exec_ok(
