@@ -2253,3 +2253,150 @@ async fn test_cross_join() {
     assert_eq!(rows.len(), 4); // 2 x 2 = 4
     cleanup(&wal);
 }
+
+// BENCHPROD-443: FULL OUTER JOIN — emit matched pairs once, NULL-pad right for unmatched-left,
+// NULL-pad left for unmatched-right. Order is unspecified, so rows are sorted before comparison.
+
+fn sorted(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    rows.sort_by_key(|r| format!("{:?}", r));
+    rows
+}
+
+#[tokio::test]
+async fn test_full_outer_join_mixed_equi() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fo_a (id INTEGER PRIMARY KEY, lval TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fo_b (id INTEGER PRIMARY KEY, akey INTEGER, bval TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fo_a VALUES (1,'a1'),(2,'a2'),(3,'a3')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fo_b VALUES (10,1,'b10'),(11,1,'b11'),(12,99,'b12')",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT * FROM fo_a FULL OUTER JOIN fo_b ON fo_a.id = fo_b.akey",
+    )
+    .await;
+    assert_eq!(
+        cols,
+        vec!["fo_a.id", "fo_a.lval", "fo_b.id", "fo_b.akey", "fo_b.bval"]
+    );
+    let s = |v: &str| Value::String(v.to_string());
+    let expected = sorted(vec![
+        vec![
+            Value::Integer(1),
+            s("a1"),
+            Value::Integer(10),
+            Value::Integer(1),
+            s("b10"),
+        ],
+        vec![
+            Value::Integer(1),
+            s("a1"),
+            Value::Integer(11),
+            Value::Integer(1),
+            s("b11"),
+        ],
+        vec![
+            Value::Integer(2),
+            s("a2"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ], // left-only
+        vec![
+            Value::Integer(3),
+            s("a3"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ], // left-only
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Integer(12),
+            Value::Integer(99),
+            s("b12"),
+        ], // right-only
+    ]);
+    assert_eq!(sorted(rows), expected);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_full_outer_join_equals_inner_when_all_match() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fm_a (id INTEGER PRIMARY KEY, lval TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fm_b (id INTEGER PRIMARY KEY, akey INTEGER)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO fm_a VALUES (1,'a1'),(2,'a2')").await;
+    exec_ok(&executor, "INSERT INTO fm_b VALUES (10,1),(11,2)").await;
+    let (_, full) = query(
+        &executor,
+        "SELECT * FROM fm_a FULL OUTER JOIN fm_b ON fm_a.id = fm_b.akey",
+    )
+    .await;
+    let (_, inner) = query(
+        &executor,
+        "SELECT * FROM fm_a INNER JOIN fm_b ON fm_a.id = fm_b.akey",
+    )
+    .await;
+    // Every row matches, so FULL OUTER must equal INNER (no NULL-padded rows).
+    let inner_sorted = sorted(inner);
+    assert_eq!(inner_sorted.len(), 2);
+    assert_eq!(sorted(full), inner_sorted);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_full_outer_join_non_equi() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE na (id INTEGER PRIMARY KEY, v INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE nb (id INTEGER PRIMARY KEY, w INTEGER)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO na VALUES (1,10),(2,50)").await;
+    exec_ok(&executor, "INSERT INTO nb VALUES (10,5),(11,50),(12,99)").await;
+    // Non-equi condition forces the nested-loop FULL path.
+    let (_, rows) = query(
+        &executor,
+        "SELECT * FROM na FULL OUTER JOIN nb ON na.v > nb.w",
+    )
+    .await;
+    let i = Value::Integer;
+    let expected = sorted(vec![
+        vec![i(1), i(10), i(10), i(5)],               // 10 > 5
+        vec![i(2), i(50), i(10), i(5)],               // 50 > 5
+        vec![Value::Null, Value::Null, i(11), i(50)], // right-only (w=50)
+        vec![Value::Null, Value::Null, i(12), i(99)], // right-only (w=99)
+    ]);
+    assert_eq!(sorted(rows), expected);
+    cleanup(&wal);
+}
