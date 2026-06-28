@@ -9,7 +9,7 @@ use crate::catalog::Column;
 use crate::catalog::{IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use crate::monitor;
-use crate::storage::Transaction;
+use crate::storage::{ScanVisitor, Transaction};
 use futures::stream::StreamExt;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
@@ -1336,6 +1336,45 @@ impl Executor {
 
                 // Full Table Scan
                 if !index_used {
+                    // BENCHPROD-444: when a LIMIT is pushed into a filtered scan, stream the
+                    // routed prefixes through a visitor so the storage layer stops reading once
+                    // enough matches are found, instead of materializing every key/value pair
+                    // (the BENCHPROD-437 caveat). The unlimited case still uses the BENCHPROD-440
+                    // parallel path below, and the no-selection case keeps storage limit pushdown.
+                    if let (Some(sel), Some(limit_value)) = (selection.as_ref(), limit) {
+                        let mut visitor = FilteredLimitScanVisitor {
+                            executor: self,
+                            selection: sel,
+                            schema: &schema,
+                            params,
+                            projection_indices: projection_indices.as_deref(),
+                            key_only_scan,
+                            zero_column_projection,
+                            pk_index,
+                            limit: limit_value,
+                            rows: Vec::with_capacity(limit_value.min(4096)),
+                            error: None,
+                        };
+                        // limit=None: the driver's limit counts visited pairs, not matched rows;
+                        // the visitor stops itself once it has collected `limit_value` matches.
+                        self.scan_routed_data_prefixes_for_each(
+                            &table_name,
+                            txn,
+                            None,
+                            &mut visitor,
+                        )
+                        .await?;
+                        let FilteredLimitScanVisitor {
+                            rows: streamed,
+                            error,
+                            ..
+                        } = visitor;
+                        if let Some(err) = error {
+                            return Err(err);
+                        }
+                        return Ok((schema, streamed, rows_satisfy_order_by));
+                    }
+
                     let scan_limit = if selection.is_none() {
                         effective_limit
                     } else {
@@ -1490,6 +1529,80 @@ impl Executor {
             _ => Err(FusionError::Execution(
                 "Unsupported table factor".to_string(),
             )),
+        }
+    }
+}
+
+/// BENCHPROD-444: streams a filtered full-table scan, collecting matching rows until `limit` is
+/// reached. Decode logic mirrors the serial full-scan loop in `scan_single_table` exactly so the
+/// streamed result is row-for-row identical; the difference is that iteration stops early (and the
+/// storage layer never materializes the full key/value set).
+struct FilteredLimitScanVisitor<'a> {
+    executor: &'a Executor,
+    selection: &'a Expr,
+    schema: &'a TableSchema,
+    params: &'a [Value],
+    projection_indices: Option<&'a [usize]>,
+    key_only_scan: bool,
+    zero_column_projection: bool,
+    pk_index: Option<usize>,
+    limit: usize,
+    rows: Vec<Vec<Value>>,
+    error: Option<FusionError>,
+}
+
+impl ScanVisitor for FilteredLimitScanVisitor<'_> {
+    fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let row = if self.key_only_scan {
+            match Executor::row_id_from_key(key) {
+                Some(pk_str) => {
+                    Executor::primary_key_row_from_id(self.schema, self.pk_index, pk_str)
+                }
+                None => return true,
+            }
+        } else if self.zero_column_projection {
+            Vec::new()
+        } else {
+            let decoded = match std::str::from_utf8(key) {
+                Ok(key_str) => {
+                    if let Some(row) = self.executor.row_cache.get(key_str) {
+                        monitor::inc_row_cache_hit();
+                        Some(row)
+                    } else if self.projection_indices.is_none() {
+                        Executor::decode_row_for_projection(value, None)
+                            .ok()
+                            .map(|row| {
+                                self.executor
+                                    .row_cache
+                                    .insert(key_str.to_string(), row.clone());
+                                row
+                            })
+                    } else {
+                        Executor::decode_row_for_projection(value, self.projection_indices).ok()
+                    }
+                }
+                Err(_) => Executor::decode_row_for_projection(value, self.projection_indices).ok(),
+            };
+            match decoded {
+                Some(row) => row,
+                None => return true,
+            }
+        };
+
+        match self
+            .executor
+            .evaluate_expr(self.selection, &row, self.schema, self.params)
+        {
+            Ok(true) => {
+                self.rows.push(row);
+                // Stop once we have collected `limit` matches.
+                self.rows.len() < self.limit
+            }
+            Ok(false) => true,
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
         }
     }
 }
