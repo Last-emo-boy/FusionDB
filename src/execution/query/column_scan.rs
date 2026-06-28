@@ -572,6 +572,91 @@ impl ScanVisitor for GroupCountScanVisitor<'_> {
     }
 }
 
+struct CountDistinctScanVisitor<'a> {
+    column_index: usize,
+    predicate: Option<&'a ColumnPredicateScanPlan>,
+    seen: &'a mut HashSet<Value>,
+    predicate_values: Vec<Value>,
+    error: Option<FusionError>,
+}
+
+impl CountDistinctScanVisitor<'_> {
+    fn visit_row(&mut self, data: &[u8]) -> Result<()> {
+        Executor::decode_predicate_values(data, self.predicate, &mut self.predicate_values)?;
+        if let Some(predicate) = self.predicate {
+            if !predicate.matches_values(&self.predicate_values) {
+                return Ok(());
+            }
+        }
+
+        let value = Executor::decode_column_or_reuse_predicate(
+            data,
+            self.column_index,
+            self.predicate,
+            &self.predicate_values,
+        )?;
+        if value != Value::Null {
+            self.seen.insert(value);
+        }
+        Ok(())
+    }
+}
+
+impl ScanVisitor for CountDistinctScanVisitor<'_> {
+    fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        match self.visit_row(value) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(err);
+                false
+            }
+        }
+    }
+}
+
+struct DistinctColumnScanVisitor<'a> {
+    column_index: usize,
+    predicate: Option<&'a ColumnPredicateScanPlan>,
+    seen: &'a mut HashSet<Value>,
+    rows: &'a mut Vec<Vec<Value>>,
+    predicate_values: Vec<Value>,
+    error: Option<FusionError>,
+}
+
+impl DistinctColumnScanVisitor<'_> {
+    fn visit_row(&mut self, data: &[u8]) -> Result<()> {
+        Executor::decode_predicate_values(data, self.predicate, &mut self.predicate_values)?;
+        if let Some(predicate) = self.predicate {
+            if !predicate.matches_values(&self.predicate_values) {
+                return Ok(());
+            }
+        }
+
+        let value = Executor::decode_column_or_reuse_predicate(
+            data,
+            self.column_index,
+            self.predicate,
+            &self.predicate_values,
+        )?;
+        if self.seen.insert(value.clone()) {
+            self.rows.push(vec![value]);
+        }
+        Ok(())
+    }
+}
+
+impl ScanVisitor for DistinctColumnScanVisitor<'_> {
+    fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        match self.visit_row(value) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(err);
+                false
+            }
+        }
+    }
+}
+
 impl GroupColumnAggregateState {
     fn new(kind: GroupColumnAggregateKind) -> Self {
         Self {
@@ -1129,29 +1214,23 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<i64> {
-        let kv_pairs = self
-            .scan_routed_data_prefixes_for_table(table_name, txn, None)
-            .await?;
-        let mut seen = HashSet::with_capacity(kv_pairs.len().min(4096));
-        let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
+        let mut seen = HashSet::with_capacity(4096);
 
-        for (_, data) in kv_pairs {
-            Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
-            if let Some(predicate) = predicate {
-                if !predicate.matches_values(&predicate_values) {
-                    continue;
-                }
-            }
-
-            let value = Self::decode_column_or_reuse_predicate(
-                &data,
+        let scan_error = {
+            let mut visitor = CountDistinctScanVisitor {
                 column_index,
                 predicate,
-                &predicate_values,
-            )?;
-            if value != Value::Null {
-                seen.insert(value);
-            }
+                seen: &mut seen,
+                predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
+                error: None,
+            };
+            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
+                .await?;
+            visitor.error
+        };
+
+        if let Some(err) = scan_error {
+            return Err(err);
         }
 
         Ok(seen.len() as i64)
@@ -1215,31 +1294,25 @@ impl Executor {
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
-        let kv_pairs = self
-            .scan_routed_data_prefixes_for_table(table_name, txn, None)
-            .await?;
-        let distinct_capacity = kv_pairs.len().min(4096);
-        let mut seen = HashSet::with_capacity(distinct_capacity);
-        let mut rows = Vec::with_capacity(distinct_capacity);
-        let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
+        let mut seen = HashSet::with_capacity(4096);
+        let mut rows = Vec::with_capacity(4096);
 
-        for (_, data) in kv_pairs {
-            Self::decode_predicate_values(&data, predicate, &mut predicate_values)?;
-            if let Some(predicate) = predicate {
-                if !predicate.matches_values(&predicate_values) {
-                    continue;
-                }
-            }
-
-            let value = Self::decode_column_or_reuse_predicate(
-                &data,
+        let scan_error = {
+            let mut visitor = DistinctColumnScanVisitor {
                 column_index,
                 predicate,
-                &predicate_values,
-            )?;
-            if seen.insert(value.clone()) {
-                rows.push(vec![value]);
-            }
+                seen: &mut seen,
+                rows: &mut rows,
+                predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
+                error: None,
+            };
+            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
+                .await?;
+            visitor.error
+        };
+
+        if let Some(err) = scan_error {
+            return Err(err);
         }
 
         Ok(rows)
