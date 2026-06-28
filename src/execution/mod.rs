@@ -89,12 +89,13 @@ pub(crate) struct SqlShardDistinctAggregateFanoutPlan {
     pub output_column: String,
 }
 
-/// Plan for `SELECT col, COUNT(*) FROM t [WHERE ...] GROUP BY col` shard-owner fan-out. Each owner
-/// runs the original query (no rewrite); results are merged by re-grouping on `group_index` and
-/// summing the counts at `count_index`. The output preserves the projection column order.
+/// Plan for `SELECT g1[, g2 ...], COUNT(*) FROM t [WHERE ...] GROUP BY g1[, g2 ...]` shard-owner
+/// fan-out. Each owner runs the original query (no rewrite); results are merged by re-grouping on the
+/// composite key (the projection values at `group_indices`, in order) and summing the counts at
+/// `count_index`. The output preserves the projection column order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SqlShardGroupCountFanoutPlan {
-    pub group_index: usize,
+    pub group_indices: Vec<usize>,
     pub count_index: usize,
     pub output_columns: Vec<String>,
 }
@@ -1283,7 +1284,6 @@ impl Executor {
             || select.having.is_some()
             || select.from.len() != 1
             || !select.from[0].joins.is_empty()
-            || select.projection.len() != 2
         {
             return None;
         }
@@ -1295,10 +1295,24 @@ impl Executor {
         else {
             return None;
         };
-        if group_exprs.len() != 1 || !group_modifiers.is_empty() {
+        if group_exprs.is_empty() || !group_modifiers.is_empty() {
             return None;
         }
-        let group_column = Self::fanout_group_column_name(&group_exprs[0])?;
+        // Projection must be exactly the group columns (any order) plus one COUNT(*).
+        if select.projection.len() != group_exprs.len() + 1 {
+            return None;
+        }
+        let mut group_set = Vec::with_capacity(group_exprs.len());
+        for group_expr in group_exprs {
+            let name = Self::fanout_group_column_name(group_expr)?;
+            if group_set
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&name))
+            {
+                return None; // duplicate group column
+            }
+            group_set.push(name);
+        }
         if !select
             .selection
             .as_ref()
@@ -1306,32 +1320,38 @@ impl Executor {
         {
             return None;
         }
-        // Exactly one projection item must be COUNT(*), the other the (identifier) group column.
         let mut count_index = None;
-        let mut group_index = None;
+        let mut group_indices = Vec::with_capacity(group_exprs.len());
+        let mut matched: Vec<String> = Vec::with_capacity(group_exprs.len());
         for (index, item) in select.projection.iter().enumerate() {
             if Self::select_projection_is_count_star(item) {
                 if count_index.is_some() {
                     return None;
                 }
                 count_index = Some(index);
-            } else if Self::select_projection_matches_column(item, &group_column) {
-                if group_index.is_some() {
-                    return None;
+            } else if let Some(name) = Self::fanout_projection_column_name(item) {
+                if !group_set.iter().any(|g| g.eq_ignore_ascii_case(&name))
+                    || matched.iter().any(|m| m.eq_ignore_ascii_case(&name))
+                {
+                    return None; // not a group column, or duplicated in projection
                 }
-                group_index = Some(index);
+                matched.push(name);
+                group_indices.push(index);
             } else {
                 return None;
             }
         }
         let count_index = count_index?;
-        let group_index = group_index?;
-        let output_columns = vec![
-            Self::select_projection_output_name(&select.projection[0])?,
-            Self::select_projection_output_name(&select.projection[1])?,
-        ];
+        if group_indices.len() != group_exprs.len() {
+            return None;
+        }
+        let output_columns = select
+            .projection
+            .iter()
+            .map(Self::select_projection_output_name)
+            .collect::<Option<Vec<_>>>()?;
         Some(SqlShardGroupCountFanoutPlan {
-            group_index,
+            group_indices,
             count_index,
             output_columns,
         })
@@ -1345,17 +1365,15 @@ impl Executor {
         }
     }
 
-    fn select_projection_matches_column(item: &SelectItem, column_name: &str) -> bool {
+    fn fanout_projection_column_name(item: &SelectItem) -> Option<String> {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return false,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
         };
         match expr {
-            Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column_name),
-            Expr::CompoundIdentifier(idents) => idents
-                .last()
-                .is_some_and(|ident| ident.value.eq_ignore_ascii_case(column_name)),
-            _ => false,
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.clone()),
+            _ => None,
         }
     }
 
@@ -3246,7 +3264,7 @@ mod tests {
             &parse_sql("SELECT region, COUNT(*) FROM orders GROUP BY region").unwrap(),
         )
         .expect("group count plan");
-        assert_eq!(p1.group_index, 0);
+        assert_eq!(p1.group_indices, vec![0]);
         assert_eq!(p1.count_index, 1);
 
         let p2 = Executor::shard_group_count_select_fanout_plan_for_statements(
@@ -3255,7 +3273,24 @@ mod tests {
         )
         .expect("group count plan reversed");
         assert_eq!(p2.count_index, 0);
-        assert_eq!(p2.group_index, 1);
+        assert_eq!(p2.group_indices, vec![1]);
+
+        // Multi-column GROUP BY: composite key, indices track projection order.
+        let p3 = Executor::shard_group_count_select_fanout_plan_for_statements(
+            &parse_sql("SELECT region, country, COUNT(*) FROM orders GROUP BY region, country")
+                .unwrap(),
+        )
+        .expect("multi-column group count plan");
+        assert_eq!(p3.group_indices, vec![0, 1]);
+        assert_eq!(p3.count_index, 2);
+
+        let p4 = Executor::shard_group_count_select_fanout_plan_for_statements(
+            &parse_sql("SELECT country, COUNT(*), region FROM orders GROUP BY region, country")
+                .unwrap(),
+        )
+        .expect("multi-column group count plan reordered");
+        assert_eq!(p4.group_indices, vec![0, 2]);
+        assert_eq!(p4.count_index, 1);
 
         // Not eligible: no GROUP BY, HAVING, multiple group cols, ORDER BY/LIMIT, non-count aggregate.
         for sql in [

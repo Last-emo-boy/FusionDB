@@ -902,7 +902,7 @@ impl PgHandler {
         let columns = match Self::accumulate_forward_group_counts(
             &mut groups,
             local_results,
-            plan.group_index,
+            &plan.group_indices,
             plan.count_index,
         ) {
             Ok(columns) => columns,
@@ -920,7 +920,7 @@ impl PgHandler {
             let owner_columns = match Self::accumulate_forward_group_counts(
                 &mut groups,
                 owner_results,
-                plan.group_index,
+                &plan.group_indices,
                 plan.count_index,
             ) {
                 Ok(columns) => columns,
@@ -939,7 +939,7 @@ impl PgHandler {
         Ok(Some(Self::responses_from_forwarded_query_results(vec![
             ForwardQueryResultJson::Select {
                 columns,
-                rows: Self::forward_group_count_rows(groups, plan.group_index, plan.count_index),
+                rows: Self::forward_group_count_rows(groups, &plan.group_indices, plan.count_index),
             },
         ])?))
     }
@@ -1633,7 +1633,7 @@ impl PgHandler {
         let columns = match Self::accumulate_forward_group_counts(
             &mut groups,
             local_results,
-            plan.group_index,
+            &plan.group_indices,
             plan.count_index,
         ) {
             Ok(columns) => columns,
@@ -1651,7 +1651,7 @@ impl PgHandler {
             let owner_columns = match Self::accumulate_forward_group_counts(
                 &mut groups,
                 owner_results,
-                plan.group_index,
+                &plan.group_indices,
                 plan.count_index,
             ) {
                 Ok(columns) => columns,
@@ -1667,7 +1667,7 @@ impl PgHandler {
 
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns,
-            rows: Self::forward_group_count_rows(groups, plan.group_index, plan.count_index),
+            rows: Self::forward_group_count_rows(groups, &plan.group_indices, plan.count_index),
         }])))
     }
 
@@ -2456,9 +2456,9 @@ impl PgHandler {
     }
 
     fn accumulate_forward_group_counts(
-        groups: &mut BTreeMap<String, (serde_json::Value, i64)>,
+        groups: &mut BTreeMap<String, (Vec<serde_json::Value>, i64)>,
         results: Vec<ForwardQueryResultJson>,
-        group_index: usize,
+        group_indices: &[usize],
         count_index: usize,
     ) -> std::result::Result<Vec<String>, pgwire::error::ErrorInfo> {
         let [result] = results.as_slice() else {
@@ -2471,18 +2471,20 @@ impl PgHandler {
                 "Shard group count fan-out received a non-SELECT result",
             ));
         };
-        if columns.len() != 2 {
-            return Err(Self::execution_error(
-                "Shard group count fan-out expected two output columns",
-            ));
+        let expected = group_indices.len() + 1;
+        if columns.len() != expected {
+            return Err(Self::execution_error(format!(
+                "Shard group count fan-out expected {} output columns",
+                expected
+            )));
         }
         for row in rows {
-            if row.len() != 2 {
-                return Err(Self::execution_error(
-                    "Shard group count fan-out expected two values per row",
-                ));
+            if row.len() != expected {
+                return Err(Self::execution_error(format!(
+                    "Shard group count fan-out expected {} values per row",
+                    expected
+                )));
             }
-            let group_value = &row[group_index];
             let count_value = &row[count_index];
             let count = count_value.as_i64().or_else(|| {
                 count_value
@@ -2495,15 +2497,15 @@ impl PgHandler {
                     count_value
                 )));
             };
-            let key = serde_json::to_string(group_value).map_err(|e| {
+            let group_values: Vec<serde_json::Value> =
+                group_indices.iter().map(|&i| row[i].clone()).collect();
+            let key = serde_json::to_string(&group_values).map_err(|e| {
                 Self::execution_error(format!(
-                    "Shard group count fan-out could not encode group key {}: {}",
-                    group_value, e
+                    "Shard group count fan-out could not encode group key {:?}: {}",
+                    group_values, e
                 ))
             })?;
-            let entry = groups
-                .entry(key)
-                .or_insert_with(|| (group_value.clone(), 0));
+            let entry = groups.entry(key).or_insert_with(|| (group_values, 0));
             entry.1 = entry
                 .1
                 .checked_add(count)
@@ -2513,14 +2515,17 @@ impl PgHandler {
     }
 
     fn forward_group_count_rows(
-        groups: BTreeMap<String, (serde_json::Value, i64)>,
-        group_index: usize,
+        groups: BTreeMap<String, (Vec<serde_json::Value>, i64)>,
+        group_indices: &[usize],
         count_index: usize,
     ) -> Vec<Vec<serde_json::Value>> {
+        let width = group_indices.len() + 1;
         let mut rows = Vec::with_capacity(groups.len());
-        for (_, (group_value, count)) in groups {
-            let mut row = vec![serde_json::Value::Null, serde_json::Value::Null];
-            row[group_index] = group_value;
+        for (_, (group_values, count)) in groups {
+            let mut row = vec![serde_json::Value::Null; width];
+            for (k, &gi) in group_indices.iter().enumerate() {
+                row[gi] = group_values[k].clone();
+            }
             row[count_index] = serde_json::json!(count);
             rows.push(row);
         }

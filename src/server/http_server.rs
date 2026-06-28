@@ -959,7 +959,7 @@ async fn try_fanout_group_count_query_to_shard_owners(
     let columns = match accumulate_fanout_group_counts(
         &mut groups,
         local_results,
-        plan.group_index,
+        &plan.group_indices,
         plan.count_index,
     ) {
         Ok(columns) => columns,
@@ -974,7 +974,7 @@ async fn try_fanout_group_count_query_to_shard_owners(
         let owner_columns = match accumulate_fanout_group_counts(
             &mut groups,
             owner_results,
-            plan.group_index,
+            &plan.group_indices,
             plan.count_index,
         ) {
             Ok(columns) => columns,
@@ -994,7 +994,7 @@ async fn try_fanout_group_count_query_to_shard_owners(
     Some(json_ok(vec![QueryResultJson::Select {
         r#type: "select".to_string(),
         columns,
-        rows: group_count_rows(groups, plan.group_index, plan.count_index),
+        rows: group_count_rows(groups, &plan.group_indices, plan.count_index),
     }]))
 }
 
@@ -1639,9 +1639,9 @@ fn fanout_count_from_select_results(
 /// canonical JSON of the group value (so NULL is its own group), summing the counts. Returns the
 /// owner's column names for cross-owner consistency checking.
 fn accumulate_fanout_group_counts(
-    groups: &mut BTreeMap<String, (serde_json::Value, i64)>,
+    groups: &mut BTreeMap<String, (Vec<serde_json::Value>, i64)>,
     results: Vec<QueryResultJson>,
-    group_index: usize,
+    group_indices: &[usize],
     count_index: usize,
 ) -> std::result::Result<Vec<String>, String> {
     let [result] = results.as_slice() else {
@@ -1650,14 +1650,20 @@ fn accumulate_fanout_group_counts(
     let QueryResultJson::Select { columns, rows, .. } = result else {
         return Err("Shard group count fan-out received a non-SELECT result".to_string());
     };
-    if columns.len() != 2 {
-        return Err("Shard group count fan-out expected two output columns".to_string());
+    let expected = group_indices.len() + 1;
+    if columns.len() != expected {
+        return Err(format!(
+            "Shard group count fan-out expected {} output columns",
+            expected
+        ));
     }
     for row in rows {
-        if row.len() != 2 {
-            return Err("Shard group count fan-out expected two values per row".to_string());
+        if row.len() != expected {
+            return Err(format!(
+                "Shard group count fan-out expected {} values per row",
+                expected
+            ));
         }
-        let group_value = &row[group_index];
         let count_value = &row[count_index];
         let count = count_value.as_i64().or_else(|| {
             count_value
@@ -1670,15 +1676,15 @@ fn accumulate_fanout_group_counts(
                 count_value
             ));
         };
-        let key = serde_json::to_string(group_value).map_err(|e| {
+        let group_values: Vec<serde_json::Value> =
+            group_indices.iter().map(|&i| row[i].clone()).collect();
+        let key = serde_json::to_string(&group_values).map_err(|e| {
             format!(
-                "Shard group count fan-out could not encode group key {}: {}",
-                group_value, e
+                "Shard group count fan-out could not encode group key {:?}: {}",
+                group_values, e
             )
         })?;
-        let entry = groups
-            .entry(key)
-            .or_insert_with(|| (group_value.clone(), 0));
+        let entry = groups.entry(key).or_insert_with(|| (group_values, 0));
         entry.1 = entry
             .1
             .checked_add(count)
@@ -1690,14 +1696,17 @@ fn accumulate_fanout_group_counts(
 /// Build the merged result rows from accumulated group counts, in projection column order, sorted
 /// by group key (BTreeMap iteration order) for determinism (GROUP BY without ORDER BY is unordered).
 fn group_count_rows(
-    groups: BTreeMap<String, (serde_json::Value, i64)>,
-    group_index: usize,
+    groups: BTreeMap<String, (Vec<serde_json::Value>, i64)>,
+    group_indices: &[usize],
     count_index: usize,
 ) -> Vec<Vec<serde_json::Value>> {
+    let width = group_indices.len() + 1;
     let mut rows = Vec::with_capacity(groups.len());
-    for (_, (group_value, count)) in groups {
-        let mut row = vec![serde_json::Value::Null, serde_json::Value::Null];
-        row[group_index] = group_value;
+    for (_, (group_values, count)) in groups {
+        let mut row = vec![serde_json::Value::Null; width];
+        for (k, &gi) in group_indices.iter().enumerate() {
+            row[gi] = group_values[k].clone();
+        }
         row[count_index] = serde_json::json!(count);
         rows.push(row);
     }
@@ -2411,7 +2420,7 @@ async fn try_fanout_group_count_execute_to_shard_owners(
     let columns = match accumulate_fanout_group_counts(
         &mut groups,
         local_results,
-        plan.group_index,
+        &plan.group_indices,
         plan.count_index,
     ) {
         Ok(columns) => columns,
@@ -2430,7 +2439,7 @@ async fn try_fanout_group_count_execute_to_shard_owners(
         let owner_columns = match accumulate_fanout_group_counts(
             &mut groups,
             owner_results,
-            plan.group_index,
+            &plan.group_indices,
             plan.count_index,
         ) {
             Ok(columns) => columns,
@@ -2450,7 +2459,7 @@ async fn try_fanout_group_count_execute_to_shard_owners(
     Some(json_ok(vec![QueryResultJson::Select {
         r#type: "select".to_string(),
         columns,
-        rows: group_count_rows(groups, plan.group_index, plan.count_index),
+        rows: group_count_rows(groups, &plan.group_indices, plan.count_index),
     }]))
 }
 
