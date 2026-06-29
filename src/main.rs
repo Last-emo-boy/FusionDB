@@ -6,6 +6,12 @@ use fusiondb::storage::{FusionStorage, Storage};
 use fusiondb::Result;
 use std::sync::Arc;
 
+// Full-table scans clone ~2 allocations per row on the parallel range-merge path; glibc malloc arena
+// locking is the measured ceiling (BENCHPROD-454). jemalloc scales allocation far better under the
+// many-threaded scan and lowers the per-row clone cost.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const CONFIG_PATH: &str = "fusiondb.toml";
 
 #[tokio::main]

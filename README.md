@@ -56,7 +56,7 @@
 | **Durability** | Segmented WAL (64MB rotation), CRC32 block checksums and LZ4 block compression on SSTables |
 | **Compaction** | 4-way merge with MVCC key deduplication |
 | **Columnar Analytics** | Arrow RecordBatch conversion, vectorized COUNT/SUM/AVG/MIN/MAX |
-| **Performance** | Optimized merge iterator, streaming COUNT(*), pre-allocated scan buffers, hash join for equi-joins, ANALYZE statistics, cost-based comma/inner join reordering |
+| **Performance** | Optimized merge iterator, parallel range-merge full scans, jemalloc allocator, streaming COUNT(*), pre-allocated scan buffers, hash join for equi-joins, ANALYZE statistics, cost-based comma/inner join reordering |
 
 ### Infrastructure
 
