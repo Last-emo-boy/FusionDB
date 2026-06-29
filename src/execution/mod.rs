@@ -118,6 +118,22 @@ pub(crate) struct SqlShardGroupAggregateFanoutPlan {
     pub output_columns: Vec<String>,
 }
 
+/// Plan for `SELECT g1[, ...], AVG(x) FROM t [WHERE ...] GROUP BY g1[, ...]` shard-owner fan-out.
+/// AVG is not directly mergeable, so each owner runs `rewritten_sql`, which replaces the AVG
+/// projection item in place with `SUM(x), COUNT(x)`; results are re-grouped on the composite key
+/// (`group_indices`, indices into the *rewritten* result) and the partial sums (`sum_index`) and
+/// counts (`count_index`) are added per group, then divided. Output rows are rebuilt in the original
+/// projection layout: group values plus the AVG value at `avg_output_index`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlShardGroupAvgFanoutPlan {
+    pub rewritten_sql: String,
+    pub group_indices: Vec<usize>,
+    pub sum_index: usize,
+    pub count_index: usize,
+    pub avg_output_index: usize,
+    pub output_columns: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStatementRecord {
     pub id: String,
@@ -876,6 +892,63 @@ impl Executor {
             .await
     }
 
+    pub(crate) fn shard_group_avg_select_fanout_plan_for_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Option<SqlShardGroupAvgFanoutPlan>> {
+        let statements = self.prepare(sql)?;
+        Ok(Self::group_avg_select_fanout_target(&statements).map(|(_, _, plan)| plan))
+    }
+
+    pub(crate) fn shard_group_avg_select_fanout_plan_for_statements(
+        statements: &[Statement],
+    ) -> Option<SqlShardGroupAvgFanoutPlan> {
+        Self::group_avg_select_fanout_target(statements).map(|(_, _, plan)| plan)
+    }
+
+    pub(crate) async fn shard_group_avg_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_group_avg_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_group_avg_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let Some((table_name, column_name, _)) = Self::group_avg_select_fanout_target(statements)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut txn = self.storage.begin_transaction().await?;
+        let Some(schema) = self
+            .load_table_schema_for_shard_routing(&table_name, &mut *txn)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(column) = schema
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&column_name))
+        else {
+            return Ok(Vec::new());
+        };
+        if !Self::is_integer_type_name(&column.data_type)
+            && !Self::is_float_type_name(&column.data_type)
+        {
+            return Ok(Vec::new());
+        }
+        drop(txn);
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
+    }
+
     pub(crate) async fn shard_count_distinct_select_fanout_owners_for_sql(
         &self,
         sql: &str,
@@ -1529,6 +1602,140 @@ impl Executor {
                 group_indices,
                 agg_index,
                 kind,
+                output_columns,
+            },
+        ))
+    }
+
+    fn group_avg_select_fanout_target(
+        statements: &[Statement],
+    ) -> Option<(String, String, SqlShardGroupAvgFanoutPlan)> {
+        let [Statement::Query(query)] = statements else {
+            return None;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+        {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, group_modifiers) =
+            &select.group_by
+        else {
+            return None;
+        };
+        if group_exprs.is_empty() || !group_modifiers.is_empty() {
+            return None;
+        }
+        if select.projection.len() != group_exprs.len() + 1 {
+            return None;
+        }
+        let mut group_set = Vec::with_capacity(group_exprs.len());
+        for group_expr in group_exprs {
+            let n = Self::fanout_group_column_name(group_expr)?;
+            if group_set
+                .iter()
+                .any(|e: &String| e.eq_ignore_ascii_case(&n))
+            {
+                return None;
+            }
+            group_set.push(n);
+        }
+        if !select
+            .selection
+            .as_ref()
+            .is_none_or(Self::select_predicate_is_fanout_local)
+        {
+            return None;
+        }
+        let mut avg: Option<(usize, String, String)> = None;
+        let mut group_indices = Vec::with_capacity(group_exprs.len());
+        let mut matched: Vec<String> = Vec::with_capacity(group_exprs.len());
+        for (index, item) in select.projection.iter().enumerate() {
+            if let Some((col_name, col_sql)) =
+                Self::select_projection_column_function_arg(item, &["AVG"])
+            {
+                if avg.is_some() {
+                    return None;
+                }
+                avg = Some((index, col_name, col_sql));
+            } else if let Some(name) = Self::fanout_projection_column_name(item) {
+                if !group_set.iter().any(|g| g.eq_ignore_ascii_case(&name))
+                    || matched.iter().any(|m| m.eq_ignore_ascii_case(&name))
+                {
+                    return None;
+                }
+                matched.push(name);
+                group_indices.push(index);
+            } else {
+                return None;
+            }
+        }
+        let (avg_index, column_name, arg_sql) = avg?;
+        if group_indices.len() != group_exprs.len() {
+            return None;
+        }
+        // AVG expands into SUM + COUNT in the rewritten projection, so group columns positioned after
+        // the AVG slot shift by +1 in the rewritten result.
+        let group_indices: Vec<usize> = group_indices
+            .into_iter()
+            .map(|i| if i > avg_index { i + 1 } else { i })
+            .collect();
+        let output_columns = select
+            .projection
+            .iter()
+            .map(Self::select_projection_output_name)
+            .collect::<Option<Vec<_>>>()?;
+
+        // Rewrite the per-owner query: keep every projection item verbatim except the AVG slot, which
+        // becomes `SUM(arg), COUNT(arg)` so partial sums and (non-null) counts can be merged across
+        // owners. FROM / WHERE / GROUP BY are preserved verbatim.
+        let mut proj_parts = Vec::with_capacity(select.projection.len() + 1);
+        for (index, item) in select.projection.iter().enumerate() {
+            if index == avg_index {
+                proj_parts.push(format!("SUM({}), COUNT({})", arg_sql, arg_sql));
+            } else {
+                proj_parts.push(item.to_string());
+            }
+        }
+        let relation_sql = select.from[0].relation.to_string();
+        let selection_sql = select
+            .selection
+            .as_ref()
+            .map(|expr| format!(" WHERE {}", expr))
+            .unwrap_or_default();
+        let group_by_sql = group_exprs
+            .iter()
+            .map(|expr| expr.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rewritten_sql = format!(
+            "SELECT {} FROM {}{} GROUP BY {}",
+            proj_parts.join(", "),
+            relation_sql,
+            selection_sql,
+            group_by_sql
+        );
+
+        Some((
+            name.to_string(),
+            column_name,
+            SqlShardGroupAvgFanoutPlan {
+                rewritten_sql,
+                group_indices,
+                sum_index: avg_index,
+                count_index: avg_index + 1,
+                avg_output_index: avg_index,
                 output_columns,
             },
         ))
@@ -3533,6 +3740,68 @@ mod tests {
         ] {
             assert!(
                 Executor::shard_group_aggregate_select_fanout_plan_for_statements(
+                    &parse_sql(sql).unwrap()
+                )
+                .is_none(),
+                "should be ineligible: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_avg_select_fanout_plan_matches_avg_shapes() {
+        // (sql, rewritten_sql, group_indices, sum_index, count_index, avg_output_index)
+        for (sql, rewritten, gidx, sidx, cidx, aoidx) in [
+            (
+                "SELECT region, AVG(amount) FROM orders GROUP BY region",
+                "SELECT region, SUM(amount), COUNT(amount) FROM orders GROUP BY region",
+                vec![0usize],
+                1usize,
+                2usize,
+                1usize,
+            ),
+            (
+                "SELECT AVG(amount), region FROM orders GROUP BY region",
+                "SELECT SUM(amount), COUNT(amount), region FROM orders GROUP BY region",
+                vec![2usize],
+                0usize,
+                1usize,
+                0usize,
+            ),
+            (
+                "SELECT region, country, AVG(amount) FROM orders GROUP BY region, country",
+                "SELECT region, country, SUM(amount), COUNT(amount) FROM orders GROUP BY region, country",
+                vec![0usize, 1usize],
+                2usize,
+                3usize,
+                2usize,
+            ),
+        ] {
+            let plan = Executor::shard_group_avg_select_fanout_plan_for_statements(
+                &parse_sql(sql).unwrap(),
+            )
+            .unwrap_or_else(|| panic!("expected group avg plan: {sql}"));
+            assert_eq!(plan.rewritten_sql, rewritten, "rewritten_sql for {sql}");
+            assert_eq!(plan.group_indices, gidx, "group_indices for {sql}");
+            assert_eq!(plan.sum_index, sidx, "sum_index for {sql}");
+            assert_eq!(plan.count_index, cidx, "count_index for {sql}");
+            assert_eq!(plan.avg_output_index, aoidx, "avg_output_index for {sql}");
+            assert_eq!(plan.output_columns.len(), gidx.len() + 1, "output arity for {sql}");
+        }
+
+        // Ineligible: non-AVG aggregates (handled by other paths), no GROUP BY (scalar avg path),
+        // HAVING / ORDER BY / LIMIT, projection arity mismatch.
+        for sql in [
+            "SELECT region, SUM(amount) FROM orders GROUP BY region",
+            "SELECT region, COUNT(*) FROM orders GROUP BY region",
+            "SELECT AVG(amount) FROM orders",
+            "SELECT region, AVG(amount) FROM orders GROUP BY region HAVING AVG(amount) > 1",
+            "SELECT region, AVG(amount) FROM orders GROUP BY region ORDER BY region",
+            "SELECT region, AVG(amount) FROM orders GROUP BY region LIMIT 5",
+            "SELECT region, country, AVG(amount) FROM orders GROUP BY region",
+        ] {
+            assert!(
+                Executor::shard_group_avg_select_fanout_plan_for_statements(
                     &parse_sql(sql).unwrap()
                 )
                 .is_none(),

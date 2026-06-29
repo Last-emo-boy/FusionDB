@@ -456,6 +456,12 @@ async fn handle_query(
     }
 
     if let Some(response) =
+        try_fanout_group_avg_query_to_shard_owners(&state, &context, &payload.sql).await
+    {
+        return response;
+    }
+
+    if let Some(response) =
         try_fanout_count_distinct_query_to_shard_owners(&state, &context, &payload.sql).await
     {
         return response;
@@ -1092,6 +1098,97 @@ async fn try_fanout_group_aggregate_query_to_shard_owners(
         r#type: "select".to_string(),
         columns,
         rows: group_aggregate_rows(groups, &plan.group_indices, plan.agg_index),
+    }]))
+}
+
+async fn try_fanout_group_avg_query_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    let plan = match state
+        .executor
+        .shard_group_avg_select_fanout_plan_for_sql(sql)
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard group avg fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+    let owners = match state
+        .executor
+        .shard_group_avg_select_fanout_owners_for_sql(sql, &[])
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard group avg fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results = match state.executor.execute_sql(&plan.rewritten_sql).await {
+        Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Execution Error: {:?}", e),
+            ));
+        }
+    };
+    let mut groups = BTreeMap::new();
+    let columns = match accumulate_fanout_group_avg(
+        &mut groups,
+        local_results,
+        &plan.group_indices,
+        plan.sum_index,
+        plan.count_index,
+    ) {
+        Ok(columns) => columns,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+
+    for owner in owners {
+        let owner_results =
+            match query_remote_shard_owner(state, context, &plan.rewritten_sql, &owner).await {
+                Ok(results) => results,
+                Err((status, message)) => return Some(json_error(status, message)),
+            };
+        let owner_columns = match accumulate_fanout_group_avg(
+            &mut groups,
+            owner_results,
+            &plan.group_indices,
+            plan.sum_index,
+            plan.count_index,
+        ) {
+            Ok(columns) => columns,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+        if owner_columns != columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard group avg fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ),
+            ));
+        }
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: plan.output_columns.clone(),
+        rows: group_avg_rows(groups, plan.avg_output_index, plan.output_columns.len()),
     }]))
 }
 
@@ -1922,6 +2019,93 @@ fn group_aggregate_rows(
     rows
 }
 
+/// Accumulate partial `SUM`/`COUNT` per group from one owner's rewritten grouped-AVG result. Keys on
+/// the canonical JSON array of the group tuple at `group_indices`, adding the sum at `sum_index` and
+/// the (non-null) count at `count_index`. Returns the rewritten result columns for cross-owner
+/// consistency checks.
+fn accumulate_fanout_group_avg(
+    groups: &mut BTreeMap<String, (Vec<serde_json::Value>, Option<FanoutSum>, i64)>,
+    results: Vec<QueryResultJson>,
+    group_indices: &[usize],
+    sum_index: usize,
+    count_index: usize,
+) -> std::result::Result<Vec<String>, String> {
+    let [result] = results.as_slice() else {
+        return Err("Shard group avg fan-out expected exactly one SELECT result".to_string());
+    };
+    let QueryResultJson::Select { columns, rows, .. } = result else {
+        return Err("Shard group avg fan-out received a non-SELECT result".to_string());
+    };
+    let expected = group_indices.len() + 2;
+    if columns.len() != expected {
+        return Err(format!(
+            "Shard group avg fan-out expected {} output columns",
+            expected
+        ));
+    }
+    for row in rows {
+        if row.len() != expected {
+            return Err(format!(
+                "Shard group avg fan-out expected {} values per row",
+                expected
+            ));
+        }
+        let group_values: Vec<serde_json::Value> =
+            group_indices.iter().map(|&i| row[i].clone()).collect();
+        let key = serde_json::to_string(&group_values).map_err(|e| {
+            format!(
+                "Shard group avg fan-out could not encode group key {:?}: {}",
+                group_values, e
+            )
+        })?;
+        let count = row[count_index].as_i64().or_else(|| {
+            row[count_index]
+                .as_u64()
+                .and_then(|count| i64::try_from(count).ok())
+        });
+        let Some(count) = count else {
+            return Err(format!(
+                "Shard group avg fan-out received a non-integer count value: {}",
+                row[count_index]
+            ));
+        };
+        let entry = groups
+            .entry(key)
+            .or_insert_with(|| (group_values, None, 0i64));
+        add_fanout_sum(&mut entry.1, fanout_sum_json_value(&row[sum_index])?)?;
+        entry.2 = entry
+            .2
+            .checked_add(count)
+            .ok_or_else(|| "Shard group avg fan-out count overflow".to_string())?;
+    }
+    Ok(columns.clone())
+}
+
+/// Rebuild grouped-AVG output rows in the original projection layout: group values in place plus the
+/// computed average (`sum / count`) at `avg_output_index`.
+fn group_avg_rows(
+    groups: BTreeMap<String, (Vec<serde_json::Value>, Option<FanoutSum>, i64)>,
+    avg_output_index: usize,
+    width: usize,
+) -> Vec<Vec<serde_json::Value>> {
+    let mut rows = Vec::with_capacity(groups.len());
+    for (_, (group_values, sum, count)) in groups {
+        let avg_value = fanout_avg_to_json(sum, count);
+        let mut row = vec![serde_json::Value::Null; width];
+        let mut g = 0;
+        for (pos, cell) in row.iter_mut().enumerate() {
+            if pos == avg_output_index {
+                *cell = avg_value.clone();
+            } else {
+                *cell = group_values[g].clone();
+                g += 1;
+            }
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 fn fanout_distinct_values_from_select_results(
     results: Vec<QueryResultJson>,
 ) -> std::result::Result<(Vec<String>, Vec<serde_json::Value>), String> {
@@ -2386,6 +2570,19 @@ async fn handle_execute(
                 return response;
             }
 
+            if let Some(response) = try_fanout_group_avg_execute_to_shard_owners(
+                &state,
+                &context,
+                &record,
+                &payload,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
             if let Some(response) = try_fanout_count_distinct_execute_to_shard_owners(
                 &state,
                 &context,
@@ -2766,6 +2963,95 @@ async fn try_fanout_group_aggregate_execute_to_shard_owners(
         r#type: "select".to_string(),
         columns,
         rows: group_aggregate_rows(groups, &plan.group_indices, plan.agg_index),
+    }]))
+}
+
+async fn try_fanout_group_avg_execute_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    let Some(plan) =
+        Executor::shard_group_avg_select_fanout_plan_for_statements(&record.statements)
+    else {
+        return None;
+    };
+    let owners = match state
+        .executor
+        .shard_group_avg_select_fanout_owners_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Shard group avg fan-out planning error: {:?}", e),
+            ));
+        }
+    };
+
+    let local_results =
+        match execute_sql_locally_for_fanout(state, &plan.rewritten_sql, params).await {
+            Ok(results) => results,
+            Err(response) => return Some(response),
+        };
+    let mut groups = BTreeMap::new();
+    let columns = match accumulate_fanout_group_avg(
+        &mut groups,
+        local_results,
+        &plan.group_indices,
+        plan.sum_index,
+        plan.count_index,
+    ) {
+        Ok(columns) => columns,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+
+    for owner in owners {
+        let owner_results = match query_remote_prepared_sql_shard_owner(
+            state,
+            context,
+            &plan.rewritten_sql,
+            payload,
+            &owner,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let owner_columns = match accumulate_fanout_group_avg(
+            &mut groups,
+            owner_results,
+            &plan.group_indices,
+            plan.sum_index,
+            plan.count_index,
+        ) {
+            Ok(columns) => columns,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+        if owner_columns != columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard group avg fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ),
+            ));
+        }
+    }
+
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns: plan.output_columns.clone(),
+        rows: group_avg_rows(groups, plan.avg_output_index, plan.output_columns.len()),
     }]))
 }
 
@@ -5151,6 +5437,108 @@ mod tests {
                 );
             }
             QueryResultJson::Success { .. } => panic!("expected fanout group max"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_fanouts_group_avg_across_shard_owners() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_group_avg_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_group_avg_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8092".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_keys = integer_primary_keys_for_owner(&local_shard_router, "gavg", 1, 2);
+        let remote_keys = integer_primary_keys_for_owner(&local_shard_router, "gavg", 2, 2);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let client = reqwest::Client::new();
+        let create_sql = "CREATE TABLE gavg (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        // Group 'a' spans both owners: AVG must merge partial sums and counts, not average the
+        // per-owner averages: (10 + 50) / 2 = 30, not (10 + 50) / 2-of-averages. 'b' = 20, 'c' = 40.
+        for (key, grp, amt) in [(local_keys[0], "a", 10), (local_keys[1], "b", 20)] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gavg (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        for (key, grp, amt) in [(remote_keys[0], "a", 50), (remote_keys[1], "c", 40)] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gavg (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+
+        let avg_q = post_query(&local_app, "SELECT grp, AVG(amt) FROM gavg GROUP BY grp").await;
+        assert_eq!(avg_q.status(), StatusCode::OK);
+        let avg_env: Envelope<Vec<QueryResultJson>> = response_json(avg_q).await;
+        match &avg_env.data.expect("avg data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                let mut rows = rows.clone();
+                rows.sort_by_key(|row| format!("{:?}", row));
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![serde_json::json!("a"), serde_json::json!(30.0)],
+                        vec![serde_json::json!("b"), serde_json::json!(20.0)],
+                        vec![serde_json::json!("c"), serde_json::json!(40.0)],
+                    ]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout group avg"),
         }
 
         let _ = std::fs::remove_file(&local_wal_path);

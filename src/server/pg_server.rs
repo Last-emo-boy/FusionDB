@@ -1045,6 +1045,100 @@ impl PgHandler {
         ])?))
     }
 
+    async fn fanout_group_avg_select_to_shard_owners(
+        &self,
+        query: &str,
+        username: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        let plan = match self
+            .executor
+            .shard_group_avg_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group avg fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_group_avg_select_fanout_owners_for_sql(query, &[])
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group avg fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let local_results = match self.executor.execute_sql(&plan.rewritten_sql).await {
+            Ok(results) => Self::forward_results_from_query_results(results),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group avg fan-out local execution error",
+                    &e,
+                )))]));
+            }
+        };
+        let mut groups = BTreeMap::new();
+        let columns = match Self::accumulate_forward_group_avg(
+            &mut groups,
+            local_results,
+            &plan.group_indices,
+            plan.sum_index,
+            plan.count_index,
+        ) {
+            Ok(columns) => columns,
+            Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_shard_owner_results(&plan.rewritten_sql, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            let owner_columns = match Self::accumulate_forward_group_avg(
+                &mut groups,
+                owner_results,
+                &plan.group_indices,
+                plan.sum_index,
+                plan.count_index,
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            if owner_columns != columns {
+                return Ok(Some(vec![Response::Error(Box::new(
+                    Self::execution_error(format!(
+                        "Shard group avg fan-out column mismatch: expected {:?}, got {:?}",
+                        columns, owner_columns
+                    )),
+                ))]));
+            }
+        }
+
+        Ok(Some(Self::responses_from_forwarded_query_results(vec![
+            ForwardQueryResultJson::Select {
+                columns: plan.output_columns.clone(),
+                rows: Self::forward_group_avg_rows(
+                    groups,
+                    plan.avg_output_index,
+                    plan.output_columns.len(),
+                ),
+            },
+        ])?))
+    }
+
     async fn fanout_count_distinct_select_to_shard_owners(
         &self,
         query: &str,
@@ -1858,6 +1952,107 @@ impl PgHandler {
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns,
             rows: Self::forward_group_aggregate_rows(groups, &plan.group_indices, plan.agg_index),
+        }])))
+    }
+
+    async fn fanout_extended_group_avg_select_to_shard_owners(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        let plan = match self
+            .executor
+            .shard_group_avg_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group avg fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_group_avg_select_fanout_owners_for_sql(query, params)
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group avg fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+
+        let local_results = match self
+            .execute_first_statement(&plan.rewritten_sql, params)
+            .await
+        {
+            Ok(result) => Self::forward_results_from_query_results(vec![result]),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group avg fan-out local execution error",
+                    &e,
+                )));
+            }
+        };
+        let mut groups = BTreeMap::new();
+        let columns = match Self::accumulate_forward_group_avg(
+            &mut groups,
+            local_results,
+            &plan.group_indices,
+            plan.sum_index,
+            plan.count_index,
+        ) {
+            Ok(columns) => columns,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_prepared_shard_owner_results(
+                    &plan.rewritten_sql,
+                    params,
+                    username,
+                    &owner,
+                )
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Err(error)),
+            };
+            let owner_columns = match Self::accumulate_forward_group_avg(
+                &mut groups,
+                owner_results,
+                &plan.group_indices,
+                plan.sum_index,
+                plan.count_index,
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return Ok(Err(error)),
+            };
+            if owner_columns != columns {
+                return Ok(Err(Self::execution_error(format!(
+                    "Shard group avg fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ))));
+            }
+        }
+
+        Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
+            columns: plan.output_columns.clone(),
+            rows: Self::forward_group_avg_rows(
+                groups,
+                plan.avg_output_index,
+                plan.output_columns.len(),
+            ),
         }])))
     }
 
@@ -2813,6 +3008,95 @@ impl PgHandler {
                 ForwardGroupAcc::Sum(total) => Self::forward_sum_to_json(total),
                 ForwardGroupAcc::Extremum(total) => total.unwrap_or(serde_json::Value::Null),
             };
+            rows.push(row);
+        }
+        rows
+    }
+
+    fn accumulate_forward_group_avg(
+        groups: &mut BTreeMap<String, (Vec<serde_json::Value>, Option<ForwardSum>, i64)>,
+        results: Vec<ForwardQueryResultJson>,
+        group_indices: &[usize],
+        sum_index: usize,
+        count_index: usize,
+    ) -> std::result::Result<Vec<String>, pgwire::error::ErrorInfo> {
+        let [result] = results.as_slice() else {
+            return Err(Self::execution_error(
+                "Shard group avg fan-out expected exactly one SELECT result",
+            ));
+        };
+        let ForwardQueryResultJson::Select { columns, rows } = result else {
+            return Err(Self::execution_error(
+                "Shard group avg fan-out received a non-SELECT result",
+            ));
+        };
+        let expected = group_indices.len() + 2;
+        if columns.len() != expected {
+            return Err(Self::execution_error(format!(
+                "Shard group avg fan-out expected {} output columns",
+                expected
+            )));
+        }
+        for row in rows {
+            if row.len() != expected {
+                return Err(Self::execution_error(format!(
+                    "Shard group avg fan-out expected {} values per row",
+                    expected
+                )));
+            }
+            let group_values: Vec<serde_json::Value> =
+                group_indices.iter().map(|&i| row[i].clone()).collect();
+            let key = serde_json::to_string(&group_values).map_err(|e| {
+                Self::execution_error(format!(
+                    "Shard group avg fan-out could not encode group key {:?}: {}",
+                    group_values, e
+                ))
+            })?;
+            let count = row[count_index].as_i64().or_else(|| {
+                row[count_index]
+                    .as_u64()
+                    .and_then(|count| i64::try_from(count).ok())
+            });
+            let Some(count) = count else {
+                return Err(Self::execution_error(format!(
+                    "Shard group avg fan-out received a non-integer count value: {}",
+                    row[count_index]
+                )));
+            };
+            let entry = groups
+                .entry(key)
+                .or_insert_with(|| (group_values, None, 0i64));
+            Self::add_forward_sum(&mut entry.1, Self::forward_sum_json_value(&row[sum_index])?)?;
+            entry.2 = match entry.2.checked_add(count) {
+                Some(total) => total,
+                None => {
+                    return Err(Self::execution_error(
+                        "Shard group avg fan-out count overflow",
+                    ));
+                }
+            };
+        }
+        Ok(columns.clone())
+    }
+
+    fn forward_group_avg_rows(
+        groups: BTreeMap<String, (Vec<serde_json::Value>, Option<ForwardSum>, i64)>,
+        avg_output_index: usize,
+        width: usize,
+    ) -> Vec<Vec<serde_json::Value>> {
+        let mut rows = Vec::with_capacity(groups.len());
+        for (_, (group_values, sum, count)) in groups {
+            let avg_value = Self::forward_avg_to_json(sum, count);
+            let mut row = vec![serde_json::Value::Null; width];
+            let mut g = 0;
+            for (pos, cell) in row.iter_mut().enumerate() {
+                if pos == avg_output_index {
+                    *cell = avg_value.clone();
+                } else {
+                    *cell = group_values[g].clone();
+                    g += 1;
+                }
+            }
             rows.push(row);
         }
         rows
@@ -8704,6 +8988,13 @@ impl SimpleQueryHandler for PgHandler {
                     return Ok(responses);
                 }
                 if let Some(mut fanout_responses) = self
+                    .fanout_group_avg_select_to_shard_owners(&fanout_query, &username)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                if let Some(mut fanout_responses) = self
                     .fanout_count_distinct_select_to_shard_owners(&fanout_query, &username)
                     .await?
                 {
@@ -9278,6 +9569,33 @@ impl ExtendedQueryHandler for PgHandler {
                     }
                     match self
                         .fanout_extended_group_aggregate_select_to_shard_owners(
+                            &query, &params, &username,
+                        )
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_group_avg_select_to_shard_owners(
                             &query, &params, &username,
                         )
                         .await?
