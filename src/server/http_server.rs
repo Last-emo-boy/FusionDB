@@ -6760,6 +6760,21 @@ mod tests {
         .await;
         assert_eq!(non_numeric.status(), StatusCode::BAD_REQUEST);
 
+        // Same for the SINGLE-aggregate planners: a non-numeric MAX/SUM/AVG argument matches the shape
+        // but is type-ineligible, so it must also fail loudly (BENCHPROD-461 — previously silent
+        // local-only because the structural is_some() short-circuit suppressed the safety net).
+        for sql in [
+            "SELECT grp, MAX(grp) FROM gx GROUP BY grp",
+            "SELECT grp, SUM(grp) FROM gx GROUP BY grp",
+            "SELECT grp, AVG(grp) FROM gx GROUP BY grp",
+        ] {
+            assert_eq!(
+                post_query(&local_app, sql).await.status(),
+                StatusCode::BAD_REQUEST,
+                "non-numeric single aggregate must error loudly: {sql}"
+            );
+        }
+
         let _ = std::fs::remove_file(&local_wal_path);
         let _ = std::fs::remove_file(&owner_wal_path);
     }

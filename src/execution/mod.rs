@@ -1210,18 +1210,16 @@ impl Executor {
         let Some(table_name) = Self::single_table_group_by_select_table(statements) else {
             return Ok(None);
         };
-        // Supported grouped fan-out shapes are handled by their own dispatchers; never fire for them.
-        // NOTE: the multi-aggregate planner matches purely on SHAPE, but its owner-eligibility also
-        // requires SUM/MIN/MAX argument columns to be numeric. A structurally-matching multi-aggregate
-        // query over a NON-numeric column would have its handler decline (empty owners), so it must NOT
-        // be short-circuited as "supported" here — otherwise a genuinely-scattering query would fall
-        // through to silent local-only results. Letting it reach the scatter check below makes it error
-        // loudly instead. (The single-aggregate planners share the same latent type-gate gap; that is a
-        // pre-existing limitation, not introduced here, and is left untouched.)
-        if Self::group_count_select_fanout_plan(statements).is_some()
-            || Self::group_aggregate_select_fanout_target(statements).is_some()
-            || Self::group_avg_select_fanout_target(statements).is_some()
-        {
+        // Only `COUNT(*)` grouped fan-out may be short-circuited as "supported" on a purely STRUCTURAL
+        // match: it has no column-type requirement, so a structural match always means its dispatcher
+        // can fan it out. The SUM/MIN/MAX/AVG (and multi-aggregate) planners additionally require their
+        // argument column to be numeric — a structurally-matching query over a NON-numeric column has
+        // its dispatcher decline (empty owners), so short-circuiting it here as "supported" would let a
+        // genuinely-scattering query fall through to silent local-only results. Those shapes therefore
+        // fall through to the scatter check below, which fails loudly instead of returning incomplete
+        // results. (An eligible, scattering aggregate is already answered by its own dispatcher before
+        // this safety net is ever reached, so this never produces a false error for a supported query.)
+        if Self::group_count_select_fanout_plan(statements).is_some() {
             return Ok(None);
         }
         // Only guard tables that actually exist locally; otherwise let the normal (loud) error path
