@@ -93,7 +93,7 @@ pub(crate) struct SqlShardDistinctAggregateFanoutPlan {
 /// fan-out. Each owner runs the original query (no rewrite); results are merged by re-grouping on the
 /// composite key (the projection values at `group_indices`, in order) and summing the counts at
 /// `count_index`. The output preserves the projection column order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SqlShardGroupCountFanoutPlan {
     pub group_indices: Vec<usize>,
     pub count_index: usize,
@@ -113,7 +113,7 @@ pub(crate) enum SqlShardGroupAggregateKind {
 /// Plan for `SELECT g1[, ...], AGG(x) FROM t [WHERE ...] GROUP BY g1[, ...]` shard-owner fan-out for
 /// AGG in {SUM, MIN, MAX}. Each owner runs the original query; results are merged by re-grouping on
 /// the composite key (`group_indices`) and reducing the aggregate value at `agg_index` per `kind`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SqlShardGroupAggregateFanoutPlan {
     pub group_indices: Vec<usize>,
     pub agg_index: usize,
@@ -137,25 +137,59 @@ pub(crate) struct GroupedOrderKey {
     pub nulls_first: bool,
 }
 
-/// Post-merge spec for a distributed grouped fan-out carrying `ORDER BY` / `LIMIT` / `OFFSET`. A group
-/// spans owners, so an owner's local `LIMIT` would be wrong (its partial top-N ≠ the global top-N);
-/// owners therefore run `per_owner_sql` (clauses stripped, returning all groups) and the fully merged
-/// rows are globally stable-sorted by `order_keys` then sliced by `offset`/`limit`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Comparison operator for a distributed grouped post-merge `HAVING` conjunct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupedHavingOp {
+    Gt,
+    GtEq,
+    Lt,
+    LtEq,
+    Eq,
+    NotEq,
+}
+
+/// One `HAVING` conjunct resolved against the output row layout: `output[col_index] <op> literal`.
+/// A group spans owners, so `HAVING` (like `LIMIT`) must be evaluated post-merge on the GLOBAL groups,
+/// never per-owner — a group below the threshold locally may be above it globally.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GroupedHavingConjunct {
+    pub col_index: usize,
+    pub op: GroupedHavingOp,
+    pub literal: serde_json::Value,
+}
+
+/// A resolved `HAVING` predicate: an AND of simple `<output-col> <cmp> <literal>` comparisons. Only
+/// this conjunctive shape is supported; anything else (OR, function calls on the row, non-literal RHS)
+/// makes resolution return `None` → the 449 net errors loudly rather than returning a wrong filter.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GroupedHaving {
+    pub conjuncts: Vec<GroupedHavingConjunct>,
+}
+
+/// Post-merge spec for a distributed grouped fan-out carrying `HAVING` / `ORDER BY` / `LIMIT` /
+/// `OFFSET`. A group spans owners, so these clauses can't run per-owner (a partial top-N or partial
+/// `HAVING` would be wrong); owners run `per_owner_sql` (clauses stripped, returning ALL groups) and
+/// the fully merged rows are filtered by `having`, then globally stable-sorted by `order_keys`, then
+/// sliced by `offset`/`limit` — in that SQL order.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GroupedPostMerge {
     pub per_owner_sql: String,
+    pub having: Option<GroupedHaving>,
     pub order_keys: Vec<GroupedOrderKey>,
     pub limit: Option<usize>,
     pub offset: usize,
 }
 
-/// Apply a distributed grouped post-merge spec to fully-merged rows in place: globally stable-sort by
-/// the resolved `ORDER BY` keys, then drop `offset` rows and truncate to `limit`. Shared by the HTTP
-/// and pgwire grouped fan-out handlers so both transports apply identical SQL ordering semantics.
+/// Apply a distributed grouped post-merge spec to fully-merged rows in place, in SQL order: filter by
+/// `having`, globally stable-sort by `order_keys`, then drop `offset` rows and truncate to `limit`.
+/// Shared by the HTTP and pgwire grouped fan-out handlers so both transports apply identical semantics.
 pub(crate) fn apply_grouped_order_limit(
     rows: &mut Vec<Vec<serde_json::Value>>,
     spec: &GroupedPostMerge,
 ) {
+    if let Some(having) = &spec.having {
+        rows.retain(|row| grouped_having_predicate_holds(row, having));
+    }
     if !spec.order_keys.is_empty() {
         rows.sort_by(|a, b| {
             for key in &spec.order_keys {
@@ -260,13 +294,44 @@ fn grouped_value_type_rank(value: &serde_json::Value) -> u8 {
     }
 }
 
+/// Evaluate a resolved `HAVING` predicate against one merged output row: every conjunct must hold
+/// (AND). A `NULL` on either side of a comparison is SQL "unknown" → the row is dropped (HAVING keeps
+/// only rows where the predicate is TRUE).
+fn grouped_having_predicate_holds(row: &[serde_json::Value], having: &GroupedHaving) -> bool {
+    having
+        .conjuncts
+        .iter()
+        .all(|conjunct| grouped_having_conjunct_holds(row, conjunct))
+}
+
+fn grouped_having_conjunct_holds(
+    row: &[serde_json::Value],
+    conjunct: &GroupedHavingConjunct,
+) -> bool {
+    let Some(value) = row.get(conjunct.col_index) else {
+        return false;
+    };
+    if value.is_null() || conjunct.literal.is_null() {
+        return false; // SQL: comparison with NULL is unknown, not TRUE
+    }
+    let ordering = compare_grouped_non_null(value, &conjunct.literal);
+    match conjunct.op {
+        GroupedHavingOp::Gt => ordering == std::cmp::Ordering::Greater,
+        GroupedHavingOp::GtEq => ordering != std::cmp::Ordering::Less,
+        GroupedHavingOp::Lt => ordering == std::cmp::Ordering::Less,
+        GroupedHavingOp::LtEq => ordering != std::cmp::Ordering::Greater,
+        GroupedHavingOp::Eq => ordering == std::cmp::Ordering::Equal,
+        GroupedHavingOp::NotEq => ordering != std::cmp::Ordering::Equal,
+    }
+}
+
 /// Plan for `SELECT g1[, ...], AVG(x) FROM t [WHERE ...] GROUP BY g1[, ...]` shard-owner fan-out.
 /// AVG is not directly mergeable, so each owner runs `rewritten_sql`, which replaces the AVG
 /// projection item in place with `SUM(x), COUNT(x)`; results are re-grouped on the composite key
 /// (`group_indices`, indices into the *rewritten* result) and the partial sums (`sum_index`) and
 /// counts (`count_index`) are added per group, then divided. Output rows are rebuilt in the original
 /// projection layout: group values plus the AVG value at `avg_output_index`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SqlShardGroupAvgFanoutPlan {
     pub rewritten_sql: String,
     pub group_indices: Vec<usize>,
@@ -1664,13 +1729,10 @@ impl Executor {
         let SetExpr::Select(select) = query.body.as_ref() else {
             return None;
         };
-        if select.distinct.is_some()
-            || select.having.is_some()
-            || select.from.len() != 1
-            || !select.from[0].joins.is_empty()
-        {
+        if select.distinct.is_some() || select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return None;
         }
+        // `HAVING` is supported via post-merge (resolved below); it is NOT rejected here.
         if !matches!(select.from[0].relation, TableFactor::Table { .. }) {
             return None;
         }
@@ -1734,11 +1796,19 @@ impl Executor {
             .iter()
             .map(Self::select_projection_output_name)
             .collect::<Option<Vec<_>>>()?;
-        let post_merge = if query.order_by.is_some() || query.limit_clause.is_some() {
-            let (order_keys, limit, offset) =
-                Self::resolve_grouped_order_limit(query, &select.projection, &output_columns)?;
+        let post_merge = if query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || select.having.is_some()
+        {
+            let (order_keys, limit, offset, having) = Self::resolve_grouped_order_limit(
+                query,
+                select.having.as_ref(),
+                &select.projection,
+                &output_columns,
+            )?;
             Some(GroupedPostMerge {
                 per_owner_sql: Self::strip_grouped_post_merge_clauses(query),
+                having,
                 order_keys,
                 limit,
                 offset,
@@ -1771,13 +1841,10 @@ impl Executor {
         let SetExpr::Select(select) = query.body.as_ref() else {
             return None;
         };
-        if select.distinct.is_some()
-            || select.having.is_some()
-            || select.from.len() != 1
-            || !select.from[0].joins.is_empty()
-        {
+        if select.distinct.is_some() || select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return None;
         }
+        // `HAVING` is supported via post-merge (resolved below); it is NOT rejected here.
         let TableFactor::Table { name, .. } = &select.from[0].relation else {
             return None;
         };
@@ -1851,11 +1918,19 @@ impl Executor {
         // Resolve any ORDER BY / LIMIT / OFFSET into a post-merge spec. When clauses are present but
         // cannot be resolved to output columns / numeric literals, return None so the 449 safety net
         // errors loudly rather than emitting a silently-unsorted distributed result.
-        let post_merge = if query.order_by.is_some() || query.limit_clause.is_some() {
-            let (order_keys, limit, offset) =
-                Self::resolve_grouped_order_limit(query, &select.projection, &output_columns)?;
+        let post_merge = if query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || select.having.is_some()
+        {
+            let (order_keys, limit, offset, having) = Self::resolve_grouped_order_limit(
+                query,
+                select.having.as_ref(),
+                &select.projection,
+                &output_columns,
+            )?;
             Some(GroupedPostMerge {
                 per_owner_sql: Self::strip_grouped_post_merge_clauses(query),
+                having,
                 order_keys,
                 limit,
                 offset,
@@ -1876,16 +1951,23 @@ impl Executor {
         ))
     }
 
-    /// Resolve a grouped query's `ORDER BY` keys + `LIMIT`/`OFFSET` into `(order_keys, limit, offset)`,
-    /// or `None` if any part is unsupported (so the caller rejects the whole plan → 449 loud error).
-    /// Over-rejection is deliberate: a wrong distributed answer is worse than a loud "unsupported".
-    /// The per-owner SQL is built by each variant separately (clause-stripped original, or — for AVG —
-    /// the already clause-free rewritten SUM/COUNT query).
+    /// Resolve a grouped query's `HAVING` + `ORDER BY` keys + `LIMIT`/`OFFSET` into
+    /// `(order_keys, limit, offset, having)`, or `None` if any part is unsupported (so the caller
+    /// rejects the whole plan → 449 loud error). Over-rejection is deliberate: a wrong distributed
+    /// answer is worse than a loud "unsupported". The per-owner SQL is built by each variant separately
+    /// (clause-stripped original, or — for AVG — the already clause-free rewritten SUM/COUNT query).
+    #[allow(clippy::type_complexity)]
     fn resolve_grouped_order_limit(
         query: &Query,
+        having: Option<&Expr>,
         projection: &[SelectItem],
         output_columns: &[String],
-    ) -> Option<(Vec<GroupedOrderKey>, Option<usize>, usize)> {
+    ) -> Option<(
+        Vec<GroupedOrderKey>,
+        Option<usize>,
+        usize,
+        Option<GroupedHaving>,
+    )> {
         let mut order_keys = Vec::new();
         if let Some(order_by) = &query.order_by {
             if order_by.interpolate.is_some() {
@@ -1938,7 +2020,180 @@ impl Executor {
             Some(LimitClause::OffsetCommaLimit { .. }) => return None, // MySQL `LIMIT a, b` form
             None => (None, 0),
         };
-        Some((order_keys, limit, offset))
+        let having = match having {
+            Some(expr) => Some(Self::resolve_grouped_having(
+                expr,
+                projection,
+                output_columns,
+            )?),
+            None => None,
+        };
+        Some((order_keys, limit, offset, having))
+    }
+
+    /// Resolve a `HAVING` predicate into an AND of `<output-col> <cmp> <literal>` conjuncts, or `None`
+    /// if it is not that conjunctive comparison shape (e.g. contains `OR`, a non-literal RHS, or a
+    /// reference that is not an output column). `None` ⇒ the caller rejects the plan ⇒ 449 loud error.
+    fn resolve_grouped_having(
+        expr: &Expr,
+        projection: &[SelectItem],
+        output_columns: &[String],
+    ) -> Option<GroupedHaving> {
+        let mut conjuncts = Vec::new();
+        Self::collect_grouped_having_conjuncts(expr, projection, output_columns, &mut conjuncts)?;
+        if conjuncts.is_empty() {
+            return None;
+        }
+        Some(GroupedHaving { conjuncts })
+    }
+
+    fn collect_grouped_having_conjuncts(
+        expr: &Expr,
+        projection: &[SelectItem],
+        output_columns: &[String],
+        out: &mut Vec<GroupedHavingConjunct>,
+    ) -> Option<()> {
+        match expr {
+            Expr::Nested(inner) => {
+                Self::collect_grouped_having_conjuncts(inner, projection, output_columns, out)
+            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                Self::collect_grouped_having_conjuncts(left, projection, output_columns, out)?;
+                Self::collect_grouped_having_conjuncts(right, projection, output_columns, out)
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let conjunct = Self::resolve_grouped_having_comparison(
+                    left,
+                    op,
+                    right,
+                    projection,
+                    output_columns,
+                )?;
+                out.push(conjunct);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve one comparison to a conjunct. Exactly one side must be a literal and the other an output
+    /// column; the operator is normalized so the column is on the left (flipping `<`/`>` when the literal
+    /// is on the left). The literal side is extracted FIRST so a bare integer is never misread as a
+    /// positional column reference (HAVING — unlike ORDER BY — has no positional semantics); a
+    /// comparison with no literal side, or with two literals, resolves to `None` → 449 loud error.
+    fn resolve_grouped_having_comparison(
+        left: &Expr,
+        op: &BinaryOperator,
+        right: &Expr,
+        projection: &[SelectItem],
+        output_columns: &[String],
+    ) -> Option<GroupedHavingConjunct> {
+        let base_op = match op {
+            BinaryOperator::Gt => GroupedHavingOp::Gt,
+            BinaryOperator::GtEq => GroupedHavingOp::GtEq,
+            BinaryOperator::Lt => GroupedHavingOp::Lt,
+            BinaryOperator::LtEq => GroupedHavingOp::LtEq,
+            BinaryOperator::Eq => GroupedHavingOp::Eq,
+            BinaryOperator::NotEq => GroupedHavingOp::NotEq,
+            _ => return None,
+        };
+        // `<column> <op> <literal>`: extract the literal on the right, resolve the column on the left.
+        if let Some(literal) = Self::grouped_having_literal(right) {
+            let col_index = Self::resolve_grouped_having_column(left, projection, output_columns)?;
+            return Some(GroupedHavingConjunct {
+                col_index,
+                op: base_op,
+                literal,
+            });
+        }
+        // `<literal> <op> <column>`: extract the literal on the left, flip the operator.
+        if let Some(literal) = Self::grouped_having_literal(left) {
+            let col_index = Self::resolve_grouped_having_column(right, projection, output_columns)?;
+            return Some(GroupedHavingConjunct {
+                col_index,
+                op: Self::flip_grouped_having_op(base_op),
+                literal,
+            });
+        }
+        None
+    }
+
+    /// Resolve a HAVING comparison operand to an output column index. Unlike ORDER BY, HAVING has no
+    /// positional column references, so a bare literal (number/string/bool/NULL, or a negated number)
+    /// is never a column — reject it before delegating to the shared resolver (whose positional branch
+    /// would otherwise read a bare integer as a 1-based column index).
+    fn resolve_grouped_having_column(
+        expr: &Expr,
+        projection: &[SelectItem],
+        output_columns: &[String],
+    ) -> Option<usize> {
+        if matches!(expr, Expr::Value(_))
+            || matches!(
+                expr,
+                Expr::UnaryOp {
+                    op: sqlparser::ast::UnaryOperator::Minus,
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        Self::resolve_grouped_order_column(expr, projection, output_columns)
+    }
+
+    fn flip_grouped_having_op(op: GroupedHavingOp) -> GroupedHavingOp {
+        match op {
+            GroupedHavingOp::Gt => GroupedHavingOp::Lt,
+            GroupedHavingOp::GtEq => GroupedHavingOp::LtEq,
+            GroupedHavingOp::Lt => GroupedHavingOp::Gt,
+            GroupedHavingOp::LtEq => GroupedHavingOp::GtEq,
+            GroupedHavingOp::Eq => GroupedHavingOp::Eq,
+            GroupedHavingOp::NotEq => GroupedHavingOp::NotEq,
+        }
+    }
+
+    /// Extract a scalar literal (number incl. negative, single-quoted string, boolean, NULL) as the
+    /// `serde_json::Value` the merged output row carries, so HAVING compares like-for-like. Returns
+    /// `None` for anything non-literal (a column, function call, parameter, etc.).
+    fn grouped_having_literal(expr: &Expr) -> Option<serde_json::Value> {
+        match expr {
+            Expr::Value(sqlparser::ast::ValueWithSpan { value, .. }) => match value {
+                sqlparser::ast::Value::Number(n, _) => {
+                    if let Ok(i) = n.parse::<i64>() {
+                        Some(serde_json::Value::Number(i.into()))
+                    } else {
+                        let f = n.parse::<f64>().ok()?;
+                        serde_json::Number::from_f64(f).map(serde_json::Value::Number)
+                    }
+                }
+                sqlparser::ast::Value::SingleQuotedString(s)
+                | sqlparser::ast::Value::DoubleQuotedString(s) => {
+                    Some(serde_json::Value::String(s.clone()))
+                }
+                sqlparser::ast::Value::Boolean(b) => Some(serde_json::Value::Bool(*b)),
+                sqlparser::ast::Value::Null => Some(serde_json::Value::Null),
+                _ => None,
+            },
+            Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Minus,
+                expr,
+            } => match Self::grouped_having_literal(expr)? {
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        Some(serde_json::Value::Number((-i).into()))
+                    } else {
+                        let f = -n.as_f64()?;
+                        serde_json::Number::from_f64(f).map(serde_json::Value::Number)
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Resolve one `ORDER BY` expression to an output column index: positional (`ORDER BY 2`), a bare
@@ -2015,13 +2270,10 @@ impl Executor {
         let SetExpr::Select(select) = query.body.as_ref() else {
             return None;
         };
-        if select.distinct.is_some()
-            || select.having.is_some()
-            || select.from.len() != 1
-            || !select.from[0].joins.is_empty()
-        {
+        if select.distinct.is_some() || select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return None;
         }
+        // `HAVING` is supported via post-merge (resolved below); it is NOT rejected here.
         let TableFactor::Table { name, .. } = &select.from[0].relation else {
             return None;
         };
@@ -2123,14 +2375,23 @@ impl Executor {
             group_by_sql
         );
 
-        // ORDER BY keys resolve against `output_columns` (the ORIGINAL projection layout), which is
-        // exactly the layout of the rebuilt AVG rows — so post-merge sort/slice indexes correctly.
-        // AVG owners always run the (already clause-free) `rewritten_sql`, so `per_owner_sql` mirrors it.
-        let post_merge = if query.order_by.is_some() || query.limit_clause.is_some() {
-            let (order_keys, limit, offset) =
-                Self::resolve_grouped_order_limit(query, &select.projection, &output_columns)?;
+        // ORDER BY keys / HAVING resolve against `output_columns` (the ORIGINAL projection layout),
+        // which is exactly the layout of the rebuilt AVG rows — so post-merge filter/sort/slice index
+        // correctly. AVG owners always run the (already clause-free) `rewritten_sql`, so `per_owner_sql`
+        // mirrors it; HAVING is evaluated post-merge on the divided AVG value, not on the partials.
+        let post_merge = if query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || select.having.is_some()
+        {
+            let (order_keys, limit, offset, having) = Self::resolve_grouped_order_limit(
+                query,
+                select.having.as_ref(),
+                &select.projection,
+                &output_columns,
+            )?;
             Some(GroupedPostMerge {
                 per_owner_sql: rewritten_sql.clone(),
+                having,
                 order_keys,
                 limit,
                 offset,
@@ -4187,7 +4448,6 @@ mod tests {
         // Query.fetch, separate from limit_clause → rejected so the row limit is never silently dropped).
         for sql in [
             "SELECT region, COUNT(*) FROM orders",
-            "SELECT region, COUNT(*) FROM orders GROUP BY region HAVING COUNT(*) > 1",
             "SELECT region, COUNT(*) FROM orders GROUP BY region, country",
             "SELECT region, SUM(amount) FROM orders GROUP BY region",
             "SELECT region, COUNT(*) FROM orders GROUP BY region ORDER BY COUNT(*) DESC FETCH FIRST 5 ROWS ONLY",
@@ -4235,13 +4495,12 @@ mod tests {
         }
 
         // Ineligible: COUNT(*) (group-count path), AVG (separate ticket), no GROUP BY,
-        // HAVING (separate ticket), projection arity mismatch. ORDER BY / LIMIT are now eligible
-        // (post-merge) and covered by `group_aggregate_fanout_resolves_order_by_limit`.
+        // projection arity mismatch. ORDER BY / LIMIT (resolves_order_by_limit) and HAVING
+        // (resolves_having) are now eligible (post-merge).
         for sql in [
             "SELECT region, COUNT(*) FROM orders GROUP BY region",
             "SELECT region, AVG(amount) FROM orders GROUP BY region",
             "SELECT region, SUM(amount) FROM orders",
-            "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > 1",
             "SELECT region, country, SUM(amount) FROM orders GROUP BY region",
         ] {
             assert!(
@@ -4375,6 +4634,7 @@ mod tests {
             &mut rows,
             &GroupedPostMerge {
                 per_owner_sql: String::new(),
+                having: None,
                 order_keys: vec![GroupedOrderKey {
                     col_index: 1,
                     asc: false,
@@ -4398,6 +4658,7 @@ mod tests {
             &mut rows,
             &GroupedPostMerge {
                 per_owner_sql: String::new(),
+                having: None,
                 order_keys: vec![GroupedOrderKey {
                     col_index: 0,
                     asc: true,
@@ -4419,6 +4680,7 @@ mod tests {
             &mut rows,
             &GroupedPostMerge {
                 per_owner_sql: String::new(),
+                having: None,
                 order_keys: vec![GroupedOrderKey {
                     col_index: 0,
                     asc: true,
@@ -4436,6 +4698,129 @@ mod tests {
                 vec![serde_json::Value::Null]
             ]
         );
+    }
+
+    #[test]
+    fn apply_grouped_post_merge_filters_having_before_order_limit() {
+        use serde_json::json;
+        // HAVING SUM > 15 AND grp <> 'd', then ORDER BY SUM DESC LIMIT 2. Rows: [grp, sum].
+        let mut rows = vec![
+            vec![json!("a"), json!(10)],
+            vec![json!("b"), json!(30)],
+            vec![json!("c"), json!(20)],
+            vec![json!("d"), json!(40)],
+            vec![json!("e"), serde_json::Value::Null],
+        ];
+        let spec = GroupedPostMerge {
+            per_owner_sql: String::new(),
+            having: Some(GroupedHaving {
+                conjuncts: vec![
+                    GroupedHavingConjunct {
+                        col_index: 1,
+                        op: GroupedHavingOp::Gt,
+                        literal: json!(15),
+                    },
+                    GroupedHavingConjunct {
+                        col_index: 0,
+                        op: GroupedHavingOp::NotEq,
+                        literal: json!("d"),
+                    },
+                ],
+            }),
+            order_keys: vec![GroupedOrderKey {
+                col_index: 1,
+                asc: false,
+                nulls_first: true,
+            }],
+            limit: Some(2),
+            offset: 0,
+        };
+        super::apply_grouped_order_limit(&mut rows, &spec);
+        // 'a'=10 drops (<=15), 'd'=40 drops (grp=d), 'e'=NULL drops (NULL>15 unknown). Remaining
+        // b=30, c=20 → ORDER BY sum DESC → [b, c].
+        assert_eq!(
+            rows,
+            vec![vec![json!("b"), json!(30)], vec![json!("c"), json!(20)]]
+        );
+    }
+
+    #[test]
+    fn group_aggregate_fanout_resolves_having() {
+        // HAVING on the aggregate output + AND a group column, literal on either side.
+        let plan = Executor::shard_group_aggregate_select_fanout_plan_for_statements(
+            &parse_sql(
+                "SELECT region, SUM(amount) FROM orders GROUP BY region \
+                 HAVING SUM(amount) > 100 AND region <> 'x' ORDER BY SUM(amount) DESC LIMIT 3",
+            )
+            .unwrap(),
+        )
+        .expect("eligible having plan");
+        let post = plan.post_merge.as_ref().expect("post_merge");
+        let having = post.having.as_ref().expect("having");
+        assert_eq!(having.conjuncts.len(), 2);
+        assert_eq!(having.conjuncts[0].col_index, 1); // SUM output column
+        assert_eq!(having.conjuncts[0].op, GroupedHavingOp::Gt);
+        assert_eq!(having.conjuncts[0].literal, serde_json::json!(100));
+        assert_eq!(having.conjuncts[1].col_index, 0); // region group column
+        assert_eq!(having.conjuncts[1].op, GroupedHavingOp::NotEq);
+        assert_eq!(post.order_keys.len(), 1);
+        assert_eq!(post.limit, Some(3));
+        // Per-owner SQL must not carry HAVING (owners return all groups).
+        assert!(!post.per_owner_sql.to_ascii_uppercase().contains("HAVING"));
+
+        // Literal-on-left flips the operator: 100 < SUM(amount) ⇒ col > 100. A SMALL literal that would
+        // fall within the positional 1..=arity range (2 <= SUM(amount)) must ALSO flip, not be misread
+        // as a positional column reference (regression guard from the 452 adversarial review).
+        for (sql, expect_op, expect_lit) in [
+            (
+                "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING 100 < SUM(amount)",
+                GroupedHavingOp::Gt,
+                100,
+            ),
+            (
+                "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING 2 <= SUM(amount)",
+                GroupedHavingOp::GtEq,
+                2,
+            ),
+        ] {
+            let flipped = Executor::shard_group_aggregate_select_fanout_plan_for_statements(
+                &parse_sql(sql).unwrap(),
+            )
+            .unwrap_or_else(|| panic!("flipped having plan: {sql}"));
+            let c = &flipped
+                .post_merge
+                .as_ref()
+                .unwrap()
+                .having
+                .as_ref()
+                .unwrap()
+                .conjuncts[0];
+            assert_eq!(c.col_index, 1, "col_index for {sql}");
+            assert_eq!(c.op, expect_op, "op for {sql}");
+            assert_eq!(
+                c.literal,
+                serde_json::json!(expect_lit),
+                "literal for {sql}"
+            );
+        }
+
+        // Unresolvable HAVING ⇒ None ⇒ 449 loud error: OR, non-output column, non-literal RHS, and
+        // constant-only predicates (a bare integer is NEVER a positional column in HAVING).
+        for sql in [
+            "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > 1 OR region = 'x'",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING COUNT(*) > 1",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > region",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING 1 > 5",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING 1 = 1",
+        ] {
+            assert!(
+                Executor::shard_group_aggregate_select_fanout_plan_for_statements(
+                    &parse_sql(sql).unwrap()
+                )
+                .is_none(),
+                "should be ineligible (unresolvable HAVING): {sql}"
+            );
+        }
     }
 
     #[test]
@@ -4504,12 +4889,12 @@ mod tests {
         assert!(!post.per_owner_sql.to_ascii_uppercase().contains("LIMIT"));
 
         // Ineligible: non-AVG aggregates (handled by other paths), no GROUP BY (scalar avg path),
-        // HAVING (separate ticket), FETCH (in Query.fetch → rejected), projection arity mismatch.
+        // FETCH (in Query.fetch → rejected), projection arity mismatch. HAVING / ORDER BY / LIMIT are
+        // now eligible (post-merge).
         for sql in [
             "SELECT region, SUM(amount) FROM orders GROUP BY region",
             "SELECT region, COUNT(*) FROM orders GROUP BY region",
             "SELECT AVG(amount) FROM orders",
-            "SELECT region, AVG(amount) FROM orders GROUP BY region HAVING AVG(amount) > 1",
             "SELECT region, country, AVG(amount) FROM orders GROUP BY region",
             "SELECT region, AVG(amount) FROM orders GROUP BY region ORDER BY region FETCH FIRST 5 ROWS ONLY",
         ] {

@@ -5965,6 +5965,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_query_fanouts_group_aggregate_having_global_filter() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_group_having_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_group_having_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_keys = integer_primary_keys_for_owner(&local_shard_router, "ghav", 1, 3);
+        let remote_keys = integer_primary_keys_for_owner(&local_shard_router, "ghav", 2, 3);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let create_sql = "CREATE TABLE ghav (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+        let client = reqwest::Client::new();
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        // Local: a=60, b=30, c=80; remote: a=60, b=10, d=50. Global sums: a=120, b=40, c=80, d=50.
+        // Group 'a' is below the HAVING threshold (100) on EACH owner (60 < 100) but above it globally
+        // (120) — a per-owner HAVING would drop 'a' on both owners and return nothing; only post-merge
+        // HAVING is correct.
+        for (key, grp, amt) in [
+            (local_keys[0], "a", 60),
+            (local_keys[1], "b", 30),
+            (local_keys[2], "c", 80),
+        ] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO ghav (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        for (key, grp, amt) in [
+            (remote_keys[0], "a", 60),
+            (remote_keys[1], "b", 10),
+            (remote_keys[2], "d", 50),
+        ] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO ghav (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+
+        // HAVING on the GLOBAL sum: only 'a' (120) exceeds 100.
+        let having = post_query(
+            &local_app,
+            "SELECT grp, SUM(amt) FROM ghav GROUP BY grp HAVING SUM(amt) > 100",
+        )
+        .await;
+        assert_eq!(having.status(), StatusCode::OK);
+        let having_env: Envelope<Vec<QueryResultJson>> = response_json(having).await;
+        match &having_env.data.expect("having data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(
+                    rows,
+                    &vec![vec![serde_json::json!("a"), serde_json::json!(120)]]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout group having"),
+        }
+
+        // HAVING + ORDER BY + LIMIT together: groups with global sum >= 50 are a=120, c=80, d=50
+        // (b=40 dropped); ORDER BY SUM DESC LIMIT 2 → a, c.
+        let combo = post_query(
+            &local_app,
+            "SELECT grp, SUM(amt) FROM ghav GROUP BY grp HAVING SUM(amt) >= 50 ORDER BY SUM(amt) DESC LIMIT 2",
+        )
+        .await;
+        assert_eq!(combo.status(), StatusCode::OK);
+        let combo_env: Envelope<Vec<QueryResultJson>> = response_json(combo).await;
+        match &combo_env.data.expect("combo data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(
+                    rows,
+                    &vec![
+                        vec![serde_json::json!("a"), serde_json::json!(120)],
+                        vec![serde_json::json!("c"), serde_json::json!(80)],
+                    ]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout group having+order+limit"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
     async fn http_query_fanouts_group_avg_across_shard_owners() {
         let local_wal_path = format!(
             "test_http_shard_owner_group_avg_local_{}.wal",

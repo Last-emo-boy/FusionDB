@@ -2101,6 +2101,31 @@ async fn test_pg_grouped_aggregate_order_by_limit_global_top_k_across_owners() {
     assert_eq!(ext_rows[0].get::<_, String>(0), "a");
     assert_eq!(ext_rows[1].get::<_, String>(0), "b");
 
+    // --- Simple protocol: HAVING on the GLOBAL sum. Group 'b' is 20 (local) and 1 (remote) — below
+    // the threshold on each owner, but 21 globally, so only post-merge HAVING keeps it. ---
+    let messages = client
+        .simple_query(
+            "SELECT grp, SUM(amt) FROM pg_gao GROUP BY grp HAVING SUM(amt) > 20 ORDER BY SUM(amt) DESC",
+        )
+        .await
+        .expect("simple grouped having query failed");
+    let rows: Vec<&tokio_postgres::SimpleQueryRow> = messages
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "HAVING SUM>20 should keep a (105) and b (21)"
+    );
+    assert_eq!(rows[0].get(0), Some("a"));
+    assert_eq!(rows[0].get(1), Some("105"));
+    assert_eq!(rows[1].get(0), Some("b"));
+    assert_eq!(rows[1].get(1), Some("21"));
+
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
 }
