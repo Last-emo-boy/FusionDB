@@ -45,10 +45,13 @@ Usage:
     2. Run benchmark:   python benchmark.py
     3. Quick mode:      BENCH_SCALE=small python benchmark.py
     4. Large mode:      BENCH_SCALE=large python benchmark.py
+    5. pgwire path:     BENCH_PROTO=pg python benchmark.py   (needs psycopg2)
 
 Options (env vars):
     FUSIONDB_URL   - HTTP endpoint (default: http://127.0.0.1:8091/query)
     BENCH_SCALE    - small / medium / large  (default: medium)
+    BENCH_PROTO    - http / pg  (default: http; pg = PostgreSQL wire protocol on :8092)
+    FUSIONDB_PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DBNAME - pgwire connection overrides
 """
 
 import requests
@@ -75,6 +78,17 @@ BASE_URL = os.environ.get("FUSIONDB_URL", "http://127.0.0.1:8091/query")
 HEALTH_URL = BASE_URL.replace("/query", "/health")
 SCALE = os.environ.get("BENCH_SCALE", "medium").lower()
 HTTP_SESSIONS = threading.local()
+
+# Transport: "http" (HTTP+JSON, default) or "pg" (PostgreSQL wire protocol, binary over TCP).
+# Same suite, same SQL — only the client/server protocol differs, so the two reports isolate the
+# protocol cost from the engine cost.
+PROTO = os.environ.get("BENCH_PROTO", "http").lower()
+PG_HOST = os.environ.get("FUSIONDB_PG_HOST", "127.0.0.1")
+PG_PORT = int(os.environ.get("FUSIONDB_PG_PORT", "8092"))
+PG_USER = os.environ.get("FUSIONDB_PG_USER", "postgres")
+PG_PASSWORD = os.environ.get("FUSIONDB_PG_PASSWORD", "fusiondb")
+PG_DBNAME = os.environ.get("FUSIONDB_PG_DBNAME", "postgres")
+PG_LOCAL = threading.local()
 
 SCALES = {
     #                 base_rows  users  products  orders  accounts  transfers  events  iters  warmup  batch  threads
@@ -170,8 +184,21 @@ class BenchResult:
         return True
 
 
-def sql(query: str, silent=True) -> Tuple[Optional[dict], float]:
-    """Execute SQL, return (json_response, latency_ms)."""
+def pg_conn():
+    """Thread-local autocommit psycopg2 connection to the pgwire server."""
+    conn = getattr(PG_LOCAL, "conn", None)
+    if conn is None:
+        import psycopg2
+        conn = psycopg2.connect(
+            host=PG_HOST, port=PG_PORT, user=PG_USER,
+            password=PG_PASSWORD, dbname=PG_DBNAME, connect_timeout=10,
+        )
+        conn.autocommit = True
+        PG_LOCAL.conn = conn
+    return conn
+
+
+def _http_sql(query: str, silent: bool) -> Tuple[Optional[dict], float]:
     try:
         t0 = time.perf_counter()
         r = http_session().post(BASE_URL, json={"sql": query}, timeout=60)
@@ -185,6 +212,39 @@ def sql(query: str, silent=True) -> Tuple[Optional[dict], float]:
         if not silent:
             print(f"  [ERR] {query[:80]}… → {e}")
         return {"status": "error", "data": None, "error": str(e)}, 0
+
+
+def _pg_sql(query: str, silent: bool) -> Tuple[Optional[dict], float]:
+    # Normalize to the same {status, data:[{type:select, columns, rows}]} shape the HTTP path returns,
+    # so rows()/record() and every caller work unchanged.
+    try:
+        t0 = time.perf_counter()
+        cur = pg_conn().cursor()
+        cur.execute(query)
+        if cur.description is not None:
+            cols = [d[0] for d in cur.description]
+            fetched = cur.fetchall()
+            ms = (time.perf_counter() - t0) * 1000
+            data = [{"type": "select", "columns": cols, "rows": [list(r) for r in fetched]}]
+        else:
+            ms = (time.perf_counter() - t0) * 1000
+            data = [{"type": "ok"}]
+        cur.close()
+        return {"status": "ok", "data": data, "error": None}, ms
+    except Exception as e:
+        # Drop a possibly-broken connection so the next call reconnects (autocommit SQL errors are
+        # recoverable, but connection-level failures are not).
+        PG_LOCAL.conn = None
+        if not silent:
+            print(f"  [ERR] {query[:80]}… → {e}")
+        return {"status": "error", "data": None, "error": str(e)}, 0
+
+
+def sql(query: str, silent=True) -> Tuple[Optional[dict], float]:
+    """Execute SQL over the selected transport, return (normalized_response, latency_ms)."""
+    if PROTO == "pg":
+        return _pg_sql(query, silent)
+    return _http_sql(query, silent)
 
 def sql_ok(q):
     res, _ = sql(q)
@@ -296,12 +356,22 @@ def setup() -> Dict[str, float]:
     print(f"  FusionDB Unified Benchmark  │  Scale: {SCALE.upper()}")
     print(f"  base_rows={C['base_rows']}  users={C['users']}  products={C['products']}  "
           f"orders={C['orders']}  accounts={C['accounts']}  events={C['events']}  threads={C['threads']}")
-    print(f"  Endpoint: {BASE_URL}")
+    if PROTO == "pg":
+        print(f"  Transport: PGWIRE  │  {PG_HOST}:{PG_PORT} (user={PG_USER})")
+    else:
+        print(f"  Transport: HTTP+JSON  │  {BASE_URL}")
     print(f"{'═'*100}\n")
 
-    try: http_session().get(HEALTH_URL, timeout=3)
-    except Exception:
-        print(f"  ERROR: FusionDB not running at {HEALTH_URL}\n  Start with: cargo run"); sys.exit(1)
+    try:
+        if PROTO == "pg":
+            res, _ = sql("SELECT 1")
+            if res.get("status") != "ok":
+                raise RuntimeError(res.get("error"))
+        else:
+            http_session().get(HEALTH_URL, timeout=3)
+    except Exception as e:
+        target = f"{PG_HOST}:{PG_PORT} (pgwire)" if PROTO == "pg" else HEALTH_URL
+        print(f"  ERROR: FusionDB not reachable at {target}: {e}\n  Start with: cargo run"); sys.exit(1)
 
     # ── Drop ──
     print("  [setup] Dropping old tables …")
@@ -827,7 +897,7 @@ def save_report(timings, all_results):
             "throughput_ops_sec": round(r.throughput_ops_sec,1),
             "error": r.error, "errors": r.errors, "note": r.note,
         })
-    fname = f"benchmark_report_{SCALE}.json"
+    fname = f"benchmark_report_{SCALE}_{PROTO}.json"
     with open(fname, "w") as f: json.dump(report, f, indent=2)
     print(f"  Report saved → {fname}")
 
