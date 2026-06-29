@@ -1,0 +1,16 @@
+{
+  "id": "BENCHPROD-461",
+  "title": "Grouped single-aggregate fan-out: non-numeric column → loud error (not silent local-only)",
+  "phase": "P5-3 Automatic sharding",
+  "status": "done",
+  "fix": "449 safety net step-2 short-circuit now lists ONLY group_count (no type gate); group_aggregate/group_avg/group_multi_aggregate fall through to the scatter check so a type-ineligible scattering query errors loudly instead of running silent local-only",
+  "mechanism": "same as the 460 multi-agg fix (already adversarially verified); eligible numeric aggregates are answered by their own dispatcher before the net; pinned→empty scatter→local; forwarded guarded by the try_unsupported wrappers",
+  "verification": {
+    "lib": 360,
+    "pg_integration": 38,
+    "sql_group_aggregate": 50,
+    "fmt": "clean",
+    "tests": "http_query_rejects_unsupported_multiowner_group_by extended: non-numeric single MAX/SUM/AVG over TEXT → BAD_REQUEST; supported numeric single+multi aggregates still OK"
+  },
+  "next": "BENCHPROD-462: DECIMAL/NUMERIC support in grouped aggregate fan-out (decimal-aware accumulator; DECIMAL is f64-backed via Value::decimal_from_f64) so SUM/MIN/MAX over NUMERIC fans out instead of loud-erroring"
+}
