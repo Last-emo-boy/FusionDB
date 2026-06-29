@@ -25,8 +25,8 @@ use moka::sync::Cache;
 use parking_lot::RwLock;
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    ObjectName, ObjectNamePart, ObjectType, OrderByKind, SelectItem, SetExpr, Statement,
-    TableFactor,
+    LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByKind, Query, SelectItem, SetExpr,
+    Statement, TableFactor,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
@@ -116,6 +116,145 @@ pub(crate) struct SqlShardGroupAggregateFanoutPlan {
     pub agg_index: usize,
     pub kind: SqlShardGroupAggregateKind,
     pub output_columns: Vec<String>,
+    /// `Some` when the query carries `ORDER BY` / `LIMIT` / `OFFSET`: owners run `per_owner_sql`
+    /// (those clauses stripped) so each returns ALL its groups, then the merged rows are globally
+    /// sorted and sliced post-merge. `None` for a plain grouped query (owners run the original SQL).
+    pub post_merge: Option<GroupedPostMerge>,
+}
+
+/// One resolved `ORDER BY` key for a distributed grouped post-merge: the output column index to sort
+/// on (rows are emitted in projection/output-column layout), the direction, and NULL placement.
+/// Resolution happens at plan time; any `ORDER BY` expression that cannot be mapped to an output
+/// column makes the whole extractor return `None` (→ the 449 safety net errors loudly), so a
+/// distributed grouped query is never silently returned unsorted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupedOrderKey {
+    pub col_index: usize,
+    pub asc: bool,
+    pub nulls_first: bool,
+}
+
+/// Post-merge spec for a distributed grouped fan-out carrying `ORDER BY` / `LIMIT` / `OFFSET`. A group
+/// spans owners, so an owner's local `LIMIT` would be wrong (its partial top-N ≠ the global top-N);
+/// owners therefore run `per_owner_sql` (clauses stripped, returning all groups) and the fully merged
+/// rows are globally stable-sorted by `order_keys` then sliced by `offset`/`limit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroupedPostMerge {
+    pub per_owner_sql: String,
+    pub order_keys: Vec<GroupedOrderKey>,
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+/// Apply a distributed grouped post-merge spec to fully-merged rows in place: globally stable-sort by
+/// the resolved `ORDER BY` keys, then drop `offset` rows and truncate to `limit`. Shared by the HTTP
+/// and pgwire grouped fan-out handlers so both transports apply identical SQL ordering semantics.
+pub(crate) fn apply_grouped_order_limit(
+    rows: &mut Vec<Vec<serde_json::Value>>,
+    spec: &GroupedPostMerge,
+) {
+    if !spec.order_keys.is_empty() {
+        rows.sort_by(|a, b| {
+            for key in &spec.order_keys {
+                let null = serde_json::Value::Null;
+                let ord = compare_grouped_order_values(
+                    a.get(key.col_index).unwrap_or(&null),
+                    b.get(key.col_index).unwrap_or(&null),
+                    key.asc,
+                    key.nulls_first,
+                );
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+    if spec.offset > 0 {
+        if spec.offset >= rows.len() {
+            rows.clear();
+        } else {
+            rows.drain(0..spec.offset);
+        }
+    }
+    if let Some(limit) = spec.limit {
+        rows.truncate(limit);
+    }
+}
+
+/// Compare two output values for `ORDER BY`, honoring direction and NULL placement. NULL placement is
+/// absolute (`nulls_first` decides the final slot regardless of `asc`); non-null values are compared
+/// by SQL semantics and then reversed for `DESC`.
+fn compare_grouped_order_values(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    asc: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let base = compare_grouped_non_null(a, b);
+            if asc {
+                base
+            } else {
+                base.reverse()
+            }
+        }
+    }
+}
+
+fn compare_grouped_non_null(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    use serde_json::Value;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            // Prefer exact integer comparison; fall back to f64 for floats / mixed int-float columns.
+            if let (Some(xi), Some(yi)) = (x.as_i64(), y.as_i64()) {
+                xi.cmp(&yi)
+            } else if let (Some(xu), Some(yu)) = (x.as_u64(), y.as_u64()) {
+                xu.cmp(&yu)
+            } else {
+                let xf = x.as_f64().unwrap_or(f64::NAN);
+                let yf = y.as_f64().unwrap_or(f64::NAN);
+                xf.partial_cmp(&yf).unwrap_or(Ordering::Equal)
+            }
+        }
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        // Mixed/other types should not occur within one output column; fall back to a deterministic,
+        // panic-free ordering by type rank then string form so the sort stays total.
+        _ => grouped_value_type_rank(a)
+            .cmp(&grouped_value_type_rank(b))
+            .then_with(|| a.to_string().cmp(&b.to_string())),
+    }
+}
+
+fn grouped_value_type_rank(value: &serde_json::Value) -> u8 {
+    use serde_json::Value;
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 2,
+        Value::String(_) => 3,
+        Value::Array(_) => 4,
+        Value::Object(_) => 5,
+    }
 }
 
 /// Plan for `SELECT g1[, ...], AVG(x) FROM t [WHERE ...] GROUP BY g1[, ...]` shard-owner fan-out.
@@ -1599,7 +1738,12 @@ impl Executor {
         let [Statement::Query(query)] = statements else {
             return None;
         };
-        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+        // `ORDER BY` / `LIMIT` / `OFFSET` are supported via post-merge (see `post_merge` below); CTEs
+        // (`WITH`) and the separate `FETCH FIRST n ROWS` clause are not. Rejecting `fetch` here routes
+        // such queries to the 449 loud-error net rather than silently dropping the row limit (it lives
+        // in `Query.fetch`, distinct from `limit_clause`, so the post-merge path would never see it).
+        // `HAVING` is still rejected (handled later, in 452).
+        if query.with.is_some() || query.fetch.is_some() {
             return None;
         }
         let SetExpr::Select(select) = query.body.as_ref() else {
@@ -1682,6 +1826,18 @@ impl Executor {
             .iter()
             .map(Self::select_projection_output_name)
             .collect::<Option<Vec<_>>>()?;
+        // Resolve any ORDER BY / LIMIT / OFFSET into a post-merge spec. When clauses are present but
+        // cannot be resolved to output columns / numeric literals, return None so the 449 safety net
+        // errors loudly rather than emitting a silently-unsorted distributed result.
+        let post_merge = if query.order_by.is_some() || query.limit_clause.is_some() {
+            Some(Self::resolve_grouped_post_merge(
+                query,
+                &select.projection,
+                &output_columns,
+            )?)
+        } else {
+            None
+        };
         Some((
             name.to_string(),
             agg_column,
@@ -1690,8 +1846,137 @@ impl Executor {
                 agg_index,
                 kind,
                 output_columns,
+                post_merge,
             },
         ))
+    }
+
+    /// Resolve a grouped query's `ORDER BY` / `LIMIT` / `OFFSET` into a [`GroupedPostMerge`] spec, or
+    /// `None` if any part is unsupported (so the caller rejects the whole plan → 449 loud error).
+    /// Over-rejection is deliberate: a wrong distributed answer is worse than a loud "unsupported".
+    fn resolve_grouped_post_merge(
+        query: &Query,
+        projection: &[SelectItem],
+        output_columns: &[String],
+    ) -> Option<GroupedPostMerge> {
+        let mut order_keys = Vec::new();
+        if let Some(order_by) = &query.order_by {
+            if order_by.interpolate.is_some() {
+                return None;
+            }
+            let OrderByKind::Expressions(exprs) = &order_by.kind else {
+                return None; // ORDER BY ALL (DuckDB/ClickHouse) unsupported
+            };
+            if exprs.is_empty() {
+                return None;
+            }
+            for order_expr in exprs {
+                if order_expr.with_fill.is_some() {
+                    return None;
+                }
+                let col_index = Self::resolve_grouped_order_column(
+                    &order_expr.expr,
+                    projection,
+                    output_columns,
+                )?;
+                let asc = order_expr.options.asc.unwrap_or(true);
+                // SQL default NULL placement: NULLS LAST for ASC, NULLS FIRST for DESC.
+                let nulls_first = order_expr.options.nulls_first.unwrap_or(!asc);
+                order_keys.push(GroupedOrderKey {
+                    col_index,
+                    asc,
+                    nulls_first,
+                });
+            }
+        }
+        let (limit, offset) = match &query.limit_clause {
+            Some(LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            }) => {
+                if !limit_by.is_empty() {
+                    return None; // ClickHouse LIMIT BY unsupported
+                }
+                let limit = match limit {
+                    Some(expr) => Some(Self::grouped_usize_literal(expr)?),
+                    None => None,
+                };
+                let offset = match offset {
+                    Some(offset) => Self::grouped_usize_literal(&offset.value)?,
+                    None => 0,
+                };
+                (limit, offset)
+            }
+            Some(LimitClause::OffsetCommaLimit { .. }) => return None, // MySQL `LIMIT a, b` form
+            None => (None, 0),
+        };
+        Some(GroupedPostMerge {
+            per_owner_sql: Self::strip_grouped_post_merge_clauses(query),
+            order_keys,
+            limit,
+            offset,
+        })
+    }
+
+    /// Resolve one `ORDER BY` expression to an output column index: positional (`ORDER BY 2`), a bare
+    /// identifier matching an output column name/alias, or a projection expression (e.g. the
+    /// `SUM(amount)` aggregate item). Returns `None` for anything else.
+    fn resolve_grouped_order_column(
+        expr: &Expr,
+        projection: &[SelectItem],
+        output_columns: &[String],
+    ) -> Option<usize> {
+        if let Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::Number(n, _),
+            ..
+        }) = expr
+        {
+            let index = n.parse::<usize>().ok()?.checked_sub(1)?;
+            return (index < output_columns.len()).then_some(index);
+        }
+        if let Expr::Identifier(ident) = expr {
+            if let Some(index) = output_columns
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(&ident.value))
+            {
+                return Some(index);
+            }
+        }
+        projection.iter().enumerate().find_map(|(index, item)| match item {
+            SelectItem::UnnamedExpr(proj_expr) if proj_expr == expr => Some(index),
+            SelectItem::ExprWithAlias { expr: proj_expr, alias }
+                if proj_expr == expr
+                    || matches!(expr, Expr::Identifier(ident) if alias.value.eq_ignore_ascii_case(&ident.value)) =>
+            {
+                Some(index)
+            }
+            _ => None,
+        })
+    }
+
+    fn grouped_usize_literal(expr: &Expr) -> Option<usize> {
+        match expr {
+            Expr::Value(sqlparser::ast::ValueWithSpan {
+                value: sqlparser::ast::Value::Number(n, _),
+                ..
+            }) => n.parse::<usize>().ok(),
+            _ => None,
+        }
+    }
+
+    /// Produce the per-owner SQL: the original grouped query with `ORDER BY` / `LIMIT` / `OFFSET` and
+    /// the inner `HAVING` removed, so every owner returns ALL its (partial) groups. The clauses are
+    /// re-applied once, post-merge, on the globally combined rows.
+    fn strip_grouped_post_merge_clauses(query: &Query) -> String {
+        let mut stripped = query.clone();
+        stripped.order_by = None;
+        stripped.limit_clause = None;
+        stripped.fetch = None;
+        if let SetExpr::Select(select) = stripped.body.as_mut() {
+            select.having = None;
+        }
+        stripped.to_string()
     }
 
     fn group_avg_select_fanout_target(
@@ -3888,14 +4173,13 @@ mod tests {
         }
 
         // Ineligible: COUNT(*) (group-count path), AVG (separate ticket), no GROUP BY,
-        // HAVING / ORDER BY / LIMIT, projection arity mismatch.
+        // HAVING (separate ticket), projection arity mismatch. ORDER BY / LIMIT are now eligible
+        // (post-merge) and covered by `group_aggregate_fanout_resolves_order_by_limit`.
         for sql in [
             "SELECT region, COUNT(*) FROM orders GROUP BY region",
             "SELECT region, AVG(amount) FROM orders GROUP BY region",
             "SELECT region, SUM(amount) FROM orders",
             "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > 1",
-            "SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY region",
-            "SELECT region, SUM(amount) FROM orders GROUP BY region LIMIT 5",
             "SELECT region, country, SUM(amount) FROM orders GROUP BY region",
         ] {
             assert!(
@@ -3906,6 +4190,190 @@ mod tests {
                 "should be ineligible: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn group_aggregate_fanout_resolves_order_by_limit() {
+        // (sql, expected order_keys as (col_index, asc, nulls_first), limit, offset, per_owner_sql)
+        let cases: &[(&str, &[(usize, bool, bool)], Option<usize>, usize)] = &[
+            // ORDER BY a group column, default ASC → NULLS LAST.
+            (
+                "SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY region",
+                &[(0, true, false)],
+                None,
+                0,
+            ),
+            // ORDER BY the aggregate output DESC → NULLS FIRST by default, with LIMIT.
+            (
+                "SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY SUM(amount) DESC LIMIT 5",
+                &[(1, false, true)],
+                Some(5),
+                0,
+            ),
+            // Positional ORDER BY + OFFSET.
+            (
+                "SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY 2 ASC LIMIT 3 OFFSET 2",
+                &[(1, true, false)],
+                Some(3),
+                2,
+            ),
+            // Alias resolution + explicit NULLS FIRST.
+            (
+                "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY total ASC NULLS FIRST",
+                &[(1, true, true)],
+                None,
+                0,
+            ),
+            // LIMIT only, no ORDER BY.
+            (
+                "SELECT region, SUM(amount) FROM orders GROUP BY region LIMIT 10",
+                &[],
+                Some(10),
+                0,
+            ),
+            // Multi-key ORDER BY (group col then aggregate, mixed direction).
+            (
+                "SELECT region, country, MAX(amount) FROM orders GROUP BY region, country ORDER BY region ASC, MAX(amount) DESC",
+                &[(0, true, false), (2, false, true)],
+                None,
+                0,
+            ),
+        ];
+        for (sql, expected_keys, limit, offset) in cases {
+            let plan = Executor::shard_group_aggregate_select_fanout_plan_for_statements(
+                &parse_sql(sql).unwrap(),
+            )
+            .unwrap_or_else(|| panic!("expected eligible plan: {sql}"));
+            let post = plan
+                .post_merge
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected post_merge: {sql}"));
+            let got: Vec<(usize, bool, bool)> = post
+                .order_keys
+                .iter()
+                .map(|k| (k.col_index, k.asc, k.nulls_first))
+                .collect();
+            assert_eq!(got.as_slice(), *expected_keys, "order_keys for {sql}");
+            assert_eq!(post.limit, *limit, "limit for {sql}");
+            assert_eq!(post.offset, *offset, "offset for {sql}");
+            // The per-owner SQL must not carry ORDER BY / LIMIT / OFFSET (each owner returns all groups).
+            let lowered = post.per_owner_sql.to_ascii_uppercase();
+            assert!(
+                !lowered.contains("ORDER BY"),
+                "per_owner_sql kept ORDER BY: {sql}"
+            );
+            assert!(
+                !lowered.contains("LIMIT"),
+                "per_owner_sql kept LIMIT: {sql}"
+            );
+            assert!(
+                !lowered.contains("OFFSET"),
+                "per_owner_sql kept OFFSET: {sql}"
+            );
+            assert!(
+                lowered.contains("GROUP BY"),
+                "per_owner_sql lost GROUP BY: {sql}"
+            );
+        }
+
+        // Unresolvable ORDER BY / unsupported clauses → None (→ 449 errors loudly, never silently wrong).
+        for sql in [
+            // ORDER BY a column that is not in the output projection.
+            "SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY amount",
+            // Positional out of range.
+            "SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY 3",
+            // Non-literal LIMIT.
+            "SELECT region, SUM(amount) FROM orders GROUP BY region LIMIT region",
+            // FETCH FIRST n ROWS lives in Query.fetch (not limit_clause): rejected so the row limit is
+            // never silently dropped post-merge (regression guard from the 451 adversarial review).
+            "SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY SUM(amount) DESC FETCH FIRST 5 ROWS ONLY",
+            "SELECT region, SUM(amount) FROM orders GROUP BY region FETCH FIRST 5 ROWS ONLY",
+        ] {
+            assert!(
+                Executor::shard_group_aggregate_select_fanout_plan_for_statements(
+                    &parse_sql(sql).unwrap()
+                )
+                .is_none(),
+                "should be ineligible (unresolvable post-merge): {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_grouped_order_limit_sorts_slices_and_orders_nulls() {
+        use serde_json::json;
+        // DESC by the aggregate (col 1), NULLS FIRST (default for DESC), then LIMIT 2.
+        let mut rows = vec![
+            vec![json!("a"), json!(10)],
+            vec![json!("b"), json!(30)],
+            vec![json!("c"), serde_json::Value::Null],
+            vec![json!("d"), json!(20)],
+        ];
+        super::apply_grouped_order_limit(
+            &mut rows,
+            &GroupedPostMerge {
+                per_owner_sql: String::new(),
+                order_keys: vec![GroupedOrderKey {
+                    col_index: 1,
+                    asc: false,
+                    nulls_first: true,
+                }],
+                limit: Some(2),
+                offset: 0,
+            },
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![json!("c"), serde_json::Value::Null],
+                vec![json!("b"), json!(30)]
+            ]
+        );
+
+        // OFFSET past the end yields an empty result.
+        let mut rows = vec![vec![json!(1)], vec![json!(2)]];
+        super::apply_grouped_order_limit(
+            &mut rows,
+            &GroupedPostMerge {
+                per_owner_sql: String::new(),
+                order_keys: vec![GroupedOrderKey {
+                    col_index: 0,
+                    asc: true,
+                    nulls_first: false,
+                }],
+                limit: None,
+                offset: 5,
+            },
+        );
+        assert!(rows.is_empty());
+
+        // ASC default NULLS LAST.
+        let mut rows = vec![
+            vec![serde_json::Value::Null],
+            vec![json!(2)],
+            vec![json!(1)],
+        ];
+        super::apply_grouped_order_limit(
+            &mut rows,
+            &GroupedPostMerge {
+                per_owner_sql: String::new(),
+                order_keys: vec![GroupedOrderKey {
+                    col_index: 0,
+                    asc: true,
+                    nulls_first: false,
+                }],
+                limit: None,
+                offset: 0,
+            },
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![json!(1)],
+                vec![json!(2)],
+                vec![serde_json::Value::Null]
+            ]
+        );
     }
 
     #[test]

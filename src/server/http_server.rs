@@ -1053,7 +1053,13 @@ async fn try_fanout_group_aggregate_query_to_shard_owners(
         }
     };
 
-    let local_results = match state.executor.execute_sql(sql).await {
+    // When the query carries ORDER BY / LIMIT / OFFSET, owners must run the stripped SQL so each
+    // returns ALL its groups; the clauses are applied once, post-merge, on the combined rows.
+    let per_owner_sql = plan
+        .post_merge
+        .as_ref()
+        .map_or(sql, |spec| spec.per_owner_sql.as_str());
+    let local_results = match state.executor.execute_sql(per_owner_sql).await {
         Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
         Err(e) => {
             return Some(json_error(
@@ -1075,10 +1081,11 @@ async fn try_fanout_group_aggregate_query_to_shard_owners(
     };
 
     for owner in owners {
-        let owner_results = match query_remote_shard_owner(state, context, sql, &owner).await {
-            Ok(results) => results,
-            Err((status, message)) => return Some(json_error(status, message)),
-        };
+        let owner_results =
+            match query_remote_shard_owner(state, context, per_owner_sql, &owner).await {
+                Ok(results) => results,
+                Err((status, message)) => return Some(json_error(status, message)),
+            };
         let owner_columns = match accumulate_fanout_group_aggregates(
             &mut groups,
             owner_results,
@@ -1100,10 +1107,14 @@ async fn try_fanout_group_aggregate_query_to_shard_owners(
         }
     }
 
+    let mut rows = group_aggregate_rows(groups, &plan.group_indices, plan.agg_index);
+    if let Some(spec) = &plan.post_merge {
+        crate::execution::apply_grouped_order_limit(&mut rows, spec);
+    }
     Some(json_ok(vec![QueryResultJson::Select {
         r#type: "select".to_string(),
         columns,
-        rows: group_aggregate_rows(groups, &plan.group_indices, plan.agg_index),
+        rows,
     }]))
 }
 
@@ -2953,7 +2964,13 @@ async fn try_fanout_group_aggregate_execute_to_shard_owners(
         }
     };
 
-    let local_results = match execute_prepared_locally_for_fanout(state, record, params).await {
+    // With ORDER BY / LIMIT / OFFSET, run the stripped SQL on every owner (all groups) and apply the
+    // clauses post-merge; otherwise forward the prepared statement verbatim as before.
+    let local_results = match &plan.post_merge {
+        Some(spec) => execute_sql_locally_for_fanout(state, &spec.per_owner_sql, params).await,
+        None => execute_prepared_locally_for_fanout(state, record, params).await,
+    };
+    let local_results = match local_results {
         Ok(results) => results,
         Err(response) => return Some(response),
     };
@@ -2970,11 +2987,22 @@ async fn try_fanout_group_aggregate_execute_to_shard_owners(
     };
 
     for owner in owners {
-        let owner_results = match query_remote_prepared_shard_owner(
-            state, context, record, payload, &owner,
-        )
-        .await
-        {
+        let owner_results = match &plan.post_merge {
+            Some(spec) => {
+                query_remote_prepared_sql_shard_owner(
+                    state,
+                    context,
+                    &spec.per_owner_sql,
+                    payload,
+                    &owner,
+                )
+                .await
+            }
+            None => {
+                query_remote_prepared_shard_owner(state, context, record, payload, &owner).await
+            }
+        };
+        let owner_results = match owner_results {
             Ok(results) => results,
             Err((status, message)) => return Some(json_error(status, message)),
         };
@@ -2999,10 +3027,14 @@ async fn try_fanout_group_aggregate_execute_to_shard_owners(
         }
     }
 
+    let mut rows = group_aggregate_rows(groups, &plan.group_indices, plan.agg_index);
+    if let Some(spec) = &plan.post_merge {
+        crate::execution::apply_grouped_order_limit(&mut rows, spec);
+    }
     Some(json_ok(vec![QueryResultJson::Select {
         r#type: "select".to_string(),
         columns,
-        rows: group_aggregate_rows(groups, &plan.group_indices, plan.agg_index),
+        rows,
     }]))
 }
 
@@ -5501,6 +5533,161 @@ mod tests {
                 );
             }
             QueryResultJson::Success { .. } => panic!("expected fanout group max"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_fanouts_group_aggregate_order_by_limit_global_top_k() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_group_agg_topk_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_group_agg_topk_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_keys = integer_primary_keys_for_owner(&local_shard_router, "gao", 1, 3);
+        let remote_keys = integer_primary_keys_for_owner(&local_shard_router, "gao", 2, 3);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let create_sql = "CREATE TABLE gao (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+        let client = reqwest::Client::new();
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        // Local owner holds groups a=5, b=20, d=15; remote owner holds a=100, c=10, b=1.
+        // Global sums: a=105, b=21, d=15, c=10. Group 'a' has a TINY local partial (5) that a buggy
+        // per-owner `LIMIT` would drop, even though 'a' is the global top group — so ORDER BY/LIMIT
+        // applied per-owner instead of post-merge would yield the wrong rows AND wrong sums.
+        for (key, grp, amt) in [
+            (local_keys[0], "a", 5),
+            (local_keys[1], "b", 20),
+            (local_keys[2], "d", 15),
+        ] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gao (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        for (key, grp, amt) in [
+            (remote_keys[0], "a", 100),
+            (remote_keys[1], "c", 10),
+            (remote_keys[2], "b", 1),
+        ] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gao (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+
+        // Global top-2 by SUM DESC — order and values are asserted exactly (NOT re-sorted).
+        let top2 = post_query(
+            &local_app,
+            "SELECT grp, SUM(amt) FROM gao GROUP BY grp ORDER BY SUM(amt) DESC LIMIT 2",
+        )
+        .await;
+        assert_eq!(top2.status(), StatusCode::OK);
+        let top2_env: Envelope<Vec<QueryResultJson>> = response_json(top2).await;
+        match &top2_env.data.expect("top2 data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(
+                    rows,
+                    &vec![
+                        vec![serde_json::json!("a"), serde_json::json!(105)],
+                        vec![serde_json::json!("b"), serde_json::json!(21)],
+                    ]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout group order/limit"),
+        }
+
+        // OFFSET past the global top-1 returns the runner-up.
+        let offset_q = post_query(
+            &local_app,
+            "SELECT grp, SUM(amt) FROM gao GROUP BY grp ORDER BY SUM(amt) DESC LIMIT 1 OFFSET 1",
+        )
+        .await;
+        assert_eq!(offset_q.status(), StatusCode::OK);
+        let offset_env: Envelope<Vec<QueryResultJson>> = response_json(offset_q).await;
+        match &offset_env.data.expect("offset data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(
+                    rows,
+                    &vec![vec![serde_json::json!("b"), serde_json::json!(21)]]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout group offset"),
+        }
+
+        // ORDER BY a group column ASC returns ALL groups, globally ordered.
+        let by_grp = post_query(
+            &local_app,
+            "SELECT grp, SUM(amt) FROM gao GROUP BY grp ORDER BY grp ASC",
+        )
+        .await;
+        assert_eq!(by_grp.status(), StatusCode::OK);
+        let by_grp_env: Envelope<Vec<QueryResultJson>> = response_json(by_grp).await;
+        match &by_grp_env.data.expect("by_grp data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(
+                    rows,
+                    &vec![
+                        vec![serde_json::json!("a"), serde_json::json!(105)],
+                        vec![serde_json::json!("b"), serde_json::json!(21)],
+                        vec![serde_json::json!("c"), serde_json::json!(10)],
+                        vec![serde_json::json!("d"), serde_json::json!(15)],
+                    ]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout group order by grp"),
         }
 
         let _ = std::fs::remove_file(&local_wal_path);

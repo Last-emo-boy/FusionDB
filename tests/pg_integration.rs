@@ -91,6 +91,28 @@ fn integer_primary_key_for_owner(
     panic!("no integer key routed to owner node {}", owner_node_id);
 }
 
+fn integer_primary_keys_for_owner(
+    router: &ShardRouter,
+    table_name: &str,
+    owner_node_id: u64,
+    count: usize,
+) -> Vec<i32> {
+    let mut keys = Vec::with_capacity(count);
+    for value in 1_i32..100_000 {
+        let row_id = fusiondb::common::encoding::encode_i64_comparable(value as i64);
+        if router.route_key(table_name, &row_id).owner_node_id == owner_node_id {
+            keys.push(value);
+            if keys.len() == count {
+                return keys;
+            }
+        }
+    }
+    panic!(
+        "not enough integer keys routed to owner node {}",
+        owner_node_id
+    );
+}
+
 fn assert_pg_shard_route_conflict(error: &tokio_postgres::Error, table_name: &str) {
     assert_pg_shard_route_conflict_with_operation(error, table_name, None);
 }
@@ -1881,6 +1903,203 @@ async fn test_pg_protocol_copy_from_stdin_forwards_non_local_shard_owner_rows() 
         }
         fusiondb::execution::QueryResult::Success { .. } => panic!("expected raw local select"),
     }
+
+    let _ = std::fs::remove_file(&owner_wal_path);
+    let _ = std::fs::remove_file(&local_wal_path);
+}
+
+#[tokio::test]
+async fn test_pg_grouped_aggregate_order_by_limit_global_top_k_across_owners() {
+    let owner_wal_path = format!(
+        "test_pg_shard_owner_group_agg_topk_owner_{}.wal",
+        uuid::Uuid::new_v4()
+    );
+    let local_wal_path = format!(
+        "test_pg_shard_owner_group_agg_topk_local_{}.wal",
+        uuid::Uuid::new_v4()
+    );
+    let owner_storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&owner_wal_path).expect("Failed to create owner storage"));
+    let local_storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&local_wal_path).expect("Failed to create local storage"));
+
+    let owner_http_port = next_http_test_port();
+    let owner_addr = format!("127.0.0.1:{}", owner_http_port);
+    let local_config = sharded_pg_test_config_with_owner_addr(4, owner_addr.clone(), 1);
+    let owner_config = sharded_pg_test_config_with_owner_addr(4, owner_addr.clone(), 2);
+    let local_router = ShardRouter::from_config(&local_config).expect("local shard router");
+    let owner_router = ShardRouter::from_config(&owner_config).expect("owner shard router");
+    let local_keys = integer_primary_keys_for_owner(&local_router, "pg_gao", 1, 3);
+    let remote_keys = integer_primary_keys_for_owner(&local_router, "pg_gao", 2, 3);
+
+    // Owner node (node 2): a real HTTP server holding the remote rows, fed directly via /query so
+    // each row lands on the owner (its keys route to node 2).
+    let owner_executor = Arc::new(Executor::with_config_and_shard_router(
+        owner_storage.clone(),
+        &StorageConfig::default(),
+        Some(owner_router.clone()),
+    ));
+    tokio::spawn(async move {
+        #[allow(deprecated)]
+        http_server::start_http_server(
+            owner_executor,
+            owner_storage,
+            "127.0.0.1",
+            owner_http_port,
+            None,
+            None,
+            "raft(node_id=2)".to_string(),
+            Some(owner_router),
+        )
+        .await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let http_client = reqwest::Client::new();
+    let owner_query_url = format!("http://{}/query", owner_addr);
+    let run_owner_sql = |sql: String| {
+        let client = http_client.clone();
+        let url = owner_query_url.clone();
+        async move {
+            let response = client
+                .post(&url)
+                .json(&serde_json::json!({ "sql": sql }))
+                .send()
+                .await
+                .expect("owner request failed");
+            assert!(
+                response.status().is_success(),
+                "owner SQL `{}` failed with HTTP {}",
+                sql,
+                response.status()
+            );
+        }
+    };
+    run_owner_sql(
+        "CREATE TABLE pg_gao (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)".to_string(),
+    )
+    .await;
+    // Remote owner rows: a=100, c=10, b=1.
+    for (key, grp, amt) in [
+        (remote_keys[0], "a", 100),
+        (remote_keys[1], "c", 10),
+        (remote_keys[2], "b", 1),
+    ] {
+        run_owner_sql(format!(
+            "INSERT INTO pg_gao (id, grp, amt) VALUES ({}, '{}', {})",
+            key, grp, amt
+        ))
+        .await;
+    }
+
+    // Local node (node 1): a real pg server holding the local rows.
+    let local_executor = Arc::new(Executor::with_config_and_shard_router(
+        local_storage.clone(),
+        &StorageConfig::default(),
+        Some(local_router),
+    ));
+    let pg_port = next_pg_test_port();
+    tokio::spawn(async move {
+        pg_server::start_pg_server(
+            local_executor,
+            local_storage,
+            "127.0.0.1",
+            pg_port,
+            "fusiondb",
+            None,
+        )
+        .await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            pg_port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query("CREATE TABLE pg_gao (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)")
+        .await
+        .expect("local CREATE TABLE failed");
+    // Local rows: a=5, b=20, d=15. Group 'a' has a tiny local partial (5) that a buggy per-owner
+    // LIMIT would drop even though 'a' is the global top group (global a=105, b=21, c=10, d=15).
+    for (key, grp, amt) in [
+        (local_keys[0], "a", 5),
+        (local_keys[1], "b", 20),
+        (local_keys[2], "d", 15),
+    ] {
+        client
+            .simple_query(&format!(
+                "INSERT INTO pg_gao (id, grp, amt) VALUES ({}, '{}', {})",
+                key, grp, amt
+            ))
+            .await
+            .expect("local INSERT failed");
+    }
+
+    // --- Simple protocol: global top-2 by SUM DESC (ordered, values exact). ---
+    let messages = client
+        .simple_query(
+            "SELECT grp, SUM(amt) FROM pg_gao GROUP BY grp ORDER BY SUM(amt) DESC LIMIT 2",
+        )
+        .await
+        .expect("simple grouped order/limit query failed");
+    let rows: Vec<&tokio_postgres::SimpleQueryRow> = messages
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "expected 2 rows from global top-2");
+    assert_eq!(rows[0].get(0), Some("a"));
+    assert_eq!(rows[0].get(1), Some("105"));
+    assert_eq!(rows[1].get(0), Some("b"));
+    assert_eq!(rows[1].get(1), Some("21"));
+
+    // --- Simple protocol: OFFSET past the global top-1 returns the runner-up. ---
+    let messages = client
+        .simple_query(
+            "SELECT grp, SUM(amt) FROM pg_gao GROUP BY grp ORDER BY SUM(amt) DESC LIMIT 1 OFFSET 1",
+        )
+        .await
+        .expect("simple grouped offset query failed");
+    let rows: Vec<&tokio_postgres::SimpleQueryRow> = messages
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("b"));
+    assert_eq!(rows[0].get(1), Some("21"));
+
+    // --- Extended protocol (client.query uses Parse/Bind/Execute): same global top-2 ordering. ---
+    let ext_rows = client
+        .query(
+            "SELECT grp, SUM(amt) FROM pg_gao GROUP BY grp ORDER BY SUM(amt) DESC LIMIT 2",
+            &[],
+        )
+        .await
+        .expect("extended grouped order/limit query failed");
+    assert_eq!(
+        ext_rows.len(),
+        2,
+        "extended path should also post-merge top-2"
+    );
+    assert_eq!(ext_rows[0].get::<_, String>(0), "a");
+    assert_eq!(ext_rows[1].get::<_, String>(0), "b");
 
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
