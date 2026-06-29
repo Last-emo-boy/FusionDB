@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-459",
+  "title": "Distributed grouped COUNT(*)/AVG ORDER BY/LIMIT/OFFSET post-merge top-N",
+  "phase": "P5-3 Automatic sharding",
+  "status": "done",
+  "builds_on": "450/451 (shared post-merge infra + group_aggregate SUM/MIN/MAX variant)",
+  "refactor": "resolve_grouped_post_merge -> resolve_grouped_order_limit (returns (order_keys, limit, offset)); each variant builds its own GroupedPostMerge (count/aggregate: strip original; avg: rewritten_sql)",
+  "variants": {
+    "group_count": "per_owner_sql = stripped original; 4 handlers switch local+remote to per_owner_sql + apply post-merge",
+    "group_avg": "per_owner_sql = rewritten_sql (already clause-free); owners already ran rewritten_sql, only added apply post-merge; order_keys index the ORIGINAL/final projection layout (not the +1-shifted rewritten layout)"
+  },
+  "entry_points_per_variant": [
+    "http /query", "http prepared /execute", "pgwire simple", "pgwire extended"
+  ],
+  "invariants_upheld": [
+    "unresolvable ORDER/LIMIT/FETCH -> None -> 449 loud error (FETCH rejected for count+avg too)",
+    "per_owner_sql used for local + every remote owner exec; avg uses rewritten_sql",
+    "order_keys col_index indexes the final output row layout",
+    "all 3 grouped variants now support ORDER BY/LIMIT atomically across 4 entry points; HAVING (452) remains"
+  ],
+  "adversarial_review": {
+    "workflow": "4-dimension find -> independent refute-by-default verify (4 agents, ~346k tokens)",
+    "confirmed_real": 0,
+    "note": "reuse of already-reviewed 451 infra + symmetric wiring left no new gaps"
+  },
+  "verification": {
+    "lib": 355,
+    "pg_integration": 38,
+    "sql_group_aggregate": 50,
+    "fmt": "clean",
+    "clippy": "no new warnings",
+    "new_or_extended_tests": [
+      "execution::tests::group_count_select_fanout_plan_matches_group_count_shapes (ORDER BY/LIMIT/OFFSET + FETCH-reject)",
+      "execution::tests::group_avg_select_fanout_plan_matches_avg_shapes (ORDER BY/LIMIT + FETCH-reject; per_owner_sql == rewritten_sql)",
+      "server::http_server::tests::http_query_fanouts_group_count_order_by_limit_global_top_k",
+      "server::http_server::tests::http_query_fanouts_group_avg_order_by_limit_global_top_k"
+    ]
+  },
+  "deferred": ["452 grouped HAVING post-merge (resolver + JSON predicate eval before ORDER/LIMIT)"]
+}
