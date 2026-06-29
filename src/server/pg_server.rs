@@ -896,7 +896,13 @@ impl PgHandler {
             }
         };
 
-        let local_results = match self.executor.execute_sql(query).await {
+        // With ORDER BY / LIMIT / OFFSET, owners run the stripped SQL (all groups); clauses are
+        // applied once, post-merge. Otherwise the original query is forwarded verbatim.
+        let per_owner_sql = plan
+            .post_merge
+            .as_ref()
+            .map_or(query, |spec| spec.per_owner_sql.as_str());
+        let local_results = match self.executor.execute_sql(per_owner_sql).await {
             Ok(results) => Self::forward_results_from_query_results(results),
             Err(e) => {
                 return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
@@ -918,7 +924,7 @@ impl PgHandler {
 
         for owner in owners {
             let owner_results = match self
-                .query_remote_shard_owner_results(query, username, &owner)
+                .query_remote_shard_owner_results(per_owner_sql, username, &owner)
                 .await?
             {
                 Ok(results) => results,
@@ -943,11 +949,13 @@ impl PgHandler {
             }
         }
 
+        let mut rows =
+            Self::forward_group_count_rows(groups, &plan.group_indices, plan.count_index);
+        if let Some(spec) = &plan.post_merge {
+            crate::execution::apply_grouped_order_limit(&mut rows, spec);
+        }
         Ok(Some(Self::responses_from_forwarded_query_results(vec![
-            ForwardQueryResultJson::Select {
-                columns,
-                rows: Self::forward_group_count_rows(groups, &plan.group_indices, plan.count_index),
-            },
+            ForwardQueryResultJson::Select { columns, rows },
         ])?))
     }
 
@@ -1131,14 +1139,15 @@ impl PgHandler {
             }
         }
 
+        let mut rows =
+            Self::forward_group_avg_rows(groups, plan.avg_output_index, plan.output_columns.len());
+        if let Some(spec) = &plan.post_merge {
+            crate::execution::apply_grouped_order_limit(&mut rows, spec);
+        }
         Ok(Some(Self::responses_from_forwarded_query_results(vec![
             ForwardQueryResultJson::Select {
                 columns: plan.output_columns.clone(),
-                rows: Self::forward_group_avg_rows(
-                    groups,
-                    plan.avg_output_index,
-                    plan.output_columns.len(),
-                ),
+                rows,
             },
         ])?))
     }
@@ -1839,7 +1848,13 @@ impl PgHandler {
             }
         };
 
-        let local_results = match self.execute_first_statement(query, params).await {
+        // With ORDER BY / LIMIT / OFFSET, owners run the stripped SQL (all groups); clauses are
+        // applied once, post-merge. Otherwise the prepared query is forwarded verbatim.
+        let per_owner_sql = plan
+            .post_merge
+            .as_ref()
+            .map_or(query, |spec| spec.per_owner_sql.as_str());
+        let local_results = match self.execute_first_statement(per_owner_sql, params).await {
             Ok(result) => Self::forward_results_from_query_results(vec![result]),
             Err(e) => {
                 return Ok(Err(Self::fusion_error(
@@ -1861,7 +1876,7 @@ impl PgHandler {
 
         for owner in owners {
             let owner_results = match self
-                .query_remote_prepared_shard_owner_results(query, params, username, &owner)
+                .query_remote_prepared_shard_owner_results(per_owner_sql, params, username, &owner)
                 .await?
             {
                 Ok(results) => results,
@@ -1884,9 +1899,14 @@ impl PgHandler {
             }
         }
 
+        let mut rows =
+            Self::forward_group_count_rows(groups, &plan.group_indices, plan.count_index);
+        if let Some(spec) = &plan.post_merge {
+            crate::execution::apply_grouped_order_limit(&mut rows, spec);
+        }
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns,
-            rows: Self::forward_group_count_rows(groups, &plan.group_indices, plan.count_index),
+            rows,
         }])))
     }
 
@@ -2081,13 +2101,14 @@ impl PgHandler {
             }
         }
 
+        let mut rows =
+            Self::forward_group_avg_rows(groups, plan.avg_output_index, plan.output_columns.len());
+        if let Some(spec) = &plan.post_merge {
+            crate::execution::apply_grouped_order_limit(&mut rows, spec);
+        }
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns: plan.output_columns.clone(),
-            rows: Self::forward_group_avg_rows(
-                groups,
-                plan.avg_output_index,
-                plan.output_columns.len(),
-            ),
+            rows,
         }])))
     }
 

@@ -98,6 +98,9 @@ pub(crate) struct SqlShardGroupCountFanoutPlan {
     pub group_indices: Vec<usize>,
     pub count_index: usize,
     pub output_columns: Vec<String>,
+    /// `Some` when the query carries `ORDER BY` / `LIMIT` / `OFFSET` (post-merge top-N — see
+    /// [`GroupedPostMerge`]); owners run `per_owner_sql` (clauses stripped) so each returns all groups.
+    pub post_merge: Option<GroupedPostMerge>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +274,10 @@ pub(crate) struct SqlShardGroupAvgFanoutPlan {
     pub count_index: usize,
     pub avg_output_index: usize,
     pub output_columns: Vec<String>,
+    /// `Some` when the query carries `ORDER BY` / `LIMIT` / `OFFSET`. AVG owners always run the
+    /// (already clause-free) `rewritten_sql`, so `per_owner_sql` mirrors it; the global sort + slice is
+    /// applied post-merge on the rebuilt AVG rows. See [`GroupedPostMerge`].
+    pub post_merge: Option<GroupedPostMerge>,
 }
 
 #[derive(Debug, Clone)]
@@ -1649,7 +1656,9 @@ impl Executor {
         let [Statement::Query(query)] = statements else {
             return None;
         };
-        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+        // `ORDER BY` / `LIMIT` / `OFFSET` are supported via post-merge; CTEs (`WITH`) and the separate
+        // `FETCH FIRST n ROWS` clause are not (rejected → 449 loud error). `HAVING` is still rejected.
+        if query.with.is_some() || query.fetch.is_some() {
             return None;
         }
         let SetExpr::Select(select) = query.body.as_ref() else {
@@ -1725,10 +1734,23 @@ impl Executor {
             .iter()
             .map(Self::select_projection_output_name)
             .collect::<Option<Vec<_>>>()?;
+        let post_merge = if query.order_by.is_some() || query.limit_clause.is_some() {
+            let (order_keys, limit, offset) =
+                Self::resolve_grouped_order_limit(query, &select.projection, &output_columns)?;
+            Some(GroupedPostMerge {
+                per_owner_sql: Self::strip_grouped_post_merge_clauses(query),
+                order_keys,
+                limit,
+                offset,
+            })
+        } else {
+            None
+        };
         Some(SqlShardGroupCountFanoutPlan {
             group_indices,
             count_index,
             output_columns,
+            post_merge,
         })
     }
 
@@ -1830,11 +1852,14 @@ impl Executor {
         // cannot be resolved to output columns / numeric literals, return None so the 449 safety net
         // errors loudly rather than emitting a silently-unsorted distributed result.
         let post_merge = if query.order_by.is_some() || query.limit_clause.is_some() {
-            Some(Self::resolve_grouped_post_merge(
-                query,
-                &select.projection,
-                &output_columns,
-            )?)
+            let (order_keys, limit, offset) =
+                Self::resolve_grouped_order_limit(query, &select.projection, &output_columns)?;
+            Some(GroupedPostMerge {
+                per_owner_sql: Self::strip_grouped_post_merge_clauses(query),
+                order_keys,
+                limit,
+                offset,
+            })
         } else {
             None
         };
@@ -1851,14 +1876,16 @@ impl Executor {
         ))
     }
 
-    /// Resolve a grouped query's `ORDER BY` / `LIMIT` / `OFFSET` into a [`GroupedPostMerge`] spec, or
-    /// `None` if any part is unsupported (so the caller rejects the whole plan → 449 loud error).
+    /// Resolve a grouped query's `ORDER BY` keys + `LIMIT`/`OFFSET` into `(order_keys, limit, offset)`,
+    /// or `None` if any part is unsupported (so the caller rejects the whole plan → 449 loud error).
     /// Over-rejection is deliberate: a wrong distributed answer is worse than a loud "unsupported".
-    fn resolve_grouped_post_merge(
+    /// The per-owner SQL is built by each variant separately (clause-stripped original, or — for AVG —
+    /// the already clause-free rewritten SUM/COUNT query).
+    fn resolve_grouped_order_limit(
         query: &Query,
         projection: &[SelectItem],
         output_columns: &[String],
-    ) -> Option<GroupedPostMerge> {
+    ) -> Option<(Vec<GroupedOrderKey>, Option<usize>, usize)> {
         let mut order_keys = Vec::new();
         if let Some(order_by) = &query.order_by {
             if order_by.interpolate.is_some() {
@@ -1911,12 +1938,7 @@ impl Executor {
             Some(LimitClause::OffsetCommaLimit { .. }) => return None, // MySQL `LIMIT a, b` form
             None => (None, 0),
         };
-        Some(GroupedPostMerge {
-            per_owner_sql: Self::strip_grouped_post_merge_clauses(query),
-            order_keys,
-            limit,
-            offset,
-        })
+        Some((order_keys, limit, offset))
     }
 
     /// Resolve one `ORDER BY` expression to an output column index: positional (`ORDER BY 2`), a bare
@@ -1985,7 +2007,9 @@ impl Executor {
         let [Statement::Query(query)] = statements else {
             return None;
         };
-        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+        // `ORDER BY` / `LIMIT` / `OFFSET` are supported via post-merge; CTEs (`WITH`) and the separate
+        // `FETCH FIRST n ROWS` clause are not (rejected → 449 loud error). `HAVING` is still rejected.
+        if query.with.is_some() || query.fetch.is_some() {
             return None;
         }
         let SetExpr::Select(select) = query.body.as_ref() else {
@@ -2099,6 +2123,22 @@ impl Executor {
             group_by_sql
         );
 
+        // ORDER BY keys resolve against `output_columns` (the ORIGINAL projection layout), which is
+        // exactly the layout of the rebuilt AVG rows — so post-merge sort/slice indexes correctly.
+        // AVG owners always run the (already clause-free) `rewritten_sql`, so `per_owner_sql` mirrors it.
+        let post_merge = if query.order_by.is_some() || query.limit_clause.is_some() {
+            let (order_keys, limit, offset) =
+                Self::resolve_grouped_order_limit(query, &select.projection, &output_columns)?;
+            Some(GroupedPostMerge {
+                per_owner_sql: rewritten_sql.clone(),
+                order_keys,
+                limit,
+                offset,
+            })
+        } else {
+            None
+        };
+
         Some((
             name.to_string(),
             column_name,
@@ -2109,6 +2149,7 @@ impl Executor {
                 count_index: avg_index + 1,
                 avg_output_index: avg_index,
                 output_columns,
+                post_merge,
             },
         ))
     }
@@ -4121,14 +4162,35 @@ mod tests {
         assert_eq!(p4.group_indices, vec![0, 2]);
         assert_eq!(p4.count_index, 1);
 
-        // Not eligible: no GROUP BY, HAVING, multiple group cols, ORDER BY/LIMIT, non-count aggregate.
+        // ORDER BY / LIMIT / OFFSET now eligible (post-merge): resolves to a GroupedPostMerge.
+        let p5 = Executor::shard_group_count_select_fanout_plan_for_statements(
+            &parse_sql(
+                "SELECT region, COUNT(*) FROM orders GROUP BY region ORDER BY COUNT(*) DESC LIMIT 3 OFFSET 1",
+            )
+            .unwrap(),
+        )
+        .expect("group count order/limit plan");
+        let post = p5.post_merge.as_ref().expect("post_merge");
+        assert_eq!(
+            post.order_keys
+                .iter()
+                .map(|k| (k.col_index, k.asc, k.nulls_first))
+                .collect::<Vec<_>>(),
+            vec![(1, false, true)]
+        );
+        assert_eq!(post.limit, Some(3));
+        assert_eq!(post.offset, 1);
+        assert!(!post.per_owner_sql.to_ascii_uppercase().contains("ORDER BY"));
+        assert!(!post.per_owner_sql.to_ascii_uppercase().contains("LIMIT"));
+
+        // Not eligible: no GROUP BY, HAVING, multiple group cols, non-count aggregate, FETCH (in
+        // Query.fetch, separate from limit_clause → rejected so the row limit is never silently dropped).
         for sql in [
             "SELECT region, COUNT(*) FROM orders",
             "SELECT region, COUNT(*) FROM orders GROUP BY region HAVING COUNT(*) > 1",
             "SELECT region, COUNT(*) FROM orders GROUP BY region, country",
-            "SELECT region, COUNT(*) FROM orders GROUP BY region ORDER BY region",
-            "SELECT region, COUNT(*) FROM orders GROUP BY region LIMIT 5",
             "SELECT region, SUM(amount) FROM orders GROUP BY region",
+            "SELECT region, COUNT(*) FROM orders GROUP BY region ORDER BY COUNT(*) DESC FETCH FIRST 5 ROWS ONLY",
         ] {
             assert!(
                 Executor::shard_group_count_select_fanout_plan_for_statements(
@@ -4417,16 +4479,39 @@ mod tests {
             assert_eq!(plan.output_columns.len(), gidx.len() + 1, "output arity for {sql}");
         }
 
+        // ORDER BY / LIMIT / OFFSET now eligible (post-merge): resolves to a GroupedPostMerge whose
+        // per_owner_sql is the (already clause-free) rewritten SUM/COUNT query, and order keys index
+        // the rebuilt AVG output layout.
+        let avg_ol = Executor::shard_group_avg_select_fanout_plan_for_statements(
+            &parse_sql(
+                "SELECT region, AVG(amount) FROM orders GROUP BY region ORDER BY AVG(amount) DESC LIMIT 2",
+            )
+            .unwrap(),
+        )
+        .expect("group avg order/limit plan");
+        let post = avg_ol.post_merge.as_ref().expect("post_merge");
+        assert_eq!(
+            post.order_keys
+                .iter()
+                .map(|k| (k.col_index, k.asc, k.nulls_first))
+                .collect::<Vec<_>>(),
+            vec![(1, false, true)]
+        );
+        assert_eq!(post.limit, Some(2));
+        // AVG owners always run the clause-free rewritten SUM/COUNT query.
+        assert_eq!(post.per_owner_sql, avg_ol.rewritten_sql);
+        assert!(!post.per_owner_sql.to_ascii_uppercase().contains("ORDER BY"));
+        assert!(!post.per_owner_sql.to_ascii_uppercase().contains("LIMIT"));
+
         // Ineligible: non-AVG aggregates (handled by other paths), no GROUP BY (scalar avg path),
-        // HAVING / ORDER BY / LIMIT, projection arity mismatch.
+        // HAVING (separate ticket), FETCH (in Query.fetch → rejected), projection arity mismatch.
         for sql in [
             "SELECT region, SUM(amount) FROM orders GROUP BY region",
             "SELECT region, COUNT(*) FROM orders GROUP BY region",
             "SELECT AVG(amount) FROM orders",
             "SELECT region, AVG(amount) FROM orders GROUP BY region HAVING AVG(amount) > 1",
-            "SELECT region, AVG(amount) FROM orders GROUP BY region ORDER BY region",
-            "SELECT region, AVG(amount) FROM orders GROUP BY region LIMIT 5",
             "SELECT region, country, AVG(amount) FROM orders GROUP BY region",
+            "SELECT region, AVG(amount) FROM orders GROUP BY region ORDER BY region FETCH FIRST 5 ROWS ONLY",
         ] {
             assert!(
                 Executor::shard_group_avg_select_fanout_plan_for_statements(
