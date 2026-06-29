@@ -2126,6 +2126,35 @@ async fn test_pg_grouped_aggregate_order_by_limit_global_top_k_across_owners() {
     assert_eq!(rows[1].get(0), Some("b"));
     assert_eq!(rows[1].get(1), Some("21"));
 
+    // --- Simple protocol: multi-aggregate fan-out (COUNT(*) + SUM merged independently per group). ---
+    // a: 5(local)+100(remote) → count 2, sum 105; b: 20+1 → count 2, sum 21; c: count 1, sum 10;
+    // d: count 1, sum 15.
+    let messages = client
+        .simple_query("SELECT grp, COUNT(*), SUM(amt) FROM pg_gao GROUP BY grp ORDER BY grp")
+        .await
+        .expect("simple multi-aggregate query failed");
+    let rows: Vec<&tokio_postgres::SimpleQueryRow> = messages
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 4);
+    let got: Vec<(Option<&str>, Option<&str>, Option<&str>)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Some("a"), Some("2"), Some("105")),
+            (Some("b"), Some("2"), Some("21")),
+            (Some("c"), Some("1"), Some("10")),
+            (Some("d"), Some("1"), Some("15")),
+        ]
+    );
+
     let _ = std::fs::remove_file(&owner_wal_path);
     let _ = std::fs::remove_file(&local_wal_path);
 }

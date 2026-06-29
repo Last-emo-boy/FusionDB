@@ -37,8 +37,8 @@ use sqlparser::ast::{
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Value}; // Import FusionError
 use crate::execution::{
-    Executor, ForeignKeyMeta, QueryResult, SqlShardExtremum, SqlShardGroupAggregateKind,
-    SqlShardOwner, SqlShardRoutingDecision,
+    Executor, ForeignKeyMeta, GroupMultiAggregate, QueryResult, SqlShardExtremum,
+    SqlShardGroupAggregateKind, SqlShardOwner, SqlShardRoutingDecision,
 };
 use crate::monitor;
 use crate::parser::parse_sql;
@@ -200,6 +200,17 @@ enum ForwardSum {
 enum ForwardGroupAcc {
     Sum(Option<ForwardSum>),
     Extremum(Option<serde_json::Value>),
+}
+
+impl ForwardGroupAcc {
+    fn new(kind: SqlShardGroupAggregateKind) -> Self {
+        match kind {
+            SqlShardGroupAggregateKind::Sum => ForwardGroupAcc::Sum(None),
+            SqlShardGroupAggregateKind::Min | SqlShardGroupAggregateKind::Max => {
+                ForwardGroupAcc::Extremum(None)
+            }
+        }
+    }
 }
 
 impl PgHandler {
@@ -1149,6 +1160,100 @@ impl PgHandler {
                 columns: plan.output_columns.clone(),
                 rows,
             },
+        ])?))
+    }
+
+    async fn fanout_group_multi_aggregate_select_to_shard_owners(
+        &self,
+        query: &str,
+        username: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        let plan = match self
+            .executor
+            .shard_group_multi_aggregate_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group multi-aggregate fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_group_multi_aggregate_select_fanout_owners_for_sql(query, &[])
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group multi-aggregate fan-out planning error",
+                    &e,
+                )))]));
+            }
+        };
+
+        let per_owner_sql = plan
+            .post_merge
+            .as_ref()
+            .map_or(query, |spec| spec.per_owner_sql.as_str());
+        let local_results = match self.executor.execute_sql(per_owner_sql).await {
+            Ok(results) => Self::forward_results_from_query_results(results),
+            Err(e) => {
+                return Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                    "Shard group multi-aggregate fan-out local execution error",
+                    &e,
+                )))]));
+            }
+        };
+        let mut groups = BTreeMap::new();
+        let columns = match Self::accumulate_forward_group_multi_aggregates(
+            &mut groups,
+            local_results,
+            &plan.group_indices,
+            &plan.aggregates,
+        ) {
+            Ok(columns) => columns,
+            Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_shard_owner_results(per_owner_sql, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            let owner_columns = match Self::accumulate_forward_group_multi_aggregates(
+                &mut groups,
+                owner_results,
+                &plan.group_indices,
+                &plan.aggregates,
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return Ok(Some(vec![Response::Error(Box::new(error))])),
+            };
+            if owner_columns != columns {
+                return Ok(Some(vec![Response::Error(Box::new(
+                    Self::execution_error(format!(
+                        "Shard group multi-aggregate fan-out column mismatch: expected {:?}, got {:?}",
+                        columns, owner_columns
+                    )),
+                ))]));
+            }
+        }
+
+        let mut rows =
+            Self::forward_group_multi_aggregate_rows(groups, &plan.group_indices, &plan.aggregates);
+        if let Some(spec) = &plan.post_merge {
+            crate::execution::apply_grouped_order_limit(&mut rows, spec);
+        }
+        Ok(Some(Self::responses_from_forwarded_query_results(vec![
+            ForwardQueryResultJson::Select { columns, rows },
         ])?))
     }
 
@@ -2108,6 +2213,102 @@ impl PgHandler {
         }
         Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
             columns: plan.output_columns.clone(),
+            rows,
+        }])))
+    }
+
+    async fn fanout_extended_group_multi_aggregate_select_to_shard_owners(
+        &self,
+        query: &str,
+        params: &[Value],
+        username: &str,
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        let plan = match self
+            .executor
+            .shard_group_multi_aggregate_select_fanout_plan_for_sql(query)
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group multi-aggregate fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+        let owners = match self
+            .executor
+            .shard_group_multi_aggregate_select_fanout_owners_for_sql(query, params)
+            .await
+        {
+            Ok(owners) if !owners.is_empty() => owners,
+            Ok(_) => return Ok(Ok(None)),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group multi-aggregate fan-out planning error",
+                    &e,
+                )));
+            }
+        };
+
+        let per_owner_sql = plan
+            .post_merge
+            .as_ref()
+            .map_or(query, |spec| spec.per_owner_sql.as_str());
+        let local_results = match self.execute_first_statement(per_owner_sql, params).await {
+            Ok(result) => Self::forward_results_from_query_results(vec![result]),
+            Err(e) => {
+                return Ok(Err(Self::fusion_error(
+                    "Shard group multi-aggregate fan-out local execution error",
+                    &e,
+                )));
+            }
+        };
+        let mut groups = BTreeMap::new();
+        let columns = match Self::accumulate_forward_group_multi_aggregates(
+            &mut groups,
+            local_results,
+            &plan.group_indices,
+            &plan.aggregates,
+        ) {
+            Ok(columns) => columns,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        for owner in owners {
+            let owner_results = match self
+                .query_remote_prepared_shard_owner_results(per_owner_sql, params, username, &owner)
+                .await?
+            {
+                Ok(results) => results,
+                Err(error) => return Ok(Err(error)),
+            };
+            let owner_columns = match Self::accumulate_forward_group_multi_aggregates(
+                &mut groups,
+                owner_results,
+                &plan.group_indices,
+                &plan.aggregates,
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return Ok(Err(error)),
+            };
+            if owner_columns != columns {
+                return Ok(Err(Self::execution_error(format!(
+                    "Shard group multi-aggregate fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ))));
+            }
+        }
+
+        let mut rows =
+            Self::forward_group_multi_aggregate_rows(groups, &plan.group_indices, &plan.aggregates);
+        if let Some(spec) = &plan.post_merge {
+            crate::execution::apply_grouped_order_limit(&mut rows, spec);
+        }
+        Ok(Ok(Some(vec![ForwardQueryResultJson::Select {
+            columns,
             rows,
         }])))
     }
@@ -3085,6 +3286,107 @@ impl PgHandler {
                 ForwardGroupAcc::Sum(total) => Self::forward_sum_to_json(total),
                 ForwardGroupAcc::Extremum(total) => total.unwrap_or(serde_json::Value::Null),
             };
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Accumulate one owner's multi-aggregate grouped result (pgwire forward path), reducing EACH
+    /// aggregate independently into its own per-group accumulator. Returns the result columns.
+    fn accumulate_forward_group_multi_aggregates(
+        groups: &mut BTreeMap<String, (Vec<serde_json::Value>, Vec<ForwardGroupAcc>)>,
+        results: Vec<ForwardQueryResultJson>,
+        group_indices: &[usize],
+        aggregates: &[GroupMultiAggregate],
+    ) -> std::result::Result<Vec<String>, pgwire::error::ErrorInfo> {
+        let [result] = results.as_slice() else {
+            return Err(Self::execution_error(
+                "Shard group multi-aggregate fan-out expected exactly one SELECT result",
+            ));
+        };
+        let ForwardQueryResultJson::Select { columns, rows } = result else {
+            return Err(Self::execution_error(
+                "Shard group multi-aggregate fan-out received a non-SELECT result",
+            ));
+        };
+        let expected = group_indices.len() + aggregates.len();
+        if columns.len() != expected {
+            return Err(Self::execution_error(format!(
+                "Shard group multi-aggregate fan-out expected {} output columns",
+                expected
+            )));
+        }
+        for row in rows {
+            if row.len() != expected {
+                return Err(Self::execution_error(format!(
+                    "Shard group multi-aggregate fan-out expected {} values per row",
+                    expected
+                )));
+            }
+            let group_values: Vec<serde_json::Value> =
+                group_indices.iter().map(|&i| row[i].clone()).collect();
+            let key = serde_json::to_string(&group_values).map_err(|e| {
+                Self::execution_error(format!(
+                    "Shard group multi-aggregate fan-out could not encode group key {:?}: {}",
+                    group_values, e
+                ))
+            })?;
+            let entry = groups.entry(key).or_insert_with(|| {
+                (
+                    group_values,
+                    aggregates
+                        .iter()
+                        .map(|a| ForwardGroupAcc::new(a.kind))
+                        .collect(),
+                )
+            });
+            for (slot, agg) in entry.1.iter_mut().zip(aggregates.iter()) {
+                let value = &row[agg.output_index];
+                match slot {
+                    ForwardGroupAcc::Sum(total) => {
+                        Self::add_forward_sum(total, Self::forward_sum_json_value(value)?)?;
+                    }
+                    ForwardGroupAcc::Extremum(total) => {
+                        let ext_kind = match agg.kind {
+                            SqlShardGroupAggregateKind::Min => SqlShardExtremum::Min,
+                            _ => SqlShardExtremum::Max,
+                        };
+                        let candidate = if value.is_null() {
+                            None
+                        } else if value.as_f64().is_some_and(|v| v.is_finite()) {
+                            Some(value.clone())
+                        } else {
+                            return Err(Self::execution_error(format!(
+                                "Shard group min/max fan-out received a non-numeric value: {}",
+                                value
+                            )));
+                        };
+                        Self::merge_forward_extremum(total, candidate, ext_kind)?;
+                    }
+                }
+            }
+        }
+        Ok(columns.clone())
+    }
+
+    fn forward_group_multi_aggregate_rows(
+        groups: BTreeMap<String, (Vec<serde_json::Value>, Vec<ForwardGroupAcc>)>,
+        group_indices: &[usize],
+        aggregates: &[GroupMultiAggregate],
+    ) -> Vec<Vec<serde_json::Value>> {
+        let width = group_indices.len() + aggregates.len();
+        let mut rows = Vec::with_capacity(groups.len());
+        for (_, (group_values, accs)) in groups {
+            let mut row = vec![serde_json::Value::Null; width];
+            for (k, &gi) in group_indices.iter().enumerate() {
+                row[gi] = group_values[k].clone();
+            }
+            for (acc, agg) in accs.into_iter().zip(aggregates.iter()) {
+                row[agg.output_index] = match acc {
+                    ForwardGroupAcc::Sum(total) => Self::forward_sum_to_json(total),
+                    ForwardGroupAcc::Extremum(total) => total.unwrap_or(serde_json::Value::Null),
+                };
+            }
             rows.push(row);
         }
         rows
@@ -9079,6 +9381,13 @@ impl SimpleQueryHandler for PgHandler {
                     return Ok(responses);
                 }
                 if let Some(mut fanout_responses) = self
+                    .fanout_group_multi_aggregate_select_to_shard_owners(&fanout_query, &username)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                if let Some(mut fanout_responses) = self
                     .fanout_unsupported_group_by_error(&fanout_query)
                     .await?
                 {
@@ -9691,6 +10000,33 @@ impl ExtendedQueryHandler for PgHandler {
                     }
                     match self
                         .fanout_extended_group_avg_select_to_shard_owners(
+                            &query, &params, &username,
+                        )
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_group_multi_aggregate_select_to_shard_owners(
                             &query, &params, &username,
                         )
                         .await?

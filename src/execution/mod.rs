@@ -345,6 +345,30 @@ pub(crate) struct SqlShardGroupAvgFanoutPlan {
     pub post_merge: Option<GroupedPostMerge>,
 }
 
+/// One aggregate in a multi-aggregate grouped fan-out: its output column index and how it merges
+/// across owners. `COUNT(*)`/`COUNT(col)`/`SUM(col)` all merge by adding partials (kind `Sum`);
+/// `MIN`/`MAX` merge by extremum. (`AVG` and `DISTINCT` aggregates are NOT supported here — they need a
+/// rewrite / value-set merge — so a projection containing them makes the extractor return `None`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupMultiAggregate {
+    pub output_index: usize,
+    pub kind: SqlShardGroupAggregateKind,
+}
+
+/// Plan for `SELECT g1[, ...], AGG1, AGG2[, ...] FROM t [WHERE ...] GROUP BY g1[, ...]` shard-owner
+/// fan-out where each AGG is `COUNT(*)` / `COUNT(col)` / `SUM(col)` / `MIN(col)` / `MAX(col)` (two or
+/// more aggregates, or shapes the single-aggregate planners don't cover). Each owner runs the original
+/// query (all of these aggregates are directly mergeable — no rewrite); results are merged by
+/// re-grouping on the composite key (`group_indices`) and reducing EACH aggregate independently at its
+/// `output_index` per its `kind`. The output preserves the projection column order.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SqlShardGroupMultiAggregateFanoutPlan {
+    pub group_indices: Vec<usize>,
+    pub aggregates: Vec<GroupMultiAggregate>,
+    pub output_columns: Vec<String>,
+    pub post_merge: Option<GroupedPostMerge>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedStatementRecord {
     pub id: String,
@@ -1187,6 +1211,13 @@ impl Executor {
             return Ok(None);
         };
         // Supported grouped fan-out shapes are handled by their own dispatchers; never fire for them.
+        // NOTE: the multi-aggregate planner matches purely on SHAPE, but its owner-eligibility also
+        // requires SUM/MIN/MAX argument columns to be numeric. A structurally-matching multi-aggregate
+        // query over a NON-numeric column would have its handler decline (empty owners), so it must NOT
+        // be short-circuited as "supported" here — otherwise a genuinely-scattering query would fall
+        // through to silent local-only results. Letting it reach the scatter check below makes it error
+        // loudly instead. (The single-aggregate planners share the same latent type-gate gap; that is a
+        // pre-existing limitation, not introduced here, and is left untouched.)
         if Self::group_count_select_fanout_plan(statements).is_some()
             || Self::group_aggregate_select_fanout_target(statements).is_some()
             || Self::group_avg_select_fanout_target(statements).is_some()
@@ -1219,8 +1250,9 @@ impl Executor {
         }
         Ok(Some(
             "Distributed GROUP BY across multiple shard owners is not supported for this query \
-             shape; results would be incomplete. Supported grouped fan-out: a single COUNT(*), \
-             SUM(col), MIN(col), MAX(col), or AVG(col) with GROUP BY col[, ...]."
+             shape; results would be incomplete. Supported grouped fan-out: one or more of COUNT(*), \
+             COUNT(col), SUM(col), MIN(col), MAX(col) (or a single AVG(col)) with GROUP BY col[, ...], \
+             optionally with HAVING / ORDER BY / LIMIT."
                 .to_string(),
         ))
     }
@@ -2413,6 +2445,212 @@ impl Executor {
                 post_merge,
             },
         ))
+    }
+
+    /// Match `SELECT g1[, ...], AGG1, AGG2[, ...] FROM t [WHERE ...] GROUP BY g1[, ...]` where every
+    /// AGG is `COUNT(*)` / `COUNT(col)` / `SUM(col)` / `MIN(col)` / `MAX(col)` (no `AVG`, no `DISTINCT`).
+    /// Returns `(table, numeric_required_columns, plan)`; `numeric_required_columns` are the `SUM`/`MIN`/
+    /// `MAX` argument columns the owner-eligibility check must verify are numeric. Dispatched AFTER the
+    /// single-aggregate planners, so it effectively handles the multi-aggregate and mixed shapes.
+    fn group_multi_aggregate_select_fanout_target(
+        statements: &[Statement],
+    ) -> Option<(String, Vec<String>, SqlShardGroupMultiAggregateFanoutPlan)> {
+        let [Statement::Query(query)] = statements else {
+            return None;
+        };
+        if query.with.is_some() || query.fetch.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.distinct.is_some() || select.from.len() != 1 || !select.from[0].joins.is_empty() {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, group_modifiers) =
+            &select.group_by
+        else {
+            return None;
+        };
+        if group_exprs.is_empty() || !group_modifiers.is_empty() {
+            return None;
+        }
+        // Projection must be the group columns plus at least one aggregate.
+        if select.projection.len() <= group_exprs.len() {
+            return None;
+        }
+        let mut group_set = Vec::with_capacity(group_exprs.len());
+        for group_expr in group_exprs {
+            let n = Self::fanout_group_column_name(group_expr)?;
+            if group_set
+                .iter()
+                .any(|e: &String| e.eq_ignore_ascii_case(&n))
+            {
+                return None;
+            }
+            group_set.push(n);
+        }
+        if !select
+            .selection
+            .as_ref()
+            .is_none_or(Self::select_predicate_is_fanout_local)
+        {
+            return None;
+        }
+        let mut group_indices = Vec::with_capacity(group_exprs.len());
+        let mut matched: Vec<String> = Vec::with_capacity(group_exprs.len());
+        let mut aggregates = Vec::new();
+        let mut numeric_columns = Vec::new();
+        for (index, item) in select.projection.iter().enumerate() {
+            if Self::select_projection_is_count_star(item) {
+                // COUNT(*) merges by summing the per-owner counts.
+                aggregates.push(GroupMultiAggregate {
+                    output_index: index,
+                    kind: SqlShardGroupAggregateKind::Sum,
+                });
+            } else if let Some(func_name) = Self::select_projection_function_name(item) {
+                if func_name.eq_ignore_ascii_case("COUNT") {
+                    // COUNT(col): reject DISTINCT (returns None), merge by summing partial counts.
+                    Self::select_projection_column_function_arg(item, &["COUNT"])?;
+                    aggregates.push(GroupMultiAggregate {
+                        output_index: index,
+                        kind: SqlShardGroupAggregateKind::Sum,
+                    });
+                } else if func_name.eq_ignore_ascii_case("SUM")
+                    || func_name.eq_ignore_ascii_case("MIN")
+                    || func_name.eq_ignore_ascii_case("MAX")
+                {
+                    let (column, _) =
+                        Self::select_projection_column_function_arg(item, &["SUM", "MIN", "MAX"])?;
+                    let kind = if func_name.eq_ignore_ascii_case("SUM") {
+                        SqlShardGroupAggregateKind::Sum
+                    } else if func_name.eq_ignore_ascii_case("MIN") {
+                        SqlShardGroupAggregateKind::Min
+                    } else {
+                        SqlShardGroupAggregateKind::Max
+                    };
+                    numeric_columns.push(column);
+                    aggregates.push(GroupMultiAggregate {
+                        output_index: index,
+                        kind,
+                    });
+                } else {
+                    return None; // AVG or any other function is not directly mergeable here
+                }
+            } else if let Some(name) = Self::fanout_projection_column_name(item) {
+                if !group_set.iter().any(|g| g.eq_ignore_ascii_case(&name))
+                    || matched.iter().any(|m| m.eq_ignore_ascii_case(&name))
+                {
+                    return None;
+                }
+                matched.push(name);
+                group_indices.push(index);
+            } else {
+                return None;
+            }
+        }
+        if group_indices.len() != group_exprs.len() || aggregates.is_empty() {
+            return None;
+        }
+        let output_columns = select
+            .projection
+            .iter()
+            .map(Self::select_projection_output_name)
+            .collect::<Option<Vec<_>>>()?;
+        let post_merge = if query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || select.having.is_some()
+        {
+            let (order_keys, limit, offset, having) = Self::resolve_grouped_order_limit(
+                query,
+                select.having.as_ref(),
+                &select.projection,
+                &output_columns,
+            )?;
+            Some(GroupedPostMerge {
+                per_owner_sql: Self::strip_grouped_post_merge_clauses(query),
+                having,
+                order_keys,
+                limit,
+                offset,
+            })
+        } else {
+            None
+        };
+        Some((
+            name.to_string(),
+            numeric_columns,
+            SqlShardGroupMultiAggregateFanoutPlan {
+                group_indices,
+                aggregates,
+                output_columns,
+                post_merge,
+            },
+        ))
+    }
+
+    pub(crate) fn shard_group_multi_aggregate_select_fanout_plan_for_sql(
+        &self,
+        sql: &str,
+    ) -> Result<Option<SqlShardGroupMultiAggregateFanoutPlan>> {
+        let statements = self.prepare(sql)?;
+        Ok(Self::group_multi_aggregate_select_fanout_target(&statements).map(|(_, _, plan)| plan))
+    }
+
+    pub(crate) fn shard_group_multi_aggregate_select_fanout_plan_for_statements(
+        statements: &[Statement],
+    ) -> Option<SqlShardGroupMultiAggregateFanoutPlan> {
+        Self::group_multi_aggregate_select_fanout_target(statements).map(|(_, _, plan)| plan)
+    }
+
+    pub(crate) async fn shard_group_multi_aggregate_select_fanout_owners_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let statements = self.prepare(sql)?;
+        self.shard_group_multi_aggregate_select_fanout_owners_for_statements(&statements, params)
+            .await
+    }
+
+    pub(crate) async fn shard_group_multi_aggregate_select_fanout_owners_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Vec<SqlShardOwner>> {
+        let Some((table_name, numeric_columns, _)) =
+            Self::group_multi_aggregate_select_fanout_target(statements)
+        else {
+            return Ok(Vec::new());
+        };
+        if !numeric_columns.is_empty() {
+            let mut txn = self.storage.begin_transaction().await?;
+            let Some(schema) = self
+                .load_table_schema_for_shard_routing(&table_name, &mut *txn)
+                .await?
+            else {
+                return Ok(Vec::new());
+            };
+            for column_name in &numeric_columns {
+                let Some(column) = schema
+                    .columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(column_name))
+                else {
+                    return Ok(Vec::new());
+                };
+                if !Self::is_integer_type_name(&column.data_type)
+                    && !Self::is_float_type_name(&column.data_type)
+                {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        self.shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await
     }
 
     fn fanout_group_column_name(expr: &Expr) -> Option<String> {
@@ -4900,6 +5138,75 @@ mod tests {
         ] {
             assert!(
                 Executor::shard_group_avg_select_fanout_plan_for_statements(
+                    &parse_sql(sql).unwrap()
+                )
+                .is_none(),
+                "should be ineligible: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_multi_aggregate_select_fanout_plan_matches_shapes() {
+        use super::SqlShardGroupAggregateKind::{Max, Min, Sum};
+        // (sql, group_indices, aggregates as (output_index, kind))
+        let cases: &[(&str, Vec<usize>, Vec<(usize, super::SqlShardGroupAggregateKind)>)] = &[
+            // COUNT(*) + SUM merge independently; both add partials (kind Sum).
+            (
+                "SELECT region, COUNT(*), SUM(amount) FROM orders GROUP BY region",
+                vec![0],
+                vec![(1, Sum), (2, Sum)],
+            ),
+            // Mixed mergeable aggregates.
+            (
+                "SELECT region, SUM(amount), MIN(amount), MAX(amount) FROM orders GROUP BY region",
+                vec![0],
+                vec![(1, Sum), (2, Min), (3, Max)],
+            ),
+            // Multi-column GROUP BY.
+            (
+                "SELECT region, country, COUNT(*), SUM(amount) FROM orders GROUP BY region, country",
+                vec![0, 1],
+                vec![(2, Sum), (3, Sum)],
+            ),
+            // Group column interleaved with aggregates; output indices track projection order.
+            (
+                "SELECT COUNT(*), region, MAX(amount) FROM orders GROUP BY region",
+                vec![1],
+                vec![(0, Sum), (2, Max)],
+            ),
+            // COUNT(col) (non-null count) merges by summing partial counts.
+            (
+                "SELECT region, COUNT(id), SUM(amount) FROM orders GROUP BY region",
+                vec![0],
+                vec![(1, Sum), (2, Sum)],
+            ),
+        ];
+        for (sql, gidx, aggs) in cases {
+            let plan = Executor::shard_group_multi_aggregate_select_fanout_plan_for_statements(
+                &parse_sql(sql).unwrap(),
+            )
+            .unwrap_or_else(|| panic!("expected multi-aggregate plan: {sql}"));
+            assert_eq!(plan.group_indices, *gidx, "group_indices for {sql}");
+            let got: Vec<(usize, super::SqlShardGroupAggregateKind)> = plan
+                .aggregates
+                .iter()
+                .map(|a| (a.output_index, a.kind))
+                .collect();
+            assert_eq!(got, *aggs, "aggregates for {sql}");
+        }
+
+        // Ineligible: AVG (not directly mergeable here), DISTINCT aggregates, no GROUP BY, a
+        // projection column that is neither a group column nor a supported aggregate.
+        for sql in [
+            "SELECT region, COUNT(*), AVG(amount) FROM orders GROUP BY region",
+            "SELECT region, COUNT(DISTINCT amount), SUM(amount) FROM orders GROUP BY region",
+            "SELECT region, SUM(DISTINCT amount), COUNT(*) FROM orders GROUP BY region",
+            "SELECT region, COUNT(*), SUM(amount) FROM orders",
+            "SELECT region, other, COUNT(*) FROM orders GROUP BY region",
+        ] {
+            assert!(
+                Executor::shard_group_multi_aggregate_select_fanout_plan_for_statements(
                     &parse_sql(sql).unwrap()
                 )
                 .is_none(),

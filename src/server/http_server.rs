@@ -21,8 +21,8 @@ use crate::distributed::api::{raft_routes, submit_raft_write, RaftAppState};
 use crate::distributed::sharding::ShardRouter;
 use crate::distributed::FusionRaft;
 use crate::execution::{
-    Executor, PreparedStatementRecord, SqlShardExtremum, SqlShardGroupAggregateKind, SqlShardOwner,
-    SqlShardRoutingDecision,
+    Executor, GroupMultiAggregate, PreparedStatementRecord, SqlShardExtremum,
+    SqlShardGroupAggregateKind, SqlShardOwner, SqlShardRoutingDecision,
 };
 use crate::parser::parse_sql;
 use crate::storage::Storage;
@@ -457,6 +457,12 @@ async fn handle_query(
 
     if let Some(response) =
         try_fanout_group_avg_query_to_shard_owners(&state, &context, &payload.sql).await
+    {
+        return response;
+    }
+
+    if let Some(response) =
+        try_fanout_group_multi_aggregate_query_to_shard_owners(&state, &context, &payload.sql).await
     {
         return response;
     }
@@ -1220,6 +1226,109 @@ async fn try_fanout_group_avg_query_to_shard_owners(
     Some(json_ok(vec![QueryResultJson::Select {
         r#type: "select".to_string(),
         columns: plan.output_columns.clone(),
+        rows,
+    }]))
+}
+
+async fn try_fanout_group_multi_aggregate_query_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    let plan = match state
+        .executor
+        .shard_group_multi_aggregate_select_fanout_plan_for_sql(sql)
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Shard group multi-aggregate fan-out planning error: {:?}",
+                    e
+                ),
+            ));
+        }
+    };
+    let owners = match state
+        .executor
+        .shard_group_multi_aggregate_select_fanout_owners_for_sql(sql, &[])
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Shard group multi-aggregate fan-out planning error: {:?}",
+                    e
+                ),
+            ));
+        }
+    };
+
+    let per_owner_sql = plan
+        .post_merge
+        .as_ref()
+        .map_or(sql, |spec| spec.per_owner_sql.as_str());
+    let local_results = match state.executor.execute_sql(per_owner_sql).await {
+        Ok(results) => results.into_iter().map(QueryResultJson::from).collect(),
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Execution Error: {:?}", e),
+            ));
+        }
+    };
+    let mut groups = BTreeMap::new();
+    let columns = match accumulate_fanout_group_multi_aggregates(
+        &mut groups,
+        local_results,
+        &plan.group_indices,
+        &plan.aggregates,
+    ) {
+        Ok(columns) => columns,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+
+    for owner in owners {
+        let owner_results =
+            match query_remote_shard_owner(state, context, per_owner_sql, &owner).await {
+                Ok(results) => results,
+                Err((status, message)) => return Some(json_error(status, message)),
+            };
+        let owner_columns = match accumulate_fanout_group_multi_aggregates(
+            &mut groups,
+            owner_results,
+            &plan.group_indices,
+            &plan.aggregates,
+        ) {
+            Ok(columns) => columns,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+        if owner_columns != columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard group multi-aggregate fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ),
+            ));
+        }
+    }
+
+    let mut rows = group_multi_aggregate_rows(groups, &plan.group_indices, &plan.aggregates);
+    if let Some(spec) = &plan.post_merge {
+        crate::execution::apply_grouped_order_limit(&mut rows, spec);
+    }
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns,
         rows,
     }]))
 }
@@ -2073,6 +2182,81 @@ fn group_aggregate_rows(
     rows
 }
 
+/// Accumulate one owner's multi-aggregate grouped result, re-grouping on the composite key and
+/// reducing EACH aggregate independently into its own per-group accumulator (COUNT/SUM by adding,
+/// MIN/MAX by extremum). Returns the result columns for cross-owner consistency checks.
+fn accumulate_fanout_group_multi_aggregates(
+    groups: &mut BTreeMap<String, (Vec<serde_json::Value>, Vec<GroupAggAcc>)>,
+    results: Vec<QueryResultJson>,
+    group_indices: &[usize],
+    aggregates: &[GroupMultiAggregate],
+) -> std::result::Result<Vec<String>, String> {
+    let [result] = results.as_slice() else {
+        return Err(
+            "Shard group multi-aggregate fan-out expected exactly one SELECT result".to_string(),
+        );
+    };
+    let QueryResultJson::Select { columns, rows, .. } = result else {
+        return Err("Shard group multi-aggregate fan-out received a non-SELECT result".to_string());
+    };
+    let expected = group_indices.len() + aggregates.len();
+    if columns.len() != expected {
+        return Err(format!(
+            "Shard group multi-aggregate fan-out expected {} output columns",
+            expected
+        ));
+    }
+    for row in rows {
+        if row.len() != expected {
+            return Err(format!(
+                "Shard group multi-aggregate fan-out expected {} values per row",
+                expected
+            ));
+        }
+        let group_values: Vec<serde_json::Value> =
+            group_indices.iter().map(|&i| row[i].clone()).collect();
+        let key = serde_json::to_string(&group_values).map_err(|e| {
+            format!(
+                "Shard group multi-aggregate fan-out could not encode group key {:?}: {}",
+                group_values, e
+            )
+        })?;
+        let entry = groups.entry(key).or_insert_with(|| {
+            (
+                group_values,
+                aggregates
+                    .iter()
+                    .map(|a| GroupAggAcc::new(a.kind))
+                    .collect(),
+            )
+        });
+        for (slot, agg) in entry.1.iter_mut().zip(aggregates.iter()) {
+            slot.update(&row[agg.output_index], agg.kind)?;
+        }
+    }
+    Ok(columns.clone())
+}
+
+fn group_multi_aggregate_rows(
+    groups: BTreeMap<String, (Vec<serde_json::Value>, Vec<GroupAggAcc>)>,
+    group_indices: &[usize],
+    aggregates: &[GroupMultiAggregate],
+) -> Vec<Vec<serde_json::Value>> {
+    let width = group_indices.len() + aggregates.len();
+    let mut rows = Vec::with_capacity(groups.len());
+    for (_, (group_values, accs)) in groups {
+        let mut row = vec![serde_json::Value::Null; width];
+        for (k, &gi) in group_indices.iter().enumerate() {
+            row[gi] = group_values[k].clone();
+        }
+        for (acc, agg) in accs.into_iter().zip(aggregates.iter()) {
+            row[agg.output_index] = acc.finalize();
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// Accumulate partial `SUM`/`COUNT` per group from one owner's rewritten grouped-AVG result. Keys on
 /// the canonical JSON array of the group tuple at `group_indices`, adding the sum at `sum_index` and
 /// the (non-null) count at `count_index`. Returns the rewritten result columns for cross-owner
@@ -2637,6 +2821,19 @@ async fn handle_execute(
                 return response;
             }
 
+            if let Some(response) = try_fanout_group_multi_aggregate_execute_to_shard_owners(
+                &state,
+                &context,
+                &record,
+                &payload,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
             if let Some(response) = try_unsupported_group_by_fanout_execute_error(
                 &state,
                 &context,
@@ -3163,6 +3360,110 @@ async fn try_fanout_group_avg_execute_to_shard_owners(
     Some(json_ok(vec![QueryResultJson::Select {
         r#type: "select".to_string(),
         columns: plan.output_columns.clone(),
+        rows,
+    }]))
+}
+
+async fn try_fanout_group_multi_aggregate_execute_to_shard_owners(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    payload: &ExecuteRequest,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    let Some(plan) =
+        Executor::shard_group_multi_aggregate_select_fanout_plan_for_statements(&record.statements)
+    else {
+        return None;
+    };
+    let owners = match state
+        .executor
+        .shard_group_multi_aggregate_select_fanout_owners_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(owners) if !owners.is_empty() => owners,
+        Ok(_) => return None,
+        Err(e) => {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Shard group multi-aggregate fan-out planning error: {:?}",
+                    e
+                ),
+            ));
+        }
+    };
+
+    let local_results = match &plan.post_merge {
+        Some(spec) => execute_sql_locally_for_fanout(state, &spec.per_owner_sql, params).await,
+        None => execute_prepared_locally_for_fanout(state, record, params).await,
+    };
+    let local_results = match local_results {
+        Ok(results) => results,
+        Err(response) => return Some(response),
+    };
+    let mut groups = BTreeMap::new();
+    let columns = match accumulate_fanout_group_multi_aggregates(
+        &mut groups,
+        local_results,
+        &plan.group_indices,
+        &plan.aggregates,
+    ) {
+        Ok(columns) => columns,
+        Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+    };
+
+    for owner in owners {
+        let owner_results = match &plan.post_merge {
+            Some(spec) => {
+                query_remote_prepared_sql_shard_owner(
+                    state,
+                    context,
+                    &spec.per_owner_sql,
+                    payload,
+                    &owner,
+                )
+                .await
+            }
+            None => {
+                query_remote_prepared_shard_owner(state, context, record, payload, &owner).await
+            }
+        };
+        let owner_results = match owner_results {
+            Ok(results) => results,
+            Err((status, message)) => return Some(json_error(status, message)),
+        };
+        let owner_columns = match accumulate_fanout_group_multi_aggregates(
+            &mut groups,
+            owner_results,
+            &plan.group_indices,
+            &plan.aggregates,
+        ) {
+            Ok(columns) => columns,
+            Err(message) => return Some(json_error(StatusCode::BAD_GATEWAY, message)),
+        };
+        if owner_columns != columns {
+            return Some(json_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Shard group multi-aggregate fan-out column mismatch: expected {:?}, got {:?}",
+                    columns, owner_columns
+                ),
+            ));
+        }
+    }
+
+    let mut rows = group_multi_aggregate_rows(groups, &plan.group_indices, &plan.aggregates);
+    if let Some(spec) = &plan.post_merge {
+        crate::execution::apply_grouped_order_limit(&mut rows, spec);
+    }
+    Some(json_ok(vec![QueryResultJson::Select {
+        r#type: "select".to_string(),
+        columns,
         rows,
     }]))
 }
@@ -6098,6 +6399,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_query_fanouts_group_multi_aggregate_across_shard_owners() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_group_multiagg_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_group_multiagg_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_keys = integer_primary_keys_for_owner(&local_shard_router, "gma", 1, 2);
+        let remote_keys = integer_primary_keys_for_owner(&local_shard_router, "gma", 2, 3);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let create_sql = "CREATE TABLE gma (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+        let client = reqwest::Client::new();
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        // Local: a/10, b/20; remote: a/30, a/5, c/40. Group 'a' spans owners: global COUNT(*)=3
+        // (1 local + 2 remote) and SUM=45 (10 + 35). Each aggregate must merge INDEPENDENTLY per group.
+        for (key, grp, amt) in [(local_keys[0], "a", 10), (local_keys[1], "b", 20)] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gma (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        for (key, grp, amt) in [
+            (remote_keys[0], "a", 30),
+            (remote_keys[1], "a", 5),
+            (remote_keys[2], "c", 40),
+        ] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gma (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+
+        // COUNT(*) + SUM merged independently per global group.
+        let q = post_query(
+            &local_app,
+            "SELECT grp, COUNT(*), SUM(amt) FROM gma GROUP BY grp",
+        )
+        .await;
+        assert_eq!(q.status(), StatusCode::OK);
+        let env: Envelope<Vec<QueryResultJson>> = response_json(q).await;
+        match &env.data.expect("multi-agg data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                let mut rows = rows.clone();
+                rows.sort_by_key(|row| format!("{:?}", row));
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![
+                            serde_json::json!("a"),
+                            serde_json::json!(3),
+                            serde_json::json!(45)
+                        ],
+                        vec![
+                            serde_json::json!("b"),
+                            serde_json::json!(1),
+                            serde_json::json!(20)
+                        ],
+                        vec![
+                            serde_json::json!("c"),
+                            serde_json::json!(1),
+                            serde_json::json!(40)
+                        ],
+                    ]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected multi-aggregate fanout"),
+        }
+
+        // Post-merge HAVING + ORDER BY on a multi-aggregate result: SUM(amt) >= 40 keeps a (45) and
+        // c (40); ORDER BY SUM(amt) DESC → a then c.
+        let combo = post_query(
+            &local_app,
+            "SELECT grp, COUNT(*), SUM(amt) FROM gma GROUP BY grp HAVING SUM(amt) >= 40 ORDER BY SUM(amt) DESC",
+        )
+        .await;
+        assert_eq!(combo.status(), StatusCode::OK);
+        let combo_env: Envelope<Vec<QueryResultJson>> = response_json(combo).await;
+        match &combo_env.data.expect("multi-agg combo data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(
+                    rows,
+                    &vec![
+                        vec![
+                            serde_json::json!("a"),
+                            serde_json::json!(3),
+                            serde_json::json!(45)
+                        ],
+                        vec![
+                            serde_json::json!("c"),
+                            serde_json::json!(1),
+                            serde_json::json!(40)
+                        ],
+                    ]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected multi-aggregate having+order"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
     async fn http_query_fanouts_group_avg_across_shard_owners() {
         let local_wal_path = format!(
             "test_http_shard_owner_group_avg_local_{}.wal",
@@ -6262,11 +6716,12 @@ mod tests {
             );
         }
 
-        // Two aggregates in one grouped projection match none of the supported grouped fan-out
-        // plans; over multiple owners this would otherwise silently return only local groups.
+        // A grouped COUNT(DISTINCT) matches none of the supported grouped fan-out plans (COUNT/SUM/
+        // MIN/MAX/AVG and multi-aggregate, none of which handle DISTINCT); over multiple owners this
+        // would otherwise silently return only local groups, so the safety net must fire.
         let resp = post_query(
             &local_app,
-            "SELECT grp, COUNT(*), SUM(amt) FROM gx GROUP BY grp",
+            "SELECT grp, COUNT(DISTINCT amt) FROM gx GROUP BY grp",
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -6277,16 +6732,33 @@ mod tests {
         let pinned = post_query(
             &local_app,
             &format!(
-                "SELECT grp, COUNT(*), SUM(amt) FROM gx WHERE id = {} GROUP BY grp",
+                "SELECT grp, COUNT(DISTINCT amt) FROM gx WHERE id = {} GROUP BY grp",
                 local_keys[0]
             ),
         )
         .await;
         assert_eq!(pinned.status(), StatusCode::OK);
 
-        // A supported grouped shape over the same owners still succeeds (no false positive).
+        // Supported grouped shapes over the same owners still succeed (no false positive): a single
+        // aggregate and a multi-aggregate projection (the latter now handled by the multi-agg fan-out).
         let ok = post_query(&local_app, "SELECT grp, SUM(amt) FROM gx GROUP BY grp").await;
         assert_eq!(ok.status(), StatusCode::OK);
+        let ok_multi = post_query(
+            &local_app,
+            "SELECT grp, COUNT(*), SUM(amt) FROM gx GROUP BY grp",
+        )
+        .await;
+        assert_eq!(ok_multi.status(), StatusCode::OK);
+
+        // A multi-aggregate whose MIN/MAX/SUM argument is a NON-numeric column matches the multi-agg
+        // shape but its owner-eligibility (numeric check) declines, so it must fail LOUDLY across owners
+        // rather than degrade to silent local-only results (regression guard from the 460 review).
+        let non_numeric = post_query(
+            &local_app,
+            "SELECT grp, COUNT(*), MAX(grp) FROM gx GROUP BY grp",
+        )
+        .await;
+        assert_eq!(non_numeric.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_file(&local_wal_path);
         let _ = std::fs::remove_file(&owner_wal_path);
