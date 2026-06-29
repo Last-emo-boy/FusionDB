@@ -462,6 +462,12 @@ async fn handle_query(
     }
 
     if let Some(response) =
+        try_unsupported_group_by_fanout_error(&state, &context, &payload.sql).await
+    {
+        return response;
+    }
+
+    if let Some(response) =
         try_fanout_count_distinct_query_to_shard_owners(&state, &context, &payload.sql).await
     {
         return response;
@@ -1190,6 +1196,28 @@ async fn try_fanout_group_avg_query_to_shard_owners(
         columns: plan.output_columns.clone(),
         rows: group_avg_rows(groups, plan.avg_output_index, plan.output_columns.len()),
     }]))
+}
+
+async fn try_unsupported_group_by_fanout_error(
+    state: &AppState,
+    context: &RequestContext,
+    sql: &str,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled {
+        return None;
+    }
+    match state
+        .executor
+        .shard_unsupported_group_by_fanout_error_for_sql(sql, &[])
+        .await
+    {
+        Ok(Some(message)) => Some(json_error(StatusCode::BAD_REQUEST, message)),
+        Ok(None) => None,
+        Err(e) => Some(json_error(
+            StatusCode::BAD_REQUEST,
+            format!("Shard group by fan-out planning error: {:?}", e),
+        )),
+    }
 }
 
 async fn try_fanout_count_distinct_query_to_shard_owners(
@@ -2583,6 +2611,18 @@ async fn handle_execute(
                 return response;
             }
 
+            if let Some(response) = try_unsupported_group_by_fanout_execute_error(
+                &state,
+                &context,
+                &record,
+                &params,
+                return_results,
+            )
+            .await
+            {
+                return response;
+            }
+
             if let Some(response) = try_fanout_count_distinct_execute_to_shard_owners(
                 &state,
                 &context,
@@ -3053,6 +3093,30 @@ async fn try_fanout_group_avg_execute_to_shard_owners(
         columns: plan.output_columns.clone(),
         rows: group_avg_rows(groups, plan.avg_output_index, plan.output_columns.len()),
     }]))
+}
+
+async fn try_unsupported_group_by_fanout_execute_error(
+    state: &AppState,
+    context: &RequestContext,
+    record: &PreparedStatementRecord,
+    params: &[Value],
+    return_results: bool,
+) -> Option<ApiResponse<Vec<QueryResultJson>>> {
+    if context.shard_forwarded || !state.shard_owner_forwarding_enabled || !return_results {
+        return None;
+    }
+    match state
+        .executor
+        .shard_unsupported_group_by_fanout_error_for_statements(&record.statements, params)
+        .await
+    {
+        Ok(Some(message)) => Some(json_error(StatusCode::BAD_REQUEST, message)),
+        Ok(None) => None,
+        Err(e) => Some(json_error(
+            StatusCode::BAD_REQUEST,
+            format!("Shard group by fan-out planning error: {:?}", e),
+        )),
+    }
 }
 
 async fn try_fanout_count_distinct_execute_to_shard_owners(
@@ -5540,6 +5604,99 @@ mod tests {
             }
             QueryResultJson::Success { .. } => panic!("expected fanout group avg"),
         }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_rejects_unsupported_multiowner_group_by() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_group_unsupported_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_group_unsupported_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8093".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_keys = integer_primary_keys_for_owner(&local_shard_router, "gx", 1, 2);
+        let remote_keys = integer_primary_keys_for_owner(&local_shard_router, "gx", 2, 2);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let client = reqwest::Client::new();
+        let create_sql = "CREATE TABLE gx (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        for (key, grp, amt) in [(local_keys[0], "a", 10), (remote_keys[0], "a", 30)] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gx (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+
+        // Two aggregates in one grouped projection match none of the supported grouped fan-out
+        // plans; over multiple owners this would otherwise silently return only local groups.
+        let resp = post_query(
+            &local_app,
+            "SELECT grp, COUNT(*), SUM(amt) FROM gx GROUP BY grp",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A bare primary-key equality is recognized as a single-owner point read, so the query never
+        // scatters: the safety net correctly does NOT fire even for an unsupported grouped shape, and
+        // it runs locally/forwards to the owner instead of erroring.
+        let pinned = post_query(
+            &local_app,
+            &format!(
+                "SELECT grp, COUNT(*), SUM(amt) FROM gx WHERE id = {} GROUP BY grp",
+                local_keys[0]
+            ),
+        )
+        .await;
+        assert_eq!(pinned.status(), StatusCode::OK);
+
+        // A supported grouped shape over the same owners still succeeds (no false positive).
+        let ok = post_query(&local_app, "SELECT grp, SUM(amt) FROM gx GROUP BY grp").await;
+        assert_eq!(ok.status(), StatusCode::OK);
 
         let _ = std::fs::remove_file(&local_wal_path);
         let _ = std::fs::remove_file(&owner_wal_path);

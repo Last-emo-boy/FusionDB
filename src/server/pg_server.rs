@@ -1139,6 +1139,26 @@ impl PgHandler {
         ])?))
     }
 
+    async fn fanout_unsupported_group_by_error(
+        &self,
+        query: &str,
+    ) -> PgWireResult<Option<Vec<Response>>> {
+        match self
+            .executor
+            .shard_unsupported_group_by_fanout_error_for_sql(query, &[])
+            .await
+        {
+            Ok(Some(message)) => Ok(Some(vec![Response::Error(Box::new(
+                Self::shard_route_error(message),
+            ))])),
+            Ok(None) => Ok(None),
+            Err(e) => Ok(Some(vec![Response::Error(Box::new(Self::fusion_error(
+                "Shard group by fan-out planning error",
+                &e,
+            )))])),
+        }
+    }
+
     async fn fanout_count_distinct_select_to_shard_owners(
         &self,
         query: &str,
@@ -2054,6 +2074,27 @@ impl PgHandler {
                 plan.output_columns.len(),
             ),
         }])))
+    }
+
+    async fn fanout_extended_unsupported_group_by_error(
+        &self,
+        query: &str,
+        params: &[Value],
+    ) -> PgWireResult<
+        std::result::Result<Option<Vec<ForwardQueryResultJson>>, pgwire::error::ErrorInfo>,
+    > {
+        match self
+            .executor
+            .shard_unsupported_group_by_fanout_error_for_sql(query, params)
+            .await
+        {
+            Ok(Some(message)) => Ok(Err(Self::shard_route_error(message))),
+            Ok(None) => Ok(Ok(None)),
+            Err(e) => Ok(Err(Self::fusion_error(
+                "Shard group by fan-out planning error",
+                &e,
+            ))),
+        }
     }
 
     async fn fanout_extended_count_distinct_select_to_shard_owners(
@@ -8995,6 +9036,13 @@ impl SimpleQueryHandler for PgHandler {
                     return Ok(responses);
                 }
                 if let Some(mut fanout_responses) = self
+                    .fanout_unsupported_group_by_error(&fanout_query)
+                    .await?
+                {
+                    responses.append(&mut fanout_responses);
+                    return Ok(responses);
+                }
+                if let Some(mut fanout_responses) = self
                     .fanout_count_distinct_select_to_shard_owners(&fanout_query, &username)
                     .await?
                 {
@@ -9598,6 +9646,31 @@ impl ExtendedQueryHandler for PgHandler {
                         .fanout_extended_group_avg_select_to_shard_owners(
                             &query, &params, &username,
                         )
+                        .await?
+                    {
+                        Ok(Some(results)) => {
+                            self.send_forwarded_extended_query_results(
+                                client,
+                                &query,
+                                &params,
+                                &result_format_codes,
+                                jdbc_client,
+                                results,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                .await
+                                .map_err(|_| Self::sink_error())?;
+                            return Ok(());
+                        }
+                    }
+                    match self
+                        .fanout_extended_unsupported_group_by_error(&query, &params)
                         .await?
                     {
                         Ok(Some(results)) => {

@@ -949,6 +949,91 @@ impl Executor {
             .await
     }
 
+    pub(crate) async fn shard_unsupported_group_by_fanout_error_for_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<String>> {
+        let statements = self.prepare(sql)?;
+        self.shard_unsupported_group_by_fanout_error_for_statements(&statements, params)
+            .await
+    }
+
+    /// Safety net for distributed `GROUP BY`. A single-table grouped SELECT that scatters across more
+    /// than one shard owner but matches none of the supported grouped fan-out plans (`COUNT(*)`,
+    /// `SUM/MIN/MAX(col)`, `AVG(col)`) would, if run locally, silently return only the local owner's
+    /// groups. Detect that gap and return `Some(message)` so the caller can fail loudly instead of
+    /// emitting incomplete results; return `None` when the query is safe (supported shape, single
+    /// owner, unknown table, or no shard router).
+    pub(crate) async fn shard_unsupported_group_by_fanout_error_for_statements(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+    ) -> Result<Option<String>> {
+        let Some(table_name) = Self::single_table_group_by_select_table(statements) else {
+            return Ok(None);
+        };
+        // Supported grouped fan-out shapes are handled by their own dispatchers; never fire for them.
+        if Self::group_count_select_fanout_plan(statements).is_some()
+            || Self::group_aggregate_select_fanout_target(statements).is_some()
+            || Self::group_avg_select_fanout_target(statements).is_some()
+        {
+            return Ok(None);
+        }
+        // Only guard tables that actually exist locally; otherwise let the normal (loud) error path
+        // surface "table not found" rather than masking it with a fan-out message.
+        {
+            let mut txn = self.storage.begin_transaction().await?;
+            if self
+                .load_table_schema_for_shard_routing(&table_name, &mut *txn)
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+        }
+        // Fire only when the query genuinely scatters: `shard_select_fanout_owners_for_prechecked_
+        // statements` returns empty when a recognized point-read pins it to one owner (or there is no
+        // router / single node), so a single-owner query is forwarded or run locally as usual. When
+        // the pin is real but the point-read recognizer is too narrow to forward it, a loud error is
+        // deliberately preferred over silently running local-only (which would be incomplete if the
+        // pinned row lives on a remote shard).
+        let owners = self
+            .shard_select_fanout_owners_for_prechecked_statements(statements, params)
+            .await?;
+        if owners.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            "Distributed GROUP BY across multiple shard owners is not supported for this query \
+             shape; results would be incomplete. Supported grouped fan-out: a single COUNT(*), \
+             SUM(col), MIN(col), MAX(col), or AVG(col) with GROUP BY col[, ...]."
+                .to_string(),
+        ))
+    }
+
+    fn single_table_group_by_select_table(statements: &[Statement]) -> Option<String> {
+        let [Statement::Query(query)] = statements else {
+            return None;
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return None;
+        };
+        if group_exprs.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
     pub(crate) async fn shard_count_distinct_select_fanout_owners_for_sql(
         &self,
         sql: &str,
