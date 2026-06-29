@@ -8524,6 +8524,13 @@ impl PgHandler {
                 .await
         } else {
             drop(session);
+            // BENCHPROD-458: an autocommit, param-free grouped-aggregate SELECT reuses the executor's
+            // result cache, giving pgwire the same cache hits as the HTTP `/query` path. Guarded to
+            // no active transaction (this branch) and no bind params (the cache keys on statement
+            // text, not bound values); writes still bump the cache epoch so reads never go stale.
+            if params.is_empty() && Executor::is_query_result_cacheable_statement(stmt) {
+                return self.executor.execute_cached_select(stmt).await;
+            }
             let mut txn = self.storage.begin_transaction().await?;
             let res = self
                 .executor
@@ -9103,6 +9110,10 @@ impl SimpleQueryHandler for PgHandler {
                 self.executor
                     .execute_in_transaction(&stmt, &mut **txn)
                     .await
+            } else if Executor::is_query_result_cacheable_statement(&stmt) {
+                // BENCHPROD-458: autocommit grouped-aggregate SELECT reuses the result cache (parity
+                // with HTTP `/query`); writes bump the epoch so cached reads never go stale.
+                self.executor.execute_cached_select(&stmt).await
             } else {
                 // Execute in implicit transaction
                 self.executor.execute(&stmt).await

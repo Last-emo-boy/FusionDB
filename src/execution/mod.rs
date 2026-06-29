@@ -2499,6 +2499,44 @@ impl Executor {
         }
     }
 
+    /// True when `stmt` is a grouped-aggregate SELECT eligible for the query-result cache (the same
+    /// predicate `execute_sql` uses on the HTTP path). Exposed so the pgwire path can opt the same
+    /// statements into the cache (BENCHPROD-458).
+    pub(crate) fn is_query_result_cacheable_statement(stmt: &Statement) -> bool {
+        Self::is_cacheable_group_aggregate_statement(stmt)
+            || Self::is_cacheable_join_group_aggregate_statement(stmt)
+    }
+
+    /// Execute a grouped-aggregate SELECT through the shared query-result cache, mirroring the cache
+    /// path in `execute_sql` so pgwire autocommit queries get the same cache hits as HTTP `/query`.
+    /// Caller must ensure the statement is cacheable (see `is_query_result_cacheable_statement`),
+    /// runs outside an explicit transaction, and has no bind params. Entries carry the current epoch,
+    /// which any write bumps via `invalidate_query_result_cache`, so cached reads never go stale.
+    pub(crate) async fn execute_cached_select(&self, stmt: &Statement) -> Result<QueryResult> {
+        let cache_key = Self::query_result_cache_key(&stmt.to_string());
+        let epoch = self.current_query_result_epoch();
+        if let Some(cached) = self.query_result_cache.get(&cache_key) {
+            if cached.epoch == epoch {
+                return Ok(QueryResult::Select {
+                    columns: cached.columns,
+                    rows: cached.rows,
+                });
+            }
+        }
+        let result = self.execute(stmt).await?;
+        if let QueryResult::Select { columns, rows } = &result {
+            self.query_result_cache.insert(
+                cache_key,
+                CachedSelectResult {
+                    epoch,
+                    columns: columns.clone(),
+                    rows: rows.clone(),
+                },
+            );
+        }
+        Ok(result)
+    }
+
     fn is_cacheable_group_aggregate_statement(stmt: &Statement) -> bool {
         let Statement::Query(query) = stmt else {
             return false;
@@ -2596,11 +2634,15 @@ impl Executor {
         if !matches!(join.relation, TableFactor::Table { .. }) {
             return false;
         }
-        if !matches!(
-            join.join_operator,
-            sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(_))
-                | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(_))
-        ) {
+        // The ON predicate must be deterministic (columns/literals/comparisons/AND only). A volatile
+        // function in ON (e.g. `... AND e.ts > NOW()`) would otherwise be cached and frozen, since the
+        // result cache only invalidates on writes, not on wall-clock time.
+        let on_expr = match &join.join_operator {
+            sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr)) => expr,
+            _ => return false,
+        };
+        if !Self::is_cacheable_join_on_expr(on_expr) {
             return false;
         }
 
@@ -2693,6 +2735,37 @@ impl Executor {
             ),
             _ => false,
         }
+    }
+
+    /// A JOIN `ON` predicate safe to admit into the result cache: only AND-combined comparisons whose
+    /// operands are column references or literals (so `a.id = b.id`, `a.x > 5` are fine). Rejects any
+    /// function call (e.g. `NOW()`, `CURRENT_DATE`) and anything else, since a volatile predicate would
+    /// be cached and frozen.
+    fn is_cacheable_join_on_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Nested(inner) => Self::is_cacheable_join_on_expr(inner),
+            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+                Self::is_cacheable_join_on_expr(left) && Self::is_cacheable_join_on_expr(right)
+            }
+            Expr::BinaryOp { left, op, right }
+                if matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Lt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::LtEq
+                ) =>
+            {
+                Self::is_cacheable_join_operand(left) && Self::is_cacheable_join_operand(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_cacheable_join_operand(expr: &Expr) -> bool {
+        Self::is_cacheable_column_expr(expr) || Self::is_cacheable_literal_expr(expr)
     }
 
     fn is_cacheable_predicate_expr(expr: &Expr) -> bool {
@@ -3895,6 +3968,26 @@ mod tests {
                 "should be ineligible: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn join_group_aggregate_cacheability_rejects_volatile_on_predicate() {
+        let cacheable =
+            |sql: &str| Executor::is_query_result_cacheable_statement(&parse_sql(sql).unwrap()[0]);
+
+        // Deterministic ON (col = col) and a compound ON (col = col AND col > literal) cache fine.
+        assert!(cacheable(
+            "SELECT u.city, COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.city"
+        ));
+        assert!(cacheable(
+            "SELECT u.city, COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id AND o.total > 100 GROUP BY u.city"
+        ));
+        // A volatile function in ON must NOT be cached (its truth changes with wall-clock time).
+        assert!(!cacheable(
+            "SELECT u.city, COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id AND o.created > NOW() GROUP BY u.city"
+        ));
+        // Single-table grouped aggregate still cacheable (sanity).
+        assert!(cacheable("SELECT city, COUNT(*) FROM users GROUP BY city"));
     }
 
     #[test]

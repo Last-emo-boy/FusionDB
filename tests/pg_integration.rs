@@ -172,6 +172,92 @@ async fn test_pg_protocol_simple_query() {
 }
 
 #[tokio::test]
+async fn test_pg_grouped_aggregate_cache_consistent_and_invalidated_by_writes() {
+    // BENCHPROD-458: pgwire autocommit grouped aggregates reuse the query-result cache (parity with
+    // HTTP). The cache must return identical results to a fresh compute AND must never serve stale
+    // results after a write.
+    let wal_path = format!("test_pg_groupcache_{}.wal", std::process::id());
+    let storage: Arc<dyn Storage> =
+        Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let executor = Arc::new(Executor::new(storage.clone()));
+    let port = next_pg_test_port();
+
+    tokio::spawn(async move {
+        pg_server::start_pg_server(executor, storage, "127.0.0.1", port, "fusiondb", None).await;
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=postgres password=fusiondb",
+            port
+        ),
+        NoTls,
+    )
+    .await
+    .expect("Failed to connect to server");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .simple_query("CREATE TABLE gc (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)")
+        .await
+        .expect("create");
+    client
+        .simple_query("INSERT INTO gc VALUES (1,'a',10),(2,'a',20),(3,'b',30)")
+        .await
+        .expect("insert");
+
+    // Autocommit grouped aggregate over the 458-cached path; simple_query returns text columns.
+    let q = "SELECT grp, COUNT(*) FROM gc GROUP BY grp ORDER BY grp";
+    async fn run(client: &tokio_postgres::Client, q: &str) -> Vec<(String, f64)> {
+        let msgs = client.simple_query(q).await.expect("group query");
+        let mut out = Vec::new();
+        for m in msgs {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
+                let grp = row.get(0).unwrap_or("").to_string();
+                let cnt: f64 = row
+                    .get(1)
+                    .unwrap_or("0")
+                    .trim()
+                    .parse()
+                    .expect("numeric count");
+                out.push((grp, cnt));
+            }
+        }
+        out
+    }
+
+    let r1 = run(&client, q).await; // computes + caches
+    let r2 = run(&client, q).await; // cache hit
+    assert_eq!(r1, r2, "cached result must equal the computed result");
+    assert_eq!(
+        r1,
+        vec![("a".to_string(), 2.0), ("b".to_string(), 1.0)],
+        "grouped counts before the write"
+    );
+
+    // A write must invalidate the cache: the next read reflects it, never stale.
+    client
+        .simple_query("INSERT INTO gc VALUES (4,'a',5)")
+        .await
+        .expect("insert2");
+    let r3 = run(&client, q).await;
+    let a_count = r3.iter().find(|(g, _)| g == "a").map(|(_, c)| *c);
+    assert_eq!(
+        a_count,
+        Some(3.0),
+        "post-write grouped query must reflect the insert (cache not stale): {:?}",
+        r3
+    );
+
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+#[tokio::test]
 async fn test_pg_protocol_extended_query() {
     let wal_path = format!("test_pg_ext_{}.wal", std::process::id());
     let storage: Arc<dyn Storage> =
