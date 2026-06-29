@@ -1272,14 +1272,8 @@ pub struct FusionTransaction {
 }
 
 impl FusionTransaction {
-    async fn for_each_visible_range<F>(&self, start: &[u8], end: &[u8], mut visit: F) -> Result<()>
-    where
-        F: FnMut(&[u8], &[u8]) -> bool + Send,
-    {
-        let read_ts = self.read_ts;
-        let start_ik = FusionStorage::encode_key(start, u64::MAX);
-
-        // 1. Snapshot MemTables (Cheap Clone)
+    /// Snapshot the visible memtables (active + immutable, newest-first) as a cheap Arc clone.
+    fn snapshot_memtables(&self) -> Vec<MemTable> {
         let mut mem_tables =
             Vec::with_capacity(self.storage.immutable_memtables.read().unwrap().len() + 1);
         {
@@ -1292,10 +1286,47 @@ impl FusionTransaction {
                 mem_tables.push(mem.clone());
             }
         }
+        mem_tables
+    }
+
+    async fn for_each_visible_range<F>(&self, start: &[u8], end: &[u8], mut visit: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool + Send,
+    {
+        // Snapshot once (cheap Arc clones), then run the shared merge over the full range.
+        let mem_tables = self.snapshot_memtables();
+        let sstables = self.storage.sstables.read().unwrap().clone();
+        Self::merge_visible_range(
+            &mem_tables,
+            &sstables,
+            &self.write_buffer,
+            self.read_ts,
+            start,
+            end,
+            &mut visit,
+        )
+        .await
+    }
+
+    /// Core N-way MVCC merge over an owned snapshot (memtables + sstables + write buffer) for the
+    /// range `[start, end)`. It takes borrowed snapshot pieces (not `&self`) so a single consistent
+    /// snapshot can be shared across several sub-range merges running on spawned tasks (see
+    /// `scan_range_parallel`). Invokes `visit(user_key, value)` for each latest visible PUT in key
+    /// order and stops early when `visit` returns false.
+    async fn merge_visible_range(
+        mem_tables: &[MemTable],
+        sstables: &[Arc<SsTable>],
+        write_buffer: &[(Vec<u8>, Option<Vec<u8>>)],
+        read_ts: u64,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut (dyn FnMut(&[u8], &[u8]) -> bool + Send),
+    ) -> Result<()> {
+        let start_ik = FusionStorage::encode_key(start, u64::MAX);
 
         // WriteBuffer
         let mut wb_latest = BTreeMap::new();
-        for (k, v) in &self.write_buffer {
+        for (k, v) in write_buffer {
             if k.as_slice() >= start && k.as_slice() < end {
                 wb_latest.insert(k.clone(), v.clone());
             }
@@ -1308,8 +1339,6 @@ impl FusionTransaction {
             };
             (ik, iv)
         });
-
-        let sstables = self.storage.sstables.read().unwrap().clone();
 
         // 2. Initialize Heap
         let mut heap = merge_heap(1 + mem_tables.len() + sstables.len());
