@@ -1,0 +1,56 @@
+{
+  "id": "BENCHPROD-450/451",
+  "title": "Distributed grouped SUM/MIN/MAX ORDER BY/LIMIT/OFFSET post-merge top-N",
+  "phase": "P5-3 Automatic sharding",
+  "status": "done",
+  "landed_together": "450 shared infra + 451 group_aggregate consumer in one feat commit (infra has no other consumer yet)",
+  "infra_450": {
+    "file": "src/execution/mod.rs",
+    "added": [
+      "GroupedOrderKey { col_index, asc, nulls_first }",
+      "GroupedPostMerge { per_owner_sql, order_keys, limit, offset } (plan.post_merge: Option<_>)",
+      "apply_grouped_order_limit(rows, spec) shared pub(crate) free fn (global stable sort + offset/limit)",
+      "compare_grouped_order_values / compare_grouped_non_null / grouped_value_type_rank (SQL JSON ordering)",
+      "strip_grouped_post_merge_clauses (nulls order_by + limit_clause + fetch + inner having)"
+    ]
+  },
+  "variant_451": {
+    "extractor": "group_aggregate_select_fanout_target relaxed: accepts order_by/limit_clause; rejects with + fetch; resolve_grouped_post_merge resolves order keys to output cols + numeric limit/offset; unresolvable -> None -> 449 loud error",
+    "entry_points": [
+      "http /query try_fanout_group_aggregate_query_to_shard_owners",
+      "http /execute try_fanout_group_aggregate_execute_to_shard_owners (prepared helpers switched on post_merge)",
+      "pgwire simple fanout_group_aggregate_select_to_shard_owners",
+      "pgwire extended fanout_extended_group_aggregate_select_to_shard_owners"
+    ]
+  },
+  "invariants_upheld": [
+    "per_owner_sql (stripped) used for BOTH local and every remote owner exec at all 4 entry points",
+    "ORDER/LIMIT/OFFSET applied once post-merge, never per-owner",
+    "unresolvable shape -> None -> 449 loud error (never silently wrong); over-rejection deliberate",
+    "only group_aggregate relaxed; group_count/group_avg still reject ORDER BY/LIMIT (count/avg+ORDER BY stay loud errors)"
+  ],
+  "adversarial_review": {
+    "workflow": "5-dimension find -> independent refute-by-default verify (8 agents, ~591k tokens)",
+    "confirmed_real": 1,
+    "refuted": 2,
+    "bug": "FETCH FIRST n ROWS in Query.fetch (separate from limit_clause) was ignored: ORDER BY ... FETCH ... was accepted but the global limit silently dropped (returns all groups) -> regression of invariant 1",
+    "fix": "reject query.fetch.is_some() in extractor guard (over-reject -> 449) + null fetch in strip + 2 rejection tests"
+  },
+  "verification": {
+    "lib": 353,
+    "pg_integration": 38,
+    "sql_group_aggregate": 50,
+    "fmt": "clean",
+    "clippy": "no new warnings",
+    "new_tests": [
+      "execution::tests::group_aggregate_fanout_resolves_order_by_limit (resolution + ineligibility incl. FETCH)",
+      "execution::tests::apply_grouped_order_limit_sorts_slices_and_orders_nulls",
+      "server::http_server::tests::http_query_fanouts_group_aggregate_order_by_limit_global_top_k",
+      "tests/pg_integration::test_pg_grouped_aggregate_order_by_limit_global_top_k_across_owners (simple + extended)"
+    ]
+  },
+  "deferred": [
+    "COUNT(*) + AVG grouped ORDER BY/LIMIT (relax group_count/group_avg, reuse infra)",
+    "452 grouped HAVING post-merge (strip already nulls inner HAVING)"
+  ]
+}
