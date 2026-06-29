@@ -1,0 +1,40 @@
+{
+  "id": "BENCHPROD-460",
+  "title": "Distributed grouped multi-aggregate fan-out (COUNT/SUM/MIN/MAX)",
+  "phase": "P5-3 Automatic sharding",
+  "status": "done",
+  "shape": "SELECT g[, ...], AGG1, AGG2[, ...] GROUP BY g; each AGG in COUNT(*)/COUNT(col)/SUM/MIN/MAX (>=2 or multi/mixed); AVG and DISTINCT excluded -> 449",
+  "design": {
+    "merge": "COUNT(*)/COUNT(col)/SUM add partials (kind Sum); MIN/MAX extremum; each aggregate merges independently into its own per-group accumulator",
+    "per_owner_sql": "owners run the ORIGINAL query (all directly mergeable, no rewrite); stripped when HAVING/ORDER/LIMIT present",
+    "dispatch": "after the single-aggregate planners at all 4 entry points; reuses post-merge (HAVING/ORDER/LIMIT)",
+    "plan": "SqlShardGroupMultiAggregateFanoutPlan { group_indices, aggregates: Vec<GroupMultiAggregate{output_index,kind}>, output_columns, post_merge }"
+  },
+  "entry_points": ["http /query", "http prepared /execute", "pgwire simple", "pgwire extended"],
+  "adversarial_review": {
+    "workflow": "4-dimension find -> independent refute-by-default verify (6 agents, ~519k tokens)",
+    "confirmed_real": 1,
+    "bug": "non-numeric SUM/MIN/MAX column: extractor matches on shape (no type check), 449 net trusted is_some() and suppressed the loud error, handler declined (empty owners) -> silent local-only multi-owner (loud->silent regression vs pre-460)",
+    "fix": "removed group_multi_aggregate...is_some() from the 449 net step-2 short-circuit -> non-numeric multi-agg reaches the scatter check -> loud error instead of silent local-only. Regression test (MAX over TEXT, 2 owners -> BAD_REQUEST) + focused re-verify.",
+    "pre_existing_left": "single-aggregate planners share the same structural-is_some() gap; numeric gate omits DECIMAL/NUMERIC -> separate follow-up"
+  },
+  "verification": {
+    "lib": 360,
+    "pg_integration": 38,
+    "sql_group_aggregate": 50,
+    "fmt": "clean",
+    "clippy": "only pre-existing let-else style lint shared with existing execute handlers",
+    "new_or_changed_tests": [
+      "execution::tests::group_multi_aggregate_select_fanout_plan_matches_shapes",
+      "server::http_server::tests::http_query_fanouts_group_multi_aggregate_across_shard_owners",
+      "server::http_server::tests::http_query_rejects_unsupported_multiowner_group_by (now uses COUNT(DISTINCT) as unsupported; asserts non-numeric multi-agg loud error)",
+      "tests/pg_integration::...top_k_across_owners (extended with a multi-aggregate simple-query assertion)"
+    ]
+  },
+  "remaining_p5_3": [
+    "mixed/multi-owner writes",
+    "distributed index ownership",
+    "broader cross-node query planning (JOINs)",
+    "follow-up: uniform numeric-gate routing + DECIMAL/NUMERIC support for single-aggregate silent-local-only gap"
+  ]
+}
