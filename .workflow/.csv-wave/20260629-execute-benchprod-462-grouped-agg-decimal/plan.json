@@ -1,0 +1,26 @@
+{
+  "id": "BENCHPROD-462",
+  "title": "DECIMAL/NUMERIC support in grouped (and scalar) aggregate fan-out",
+  "phase": "P5-3 Automatic sharding",
+  "status": "done",
+  "discovery": "DECIMAL is f64-backed, serializes to JSON as a STRING. SUM/AVG over DECIMAL return JSON numbers (float); MIN/MAX return JSON strings; COUNT returns ints. So the sum path never sees decimal strings — only MIN/MAX does.",
+  "changes": {
+    "numeric_gate": "added is_decimal_type_name to 6 owner-eligibility gates (group_aggregate/group_avg/group_multi_aggregate + scalar avg/avg_distinct/min_max)",
+    "extremum": "fanout_extremum_value/forward_extremum_value map a finite-decimal JSON string to Value::Decimal (numeric compare) before merge_*_extremum; candidate-acceptance sites accept decimal strings (2 http: GroupAggAcc::update + scalar; 3 pg: single-agg + multi-agg accumulators + scalar)",
+    "sum": "UNCHANGED — FanoutSum/ForwardSum have no Decimal variant (SUM/AVG return numbers). The initially-added decimal sum path was removed as dead code (extreme simplicity)."
+  },
+  "safety": "TEXT columns still rejected by the gate (461), so no non-decimal string reaches the extremum path; int/float extremum unchanged",
+  "verification": {
+    "lib": 362,
+    "pg_integration": 38,
+    "sql_group_aggregate": 50,
+    "fmt": "clean",
+    "clippy": "no new",
+    "tests": [
+      "server::http_server::tests::fanout_extremum_compares_decimal_strings_numerically (lexical-vs-numeric trap: '9.50' vs '30.25')",
+      "server::http_server::tests::http_query_fanouts_group_decimal_aggregates_across_shard_owners (2-owner DECIMAL multi-agg SUM/MIN/MAX + AVG)"
+    ],
+    "pg_decimal_coverage": "pgwire decimal path is a line-by-line mirror, covered by the http unit test of the shared logic + the existing pgwire 2-node fan-out integration test + adversarial review"
+  },
+  "out_of_scope": ["scalar SUM(DISTINCT) over DECIMAL (distinct-value sum path sees decimal strings; separate follow-up)"]
+}
