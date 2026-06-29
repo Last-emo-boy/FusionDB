@@ -1,0 +1,36 @@
+{
+  "id": "BENCHPROD-452",
+  "title": "Distributed grouped HAVING post-merge",
+  "phase": "P5-3 Automatic sharding",
+  "status": "done",
+  "completes": "grouped post-merge family (450/451 ORDER BY/LIMIT SUM/MIN/MAX; 459 COUNT/AVG; 452 HAVING all variants)",
+  "design": {
+    "spec": "GroupedPostMerge.having: Option<GroupedHaving> = AND of {col_index, op, literal}",
+    "apply_order": "filter HAVING -> stable-sort ORDER BY -> offset/limit (SQL order)",
+    "null": "NULL on either side of a comparison drops the row (SQL unknown != TRUE)",
+    "resolution": "AND-tree of <output-col> <cmp> <literal>; OR/NOT/IN/BETWEEN/function/non-literal -> None -> 449 loud error",
+    "per_owner_sql": "count/aggregate: strip nulls inner HAVING; avg: rewritten_sql never had HAVING",
+    "derive": "3 plan structs dropped Eq (serde_json::Value not Eq); PartialEq only"
+  },
+  "adversarial_review": {
+    "workflow": "4-dimension find -> independent refute-by-default verify (6 agents, ~399k tokens)",
+    "confirmed_real": 1,
+    "bug": "HAVING reused ORDER BY positional resolver: a bare integer was misread as a 1-based positional column index (HAVING has no positional semantics) -> `HAVING 1 > 5` silently became `region > 5` (returns all groups); `HAVING 2 <= SUM` mis-resolved/over-rejected",
+    "fix": "resolve_grouped_having_comparison extracts the literal side first; resolve_grouped_having_column rejects bare literals (Value/UnaryOp-Minus) before delegating, so the positional branch never fires for HAVING. Constant-only predicates -> None -> 449. Regression tests added.",
+    "post_fix_recheck": "single focused adversarial verifier on the fixed resolver"
+  },
+  "verification": {
+    "lib": 358,
+    "pg_integration": 38,
+    "sql_group_aggregate": 50,
+    "fmt": "clean",
+    "clippy": "no new warnings",
+    "new_or_extended_tests": [
+      "execution::tests::group_aggregate_fanout_resolves_having (resolution, flip, small-literal-not-positional regression, ineligible incl. constant-only)",
+      "execution::tests::apply_grouped_post_merge_filters_having_before_order_limit",
+      "server::http_server::tests::http_query_fanouts_group_aggregate_having_global_filter (global filter + HAVING+ORDER+LIMIT)",
+      "tests/pg_integration::...top_k_across_owners (extended with a HAVING-on-global-sum assertion)"
+    ]
+  },
+  "remaining_p5_3": ["mixed/multi-owner writes", "distributed index ownership", "broader cross-node query planning"]
+}
