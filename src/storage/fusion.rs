@@ -1514,6 +1514,135 @@ impl FusionTransaction {
 
         Ok(())
     }
+
+    /// Parallel equivalent of an unbounded `scan_range` over `[start, end)`: splits the range into
+    /// disjoint integer-primary-key sub-ranges and merges them on spawned tasks over one shared
+    /// snapshot, then concatenates in key order. Disjoint sub-ranges + a single shared snapshot +
+    /// one `read_ts` make the result identical to the serial scan (no cross-boundary dedup needed).
+    /// Falls back to the serial scan when the key space is not integer-PK or is below the threshold.
+    async fn scan_range_parallel(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(splits) = self.integer_pk_range_splits(start, end).await? else {
+            return self.scan_range(start, end, None).await;
+        };
+
+        // One consistent snapshot shared (Arc) across all sub-range merges.
+        let mem_tables = Arc::new(self.snapshot_memtables());
+        let sstables = Arc::new(self.storage.sstables.read().unwrap().clone());
+        let write_buffer = Arc::new(self.write_buffer.clone());
+        let read_ts = self.read_ts;
+
+        // Bounds: [start, splits[0]), [splits[0], splits[1]), ..., [splits[last], end).
+        let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(splits.len() + 2);
+        bounds.push(start.to_vec());
+        bounds.extend(splits);
+        bounds.push(end.to_vec());
+
+        let mut handles = Vec::with_capacity(bounds.len() - 1);
+        for pair in bounds.windows(2) {
+            let sub_start = pair[0].clone();
+            let sub_end = pair[1].clone();
+            let mem_tables = mem_tables.clone();
+            let sstables = sstables.clone();
+            let write_buffer = write_buffer.clone();
+            handles.push(tokio::spawn(async move {
+                let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut visit = |user_k: &[u8], val: &[u8]| {
+                    rows.push((user_k.to_vec(), val.to_vec()));
+                    true
+                };
+                FusionTransaction::merge_visible_range(
+                    mem_tables.as_slice(),
+                    sstables.as_slice(),
+                    write_buffer.as_slice(),
+                    read_ts,
+                    &sub_start,
+                    &sub_end,
+                    &mut visit,
+                )
+                .await?;
+                Ok::<Vec<(Vec<u8>, Vec<u8>)>, FusionError>(rows)
+            }));
+        }
+
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for handle in handles {
+            let part = handle.await.map_err(|e| {
+                FusionError::Storage(format!("parallel scan task panicked: {}", e))
+            })??;
+            out.extend(part);
+        }
+        Ok(out)
+    }
+
+    /// Derive up to K-1 split keys dividing `[start, end)` into roughly even integer-primary-key
+    /// sub-ranges (keys shaped `<table prefix> ++ <16 ASCII hex>`, the `encode_i64_comparable`
+    /// encoding). Returns `None` — so the caller stays serial — when the range is empty, not that
+    /// encoding, or estimated to hold fewer than `PARALLEL_SCAN_MIN_ROWS` rows.
+    async fn integer_pk_range_splits(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        const PARALLEL_SCAN_SHARDS_CAP: usize = 8;
+        const PARALLEL_SCAN_MIN_ROWS: u64 = 8192;
+
+        let shards = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(PARALLEL_SCAN_SHARDS_CAP);
+        if shards <= 1 {
+            return Ok(None);
+        }
+        let (Some((min_key, _)), Some((max_key, _))) =
+            (self.first(start, end).await?, self.last(start, end).await?)
+        else {
+            return Ok(None);
+        };
+        // Both keys must be `<table prefix> ++ <16 ASCII hex>` sharing the same prefix.
+        if min_key.len() != max_key.len() || min_key.len() < 16 {
+            return Ok(None);
+        }
+        let prefix_len = min_key.len() - 16;
+        if min_key[..prefix_len] != max_key[..prefix_len] {
+            return Ok(None);
+        }
+        let parse_hex = |k: &[u8]| -> Option<u64> {
+            let suffix = &k[prefix_len..];
+            if !suffix.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            u64::from_str_radix(std::str::from_utf8(suffix).ok()?, 16).ok()
+        };
+        let (Some(min_u), Some(max_u)) = (parse_hex(&min_key), parse_hex(&max_key)) else {
+            return Ok(None);
+        };
+        if max_u <= min_u || max_u - min_u < PARALLEL_SCAN_MIN_ROWS {
+            return Ok(None);
+        }
+        let span = max_u - min_u;
+        let mut splits: Vec<Vec<u8>> = Vec::with_capacity(shards - 1);
+        let mut last_boundary: Option<u64> = None;
+        for i in 1..shards {
+            // Interpolate in u128 — `span` can approach u64::MAX (ids spanning the full i64 range),
+            // so `span * i` would overflow u64. The result is always <= max_u, so the cast is lossless.
+            let boundary = min_u + ((span as u128 * i as u128) / shards as u128) as u64;
+            if boundary <= min_u || boundary >= max_u || last_boundary == Some(boundary) {
+                continue;
+            }
+            last_boundary = Some(boundary);
+            let mut key = min_key[..prefix_len].to_vec();
+            key.extend_from_slice(format!("{:016x}", boundary).as_bytes());
+            splits.push(key);
+        }
+        if splits.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(splits))
+    }
 }
 
 #[async_trait]
@@ -1618,6 +1747,21 @@ impl Transaction for FusionTransaction {
             return self.scan_range(prefix, &end, limit).await;
         }
         Ok(Vec::new())
+    }
+
+    async fn scan_prefix_parallel(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // A pushed limit keeps the serial early-break; only unbounded scans split in parallel.
+        if limit.is_some() {
+            return self.scan_prefix(prefix, limit).await;
+        }
+        let Some(end) = FusionStorage::prefix_end(prefix) else {
+            return Ok(Vec::new());
+        };
+        self.scan_range_parallel(prefix, &end).await
     }
 
     async fn scan_prefix_for_each(
@@ -2689,6 +2833,122 @@ mod tests {
 
         let txn = storage.begin_transaction().await.unwrap();
         assert_eq!(txn.count_prefix(prefix).await.unwrap(), 10_000);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn scan_prefix_parallel_matches_serial_across_split_boundaries() {
+        use crate::common::encoding::encode_i64_comparable;
+
+        let data_dir = unique_storage_dir("parallel_scan_equiv");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        let prefix = b"data:pscan:";
+        let n: i64 = 20_000; // > the 8192 parallel threshold
+
+        // Base versions at ts=1 in an immutable memtable, then flushed to an SSTable so the parallel
+        // sub-ranges exercise the SSTable iterator path (the real full-scan scenario).
+        let base = MemTable::new(1);
+        for id in 0..n {
+            let key = format!("data:pscan:{}", encode_i64_comparable(id));
+            base.insert(
+                FusionStorage::encode_key(key.as_bytes(), 1),
+                FusionStorage::encode_value(true, format!("v{id}").as_bytes()),
+            );
+        }
+        storage.immutable_memtables.write().unwrap().push(base);
+        storage.flush_all_immutable_memtables().await;
+
+        // Overwrites (ts=2) and one tombstone in the active memtable — exercises MVCC dedup that must
+        // resolve identically regardless of which sub-range a key falls into.
+        {
+            let active = storage.active_memtable.read().unwrap();
+            for id in (0..n).step_by(997) {
+                let key = format!("data:pscan:{}", encode_i64_comparable(id));
+                active.insert(
+                    FusionStorage::encode_key(key.as_bytes(), 2),
+                    FusionStorage::encode_value(true, b"updated"),
+                );
+            }
+            let dk = format!("data:pscan:{}", encode_i64_comparable(12_345));
+            active.insert(
+                FusionStorage::encode_key(dk.as_bytes(), 2),
+                FusionStorage::encode_value(false, b""),
+            );
+        }
+        storage.current_ts.store(2, Ordering::SeqCst);
+
+        let txn = storage.begin_transaction().await.unwrap();
+        let serial = txn.scan_prefix(prefix, None).await.unwrap();
+        let parallel = txn.scan_prefix_parallel(prefix, None).await.unwrap();
+
+        // Parallel scan must be byte-for-byte identical (same rows, same key order) to the serial scan.
+        assert_eq!(
+            serial, parallel,
+            "parallel range-merge must equal the serial scan"
+        );
+        assert_eq!(
+            serial.len(),
+            (n as usize) - 1,
+            "one id was tombstoned at ts=2"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn scan_prefix_parallel_handles_full_i64_id_span_without_overflow() {
+        use crate::common::encoding::encode_i64_comparable;
+
+        let data_dir = unique_storage_dir("parallel_scan_wide_span");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        let prefix = b"data:wspan:";
+        // Ids spanning the full i64 range so `max_u - min_u` approaches u64::MAX. The interpolation
+        // must use u128 internally; multiplying `span * shard` in u64 would panic (debug) or wrap
+        // into out-of-order boundaries (release) -> duplicated/missing rows.
+        let ids: [i64; 8] = [
+            i64::MIN,
+            i64::MIN + 1,
+            -3_000_000_000,
+            -1,
+            0,
+            1,
+            6_637_030_065_269_067_181,
+            i64::MAX,
+        ];
+        let mem = MemTable::new(1);
+        for id in ids {
+            let key = format!("data:wspan:{}", encode_i64_comparable(id));
+            mem.insert(
+                FusionStorage::encode_key(key.as_bytes(), 1),
+                FusionStorage::encode_value(true, b"v"),
+            );
+        }
+        storage.immutable_memtables.write().unwrap().push(mem);
+        storage.current_ts.store(1, Ordering::SeqCst);
+
+        let txn = storage.begin_transaction().await.unwrap();
+        let serial = txn.scan_prefix(prefix, None).await.unwrap();
+        let parallel = txn.scan_prefix_parallel(prefix, None).await.unwrap();
+        assert_eq!(
+            serial, parallel,
+            "wide-span parallel scan must equal serial (no overflow-induced gaps/dupes)"
+        );
+        assert_eq!(serial.len(), ids.len(), "all rows returned exactly once");
 
         cleanup_storage_dir(&data_dir);
     }

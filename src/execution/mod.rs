@@ -600,7 +600,9 @@ impl Executor {
             if remaining == Some(0) {
                 break;
             }
-            let mut shard_pairs = txn.scan_prefix(prefix.as_bytes(), remaining).await?;
+            let mut shard_pairs = txn
+                .scan_prefix_parallel(prefix.as_bytes(), remaining)
+                .await?;
             pairs.append(&mut shard_pairs);
             if limit.is_some_and(|limit| pairs.len() >= limit) {
                 break;

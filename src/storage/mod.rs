@@ -47,6 +47,17 @@ pub trait Transaction: Send + Sync {
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// Like [`scan_prefix`], but the implementation may split a large unbounded prefix scan into
+    /// disjoint sub-ranges merged in parallel. Results are identical to `scan_prefix` (same rows,
+    /// same key order); engines without a parallel path inherit the serial default.
+    async fn scan_prefix_parallel(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_prefix(prefix, limit).await
+    }
+
     /// Visit keys with a prefix without materializing the full result set.
     ///
     /// The visitor returns `false` to stop early. The return value is the number
