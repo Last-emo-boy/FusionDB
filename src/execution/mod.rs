@@ -1121,6 +1121,7 @@ impl Executor {
         };
         if !Self::is_integer_type_name(&column.data_type)
             && !Self::is_float_type_name(&column.data_type)
+            && !Self::is_decimal_type_name(&column.data_type)
         {
             return Ok(Vec::new());
         }
@@ -1178,6 +1179,7 @@ impl Executor {
         };
         if !Self::is_integer_type_name(&column.data_type)
             && !Self::is_float_type_name(&column.data_type)
+            && !Self::is_decimal_type_name(&column.data_type)
         {
             return Ok(Vec::new());
         }
@@ -1393,6 +1395,7 @@ impl Executor {
         };
         if !Self::is_integer_type_name(&column.data_type)
             && !Self::is_float_type_name(&column.data_type)
+            && !Self::is_decimal_type_name(&column.data_type)
         {
             return Ok(Vec::new());
         }
@@ -1500,6 +1503,7 @@ impl Executor {
         };
         if !Self::is_integer_type_name(&column.data_type)
             && !Self::is_float_type_name(&column.data_type)
+            && !Self::is_decimal_type_name(&column.data_type)
         {
             return Ok(Vec::new());
         }
@@ -1547,6 +1551,7 @@ impl Executor {
         };
         if !Self::is_integer_type_name(&column.data_type)
             && !Self::is_float_type_name(&column.data_type)
+            && !Self::is_decimal_type_name(&column.data_type)
         {
             return Ok(Vec::new());
         }
@@ -2642,6 +2647,7 @@ impl Executor {
                 };
                 if !Self::is_integer_type_name(&column.data_type)
                     && !Self::is_float_type_name(&column.data_type)
+                    && !Self::is_decimal_type_name(&column.data_type)
                 {
                     return Ok(Vec::new());
                 }

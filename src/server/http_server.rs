@@ -2100,7 +2100,9 @@ impl GroupAggAcc {
                 };
                 let candidate = if value.is_null() {
                     None
-                } else if value.as_f64().is_some_and(|v| v.is_finite()) {
+                } else if value.as_f64().is_some_and(|v| v.is_finite())
+                    || fanout_decimal_f64(value).is_some()
+                {
                     Some(value.clone())
                 } else {
                     return Err(format!(
@@ -2412,6 +2414,30 @@ enum FanoutSum {
     Float(f64),
 }
 
+/// Detect a fan-out aggregate value that is a JSON STRING holding a finite DECIMAL/NUMERIC number (the
+/// JSON representation of `Value::Decimal`). `MIN`/`MAX` over a DECIMAL column return the value itself,
+/// which serializes as such a string; `SUM`/`AVG` over DECIMAL return a float, so only the extremum
+/// path needs this. Returns `None` for any non-string / non-finite value.
+fn fanout_decimal_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::String(s) => s.parse::<f64>().ok().filter(|v| v.is_finite()),
+        _ => None,
+    }
+}
+
+/// Wrap a fan-out value for MIN/MAX comparison: a JSON string holding a finite decimal becomes
+/// `Value::Decimal` (numeric compare via `compare_decimal_strings`) rather than `Value::String`
+/// (lexical compare). Only decimal/int/float columns reach the extremum path (the numeric gate rejects
+/// text), so treating a numeric-looking string as a decimal is safe here.
+fn fanout_extremum_value(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::String(s) if fanout_decimal_f64(value).is_some() => {
+            Value::Decimal(s.clone())
+        }
+        _ => Value::from_json(value),
+    }
+}
+
 fn fanout_sum_from_select_results(
     results: Vec<QueryResultJson>,
 ) -> std::result::Result<(Vec<String>, Option<FanoutSum>), String> {
@@ -2556,7 +2582,8 @@ fn fanout_extremum_from_select_results(
     if value.is_null() {
         return Ok((columns.clone(), None));
     }
-    if value.as_f64().is_some_and(|value| value.is_finite()) {
+    if value.as_f64().is_some_and(|value| value.is_finite()) || fanout_decimal_f64(value).is_some()
+    {
         return Ok((columns.clone(), Some(value.clone())));
     }
     Err(format!(
@@ -2577,8 +2604,8 @@ fn merge_fanout_extremum(
         *total = Some(value);
         return Ok(());
     };
-    let candidate_value = Value::from_json(&value);
-    let current_value = Value::from_json(current);
+    let candidate_value = fanout_extremum_value(&value);
+    let current_value = fanout_extremum_value(current);
     let should_replace = match kind {
         SqlShardExtremum::Min => candidate_value.compare(&current_value).is_lt(),
         SqlShardExtremum::Max => candidate_value.compare(&current_value).is_gt(),
@@ -4720,6 +4747,22 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::util::ServiceExt;
 
+    #[test]
+    fn fanout_extremum_compares_decimal_strings_numerically() {
+        use serde_json::json;
+        // MIN/MAX over a DECIMAL column return the value as a JSON string. The merge must compare them
+        // NUMERICALLY, not lexically: lexically "9.50" > "30.25" (since '9' > '3'), but numerically
+        // 9.50 < 30.25. (SUM/AVG over DECIMAL return floats, so only the extremum path sees strings.)
+        let mut mx = None;
+        merge_fanout_extremum(&mut mx, Some(json!("9.50")), SqlShardExtremum::Max).unwrap();
+        merge_fanout_extremum(&mut mx, Some(json!("30.25")), SqlShardExtremum::Max).unwrap();
+        assert_eq!(mx, Some(json!("30.25")));
+        let mut mn = None;
+        merge_fanout_extremum(&mut mn, Some(json!("9.50")), SqlShardExtremum::Min).unwrap();
+        merge_fanout_extremum(&mut mn, Some(json!("30.25")), SqlShardExtremum::Min).unwrap();
+        assert_eq!(mn, Some(json!("9.50")));
+    }
+
     use crate::auth::{save_user, UserRecord};
     use crate::config::{
         Config, DistributedPeerConfig, ShardingConfig, ShardingStrategy, StorageConfig,
@@ -6545,6 +6588,148 @@ mod tests {
                 );
             }
             QueryResultJson::Success { .. } => panic!("expected multi-aggregate having+order"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[tokio::test]
+    async fn http_query_fanouts_group_decimal_aggregates_across_shard_owners() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_group_decimal_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_group_decimal_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_keys = integer_primary_keys_for_owner(&local_shard_router, "gdec", 1, 2);
+        let remote_keys = integer_primary_keys_for_owner(&local_shard_router, "gdec", 2, 2);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let create_sql = "CREATE TABLE gdec (id INTEGER PRIMARY KEY, grp TEXT, amt DECIMAL(10,2))";
+        let client = reqwest::Client::new();
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        // Local: a=9.50, b=5.25; remote: a=30.25, c=100.00. Group 'a' spans owners. Global a:
+        // SUM=39.75, MIN=9.50, MAX=30.25. MIN/MAX must compare NUMERICALLY: lexically "9.50" > "30.25",
+        // so a string-compare bug would return the wrong extremum.
+        for (key, grp, amt) in [(local_keys[0], "a", "9.50"), (local_keys[1], "b", "5.25")] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gdec (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        for (key, grp, amt) in [
+            (remote_keys[0], "a", "30.25"),
+            (remote_keys[1], "c", "100.00"),
+        ] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO gdec (id, grp, amt) VALUES ({}, '{}', {})",
+                        key, grp, amt
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+
+        // Multi-aggregate over DECIMAL: SUM / MIN / MAX merged per global group.
+        let q = post_query(
+            &local_app,
+            "SELECT grp, SUM(amt), MIN(amt), MAX(amt) FROM gdec GROUP BY grp",
+        )
+        .await;
+        assert_eq!(q.status(), StatusCode::OK);
+        let env: Envelope<Vec<QueryResultJson>> = response_json(q).await;
+        // DECIMAL aggregate values may come back as a JSON string (MIN/MAX preserve the decimal value)
+        // or a JSON number (SUM returns a float); accept either and compare numerically.
+        let parse = |v: &serde_json::Value| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+        };
+        match &env.data.expect("decimal data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                let mut got: Vec<(String, Option<f64>, Option<f64>, Option<f64>)> = rows
+                    .iter()
+                    .map(|r| {
+                        (
+                            r[0].as_str().unwrap_or_default().to_string(),
+                            parse(&r[1]),
+                            parse(&r[2]),
+                            parse(&r[3]),
+                        )
+                    })
+                    .collect();
+                got.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(
+                    got,
+                    vec![
+                        ("a".to_string(), Some(39.75), Some(9.50), Some(30.25)),
+                        ("b".to_string(), Some(5.25), Some(5.25), Some(5.25)),
+                        ("c".to_string(), Some(100.00), Some(100.00), Some(100.00)),
+                    ]
+                );
+            }
+            QueryResultJson::Success { .. } => panic!("expected decimal multi-aggregate fanout"),
+        }
+
+        // AVG over DECIMAL: global a = (9.50 + 30.25) / 2 = 19.875.
+        let avg = post_query(&local_app, "SELECT grp, AVG(amt) FROM gdec GROUP BY grp").await;
+        assert_eq!(avg.status(), StatusCode::OK);
+        let avg_env: Envelope<Vec<QueryResultJson>> = response_json(avg).await;
+        match &avg_env.data.expect("decimal avg data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                let a_row = rows
+                    .iter()
+                    .find(|r| r[0].as_str() == Some("a"))
+                    .expect("group a");
+                assert_eq!(parse(&a_row[1]), Some(19.875));
+            }
+            QueryResultJson::Success { .. } => panic!("expected decimal avg fanout"),
         }
 
         let _ = std::fs::remove_file(&local_wal_path);

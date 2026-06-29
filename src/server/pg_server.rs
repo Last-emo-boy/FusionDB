@@ -196,6 +196,27 @@ enum ForwardSum {
     Float(f64),
 }
 
+/// Detect a JSON STRING holding a finite DECIMAL/NUMERIC number (the JSON form of `Value::Decimal`).
+/// Only the MIN/MAX (extremum) path needs this — `SUM`/`AVG` over DECIMAL return a float.
+fn forward_decimal_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::String(s) => s.parse::<f64>().ok().filter(|v| v.is_finite()),
+        _ => None,
+    }
+}
+
+/// Wrap a value for MIN/MAX comparison: a finite-decimal JSON string becomes `Value::Decimal` (numeric
+/// compare) rather than `Value::String` (lexical). Only decimal/int/float columns reach the extremum
+/// path, so a numeric-looking string is safely a decimal here.
+fn forward_extremum_value(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::String(s) if forward_decimal_f64(value).is_some() => {
+            Value::Decimal(s.clone())
+        }
+        _ => Value::from_json(value),
+    }
+}
+
 /// Per-group running accumulator for grouped SUM/MIN/MAX fan-out (pgwire forward path).
 enum ForwardGroupAcc {
     Sum(Option<ForwardSum>),
@@ -3255,7 +3276,9 @@ impl PgHandler {
                     };
                     let candidate = if value.is_null() {
                         None
-                    } else if value.as_f64().is_some_and(|v| v.is_finite()) {
+                    } else if value.as_f64().is_some_and(|v| v.is_finite())
+                        || forward_decimal_f64(value).is_some()
+                    {
                         Some(value.clone())
                     } else {
                         return Err(Self::execution_error(format!(
@@ -3353,7 +3376,9 @@ impl PgHandler {
                         };
                         let candidate = if value.is_null() {
                             None
-                        } else if value.as_f64().is_some_and(|v| v.is_finite()) {
+                        } else if value.as_f64().is_some_and(|v| v.is_finite())
+                            || forward_decimal_f64(value).is_some()
+                        {
                             Some(value.clone())
                         } else {
                             return Err(Self::execution_error(format!(
@@ -3723,7 +3748,9 @@ impl PgHandler {
         if value.is_null() {
             return Ok((columns.clone(), None));
         }
-        if value.as_f64().is_some_and(|value| value.is_finite()) {
+        if value.as_f64().is_some_and(|value| value.is_finite())
+            || forward_decimal_f64(value).is_some()
+        {
             return Ok((columns.clone(), Some(value.clone())));
         }
         Err(Self::execution_error(format!(
@@ -3744,8 +3771,8 @@ impl PgHandler {
             *total = Some(value);
             return Ok(());
         };
-        let candidate_value = Value::from_json(&value);
-        let current_value = Value::from_json(current);
+        let candidate_value = forward_extremum_value(&value);
+        let current_value = forward_extremum_value(current);
         let should_replace = match kind {
             SqlShardExtremum::Min => candidate_value.compare(&current_value).is_lt(),
             SqlShardExtremum::Max => candidate_value.compare(&current_value).is_gt(),
