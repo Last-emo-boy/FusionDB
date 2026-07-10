@@ -517,43 +517,63 @@ fn block_sql_zone_maps(
     schemas: &BTreeMap<String, TableSchema>,
 ) -> (bool, Vec<SsTableSqlZoneMap>) {
     let Some(suffix_len) = suffix_len else {
-        return (false, Vec::new());
+        {
+            return (false, Vec::new());
+        }
     };
     if schemas.is_empty() {
-        return (false, Vec::new());
+        {
+            return (false, Vec::new());
+        }
     }
     if schemas.keys().any(|table_name| table_name.contains(':')) {
-        return (false, Vec::new());
+        {
+            return (false, Vec::new());
+        }
     }
 
     let mut maps: BTreeMap<(Vec<u8>, u32), SqlZoneMapAccumulator> = BTreeMap::new();
     let mut cursor = std::io::Cursor::new(buf);
     for _ in 0..count {
         let Some(k_len) = read_cursor_u32(&mut cursor).map(|len| len as usize) else {
-            return (false, Vec::new());
+            {
+                return (false, Vec::new());
+            }
         };
         let Some(key) = take_cursor_bytes(&mut cursor, k_len) else {
-            return (false, Vec::new());
+            {
+                return (false, Vec::new());
+            }
         };
         let Some(v_len) = read_cursor_u32(&mut cursor).map(|len| len as usize) else {
-            return (false, Vec::new());
+            {
+                return (false, Vec::new());
+            }
         };
         let Some(value) = take_cursor_bytes(&mut cursor, v_len) else {
-            return (false, Vec::new());
+            {
+                return (false, Vec::new());
+            }
         };
 
         let Some(user_key_len) = key.len().checked_sub(suffix_len) else {
-            return (false, Vec::new());
+            {
+                return (false, Vec::new());
+            }
         };
         let user_key = &key[..user_key_len];
         let Some((table_prefix, table_name)) = data_table_prefix_and_name(user_key) else {
             continue;
         };
         let Some(schema) = schemas.get(table_name) else {
-            return (false, Vec::new());
+            {
+                return (false, Vec::new());
+            }
         };
         let Some((&flag, row_payload)) = value.split_first() else {
-            return (false, Vec::new());
+            {
+                return (false, Vec::new());
+            }
         };
         let is_put = match flag {
             0 => false,
@@ -585,7 +605,9 @@ fn block_sql_zone_maps(
                     Ok(None) | Err(_) => return (false, Vec::new()),
                 };
                 if !accumulator.observe_put(&value) {
-                    return (false, Vec::new());
+                    {
+                        return (false, Vec::new());
+                    }
                 }
             } else {
                 accumulator.observe_tombstone();
@@ -593,7 +615,9 @@ fn block_sql_zone_maps(
         }
     }
     if cursor.position() as usize != buf.len() {
-        return (false, Vec::new());
+        {
+            return (false, Vec::new());
+        }
     }
 
     (

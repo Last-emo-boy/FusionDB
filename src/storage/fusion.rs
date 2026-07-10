@@ -3197,9 +3197,21 @@ impl FusionTransaction {
                     }
                 };
 
+            // Blocks entirely outside [start, end) are simply irrelevant to
+            // this (sub-)scan — not a metadata failure. Parallel full scans
+            // split the keyspace into K slices; without this test every
+            // slice paid an interval clone + a bogus IncompleteMetadata
+            // fail-open for the other slices' blocks (exactly (K-1)/K of
+            // all evaluations, BENCHPROD-470).
+            if last_user_key.as_slice() < start || first_user_key.as_slice() >= end {
+                continue;
+            }
+
             crate::monitor::inc_sstable_block_zone_map_filter_check();
 
             if first_user_key.as_slice() < start || last_user_key.as_slice() >= end {
+                // Partially overlapping the range boundary: pruning must not
+                // trust a decision that spans beyond the validated range.
                 Self::record_sql_zone_map_fail_open(
                     SqlBlockZoneMapFailOpenReason::IncompleteMetadata,
                 );
