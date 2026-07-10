@@ -1,0 +1,17 @@
+{
+  "id": "BENCHPROD-466d",
+  "title": "Raft snapshot install rebuilds the trigram index",
+  "phase": "P5 Distributed coherence (466 series, first slice)",
+  "status": "done",
+  "discovery": "replace_visible_entries_for_snapshot rebuilt only the vector index after installing snapshot entries; the trigram index kept pre-snapshot postings (or stayed empty on a fresh follower), so trigram-served wildcard LIKE answered from stale state. Found by the 465 adversarial review, verified.",
+  "changes": {
+    "catalog": "Column::is_trigram_text_column() — single source of truth for trigram eligibility (was a private predicate in dml/mod.rs)",
+    "trigram": "numeric_row_id_for_str moved storage-side (Executor delegates)",
+    "fusion": "rebuild_trigram_index() mirroring rebuild_vector_index (schema scan -> per-table trigram columns -> data scan -> postings); wired after the vector rebuild in replace_visible_entries_for_snapshot with a fresh TrigramIndex"
+  },
+  "verification": "test_snapshot_install_rebuilds_trigram_index (export visible state, wipe in-memory trigram simulating a fresh follower, install, assert postings + LIKE results); full gate green",
+  "disclosures": [
+    "mirrors the vector rebuild's legacy data:-prefix scan (sharded shard:N:data: prefixes not scanned — same pre-existing limitation as the vector rebuild, one fix for both later)",
+    "466 series remainder open: deterministic KvBatch replication (leader captures OCC write set + side deltas, apply-time deterministic revalidation), pgwire DML through Raft, vote/log persistence"
+  ]
+}
