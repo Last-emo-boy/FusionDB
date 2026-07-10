@@ -72,3 +72,19 @@ xlarge 数据集上 SELECT * FROM bench WHERE id>250000 LIMIT 100:warm 29.3s 且
 对照实验(xlarge bench 表 50 万行):LIMIT 100 无 WHERE=281ms 正常;id>499900 LIMIT 100(百行区间)=31ms 正常;id>250000 LIMIT 100=29s——limit=None 到达 PK 区间分支,整个 25 万行区间物化后截断(区间边界正常、limit 丢失);val=42 LIMIT 100(val 有 idx_bench_val 索引)=6.2s——索引等值路径未命中或探测爆炸,独立病灶。push_down_limit 守卫(query/mod.rs:2643)文本应命中①——查三个 scan_single_table 调用点(1919/1932/2831)哪条路径实际执行、其 limit 实参;②先看 EXPLAIN val=42 与 try_index_scan 在 xlarge 的 stats_guided_index_probe_limit(65536 上限)是否放弃索引。另:29s/25万行=116µs/行的物化本身也反常(第三层问题,或与 zone-map fail-open 相关)。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="469,correction,index-persistence" date="2026-07-10" title="469 修正:索引持久性无恙,缺陷②撤销(2026-07-10)" source="main@5a18cb1">
+
+### 469 修正:索引持久性无恙,缺陷②撤销(2026-07-10)
+
+更正先前判断:bench.val 从未有索引——benchmark.py 设计了双表(bench 无索引测全扫/bench_idx 带索引测索引扫,4648/4763-4765),post-restart 的 val=42 6.2s 查错了表,与报告 Full scan 6.0s 一致即全扫本身。索引跨重启持久性经两轮重现验证无恙(小规模干净重启✓、checkpoint+SIGKILL✓,EXPLAIN 走索引✓)。469 剩两个真问题:①Range id>N LIMIT 未下推(整区间物化,29s,已隔离);③全扫单行成本 12µs/行 vs 活动记录的 parallel-merge 0.4µs/行地板 =30×(HTTP 路径,需扣除 JSON 序列化后定位)。
+
+</spec-entry>
+
+<spec-entry category="debug" keywords="469,zone-map,limit,root-cause" date="2026-07-10" title="469 根因与修复:zone-map 预计算击穿 LIMIT 早停(2026-07-10)" source="main@5a18cb1">
+
+### 469 根因与修复:zone-map 预计算击穿 LIMIT 早停(2026-07-10)
+
+根因:merge_visible_range 为每个 SSTable 调 sql_zone_map_skip_offsets_for_sstable,对区间内每块预评估 zone map 且每块做遍历全 memtable 的 MVCC fail-open 校验——O(区间块数×memtable 探测),LIMIT 早停被击穿(LIMIT 100 先付 25 万行区间全款)。修复:PK 区间分支仅无 limit 时挂剪枝计划(scan/mod.rs)。实测 50 万行:2715ms→2.2ms warm(~1200×),正确性验证通过。途中撤销两个错误假设:索引跨重启丢失(查错表,bench/bench_idx 双表)、limit 未下推(守卫链完好)。方法论沉淀:visits 计数+耗时打点一击定位 setup-vs-loop;'预计算 vs 早停'是一类模式——全扫 zone-map 挂载点(444 visitor 自停)同类待测。
+
+</spec-entry>

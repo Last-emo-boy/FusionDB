@@ -1,0 +1,18 @@
+{
+  "id": "BENCHPROD-469",
+  "title": "Zone-map skip precompute defeats LIMIT early-stop on PK range scans",
+  "phase": "Perf (xlarge capability follow-up)",
+  "status": "done",
+  "discovery": "xlarge report: Range id>N LIMIT 100 = 12s (bench) / 29s (post-restart memtable-heavy). Dissection chain: (1) metrics delta proved limit reached storage and visitor stopped at exactly 100 visits, yet 2.7s elapsed -> setup cost O(range); (2) instrumented probes localized it; (3) merge_visible_range seeds each SSTable iterator with sql_zone_map_skip_offsets_for_sstable, which pre-evaluates zone maps for EVERY block in [start,end) INCLUDING an MVCC fail-open probe over all memtables per block — a LIMIT 100 scan paid the whole 250k-row range up front. Corrections along the way: the suspected 'index lost across restart' was a measurement error (benchmark uses unindexed bench + indexed bench_idx twins); suspected 'limit not pushed' was wrong (guard chain verified intact end-to-end).",
+  "fix": "attach the zone-map pruning plan only when the PK range scan is UNLIMITED (scan/mod.rs PK-range branch): pruning's payoff model is bulk scans; early-stopping scans read few blocks anyway",
+  "verification": {
+    "local_500k": "id>250000 LIMIT 100: 2715ms -> 19.8ms cold / 2.2ms warm (~1200x); id>499900 LIMIT 100: 3.3ms; correctness: COUNT over range = 249,999, LIMIT returns exactly 100",
+    "unlimited_scans": "unchanged — zone-map plan still attached (its design target, covered by the zone-map matrix benchmarks)",
+    "gate": "fmt/clippy/--all-targets"
+  },
+  "followups": [
+    "same precompute-vs-early-stop class exists at the full-scan zone-map attach site when FilteredLimitScanVisitor self-stops (driver passes storage limit=None) — measure before changing",
+    "residual: WHERE ... AND 1=1 variant still ~570ms pre-fix, hinting a second smaller O(range) cost in seeding; re-measure post-fix",
+    "xlarge re-run of parts 1/4 to confirm Range/Analytics recovery"
+  ]
+}
