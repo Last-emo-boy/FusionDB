@@ -1,0 +1,14 @@
+{
+  "id": "BENCHPROD-468",
+  "title": "SSTable bloom filters sized to real entry count (xlarge load collapse)",
+  "phase": "Perf/correctness (found by user-requested xlarge run)",
+  "status": "done",
+  "discovery": "xlarge load crawled at ~330 rows/s vs the 2026-07-08 baseline's 20,403 rows/s; per-batch INSERT time grew linearly with total data (5-16s per 1000-row batch at 1.1M rows). Metrics delta on one batch: sstable_user_key_filter_positive_count == check_count == 3003 — 100% bloom false positives for ABSENT keys, so every per-row PK-duplicate-check get paid real block reads on every SSTable (O(sstable count) per get => O(n) per batch). Root cause: every SsTableBuilder bloom (whole-key, prefix, user-key v3, sql-index-prefix v4) was hard-coded to expected_items(100_000) while a 32MB memtable flush carries 300-500k+ internal keys — 3-5x overload saturates the filter (measured 37% FP at 3x in the unit test, ~100% in production). Latent since the filter work (July 9-10 checkpoint); never exposed because small/medium scales do not fill a memtable. NOT caused by 463-466d (isolated repro on HEAD reproduced; bisect builds confirmed unnecessary after metrics pinpointed the mechanism).",
+  "fix": "SsTableBuilder::set_expected_filter_items(n) rebuilds the whole-key filter and sizes the three prefix filters (min 10k); sstable_builder_with_zone_maps takes expected_items; flush passes mem.map.len(), compaction passes sum of input SsTable::estimated_entry_count() (per-block entry_count sums, block-count heuristic fallback)",
+  "verification": {
+    "microrepro": "single indexed-TEXT table, 1000-row batches to 500k rows: HEAD 38ms@60k -> 682ms@500k (linear); FIX flat ~60ms@500k (11x at 500k); metrics: FP 3003->13 (0.43%), block reads 6007->37, batch 1016ms->62ms",
+    "unit": "filter_sized_to_entry_count_keeps_false_positives_low (sized <5% over 2000 absent probes; saturated-default guard >20% at 3x overload)",
+    "gate": "fmt/clippy/--all-targets"
+  },
+  "followups": ["xlarge full run (user-requested capability snapshot) now unblocked", "existing overloaded SSTables on disk keep their saturated filters until compaction rewrites them — self-healing over time, rebuild not required"]
+}
