@@ -241,15 +241,15 @@ impl Executor {
             || Self::type_name_starts_with_ascii_case_insensitive(data_type, "DEC(")
     }
 
-    fn is_boolean_type_name(data_type: &str) -> bool {
+    pub(crate) fn is_boolean_type_name(data_type: &str) -> bool {
         Self::type_name_matches_any(data_type, &["BOOL", "BOOLEAN"])
     }
 
-    fn is_date_type_name(data_type: &str) -> bool {
+    pub(crate) fn is_date_type_name(data_type: &str) -> bool {
         Self::type_name_matches_any(data_type, &["DATE", "DATE32"])
     }
 
-    fn is_timestamp_type_name(data_type: &str) -> bool {
+    pub(crate) fn is_timestamp_type_name(data_type: &str) -> bool {
         Self::type_name_matches_any(
             data_type,
             &[
@@ -263,12 +263,12 @@ impl Executor {
             || Self::type_name_starts_with_ascii_case_insensitive(data_type, "DATETIME(")
     }
 
-    fn is_interval_type_name(data_type: &str) -> bool {
+    pub(crate) fn is_interval_type_name(data_type: &str) -> bool {
         data_type.eq_ignore_ascii_case("INTERVAL")
             || Self::type_name_starts_with_ascii_case_insensitive(data_type, "INTERVAL ")
     }
 
-    fn is_text_type_name(data_type: &str) -> bool {
+    pub(crate) fn is_text_type_name(data_type: &str) -> bool {
         Self::type_name_matches_any(data_type, &["TEXT", "STRING", "VARCHAR", "CHAR"])
             || Self::type_name_starts_with_ascii_case_insensitive(data_type, "VARCHAR(")
             || Self::type_name_starts_with_ascii_case_insensitive(data_type, "CHAR(")

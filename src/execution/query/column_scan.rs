@@ -1,6 +1,7 @@
 use crate::catalog::IndexType;
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
+use crate::execution::analyze::TableStats;
 use crate::storage::{ScanVisitor, Transaction};
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
@@ -10,6 +11,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use super::Executor;
+
+const COLUMN_SCAN_BATCH_SIZE: usize = 1024;
+const GROUP_BY_COUNT_INDEX_STATS_MIN_ENTRIES: usize = 65_536;
 
 #[derive(Clone, Copy)]
 enum ColumnAggregateKind {
@@ -174,6 +178,68 @@ impl ColumnPredicateScanPlan {
     }
 }
 
+struct ColumnScanBatch {
+    rows: Vec<Vec<u8>>,
+    selected: Vec<usize>,
+    predicate_values: Vec<Vec<Value>>,
+    predicate_scratch: Vec<Value>,
+}
+
+impl ColumnScanBatch {
+    fn new(predicate: Option<&ColumnPredicateScanPlan>) -> Self {
+        Self {
+            rows: Vec::with_capacity(COLUMN_SCAN_BATCH_SIZE),
+            selected: Vec::with_capacity(COLUMN_SCAN_BATCH_SIZE),
+            predicate_values: Vec::with_capacity(predicate.map_or(0, |_| COLUMN_SCAN_BATCH_SIZE)),
+            predicate_scratch: ColumnPredicateScanPlan::scratch_values(predicate),
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) -> bool {
+        self.rows.push(data.to_vec());
+        self.rows.len() >= COLUMN_SCAN_BATCH_SIZE
+    }
+
+    fn flush_with<F>(
+        &mut self,
+        predicate: Option<&ColumnPredicateScanPlan>,
+        mut apply_matched_row: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[Value]) -> Result<()>,
+    {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+
+        self.selected.clear();
+        self.predicate_values.clear();
+        if let Some(predicate) = predicate {
+            for (row_index, row) in self.rows.iter().enumerate() {
+                predicate.decode_values(row, &mut self.predicate_scratch)?;
+                if predicate.matches_values(&self.predicate_scratch) {
+                    self.selected.push(row_index);
+                    self.predicate_values.push(self.predicate_scratch.clone());
+                }
+            }
+        } else {
+            self.selected.extend(0..self.rows.len());
+        }
+
+        for (selection_slot, &row_index) in self.selected.iter().enumerate() {
+            let predicate_values = if predicate.is_some() {
+                self.predicate_values[selection_slot].as_slice()
+            } else {
+                &[]
+            };
+            apply_matched_row(&self.rows[row_index], predicate_values)?;
+        }
+
+        self.rows.clear();
+        Ok(())
+    }
+}
+
 struct ColumnAggregateState {
     kind: ColumnAggregateKind,
     sum: f64,
@@ -325,11 +391,36 @@ fn finalize_column_aggregate_states(states: &[ColumnAggregateState]) -> Vec<Valu
     values
 }
 
+fn apply_column_aggregate_matched_row(
+    plans: &[ColumnAggregateScanPlan],
+    predicate: Option<&ColumnPredicateScanPlan>,
+    states: &mut [ColumnAggregateState],
+    predicate_values: &[Value],
+    data: &[u8],
+) -> Result<()> {
+    for (state, plan) in states.iter_mut().zip(plans.iter()) {
+        if let Some(column_index) = plan.column_index {
+            let value = Executor::decode_column_or_reuse_predicate(
+                data,
+                column_index,
+                predicate,
+                predicate_values,
+            )?;
+            state.update(value);
+        } else {
+            state.update(Value::Integer(1));
+        }
+    }
+
+    Ok(())
+}
+
 struct ColumnAggregateScanVisitor<'a> {
     plans: &'a [ColumnAggregateScanPlan],
     predicate: Option<&'a ColumnPredicateScanPlan>,
     states: &'a mut [ColumnAggregateState],
     predicate_values: Vec<Value>,
+    batch: Option<ColumnScanBatch>,
     error: Option<FusionError>,
 }
 
@@ -342,18 +433,23 @@ impl ColumnAggregateScanVisitor<'_> {
             }
         }
 
-        for (state, plan) in self.states.iter_mut().zip(self.plans.iter()) {
-            if let Some(column_index) = plan.column_index {
-                let value = Executor::decode_column_or_reuse_predicate(
-                    data,
-                    column_index,
-                    self.predicate,
-                    &self.predicate_values,
-                )?;
-                state.update(value);
-            } else {
-                state.update(Value::Integer(1));
-            }
+        apply_column_aggregate_matched_row(
+            self.plans,
+            self.predicate,
+            self.states,
+            &self.predicate_values,
+            data,
+        )
+    }
+
+    fn flush_batch(&mut self) -> Result<()> {
+        if let Some(batch) = self.batch.as_mut() {
+            let plans = self.plans;
+            let predicate = self.predicate;
+            let states = &mut *self.states;
+            batch.flush_with(predicate, |data, predicate_values| {
+                apply_column_aggregate_matched_row(plans, predicate, states, predicate_values, data)
+            })?;
         }
 
         Ok(())
@@ -362,6 +458,20 @@ impl ColumnAggregateScanVisitor<'_> {
 
 impl ScanVisitor for ColumnAggregateScanVisitor<'_> {
     fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        let should_flush = match self.batch.as_mut() {
+            Some(batch) => batch.push(value),
+            None => false,
+        };
+        if self.batch.is_some() {
+            if should_flush {
+                if let Err(error) = self.flush_batch() {
+                    self.error = Some(error);
+                    return false;
+                }
+            }
+            return true;
+        }
+
         if let Err(error) = self.visit_row(value) {
             self.error = Some(error);
             return false;
@@ -409,12 +519,105 @@ fn group_column_aggregate_states(
     states
 }
 
+fn apply_group_aggregate_matched_row(
+    group_column_indices: &[usize],
+    aggregate_plans: &[GroupColumnAggregateScanPlan],
+    predicate: Option<&ColumnPredicateScanPlan>,
+    groups: &mut HashMap<Vec<Value>, Vec<GroupColumnAggregateState>>,
+    predicate_values: &[Value],
+    data: &[u8],
+) -> Result<()> {
+    let mut group_values = Vec::with_capacity(group_column_indices.len());
+    for &group_column_index in group_column_indices {
+        group_values.push(Executor::decode_column_or_reuse_predicate(
+            data,
+            group_column_index,
+            predicate,
+            predicate_values,
+        )?);
+    }
+
+    let states = groups
+        .entry(group_values)
+        .or_insert_with(|| group_column_aggregate_states(aggregate_plans));
+
+    for (state, plan) in states.iter_mut().zip(aggregate_plans.iter()) {
+        if let Some(column_index) = plan.column_index {
+            let value = Executor::decode_column_or_reuse_predicate(
+                data,
+                column_index,
+                predicate,
+                predicate_values,
+            )?;
+            state.update_value(value);
+        } else {
+            state.update_count_star();
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_single_group_aggregate_matched_row(
+    group_column_index: usize,
+    aggregate_plans: &[GroupColumnAggregateScanPlan],
+    predicate: Option<&ColumnPredicateScanPlan>,
+    groups: &mut HashMap<Value, Vec<GroupColumnAggregateState>>,
+    predicate_values: &[Value],
+    data: &[u8],
+) -> Result<()> {
+    let group_value = Executor::decode_column_or_reuse_predicate(
+        data,
+        group_column_index,
+        predicate,
+        predicate_values,
+    )?;
+
+    let states = groups
+        .entry(group_value)
+        .or_insert_with(|| group_column_aggregate_states(aggregate_plans));
+
+    for (state, plan) in states.iter_mut().zip(aggregate_plans.iter()) {
+        if let Some(column_index) = plan.column_index {
+            let value = Executor::decode_column_or_reuse_predicate(
+                data,
+                column_index,
+                predicate,
+                predicate_values,
+            )?;
+            state.update_value(value);
+        } else {
+            state.update_count_star();
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_group_count_matched_row(
+    group_column_index: usize,
+    predicate: Option<&ColumnPredicateScanPlan>,
+    counts: &mut HashMap<Value, i64>,
+    predicate_values: &[Value],
+    data: &[u8],
+) -> Result<()> {
+    let value = Executor::decode_column_or_reuse_predicate(
+        data,
+        group_column_index,
+        predicate,
+        predicate_values,
+    )?;
+    *counts.entry(value).or_insert(0) += 1;
+    Ok(())
+}
+
 struct GroupAggregateScanVisitor<'a> {
     group_column_indices: &'a [usize],
     aggregate_plans: &'a [GroupColumnAggregateScanPlan],
     predicate: Option<&'a ColumnPredicateScanPlan>,
     groups: &'a mut HashMap<Vec<Value>, Vec<GroupColumnAggregateState>>,
     predicate_values: Vec<Value>,
+    batch: Option<ColumnScanBatch>,
     error: Option<FusionError>,
 }
 
@@ -427,33 +630,32 @@ impl GroupAggregateScanVisitor<'_> {
             }
         }
 
-        let mut group_values = Vec::with_capacity(self.group_column_indices.len());
-        for &group_column_index in self.group_column_indices {
-            group_values.push(Executor::decode_column_or_reuse_predicate(
-                data,
-                group_column_index,
-                self.predicate,
-                &self.predicate_values,
-            )?);
-        }
+        apply_group_aggregate_matched_row(
+            self.group_column_indices,
+            self.aggregate_plans,
+            self.predicate,
+            self.groups,
+            &self.predicate_values,
+            data,
+        )
+    }
 
-        let states = self
-            .groups
-            .entry(group_values)
-            .or_insert_with(|| group_column_aggregate_states(self.aggregate_plans));
-
-        for (state, plan) in states.iter_mut().zip(self.aggregate_plans.iter()) {
-            if let Some(column_index) = plan.column_index {
-                let value = Executor::decode_column_or_reuse_predicate(
+    fn flush_batch(&mut self) -> Result<()> {
+        if let Some(batch) = self.batch.as_mut() {
+            let group_column_indices = self.group_column_indices;
+            let aggregate_plans = self.aggregate_plans;
+            let predicate = self.predicate;
+            let groups = &mut *self.groups;
+            batch.flush_with(predicate, |data, predicate_values| {
+                apply_group_aggregate_matched_row(
+                    group_column_indices,
+                    aggregate_plans,
+                    predicate,
+                    groups,
+                    predicate_values,
                     data,
-                    column_index,
-                    self.predicate,
-                    &self.predicate_values,
-                )?;
-                state.update_value(value);
-            } else {
-                state.update_count_star();
-            }
+                )
+            })?;
         }
 
         Ok(())
@@ -462,6 +664,20 @@ impl GroupAggregateScanVisitor<'_> {
 
 impl ScanVisitor for GroupAggregateScanVisitor<'_> {
     fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        let should_flush = match self.batch.as_mut() {
+            Some(batch) => batch.push(value),
+            None => false,
+        };
+        if self.batch.is_some() {
+            if should_flush {
+                if let Err(err) = self.flush_batch() {
+                    self.error = Some(err);
+                    return false;
+                }
+            }
+            return true;
+        }
+
         match self.visit_row(value) {
             Ok(()) => true,
             Err(err) => {
@@ -478,6 +694,7 @@ struct SingleGroupAggregateScanVisitor<'a> {
     predicate: Option<&'a ColumnPredicateScanPlan>,
     groups: &'a mut HashMap<Value, Vec<GroupColumnAggregateState>>,
     predicate_values: Vec<Value>,
+    batch: Option<ColumnScanBatch>,
     error: Option<FusionError>,
 }
 
@@ -490,30 +707,32 @@ impl SingleGroupAggregateScanVisitor<'_> {
             }
         }
 
-        let group_value = Executor::decode_column_or_reuse_predicate(
-            data,
+        apply_single_group_aggregate_matched_row(
             self.group_column_index,
+            self.aggregate_plans,
             self.predicate,
+            self.groups,
             &self.predicate_values,
-        )?;
+            data,
+        )
+    }
 
-        let states = self
-            .groups
-            .entry(group_value)
-            .or_insert_with(|| group_column_aggregate_states(self.aggregate_plans));
-
-        for (state, plan) in states.iter_mut().zip(self.aggregate_plans.iter()) {
-            if let Some(column_index) = plan.column_index {
-                let value = Executor::decode_column_or_reuse_predicate(
+    fn flush_batch(&mut self) -> Result<()> {
+        if let Some(batch) = self.batch.as_mut() {
+            let group_column_index = self.group_column_index;
+            let aggregate_plans = self.aggregate_plans;
+            let predicate = self.predicate;
+            let groups = &mut *self.groups;
+            batch.flush_with(predicate, |data, predicate_values| {
+                apply_single_group_aggregate_matched_row(
+                    group_column_index,
+                    aggregate_plans,
+                    predicate,
+                    groups,
+                    predicate_values,
                     data,
-                    column_index,
-                    self.predicate,
-                    &self.predicate_values,
-                )?;
-                state.update_value(value);
-            } else {
-                state.update_count_star();
-            }
+                )
+            })?;
         }
 
         Ok(())
@@ -522,6 +741,20 @@ impl SingleGroupAggregateScanVisitor<'_> {
 
 impl ScanVisitor for SingleGroupAggregateScanVisitor<'_> {
     fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        let should_flush = match self.batch.as_mut() {
+            Some(batch) => batch.push(value),
+            None => false,
+        };
+        if self.batch.is_some() {
+            if should_flush {
+                if let Err(err) = self.flush_batch() {
+                    self.error = Some(err);
+                    return false;
+                }
+            }
+            return true;
+        }
+
         match self.visit_row(value) {
             Ok(()) => true,
             Err(err) => {
@@ -537,6 +770,7 @@ struct GroupCountScanVisitor<'a> {
     predicate: Option<&'a ColumnPredicateScanPlan>,
     counts: &'a mut HashMap<Value, i64>,
     predicate_values: Vec<Value>,
+    batch: Option<ColumnScanBatch>,
     error: Option<FusionError>,
 }
 
@@ -549,19 +783,51 @@ impl GroupCountScanVisitor<'_> {
             }
         }
 
-        let value = Executor::decode_column_or_reuse_predicate(
-            data,
+        apply_group_count_matched_row(
             self.group_column_index,
             self.predicate,
+            self.counts,
             &self.predicate_values,
-        )?;
-        *self.counts.entry(value).or_insert(0) += 1;
+            data,
+        )
+    }
+
+    fn flush_batch(&mut self) -> Result<()> {
+        if let Some(batch) = self.batch.as_mut() {
+            let group_column_index = self.group_column_index;
+            let predicate = self.predicate;
+            let counts = &mut *self.counts;
+            batch.flush_with(predicate, |data, predicate_values| {
+                apply_group_count_matched_row(
+                    group_column_index,
+                    predicate,
+                    counts,
+                    predicate_values,
+                    data,
+                )
+            })?;
+        }
+
         Ok(())
     }
 }
 
 impl ScanVisitor for GroupCountScanVisitor<'_> {
     fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
+        let should_flush = match self.batch.as_mut() {
+            Some(batch) => batch.push(value),
+            None => false,
+        };
+        if self.batch.is_some() {
+            if should_flush {
+                if let Err(err) = self.flush_batch() {
+                    self.error = Some(err);
+                    return false;
+                }
+            }
+            return true;
+        }
+
         match self.visit_row(value) {
             Ok(()) => true,
             Err(err) => {
@@ -802,6 +1068,46 @@ impl GroupColumnAggregateState {
 }
 
 impl Executor {
+    fn column_scan_numeric_data_type(data_type: &str) -> bool {
+        Self::is_integer_type_name(data_type)
+            || Self::is_float_type_name(data_type)
+            || Self::is_decimal_type_name(data_type)
+    }
+
+    fn column_aggregate_batch_supported(
+        plans: &[ColumnAggregateScanPlan],
+        schema: &TableSchema,
+    ) -> bool {
+        plans.iter().all(|plan| match plan.kind {
+            ColumnAggregateKind::CountStar | ColumnAggregateKind::CountColumn => true,
+            ColumnAggregateKind::Sum
+            | ColumnAggregateKind::Avg
+            | ColumnAggregateKind::Min
+            | ColumnAggregateKind::Max => plan
+                .column_index
+                .and_then(|index| schema.columns.get(index))
+                .is_some_and(|column| Self::column_scan_numeric_data_type(&column.data_type)),
+            ColumnAggregateKind::StringAgg => false,
+        })
+    }
+
+    fn group_column_aggregate_batch_supported(
+        aggregate_plans: &[GroupColumnAggregateScanPlan],
+        schema: &TableSchema,
+    ) -> bool {
+        aggregate_plans.iter().all(|plan| match plan.kind {
+            GroupColumnAggregateKind::CountStar | GroupColumnAggregateKind::CountColumn => true,
+            GroupColumnAggregateKind::Sum
+            | GroupColumnAggregateKind::Avg
+            | GroupColumnAggregateKind::Min
+            | GroupColumnAggregateKind::Max => plan
+                .column_index
+                .and_then(|index| schema.columns.get(index))
+                .is_some_and(|column| Self::column_scan_numeric_data_type(&column.data_type)),
+            GroupColumnAggregateKind::CountDistinct | GroupColumnAggregateKind::StringAgg => false,
+        })
+    }
+
     fn decode_predicate_values(
         data: &[u8],
         predicate: Option<&ColumnPredicateScanPlan>,
@@ -962,10 +1268,18 @@ impl Executor {
                 predicate,
                 states: &mut states,
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
+                batch: schema
+                    .filter(|schema| Self::column_aggregate_batch_supported(plans, schema))
+                    .map(|_| ColumnScanBatch::new(predicate)),
                 error: None,
             };
             self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
+            if visitor.error.is_none() {
+                if let Err(err) = visitor.flush_batch() {
+                    visitor.error = Some(err);
+                }
+            }
             visitor.error
         };
 
@@ -1021,6 +1335,7 @@ impl Executor {
             predicate: Some(predicate),
             states: &mut states,
             predicate_values: ColumnPredicateScanPlan::scratch_values(Some(predicate)),
+            batch: None,
             error: None,
         };
 
@@ -1174,7 +1489,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn count_distinct_projection<'a>(
+    pub(crate) fn count_distinct_projection<'a>(
         projection: &'a [SelectItem],
         schema: &TableSchema,
         allowed_qualifiers: Option<&[String]>,
@@ -1211,9 +1526,19 @@ impl Executor {
         &self,
         table_name: &str,
         column_index: usize,
+        schema: &TableSchema,
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<i64> {
+        if predicate.is_none() {
+            if let Some(count) = self
+                .count_distinct_index_key_scan(table_name, column_index, schema, txn)
+                .await?
+            {
+                return Ok(count);
+            }
+        }
+
         let mut seen = HashSet::with_capacity(4096);
 
         let scan_error = {
@@ -1236,7 +1561,211 @@ impl Executor {
         Ok(seen.len() as i64)
     }
 
-    pub(super) fn single_column_distinct_projection<'a>(
+    fn column_scan_index_value_key_from_prefixed_key<'a>(
+        key: &'a [u8],
+        prefix: &str,
+    ) -> Option<&'a str> {
+        let key = std::str::from_utf8(key).ok()?;
+        let suffix = key.strip_prefix(prefix)?;
+        let (value_key, row_id) = suffix.rsplit_once(':')?;
+        if row_id.is_empty() {
+            return None;
+        }
+        Some(value_key)
+    }
+
+    fn column_scan_index_count_summary_value_key_from_prefixed_key<'a>(
+        key: &'a [u8],
+        prefix: &str,
+    ) -> Option<&'a str> {
+        std::str::from_utf8(key).ok()?.strip_prefix(prefix)
+    }
+
+    pub(crate) fn secondary_index_distinct_key_type_supported(data_type: &str) -> bool {
+        Self::secondary_index_order_type_supported(data_type)
+            || Self::is_text_type_name(data_type)
+            || Self::is_decimal_type_name(data_type)
+    }
+
+    pub(crate) fn secondary_index_group_key_type_supported(data_type: &str) -> bool {
+        Self::secondary_index_distinct_key_type_supported(data_type)
+    }
+
+    pub(crate) fn secondary_index_loose_key_type_supported(data_type: &str) -> bool {
+        Self::secondary_index_order_type_supported(data_type)
+    }
+
+    fn secondary_index_group_value_from_key(value_key: &str, column_type: &str) -> Option<Value> {
+        if let Some(value) = Self::secondary_index_value_from_key(value_key, column_type) {
+            return Some(value);
+        }
+        if Self::is_text_type_name(column_type) {
+            Some(Value::String(value_key.to_string()))
+        } else if Self::is_decimal_type_name(column_type) {
+            value_key
+                .strip_prefix("dec:")
+                .map(|value| Value::Decimal(value.to_string()))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) async fn group_by_count_index_key_scan_cost_allowed(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        schema: &TableSchema,
+        txn: &mut dyn Transaction,
+    ) -> Result<bool> {
+        let Some(stats) = self.load_table_stats(table_name, txn).await? else {
+            return Ok(true);
+        };
+        Ok(Self::group_by_count_index_key_scan_stats_allowed(
+            &stats,
+            column_index,
+            schema,
+        ))
+    }
+
+    fn group_by_count_index_key_scan_stats_allowed(
+        stats: &TableStats,
+        column_index: usize,
+        schema: &TableSchema,
+    ) -> bool {
+        let Some(column) = schema.columns.get(column_index) else {
+            return true;
+        };
+        let column_name = column.name.as_str();
+        let unqualified = column_name.rsplit('.').next().unwrap_or(column_name);
+        let Some(column_stats) = stats.columns.iter().find(|stats| {
+            stats.name.eq_ignore_ascii_case(column_name)
+                || stats.name.eq_ignore_ascii_case(unqualified)
+        }) else {
+            return true;
+        };
+
+        let index_entries = stats.row_count.saturating_sub(column_stats.null_count);
+        index_entries >= GROUP_BY_COUNT_INDEX_STATS_MIN_ENTRIES
+    }
+
+    fn column_scan_index_prefix_end(prefix: &str) -> Vec<u8> {
+        let mut key = prefix.as_bytes().to_vec();
+        key.push(0xFF);
+        key
+    }
+
+    fn column_scan_index_next_value_seek(prefix: &str, value_key: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(prefix.len() + value_key.len() + 2);
+        key.extend_from_slice(prefix.as_bytes());
+        key.extend_from_slice(value_key.as_bytes());
+        key.push(b':');
+        key.push(0xFF);
+        key
+    }
+
+    async fn scan_distinct_index_value_keys_loose<F>(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        txn: &mut dyn Transaction,
+        mut visit_value_key: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        for prefix in self.routed_index_prefixes_for_column(table_name, column_name) {
+            let end = Self::column_scan_index_prefix_end(&prefix);
+            let mut seek = prefix.as_bytes().to_vec();
+            while seek < end {
+                crate::monitor::inc_index_loose_seek();
+                let Some((key, _)) = txn.first(&seek, &end).await? else {
+                    break;
+                };
+                let Some(value_key) =
+                    Self::column_scan_index_value_key_from_prefixed_key(&key, &prefix)
+                else {
+                    return Ok(false);
+                };
+                if !visit_value_key(value_key) {
+                    return Ok(false);
+                }
+                crate::monitor::inc_index_loose_value();
+
+                let next_seek = Self::column_scan_index_next_value_seek(&prefix, value_key);
+                if next_seek <= key {
+                    return Ok(false);
+                }
+                crate::monitor::inc_index_loose_run_skip();
+                seek = next_seek;
+            }
+        }
+        Ok(true)
+    }
+
+    async fn count_distinct_index_key_scan(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        schema: &TableSchema,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<i64>> {
+        if self.shard_router.is_some() {
+            return Ok(None);
+        }
+
+        let Some(column) = schema.columns.get(column_index) else {
+            return Ok(None);
+        };
+        if column.is_primary
+            || !column.is_indexed
+            || column.index_type != IndexType::BTree
+            || !Self::secondary_index_distinct_key_type_supported(&column.data_type)
+        {
+            return Ok(None);
+        }
+
+        if Self::secondary_index_loose_key_type_supported(&column.data_type) {
+            let mut count = 0i64;
+            let success = self
+                .scan_distinct_index_value_keys_loose(table_name, &column.name, txn, |_| {
+                    count += 1;
+                    true
+                })
+                .await?;
+            return if success { Ok(Some(count)) } else { Ok(None) };
+        }
+
+        let mut previous_value_key: Option<String> = None;
+        let mut count = 0i64;
+
+        for prefix in self.routed_index_prefixes_for_column(table_name, &column.name) {
+            let mut malformed_key = false;
+            let mut visitor = |key: &[u8], _: &[u8]| -> bool {
+                crate::monitor::add_index_key_stream_entry_visits(1);
+                let Some(value_key) =
+                    Self::column_scan_index_value_key_from_prefixed_key(&key, &prefix)
+                else {
+                    malformed_key = true;
+                    return false;
+                };
+
+                if previous_value_key.as_deref() != Some(value_key) {
+                    count += 1;
+                    previous_value_key = Some(value_key.to_string());
+                }
+                true
+            };
+            self.scan_routed_prefixes_for_each(vec![prefix.clone()], txn, None, &mut visitor)
+                .await?;
+            if malformed_key {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(count))
+    }
+
+    pub(crate) fn single_column_distinct_projection<'a>(
         projection: &'a [SelectItem],
         schema: &TableSchema,
     ) -> Option<(usize, String)> {
@@ -1291,9 +1820,19 @@ impl Executor {
         &self,
         table_name: &str,
         column_index: usize,
+        schema: &TableSchema,
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
+        if predicate.is_none() {
+            if let Some(rows) = self
+                .distinct_index_key_scan(table_name, column_index, schema, txn)
+                .await?
+            {
+                return Ok(rows);
+            }
+        }
+
         let mut seen = HashSet::with_capacity(4096);
         let mut rows = Vec::with_capacity(4096);
 
@@ -1318,7 +1857,49 @@ impl Executor {
         Ok(rows)
     }
 
-    pub(super) fn simple_group_by_count_projection(
+    async fn distinct_index_key_scan(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        schema: &TableSchema,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        if self.shard_router.is_some() {
+            return Ok(None);
+        }
+
+        let Some(column) = schema.columns.get(column_index) else {
+            return Ok(None);
+        };
+        if column.is_primary
+            || !column.is_indexed
+            || column.index_type != IndexType::BTree
+            || column.is_nullable
+            || !Self::secondary_index_order_type_supported(&column.data_type)
+        {
+            return Ok(None);
+        }
+
+        let mut rows = Vec::with_capacity(4096);
+        let success = self
+            .scan_distinct_index_value_keys_loose(table_name, &column.name, txn, |value_key| {
+                let Some(value) =
+                    Self::secondary_index_value_from_key(value_key, &column.data_type)
+                else {
+                    return false;
+                };
+                rows.push(vec![value]);
+                true
+            })
+            .await?;
+        if !success {
+            return Ok(None);
+        }
+
+        Ok(Some(rows))
+    }
+
+    pub(crate) fn simple_group_by_count_projection(
         projection: &[SelectItem],
         group_exprs: &[Expr],
         schema: &TableSchema,
@@ -1388,9 +1969,19 @@ impl Executor {
         &self,
         table_name: &str,
         column_index: usize,
+        schema: &TableSchema,
         predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
+        if predicate.is_none() {
+            if let Some(rows) = self
+                .group_by_count_index_key_scan(table_name, column_index, schema, txn)
+                .await?
+            {
+                return Ok(rows);
+            }
+        }
+
         let mut counts: HashMap<Value, i64> = HashMap::with_capacity(4096);
 
         let scan_error = {
@@ -1399,10 +1990,16 @@ impl Executor {
                 predicate,
                 counts: &mut counts,
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
+                batch: Some(ColumnScanBatch::new(predicate)),
                 error: None,
             };
             self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
+            if visitor.error.is_none() {
+                if let Err(err) = visitor.flush_batch() {
+                    visitor.error = Some(err);
+                }
+            }
             visitor.error
         };
 
@@ -1415,6 +2012,156 @@ impl Executor {
             rows.push(vec![value, Value::Integer(count)]);
         }
         Ok(rows)
+    }
+
+    async fn group_by_count_summary_index_scan(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        column_type: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        let Some((expected_total_entries, expected_group_count)) = self
+            .load_index_count_summary_meta(table_name, column_name, txn)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let prefix = Self::index_count_summary_prefix_for_column(table_name, column_name);
+        let mut rows = Vec::with_capacity(4096);
+        let mut total_entries = 0i64;
+        let mut group_count = 0usize;
+        let mut malformed_summary = false;
+        let mut visitor = |key: &[u8], value: &[u8]| -> bool {
+            crate::monitor::add_index_group_count_summary_entry_visits(1);
+            let Some(value_key) =
+                Self::column_scan_index_count_summary_value_key_from_prefixed_key(key, &prefix)
+            else {
+                malformed_summary = true;
+                return false;
+            };
+            let Some(count) = Self::decode_index_count_summary_count(value) else {
+                malformed_summary = true;
+                return false;
+            };
+            if count <= 0 {
+                malformed_summary = true;
+                return false;
+            }
+            let Some(group_value) =
+                Self::secondary_index_group_value_from_key(value_key, column_type)
+            else {
+                malformed_summary = true;
+                return false;
+            };
+            let Some(new_total_entries) = total_entries.checked_add(count) else {
+                malformed_summary = true;
+                return false;
+            };
+            let Some(new_group_count) = group_count.checked_add(1) else {
+                malformed_summary = true;
+                return false;
+            };
+            total_entries = new_total_entries;
+            group_count = new_group_count;
+            rows.push(vec![group_value, Value::Integer(count)]);
+            true
+        };
+        txn.scan_prefix_for_each(prefix.as_bytes(), None, &mut visitor)
+            .await?;
+        if malformed_summary
+            || total_entries != expected_total_entries
+            || group_count != expected_group_count
+        {
+            return Ok(None);
+        }
+        Ok(Some(rows))
+    }
+
+    async fn group_by_count_index_key_scan(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        schema: &TableSchema,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        if self.shard_router.is_some() {
+            return Ok(None);
+        }
+
+        let Some(column) = schema.columns.get(column_index) else {
+            return Ok(None);
+        };
+        if column.is_primary
+            || !column.is_indexed
+            || column.index_type != IndexType::BTree
+            || column.is_nullable
+            || !Self::secondary_index_group_key_type_supported(&column.data_type)
+        {
+            return Ok(None);
+        }
+        if let Some(rows) = self
+            .group_by_count_summary_index_scan(table_name, &column.name, &column.data_type, txn)
+            .await?
+        {
+            return Ok(Some(rows));
+        }
+        if !self
+            .group_by_count_index_key_scan_cost_allowed(table_name, column_index, schema, txn)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        let mut rows = Vec::with_capacity(4096);
+        let mut current_value_key: Option<String> = None;
+        let mut current_value: Option<Value> = None;
+        let mut current_count = 0i64;
+
+        for prefix in self.routed_index_prefixes_for_column(table_name, &column.name) {
+            let mut malformed_key = false;
+            let mut visitor = |key: &[u8], _: &[u8]| -> bool {
+                crate::monitor::add_index_key_stream_entry_visits(1);
+                let Some(value_key) =
+                    Self::column_scan_index_value_key_from_prefixed_key(&key, &prefix)
+                else {
+                    malformed_key = true;
+                    return false;
+                };
+
+                if current_value_key.as_deref() == Some(value_key) {
+                    current_count += 1;
+                    return true;
+                }
+
+                if let Some(value) = current_value.take() {
+                    rows.push(vec![value, Value::Integer(current_count)]);
+                }
+
+                let Some(value) =
+                    Self::secondary_index_group_value_from_key(value_key, &column.data_type)
+                else {
+                    malformed_key = true;
+                    return false;
+                };
+                current_value_key = Some(value_key.to_string());
+                current_value = Some(value);
+                current_count = 1;
+                true
+            };
+            self.scan_routed_prefixes_for_each(vec![prefix.clone()], txn, None, &mut visitor)
+                .await?;
+            if malformed_key {
+                return Ok(None);
+            }
+        }
+
+        if let Some(value) = current_value {
+            rows.push(vec![value, Value::Integer(current_count)]);
+        }
+
+        Ok(Some(rows))
     }
 
     pub(super) fn simple_group_by_column_aggregate_projection(
@@ -1570,6 +2317,7 @@ impl Executor {
         group_column_indices: &[usize],
         aggregate_plans: &[GroupColumnAggregateScanPlan],
         predicate: Option<&ColumnPredicateScanPlan>,
+        schema: &TableSchema,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         if let [group_column_index] = group_column_indices {
@@ -1579,6 +2327,7 @@ impl Executor {
                     *group_column_index,
                     aggregate_plans,
                     predicate,
+                    schema,
                     txn,
                 )
                 .await;
@@ -1594,10 +2343,17 @@ impl Executor {
                 predicate,
                 groups: &mut groups,
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
+                batch: Self::group_column_aggregate_batch_supported(aggregate_plans, schema)
+                    .then(|| ColumnScanBatch::new(predicate)),
                 error: None,
             };
             self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
+            if visitor.error.is_none() {
+                if let Err(err) = visitor.flush_batch() {
+                    visitor.error = Some(err);
+                }
+            }
             visitor.error
         };
 
@@ -1621,6 +2377,7 @@ impl Executor {
         group_column_index: usize,
         aggregate_plans: &[GroupColumnAggregateScanPlan],
         predicate: Option<&ColumnPredicateScanPlan>,
+        schema: &TableSchema,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         let mut groups: HashMap<Value, Vec<GroupColumnAggregateState>> =
@@ -1633,10 +2390,17 @@ impl Executor {
                 predicate,
                 groups: &mut groups,
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
+                batch: Self::group_column_aggregate_batch_supported(aggregate_plans, schema)
+                    .then(|| ColumnScanBatch::new(predicate)),
                 error: None,
             };
             self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
+            if visitor.error.is_none() {
+                if let Err(err) = visitor.flush_batch() {
+                    visitor.error = Some(err);
+                }
+            }
             visitor.error
         };
 
@@ -1701,7 +2465,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn simple_order_limit_supported(
+    pub(crate) fn simple_order_limit_supported(
         columns: &[String],
         order_by: Option<&sqlparser::ast::OrderBy>,
     ) -> bool {
@@ -1784,6 +2548,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Column;
+    use crate::execution::analyze::{ColumnStats, DistinctCountKind, DistinctCountMethod};
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     #[test]
@@ -1889,6 +2655,94 @@ mod tests {
         };
 
         assert!(Executor::is_simple_count_star(func));
+    }
+
+    fn group_count_stats(row_count: usize, null_count: usize) -> TableStats {
+        TableStats {
+            table_name: "metrics".to_string(),
+            row_count,
+            analyzed_rows: row_count,
+            sampled: false,
+            columns: vec![ColumnStats {
+                name: "bucket".to_string(),
+                null_count,
+                distinct_count: 10,
+                distinct_kind: DistinctCountKind::Exact,
+                distinct_method: DistinctCountMethod::ExactSet,
+                min: Some(Value::Integer(0)),
+                max: Some(Value::Integer(9)),
+                most_common_values: Vec::new(),
+                histogram: Vec::new(),
+            }],
+            updated_at_epoch_ms: 0,
+        }
+    }
+
+    fn group_count_schema() -> TableSchema {
+        TableSchema::new(
+            "metrics".to_string(),
+            vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    is_primary: true,
+                    is_indexed: true,
+                    index_type: IndexType::BTree,
+                    default_value: None,
+                    is_nullable: false,
+                    is_unique: true,
+                    check_expr: None,
+                },
+                Column {
+                    name: "bucket".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    is_primary: false,
+                    is_indexed: true,
+                    index_type: IndexType::BTree,
+                    default_value: None,
+                    is_nullable: false,
+                    is_unique: false,
+                    check_expr: None,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn group_by_count_index_key_scan_stats_gate_uses_index_entries() {
+        let schema = group_count_schema();
+
+        assert!(!Executor::group_by_count_index_key_scan_stats_allowed(
+            &group_count_stats(GROUP_BY_COUNT_INDEX_STATS_MIN_ENTRIES - 1, 0),
+            1,
+            &schema
+        ));
+        assert!(Executor::group_by_count_index_key_scan_stats_allowed(
+            &group_count_stats(GROUP_BY_COUNT_INDEX_STATS_MIN_ENTRIES, 0),
+            1,
+            &schema
+        ));
+        assert!(!Executor::group_by_count_index_key_scan_stats_allowed(
+            &group_count_stats(GROUP_BY_COUNT_INDEX_STATS_MIN_ENTRIES, 1),
+            1,
+            &schema
+        ));
+    }
+
+    #[test]
+    fn group_by_count_index_key_scan_stats_gate_fails_open_on_missing_stats() {
+        let schema = group_count_schema();
+        let mut stats = group_count_stats(1, 0);
+        stats.columns.clear();
+
+        assert!(Executor::group_by_count_index_key_scan_stats_allowed(
+            &stats, 1, &schema
+        ));
+        assert!(Executor::group_by_count_index_key_scan_stats_allowed(
+            &group_count_stats(1, 0),
+            99,
+            &schema
+        ));
     }
 
     #[test]

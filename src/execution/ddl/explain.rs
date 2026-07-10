@@ -1,10 +1,14 @@
-use crate::catalog::TableSchema;
+use crate::catalog::{IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
 use crate::storage::Transaction;
-use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement, TableFactor, TableWithJoins};
+use sqlparser::ast::{
+    BinaryOperator, Expr, LimitClause, OrderByKind, SetExpr, Statement, TableFactor, TableWithJoins,
+};
 use std::collections::HashSet;
+use std::time::Duration;
 
-use super::super::analyze::{ColumnStats, TableStats};
+use super::super::analyze::TableStats;
+use super::super::stats::StatsEstimator;
 use super::super::{Executor, QueryResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +131,38 @@ mod tests {
         drop(executor);
         let _ = std::fs::remove_file(wal_path);
     }
+
+    #[test]
+    fn explain_q_error_label_handles_zero_and_missing_estimates() {
+        assert_eq!(Executor::explain_q_error_label(None, 3), "n/a");
+        assert_eq!(Executor::explain_q_error_label(Some(0), 0), "1.00");
+        assert_eq!(Executor::explain_q_error_label(Some(0), 5), "inf");
+        assert_eq!(Executor::explain_q_error_label(Some(2), 3), "1.50");
+        assert_eq!(Executor::explain_q_error_label(Some(9), 3), "3.00");
+    }
+
+    #[test]
+    fn explain_apply_limit_clause_to_estimate_handles_offset_and_limit() {
+        let query = crate::parser::parse_sql("SELECT * FROM users LIMIT 2 OFFSET 3")
+            .expect("parse")
+            .remove(0);
+        let Statement::Query(query) = query else {
+            panic!("expected query");
+        };
+
+        assert_eq!(
+            Executor::explain_apply_limit_clause_to_estimate(Some(10), &query.limit_clause),
+            Some(2)
+        );
+        assert_eq!(
+            Executor::explain_apply_limit_clause_to_estimate(Some(4), &query.limit_clause),
+            Some(1)
+        );
+        assert_eq!(
+            Executor::explain_apply_limit_clause_to_estimate(Some(3), &query.limit_clause),
+            Some(0)
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +178,12 @@ struct ExplainJoinRelation {
     stats: Option<TableStats>,
     base_rows: usize,
     estimated_rows: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExplainJoinEdge {
+    left_column: usize,
+    right_column: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -160,12 +202,26 @@ impl Executor {
         params: &[Value],
     ) -> Result<QueryResult> {
         if analyze {
-            let start = std::time::Instant::now();
-            let _ = Box::pin(self.execute_in_transaction_with_params(stmt, txn, params)).await?;
-            let duration = start.elapsed();
-
+            let planning_start = std::time::Instant::now();
             let plan = self.explain_statement_plan(stmt, txn).await?;
-            let output = format!("Execution Time: {:?}\nPlan:\n{}", duration, plan);
+            let estimated_rows = self.explain_statement_estimate_rows(stmt, txn).await?;
+            let planning_duration = planning_start.elapsed();
+
+            let execution_start = std::time::Instant::now();
+            let result =
+                Box::pin(self.execute_in_transaction_with_params(stmt, txn, params)).await?;
+            let execution_duration = execution_start.elapsed();
+            let actual_rows = Self::explain_actual_rows(&result);
+
+            let output = format!(
+                "Planning Time: {:.3} ms\nExecution Time: {:.3} ms\nActual Rows: {}\nEstimate Rows: {}\nQ-Error: {}\nPlan:\n{}",
+                Self::explain_duration_ms(planning_duration),
+                Self::explain_duration_ms(execution_duration),
+                actual_rows,
+                Self::explain_estimate_rows_label(estimated_rows),
+                Self::explain_q_error_label(estimated_rows, actual_rows),
+                plan
+            );
 
             Ok(QueryResult::Select {
                 columns: vec!["EXPLAIN ANALYZE".to_string()],
@@ -177,6 +233,134 @@ impl Executor {
                 columns: vec!["EXPLAIN".to_string()],
                 rows: vec![vec![Value::String(plan)]],
             })
+        }
+    }
+
+    fn explain_duration_ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    fn explain_actual_rows(result: &QueryResult) -> usize {
+        match result {
+            QueryResult::Select { rows, .. } => rows.len(),
+            QueryResult::Success { .. } => 0,
+        }
+    }
+
+    fn explain_estimate_rows_label(estimated_rows: Option<usize>) -> String {
+        estimated_rows
+            .map(|rows| rows.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    }
+
+    fn explain_q_error_label(estimated_rows: Option<usize>, actual_rows: usize) -> String {
+        let Some(estimated_rows) = estimated_rows else {
+            return "n/a".to_string();
+        };
+        match (estimated_rows, actual_rows) {
+            (0, 0) => "1.00".to_string(),
+            (0, _) | (_, 0) => "inf".to_string(),
+            (estimate, actual) => {
+                let estimate = estimate as f64;
+                let actual = actual as f64;
+                format!("{:.2}", (estimate / actual).max(actual / estimate))
+            }
+        }
+    }
+
+    async fn explain_statement_estimate_rows(
+        &self,
+        stmt: &Statement,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<usize>> {
+        match stmt {
+            Statement::Query(query) => self.explain_query_estimate_rows(query, txn).await,
+            _ => Ok(None),
+        }
+    }
+
+    async fn explain_query_estimate_rows(
+        &self,
+        query: &sqlparser::ast::Query,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<usize>> {
+        let SetExpr::Select(select) = &query.body.as_ref() else {
+            return Ok(None);
+        };
+
+        let inner_join_order_input =
+            Self::inner_join_chain_as_comma_join(&select.from, &select.selection);
+        let (join_order_from, join_order_selection) =
+            if let Some((flattened, combined_selection)) = &inner_join_order_input {
+                (flattened.as_slice(), combined_selection)
+            } else {
+                (select.from.as_slice(), &select.selection)
+            };
+
+        if let Some(join_order) = self
+            .explain_comma_join_order(join_order_from, join_order_selection, txn)
+            .await?
+        {
+            return Ok(Self::explain_apply_limit_clause_to_estimate(
+                Some(join_order.rows),
+                &query.limit_clause,
+            ));
+        }
+
+        let Some(table) = select.from.first() else {
+            return Ok(None);
+        };
+        let access_path = self
+            .explain_select_table_access(&table.relation, select, query, txn)
+            .await?;
+        let estimated_rows = self
+            .explain_table_estimate(&table.relation, &select.selection, &access_path, txn)
+            .await?
+            .map(|estimate| estimate.rows);
+        Ok(Self::explain_apply_limit_clause_to_estimate(
+            estimated_rows,
+            &query.limit_clause,
+        ))
+    }
+
+    fn explain_apply_limit_clause_to_estimate(
+        estimated_rows: Option<usize>,
+        limit_clause: &Option<LimitClause>,
+    ) -> Option<usize> {
+        let mut rows = estimated_rows?;
+        let Some(LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) = limit_clause
+        else {
+            return Some(rows);
+        };
+        if !limit_by.is_empty() {
+            return Some(rows);
+        }
+
+        let offset = offset
+            .as_ref()
+            .and_then(|offset| Self::explain_usize_literal(&offset.value))
+            .unwrap_or(0);
+        rows = rows.saturating_sub(offset);
+
+        if let Some(limit) = limit.as_ref().and_then(Self::explain_usize_literal) {
+            rows = rows.min(limit);
+        }
+
+        Some(rows)
+    }
+
+    fn explain_usize_literal(expr: &Expr) -> Option<usize> {
+        match expr {
+            Expr::Value(sqlparser::ast::ValueWithSpan {
+                value: sqlparser::ast::Value::Number(value, _),
+                ..
+            }) => value.parse::<usize>().ok(),
+            Expr::Nested(inner) => Self::explain_usize_literal(inner),
+            _ => None,
         }
     }
 
@@ -206,7 +390,7 @@ impl Executor {
             if let Some(table) = select.from.first() {
                 plan.push_str(&format!("  FROM: {}\n", table.relation));
                 let access_path = self
-                    .explain_table_access(&table.relation, &select.selection, txn)
+                    .explain_select_table_access(&table.relation, select, query, txn)
                     .await?;
                 plan.push_str(&format!("  Access Path: {}\n", access_path.description));
                 if let Some(estimate) = self
@@ -290,6 +474,395 @@ impl Executor {
         }
     }
 
+    async fn explain_select_table_access(
+        &self,
+        table: &TableFactor,
+        select: &sqlparser::ast::Select,
+        query: &sqlparser::ast::Query,
+        txn: &mut dyn Transaction,
+    ) -> Result<ExplainAccessPath> {
+        let access_path = self
+            .explain_table_access(table, &select.selection, txn)
+            .await?;
+        if select.selection.is_some() {
+            if let Some(ordered_composite_access) = self
+                .explain_ordered_composite_index_access(table, select, query, txn)
+                .await?
+            {
+                return Ok(ordered_composite_access);
+            }
+        }
+        if access_path.kind != ExplainAccessKind::FullTableScan || select.selection.is_some() {
+            return Ok(access_path);
+        }
+
+        if let Some(group_access) = self
+            .explain_group_by_secondary_index_access(table, select, query, txn)
+            .await?
+        {
+            return Ok(group_access);
+        }
+
+        if let Some(distinct_access) = self
+            .explain_distinct_secondary_index_access(table, select, query, txn)
+            .await?
+        {
+            return Ok(distinct_access);
+        }
+
+        if let Some(ordered_access) = self
+            .explain_ordered_secondary_index_access(table, select, query, txn)
+            .await?
+        {
+            return Ok(ordered_access);
+        }
+
+        Ok(access_path)
+    }
+
+    async fn explain_group_by_secondary_index_access(
+        &self,
+        table: &TableFactor,
+        select: &sqlparser::ast::Select,
+        query: &sqlparser::ast::Query,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<ExplainAccessPath>> {
+        if self.shard_router.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.selection.is_some()
+            || select.having.is_some()
+            || select.distinct.is_some()
+        {
+            return Ok(None);
+        }
+
+        let sqlparser::ast::GroupByExpr::Expressions(group_exprs, _) = &select.group_by else {
+            return Ok(None);
+        };
+        if group_exprs.is_empty() {
+            return Ok(None);
+        }
+
+        let TableFactor::Table { name, .. } = table else {
+            return Ok(None);
+        };
+        let table_name = name.to_string();
+        let Some(schema) = self.load_explain_schema(&table_name, txn).await? else {
+            return Ok(None);
+        };
+
+        let Some((column_index, group_name, count_name)) =
+            Self::simple_group_by_count_projection(&select.projection, group_exprs, &schema)
+        else {
+            return Ok(None);
+        };
+        let columns = vec![group_name, count_name];
+        if !Self::simple_order_limit_supported(&columns, query.order_by.as_ref()) {
+            return Ok(None);
+        }
+
+        let Some(column) = schema.columns.get(column_index) else {
+            return Ok(None);
+        };
+        if column.is_primary
+            || !column.is_indexed
+            || column.index_type != IndexType::BTree
+            || column.is_nullable
+            || !Self::secondary_index_group_key_type_supported(&column.data_type)
+        {
+            return Ok(None);
+        }
+        if self
+            .index_count_summary_available(&table_name, &column.name, txn)
+            .await?
+        {
+            return Ok(Some(ExplainAccessPath::new(
+                format!(
+                    "Index Scan using group secondary BTree on {} (GROUP BY COUNT summary index)",
+                    column.name
+                ),
+                ExplainAccessKind::IndexScan,
+            )));
+        }
+        if !self
+            .group_by_count_index_key_scan_cost_allowed(&table_name, column_index, &schema, txn)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(ExplainAccessPath::new(
+            format!(
+                "Index Scan using group secondary BTree on {} (GROUP BY COUNT key stream)",
+                column.name
+            ),
+            ExplainAccessKind::IndexScan,
+        )))
+    }
+
+    async fn explain_distinct_secondary_index_access(
+        &self,
+        table: &TableFactor,
+        select: &sqlparser::ast::Select,
+        query: &sqlparser::ast::Query,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<ExplainAccessPath>> {
+        if self.shard_router.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.selection.is_some()
+            || select.having.is_some()
+            || !matches!(
+                select.group_by,
+                sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty()
+            )
+        {
+            return Ok(None);
+        }
+
+        let TableFactor::Table { name, alias, .. } = table else {
+            return Ok(None);
+        };
+        let table_name = name.to_string();
+        let Some(schema) = self.load_explain_schema(&table_name, txn).await? else {
+            return Ok(None);
+        };
+
+        let mut qualifiers = Vec::with_capacity(2);
+        qualifiers.push(table_name);
+        if let Some(alias) = alias {
+            qualifiers.push(alias.name.value.clone());
+        }
+
+        if select.distinct.is_some() {
+            let Some((column_index, output_name)) =
+                Self::single_column_distinct_projection(&select.projection, &schema)
+            else {
+                return Ok(None);
+            };
+            let columns = vec![output_name];
+            if !Self::simple_order_limit_supported(&columns, query.order_by.as_ref()) {
+                return Ok(None);
+            }
+            let Some(column) = schema.columns.get(column_index) else {
+                return Ok(None);
+            };
+            if column.is_primary
+                || !column.is_indexed
+                || column.index_type != IndexType::BTree
+                || column.is_nullable
+                || !Self::secondary_index_order_type_supported(&column.data_type)
+            {
+                return Ok(None);
+            }
+
+            let access_mode = if Self::secondary_index_loose_key_type_supported(&column.data_type) {
+                "DISTINCT loose key seek"
+            } else {
+                "DISTINCT key stream"
+            };
+            return Ok(Some(ExplainAccessPath::new(
+                format!(
+                    "Index Scan using distinct secondary BTree on {} ({})",
+                    column.name, access_mode
+                ),
+                ExplainAccessKind::IndexScan,
+            )));
+        }
+
+        if query.order_by.is_some() || query.limit_clause.is_some() {
+            return Ok(None);
+        }
+
+        let Some((column_index, _output_name)) =
+            Self::count_distinct_projection(&select.projection, &schema, Some(&qualifiers))
+        else {
+            return Ok(None);
+        };
+        let Some(column) = schema.columns.get(column_index) else {
+            return Ok(None);
+        };
+        if column.is_primary
+            || !column.is_indexed
+            || column.index_type != IndexType::BTree
+            || !Self::secondary_index_distinct_key_type_supported(&column.data_type)
+        {
+            return Ok(None);
+        }
+
+        let access_mode = if Self::secondary_index_loose_key_type_supported(&column.data_type) {
+            "COUNT DISTINCT loose key seek"
+        } else {
+            "COUNT DISTINCT key stream"
+        };
+        Ok(Some(ExplainAccessPath::new(
+            format!(
+                "Index Scan using distinct secondary BTree on {} ({})",
+                column.name, access_mode
+            ),
+            ExplainAccessKind::IndexScan,
+        )))
+    }
+
+    async fn explain_ordered_secondary_index_access(
+        &self,
+        table: &TableFactor,
+        select: &sqlparser::ast::Select,
+        query: &sqlparser::ast::Query,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<ExplainAccessPath>> {
+        if self.shard_router.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.having.is_some()
+            || select.distinct.is_some()
+            || self.projection_contains_aggregate_or_window(&select.projection)
+            || !matches!(
+                select.group_by,
+                sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty()
+            )
+            || !self.order_by_allows_streaming_topk(query.order_by.as_ref(), &select.projection)
+        {
+            return Ok(None);
+        }
+
+        let Some(ordered_limit) = Self::explain_streaming_order_limit(&query.limit_clause) else {
+            return Ok(None);
+        };
+        let Some(order_by) = &query.order_by else {
+            return Ok(None);
+        };
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return Ok(None);
+        };
+        let [order_expr] = exprs.as_slice() else {
+            return Ok(None);
+        };
+        let order_asc = order_expr.options.asc.unwrap_or(true);
+        if !order_asc && !txn.supports_bounded_scan_range_reverse() {
+            return Ok(None);
+        }
+        let TableFactor::Table { name, .. } = table else {
+            return Ok(None);
+        };
+        let table_name = name.to_string();
+        let Some(schema) = self.load_explain_schema(&table_name, txn).await? else {
+            return Ok(None);
+        };
+        let Some(order_col) = Self::order_limit_column_name(&order_expr.expr) else {
+            return Ok(None);
+        };
+        let Ok(col_idx) = self.resolve_column_index(&order_col, &schema) else {
+            return Ok(None);
+        };
+        let Some(col) = schema.columns.get(col_idx) else {
+            return Ok(None);
+        };
+        if col.is_primary
+            || !col.is_indexed
+            || col.index_type != IndexType::BTree
+            || col.is_nullable
+            || !Self::secondary_index_order_type_supported(&col.data_type)
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(ExplainAccessPath::new(
+            format!(
+                "Index Scan using ordered secondary BTree on {} {} (ORDER BY/LIMIT, rows <= {})",
+                col.name,
+                if order_asc { "ASC" } else { "DESC" },
+                ordered_limit
+            ),
+            ExplainAccessKind::IndexScan,
+        )))
+    }
+
+    async fn explain_ordered_composite_index_access(
+        &self,
+        table: &TableFactor,
+        select: &sqlparser::ast::Select,
+        query: &sqlparser::ast::Query,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<ExplainAccessPath>> {
+        if select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.having.is_some()
+            || select.distinct.is_some()
+            || self.projection_contains_aggregate_or_window(&select.projection)
+            || !matches!(
+                select.group_by,
+                sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty()
+            )
+            || !self.order_by_allows_streaming_topk(query.order_by.as_ref(), &select.projection)
+        {
+            return Ok(None);
+        }
+
+        let Some(selection) = &select.selection else {
+            return Ok(None);
+        };
+        let Some(ordered_limit) = Self::explain_streaming_order_limit(&query.limit_clause) else {
+            return Ok(None);
+        };
+        let Some(order_by) = &query.order_by else {
+            return Ok(None);
+        };
+        let TableFactor::Table { name, .. } = table else {
+            return Ok(None);
+        };
+        let table_name = name.to_string();
+        let Some(schema) = self.load_explain_schema(&table_name, txn).await? else {
+            return Ok(None);
+        };
+
+        let Some(access) = self
+            .composite_ordered_index_for_explain(
+                selection,
+                &table_name,
+                &schema,
+                txn,
+                Some(order_by),
+                ordered_limit,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(ExplainAccessPath::new(
+            format!(
+                "Index Scan using ordered composite BTree {} on {} {} (ORDER BY/LIMIT, rows <= {})",
+                access.index_name,
+                access.order_column,
+                if access.ascending { "ASC" } else { "DESC" },
+                access.row_limit
+            ),
+            ExplainAccessKind::IndexScan,
+        )))
+    }
+
+    fn explain_streaming_order_limit(limit_clause: &Option<LimitClause>) -> Option<usize> {
+        let LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } = limit_clause.as_ref()?
+        else {
+            return None;
+        };
+        if !limit_by.is_empty() {
+            return None;
+        }
+        let limit = limit.as_ref().and_then(Self::explain_usize_literal)?;
+        let offset = offset
+            .as_ref()
+            .and_then(|offset| Self::explain_usize_literal(&offset.value))
+            .unwrap_or(0);
+        Some(limit.saturating_add(offset))
+    }
+
     async fn explain_table_access(
         &self,
         table: &TableFactor,
@@ -314,23 +887,27 @@ impl Executor {
                         ));
                     }
 
+                    if self.explain_primary_key_range_selection(sel, &schema) {
+                        return Ok(ExplainAccessPath::new(
+                            "Primary Key Range Scan (Clustered Index)",
+                            ExplainAccessKind::PrimaryKeyRangeScan,
+                        ));
+                    }
+
                     if let Expr::BinaryOp { left, op, right } = sel {
                         if *op == BinaryOperator::Eq {
-                            if (self.explain_column_index(left, &schema) == Some(0)
-                                && !self.explain_expr_has_column_reference(right))
-                                || (self.explain_column_index(right, &schema) == Some(0)
-                                    && !self.explain_expr_has_column_reference(left))
-                            {
-                                return Ok(ExplainAccessPath::new(
-                                    "Primary Key Lookup (Clustered Index)",
-                                    ExplainAccessKind::PrimaryKeyLookup,
-                                ));
+                            if let Some(pk_idx) = schema.get_primary_key_index() {
+                                if (self.explain_column_index(left, &schema) == Some(pk_idx)
+                                    && !self.explain_expr_has_column_reference(right))
+                                    || (self.explain_column_index(right, &schema) == Some(pk_idx)
+                                        && !self.explain_expr_has_column_reference(left))
+                                {
+                                    return Ok(ExplainAccessPath::new(
+                                        "Primary Key Lookup (Clustered Index)",
+                                        ExplainAccessKind::PrimaryKeyLookup,
+                                    ));
+                                }
                             }
-                        } else if self.explain_primary_key_range(left, op, right, &schema) {
-                            return Ok(ExplainAccessPath::new(
-                                "Primary Key Range Scan (Clustered Index)",
-                                ExplainAccessKind::PrimaryKeyRangeScan,
-                            ));
                         }
                     }
 
@@ -440,7 +1017,7 @@ impl Executor {
             }
         }
 
-        estimated.then(|| Self::selectivity_to_rows(stats.row_count, selectivity))
+        estimated.then(|| StatsEstimator::selectivity_to_rows(stats.row_count, selectivity))
     }
 
     fn estimate_predicate_selectivity(
@@ -449,19 +1026,11 @@ impl Executor {
         schema: &TableSchema,
         stats: &TableStats,
     ) -> Option<f64> {
+        let estimator = StatsEstimator::new(schema, stats);
         match expr {
             Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
                 let column_idx = self.explain_column_constant_index(left, right, schema)?;
-                let column = schema.columns.get(column_idx)?;
-                if column.is_primary || column.is_unique {
-                    return Some(Self::one_row_selectivity(stats.row_count));
-                }
-                let column_stats = Self::column_stats_for_schema_index(stats, schema, column_idx)?;
-                if column_stats.distinct_count > 0 {
-                    Some((1.0 / column_stats.distinct_count as f64).clamp(0.0, 1.0))
-                } else {
-                    None
-                }
+                estimator.equality_selectivity(column_idx)
             }
             Expr::BinaryOp { left, op, right }
                 if matches!(
@@ -473,20 +1042,15 @@ impl Executor {
                 ) =>
             {
                 self.explain_column_constant_index(left, right, schema)
-                    .map(|_| 0.333)
+                    .and_then(|column_idx| estimator.range_selectivity(column_idx))
             }
             Expr::IsNull(inner) => {
                 let column_idx = self.explain_column_index(inner, schema)?;
-                let column_stats = Self::column_stats_for_schema_index(stats, schema, column_idx)?;
-                Some(Self::ratio(column_stats.null_count, stats.row_count))
+                estimator.null_selectivity(column_idx)
             }
             Expr::IsNotNull(inner) => {
                 let column_idx = self.explain_column_index(inner, schema)?;
-                let column_stats = Self::column_stats_for_schema_index(stats, schema, column_idx)?;
-                Some(Self::ratio(
-                    stats.row_count.saturating_sub(column_stats.null_count),
-                    stats.row_count,
-                ))
+                estimator.not_null_selectivity(column_idx)
             }
             Expr::InList {
                 expr,
@@ -494,23 +1058,11 @@ impl Executor {
                 negated,
             } if !*negated => {
                 let column_idx = self.explain_column_index(expr, schema)?;
-                let column = schema.columns.get(column_idx)?;
-                if column.is_primary || column.is_unique {
-                    return Some(Self::ratio(
-                        list.len().min(stats.row_count),
-                        stats.row_count,
-                    ));
-                }
-                let column_stats = Self::column_stats_for_schema_index(stats, schema, column_idx)?;
-                if column_stats.distinct_count > 0 {
-                    Some((list.len() as f64 / column_stats.distinct_count as f64).clamp(0.0, 1.0))
-                } else {
-                    None
-                }
+                estimator.in_list_selectivity(column_idx, list.len())
             }
-            Expr::Like { expr, negated, .. } if !*negated => {
-                self.explain_column_index(expr, schema).map(|_| 0.1)
-            }
+            Expr::Like { expr, negated, .. } if !*negated => self
+                .explain_column_index(expr, schema)
+                .and_then(|column_idx| estimator.like_selectivity(column_idx)),
             Expr::Nested(inner) => self.estimate_predicate_selectivity(inner, schema, stats),
             _ => None,
         }
@@ -537,43 +1089,6 @@ impl Executor {
             right_idx
         } else {
             None
-        }
-    }
-
-    fn column_stats_for_schema_index<'a>(
-        stats: &'a TableStats,
-        schema: &TableSchema,
-        index: usize,
-    ) -> Option<&'a ColumnStats> {
-        let column_name = schema.columns.get(index)?.name.as_str();
-        let unqualified = column_name.rsplit('.').next().unwrap_or(column_name);
-        stats.columns.iter().find(|column| {
-            column.name.eq_ignore_ascii_case(column_name)
-                || column.name.eq_ignore_ascii_case(unqualified)
-        })
-    }
-
-    fn selectivity_to_rows(row_count: usize, selectivity: f64) -> usize {
-        if row_count == 0 {
-            return 0;
-        }
-        let rows = (row_count as f64 * selectivity.clamp(0.0, 1.0)).ceil() as usize;
-        rows.clamp(1, row_count)
-    }
-
-    fn one_row_selectivity(row_count: usize) -> f64 {
-        if row_count == 0 {
-            0.0
-        } else {
-            1.0 / row_count as f64
-        }
-    }
-
-    fn ratio(numerator: usize, denominator: usize) -> f64 {
-        if denominator == 0 {
-            0.0
-        } else {
-            (numerator as f64 / denominator as f64).clamp(0.0, 1.0)
         }
     }
 
@@ -668,6 +1183,8 @@ impl Executor {
         let relation_count = relations.len();
         let mut local_counts = vec![0usize; relation_count];
         let mut edge_counts = vec![vec![0usize; relation_count]; relation_count];
+        let mut join_edges =
+            vec![vec![Vec::<ExplainJoinEdge>::new(); relation_count]; relation_count];
         let mut schemas = Vec::with_capacity(relations.len());
         for relation in &relations {
             schemas.push(relation.schema.clone());
@@ -695,6 +1212,15 @@ impl Executor {
             } else if members.len() == 2 {
                 edge_counts[members[0]][members[1]] += 1;
                 edge_counts[members[1]][members[0]] += 1;
+                if let Some(edge) =
+                    self.explain_equality_join_edge(predicate, members[0], members[1], &schemas)
+                {
+                    join_edges[members[0]][members[1]].push(edge);
+                    join_edges[members[1]][members[0]].push(ExplainJoinEdge {
+                        left_column: edge.right_column,
+                        right_column: edge.left_column,
+                    });
+                }
             }
         }
 
@@ -706,7 +1232,8 @@ impl Executor {
         }
 
         let order = Self::choose_explain_join_order(&relations, &local_counts, &edge_counts);
-        let (rows, cost) = Self::estimate_join_order_cost(&relations, &order, &edge_counts);
+        let (rows, cost) =
+            Self::estimate_join_order_cost(&relations, &order, &edge_counts, &join_edges);
         let mut labels = Vec::with_capacity(order.len());
         for index in &order {
             let relation = &relations[*index];
@@ -804,6 +1331,7 @@ impl Executor {
         relations: &[ExplainJoinRelation],
         order: &[usize],
         edge_counts: &[Vec<usize>],
+        join_edges: &[Vec<Vec<ExplainJoinEdge>>],
     ) -> (usize, f64) {
         let Some((&first, rest)) = order.split_first() else {
             return (0, 0.0);
@@ -821,7 +1349,10 @@ impl Executor {
                 .sum::<usize>();
 
             rows = if connected_edges > 0 {
-                rows.max(right_rows).max(1)
+                Self::estimate_connected_join_rows(
+                    relations, &placed, *index, rows, right_rows, join_edges,
+                )
+                .unwrap_or_else(|| rows.max(right_rows).max(1))
             } else {
                 rows.saturating_mul(right_rows).max(1)
             };
@@ -830,6 +1361,42 @@ impl Executor {
         }
 
         (rows, cost)
+    }
+
+    fn estimate_connected_join_rows(
+        relations: &[ExplainJoinRelation],
+        placed: &[usize],
+        candidate: usize,
+        placed_rows: usize,
+        candidate_rows: usize,
+        join_edges: &[Vec<Vec<ExplainJoinEdge>>],
+    ) -> Option<usize> {
+        let candidate_relation = relations.get(candidate)?;
+        let candidate_stats = candidate_relation.stats.as_ref()?;
+        let mut best_rows = None;
+
+        for placed_index in placed {
+            let placed_relation = relations.get(*placed_index)?;
+            let placed_stats = placed_relation.stats.as_ref()?;
+            for edge in join_edges.get(*placed_index)?.get(candidate)? {
+                let Some(estimate) = StatsEstimator::equality_join_estimate(
+                    &placed_relation.schema,
+                    placed_stats,
+                    edge.left_column,
+                    placed_rows,
+                    &candidate_relation.schema,
+                    candidate_stats,
+                    edge.right_column,
+                    candidate_rows,
+                ) else {
+                    continue;
+                };
+                best_rows =
+                    Some(best_rows.map_or(estimate.rows, |rows: usize| rows.min(estimate.rows)));
+            }
+        }
+
+        best_rows
     }
 
     fn predicate_schema_members_for_explain(
@@ -866,6 +1433,55 @@ impl Executor {
         }
         member_list.sort_unstable();
         Some(member_list)
+    }
+
+    fn explain_equality_join_edge(
+        &self,
+        expr: &Expr,
+        left_relation: usize,
+        right_relation: usize,
+        schemas: &[TableSchema],
+    ) -> Option<ExplainJoinEdge> {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = expr
+        else {
+            if let Expr::Nested(inner) = expr {
+                return self.explain_equality_join_edge(
+                    inner,
+                    left_relation,
+                    right_relation,
+                    schemas,
+                );
+            }
+            return None;
+        };
+
+        let left_schema = schemas.get(left_relation)?;
+        let right_schema = schemas.get(right_relation)?;
+        if let (Some(left_column), Some(right_column)) = (
+            self.explain_column_index(left, left_schema),
+            self.explain_column_index(right, right_schema),
+        ) {
+            return Some(ExplainJoinEdge {
+                left_column,
+                right_column,
+            });
+        }
+
+        if let (Some(left_column), Some(right_column)) = (
+            self.explain_column_index(right, left_schema),
+            self.explain_column_index(left, right_schema),
+        ) {
+            return Some(ExplainJoinEdge {
+                left_column,
+                right_column,
+            });
+        }
+
+        None
     }
 
     fn schema_contains_column_name_for_explain(
@@ -965,6 +1581,17 @@ impl Executor {
         self.expr_has_column_reference(expr)
     }
 
+    fn explain_primary_key_range_selection(&self, selection: &Expr, schema: &TableSchema) -> bool {
+        let predicates = Self::collect_conjunctive_predicates(selection);
+        !predicates.is_empty()
+            && predicates.into_iter().all(|predicate| {
+                let Expr::BinaryOp { left, op, right } = predicate else {
+                    return false;
+                };
+                self.explain_primary_key_range(&left, &op, &right, schema)
+            })
+    }
+
     fn explain_primary_key_range(
         &self,
         left: &Expr,
@@ -979,9 +1606,12 @@ impl Executor {
             return false;
         }
 
-        (self.explain_column_index(left, schema) == Some(0)
+        let Some(pk_idx) = schema.get_primary_key_index() else {
+            return false;
+        };
+        (self.explain_column_index(left, schema) == Some(pk_idx)
             && !self.explain_expr_has_column_reference(right))
-            || (self.explain_column_index(right, schema) == Some(0)
+            || (self.explain_column_index(right, schema) == Some(pk_idx)
                 && !self.explain_expr_has_column_reference(left))
     }
 

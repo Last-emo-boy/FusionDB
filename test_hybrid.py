@@ -1,6 +1,12 @@
 import requests
 import json
 import math
+import os
+
+AUTH = (
+    os.environ.get("FUSIONDB_HTTP_USER", "postgres"),
+    os.environ.get("FUSIONDB_HTTP_PASSWORD", "fusiondb"),
+)
 
 BASE_URL = "http://localhost:8091/query"
 
@@ -17,7 +23,7 @@ URL = get_base_url()
 def execute_sql(sql):
     print(f"Executing: {sql}")
     try:
-        response = requests.post(URL, json={"sql": sql})
+        response = requests.post(URL, json={"sql": sql}, auth=AUTH)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -61,7 +67,7 @@ def test_hybrid():
     res = execute_sql(sql)
     print(json.dumps(res, indent=2))
     
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     # Should only return id 3
     # id 1 matches FTS but fails vector check (dist 1.414 > 1.0)
     # id 2 matches vector (dist 0) but fails FTS (no "Database")
@@ -69,7 +75,7 @@ def test_hybrid():
     # id 4 fails both
     
     assert len(rows) == 1
-    assert rows[0][0]['Integer'] == 3
+    assert rows[0][0] == 3
     
     print("\nALL HYBRID TESTS PASSED!")
 

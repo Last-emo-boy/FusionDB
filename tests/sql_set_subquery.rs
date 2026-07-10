@@ -815,6 +815,205 @@ async fn test_subquery_not_in() {
 }
 
 #[tokio::test]
+async fn test_subquery_in_large_duplicate_membership() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE in_dup_items (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE in_dup_refs (id INTEGER PRIMARY KEY, item_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO in_dup_items VALUES
+            (1, 'ordered-a'),
+            (2, 'never-a'),
+            (3, 'ordered-b'),
+            (4, 'never-b')",
+    )
+    .await;
+
+    let mut duplicate_rows = Vec::with_capacity(256);
+    for id in 1..=256 {
+        let item_id = if id % 2 == 0 { 1 } else { 3 };
+        duplicate_rows.push(format!("({}, {})", id, item_id));
+    }
+    exec_ok(
+        &executor,
+        &format!(
+            "INSERT INTO in_dup_refs VALUES {}",
+            duplicate_rows.join(", ")
+        ),
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM in_dup_items
+         WHERE id IN (SELECT item_id FROM in_dup_refs)
+         ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_correlated_in_qualified_outer_alias_with_inner_name_collision() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE outer_groups (id INTEGER PRIMARY KEY, group_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE inner_groups (id INTEGER PRIMARY KEY, group_id INTEGER, item_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO outer_groups VALUES (1, 10), (2, 20), (3, 30)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO inner_groups VALUES (100, 10, 1), (101, 20, 3)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT o.id FROM outer_groups o
+         WHERE o.id IN (
+             SELECT i.item_id FROM inner_groups i WHERE i.group_id = o.group_id
+         )
+         ORDER BY o.id",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    let (_, not_in_rows) = query(
+        &executor,
+        "SELECT o.id FROM outer_groups o
+         WHERE o.id NOT IN (
+             SELECT i.item_id FROM inner_groups i WHERE i.group_id = o.group_id
+         )
+         ORDER BY o.id",
+    )
+    .await;
+    assert_eq!(
+        not_in_rows,
+        vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_subquery_not_in_respects_null_membership() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE not_in_probe (id INTEGER, label TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "CREATE TABLE not_in_rhs (rhs_id INTEGER)").await;
+    exec_ok(&executor, "CREATE TABLE not_in_empty_rhs (rhs_id INTEGER)").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO not_in_probe VALUES (1, 'one'), (2, 'two'), (NULL, 'null-probe')",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO not_in_rhs VALUES (2), (NULL)").await;
+
+    let (_, in_rows) = query(
+        &executor,
+        "SELECT label FROM not_in_probe
+         WHERE id IN (SELECT rhs_id FROM not_in_rhs)
+         ORDER BY label",
+    )
+    .await;
+    assert_eq!(in_rows, vec![vec![Value::String("two".to_string())]]);
+
+    let (_, not_in_rows) = query(
+        &executor,
+        "SELECT label FROM not_in_probe
+         WHERE id NOT IN (SELECT rhs_id FROM not_in_rhs)
+         ORDER BY label",
+    )
+    .await;
+    assert!(not_in_rows.is_empty());
+
+    let (_, fallback_not_in_rows) = query(
+        &executor,
+        "SELECT label FROM not_in_probe
+         WHERE id NOT IN (SELECT rhs_id FROM not_in_rhs GROUP BY rhs_id)
+         ORDER BY label",
+    )
+    .await;
+    assert!(fallback_not_in_rows.is_empty());
+
+    let (_, not_wrapped_rows) = query(
+        &executor,
+        "SELECT label FROM not_in_probe
+         WHERE NOT (id NOT IN (SELECT rhs_id FROM not_in_rhs))
+         ORDER BY label",
+    )
+    .await;
+    assert_eq!(
+        not_wrapped_rows,
+        vec![vec![Value::String("two".to_string())]]
+    );
+
+    let (_, true_or_rows) = query(
+        &executor,
+        "SELECT label FROM not_in_probe
+         WHERE TRUE OR id NOT IN (SELECT rhs_id FROM not_in_rhs)
+         ORDER BY label",
+    )
+    .await;
+    assert_eq!(
+        true_or_rows,
+        vec![
+            vec![Value::String("null-probe".to_string())],
+            vec![Value::String("one".to_string())],
+            vec![Value::String("two".to_string())],
+        ]
+    );
+
+    let (_, empty_not_in_rows) = query(
+        &executor,
+        "SELECT label FROM not_in_probe
+         WHERE id NOT IN (SELECT rhs_id FROM not_in_empty_rhs)
+         ORDER BY label",
+    )
+    .await;
+    assert_eq!(
+        empty_not_in_rows,
+        vec![
+            vec![Value::String("null-probe".to_string())],
+            vec![Value::String("one".to_string())],
+            vec![Value::String("two".to_string())],
+        ]
+    );
+
+    let (_, fallback_empty_not_in_rows) = query(
+        &executor,
+        "SELECT label FROM not_in_probe
+         WHERE id NOT IN (SELECT rhs_id FROM not_in_empty_rhs GROUP BY rhs_id)
+         ORDER BY label",
+    )
+    .await;
+    assert_eq!(fallback_empty_not_in_rows, empty_not_in_rows);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_scalar_subquery() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -1060,7 +1259,12 @@ async fn test_quantified_array_comparison_predicates() {
              1 <> ALL (ARRAY[2, 3]),
              1 = ANY (ARRAY[2, 1]),
              1 = ANY (ARRAY[2, 3]),
-             1 <> ALL (ARRAY[1, 2])",
+             1 <> ALL (ARRAY[1, 2]),
+             1 = ANY (ARRAY[2, NULL]),
+             1 <> ALL (ARRAY[2, NULL]),
+             1 = ANY (ARRAY[NULL, 1]),
+             1 = ALL (ARRAY[1, NULL]),
+             1 = ALL (ARRAY[1, 2, NULL])",
     )
     .await;
 
@@ -1070,7 +1274,12 @@ async fn test_quantified_array_comparison_predicates() {
             Value::Boolean(true),
             Value::Boolean(true),
             Value::Boolean(false),
-            Value::Boolean(false)
+            Value::Boolean(false),
+            Value::Null,
+            Value::Null,
+            Value::Boolean(true),
+            Value::Null,
+            Value::Boolean(false),
         ]]
     );
     cleanup(&wal);

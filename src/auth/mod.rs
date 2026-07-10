@@ -1,3 +1,7 @@
+use pbkdf2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Pbkdf2,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -22,7 +26,15 @@ impl UserRecord {
     }
 
     pub fn verify_password(&self, password: &str) -> bool {
-        self.password_hash == hash_password(password)
+        if self.password_hash.starts_with("$pbkdf2-") {
+            return PasswordHash::new(&self.password_hash)
+                .ok()
+                .is_some_and(|hash| Pbkdf2.verify_password(password.as_bytes(), &hash).is_ok());
+        }
+
+        // Existing user records used an unsalted SHA-256 hex digest. Keep read compatibility so
+        // deployments can rotate those passwords without locking users out.
+        self.password_hash == legacy_sha256_password_hash(password)
     }
 
     pub fn has_permission(&self, table: &str, operation: &str) -> bool {
@@ -58,6 +70,14 @@ impl UserRecord {
 }
 
 pub fn hash_password(password: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    Pbkdf2
+        .hash_password(password.as_bytes(), &salt)
+        .expect("PBKDF2 default parameters and generated salt are valid")
+        .to_string()
+}
+
+fn legacy_sha256_password_hash(password: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -139,4 +159,32 @@ pub async fn list_users(txn: &mut dyn Transaction) -> Result<Vec<(String, UserRe
         }
     }
     Ok(users)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_user_passwords_use_salted_pbkdf2() {
+        let first = UserRecord::new("correct horse battery staple", false);
+        let second = UserRecord::new("correct horse battery staple", false);
+
+        assert!(first.password_hash.starts_with("$pbkdf2-sha256$"));
+        assert_ne!(first.password_hash, second.password_hash);
+        assert!(first.verify_password("correct horse battery staple"));
+        assert!(!first.verify_password("wrong"));
+    }
+
+    #[test]
+    fn legacy_sha256_passwords_remain_verifiable() {
+        let record = UserRecord {
+            password_hash: legacy_sha256_password_hash("legacy-password"),
+            is_superuser: false,
+            permissions: HashMap::new(),
+        };
+
+        assert!(record.verify_password("legacy-password"));
+        assert!(!record.verify_password("wrong"));
+    }
 }

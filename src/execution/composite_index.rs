@@ -13,7 +13,16 @@ pub(crate) struct CompositeIndexMeta {
     pub name: String,
     pub table: String,
     pub columns: Vec<String>,
+    pub include_columns: Vec<String>,
     pub ordered_encoding: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompositeOrderedIndexAccess {
+    pub index_name: String,
+    pub order_column: String,
+    pub ascending: bool,
+    pub row_limit: usize,
 }
 
 #[derive(Clone)]
@@ -48,6 +57,8 @@ fn join_composite_index_parts(parts: &[String], separator: &str) -> String {
 }
 
 impl Executor {
+    const MAX_C5_COMPOSITE_META_PARTS: usize = 1024;
+
     fn composite_index_table_marker_key(table_name: &str) -> String {
         let mut key =
             String::with_capacity("index_meta_table:".len() + table_name.len() + ":__marker".len());
@@ -106,6 +117,106 @@ impl Executor {
         Self::composite_index_meta_value_for_prefix("v3", table, columns)
     }
 
+    fn append_c5_meta_count(value: &mut String, count: usize) {
+        value.push_str(&count.to_string());
+        value.push(':');
+    }
+
+    fn append_c5_meta_part(value: &mut String, part: &str) {
+        Self::append_c5_meta_count(value, part.len());
+        value.push_str(part);
+    }
+
+    fn read_c5_meta_count(meta: &str, cursor: &mut usize) -> Option<usize> {
+        let rest = meta.get(*cursor..)?;
+        let colon = rest.find(':')?;
+        if colon == 0 {
+            return None;
+        }
+        let count = rest.get(..colon)?.parse::<usize>().ok()?;
+        *cursor = cursor.checked_add(colon + 1)?;
+        Some(count)
+    }
+
+    fn read_c5_meta_part(meta: &str, cursor: &mut usize) -> Option<String> {
+        let len = Self::read_c5_meta_count(meta, cursor)?;
+        let end = cursor.checked_add(len)?;
+        let part = meta.get(*cursor..end)?;
+        *cursor = end;
+        Some(part.to_string())
+    }
+
+    fn parse_c5_index_meta_payload(meta: &str) -> Option<(String, Vec<String>, Vec<String>)> {
+        let mut cursor = 0;
+        let table = Self::read_c5_meta_part(meta, &mut cursor)?;
+        let column_count = Self::read_c5_meta_count(meta, &mut cursor)?;
+        if table.is_empty()
+            || column_count == 0
+            || column_count > Self::MAX_C5_COMPOSITE_META_PARTS
+            || column_count > meta.len()
+        {
+            return None;
+        }
+
+        let mut columns = Vec::with_capacity(column_count);
+        for _ in 0..column_count {
+            let column = Self::read_c5_meta_part(meta, &mut cursor)?;
+            if column.is_empty() {
+                return None;
+            }
+            columns.push(column);
+        }
+
+        let include_count = Self::read_c5_meta_count(meta, &mut cursor)?;
+        if include_count == 0
+            || include_count > Self::MAX_C5_COMPOSITE_META_PARTS
+            || include_count > meta.len()
+        {
+            return None;
+        }
+        let mut include_columns = Vec::with_capacity(include_count);
+        for _ in 0..include_count {
+            let include_column = Self::read_c5_meta_part(meta, &mut cursor)?;
+            if include_column.is_empty() {
+                return None;
+            }
+            include_columns.push(include_column);
+        }
+
+        (cursor == meta.len()).then_some((table, columns, include_columns))
+    }
+
+    pub(crate) fn composite_index_meta_value_with_include(
+        table: &str,
+        columns: &[String],
+        include_columns: &[String],
+    ) -> String {
+        if include_columns.is_empty() {
+            return Self::composite_index_meta_value(table, columns);
+        }
+
+        let columns_len: usize = columns.iter().map(String::len).sum();
+        let include_len: usize = include_columns.iter().map(String::len).sum();
+        let mut value = String::with_capacity(
+            "c5:".len()
+                + table.len()
+                + columns_len
+                + include_len
+                + (columns.len() + include_columns.len() + 3) * 8,
+        );
+        value.push_str("c5:");
+        Self::append_c5_meta_part(&mut value, table);
+        Self::append_c5_meta_count(&mut value, columns.len());
+        for column in columns {
+            Self::append_c5_meta_part(&mut value, column);
+        }
+        Self::append_c5_meta_count(&mut value, include_columns.len());
+        for include_column in include_columns {
+            Self::append_c5_meta_part(&mut value, include_column);
+        }
+        value
+    }
+
     pub(crate) fn composite_unique_meta_value(table: &str, columns: &[String]) -> String {
         Self::composite_index_meta_value_for_prefix("u3", table, columns)
     }
@@ -118,6 +229,34 @@ impl Executor {
         value
     }
 
+    pub(crate) fn single_column_index_meta_value_with_include(
+        table: &str,
+        column: &str,
+        include_columns: &[String],
+    ) -> String {
+        if include_columns.is_empty() {
+            return Self::single_column_index_meta_value(table, column);
+        }
+
+        let include_len = include_columns.iter().map(String::len).sum::<usize>();
+        let mut value = String::with_capacity(
+            "s3:".len()
+                + table.len()
+                + column.len()
+                + include_len
+                + (include_columns.len() + 3) * 8,
+        );
+        value.push_str("s3:");
+        Self::append_c5_meta_part(&mut value, table);
+        Self::append_c5_meta_count(&mut value, 1);
+        Self::append_c5_meta_part(&mut value, column);
+        Self::append_c5_meta_count(&mut value, include_columns.len());
+        for include_column in include_columns {
+            Self::append_c5_meta_part(&mut value, include_column);
+        }
+        value
+    }
+
     fn prefixed_index_component(prefix: char, encoded: &str) -> String {
         let mut component = String::with_capacity(prefix.len_utf8() + encoded.len());
         component.push(prefix);
@@ -126,6 +265,89 @@ impl Executor {
     }
 
     pub(crate) fn parse_index_meta(index_name: &str, meta_str: &str) -> Option<CompositeIndexMeta> {
+        if let Some(rest) = meta_str.strip_prefix("s3:") {
+            let (table, columns, include_columns) = Self::parse_c5_index_meta_payload(rest)?;
+            if columns.len() != 1 {
+                return None;
+            }
+
+            return Some(CompositeIndexMeta {
+                name: index_name.to_string(),
+                table,
+                columns,
+                include_columns,
+                ordered_encoding: false,
+            });
+        }
+
+        if let Some(rest) = meta_str.strip_prefix("s2:") {
+            let (table_and_column, includes) = rest.rsplit_once(':')?;
+            let (table, column) = table_and_column.split_once(':')?;
+            let mut include_columns = Vec::with_capacity(includes.matches(',').count() + 1);
+            for include_column in includes.split(',') {
+                let include_column = include_column.trim();
+                if !include_column.is_empty() {
+                    include_columns.push(include_column.to_owned());
+                }
+            }
+
+            if table.is_empty() || column.is_empty() || include_columns.is_empty() {
+                return None;
+            }
+
+            return Some(CompositeIndexMeta {
+                name: index_name.to_string(),
+                table: table.to_string(),
+                columns: vec![column.to_string()],
+                include_columns,
+                ordered_encoding: false,
+            });
+        }
+
+        if let Some(rest) = meta_str.strip_prefix("c5:") {
+            let (table, columns, include_columns) = Self::parse_c5_index_meta_payload(rest)?;
+            return Some(CompositeIndexMeta {
+                name: index_name.to_string(),
+                table,
+                columns,
+                include_columns,
+                ordered_encoding: true,
+            });
+        }
+
+        if let Some(rest) = meta_str.strip_prefix("c4:") {
+            let mut parts = rest.splitn(3, ':');
+            let table = parts.next()?;
+            let columns = parts.next()?;
+            let includes = parts.next()?;
+            let mut parsed_columns = Vec::with_capacity(columns.matches(',').count() + 1);
+            for column in columns.split(',') {
+                let column = column.trim();
+                if !column.is_empty() {
+                    parsed_columns.push(column.to_owned());
+                }
+            }
+            let mut include_columns = Vec::with_capacity(includes.matches(',').count() + 1);
+            for include_column in includes.split(',') {
+                let include_column = include_column.trim();
+                if !include_column.is_empty() {
+                    include_columns.push(include_column.to_owned());
+                }
+            }
+
+            if table.is_empty() || parsed_columns.is_empty() || include_columns.is_empty() {
+                return None;
+            }
+
+            return Some(CompositeIndexMeta {
+                name: index_name.to_string(),
+                table: table.to_string(),
+                columns: parsed_columns,
+                include_columns,
+                ordered_encoding: true,
+            });
+        }
+
         let rest = meta_str
             .strip_prefix("v3:")
             .or_else(|| meta_str.strip_prefix("u3:"));
@@ -147,6 +369,7 @@ impl Executor {
                 name: index_name.to_string(),
                 table: table.to_string(),
                 columns: parsed_columns,
+                include_columns: Vec::new(),
                 ordered_encoding: true,
             })
         } else if let Some(rest) = meta_str.strip_prefix("v2:") {
@@ -167,6 +390,7 @@ impl Executor {
                 name: index_name.to_string(),
                 table: table.to_string(),
                 columns: parsed_columns,
+                include_columns: Vec::new(),
                 ordered_encoding: false,
             })
         } else {
@@ -179,9 +403,96 @@ impl Executor {
                 name: index_name.to_string(),
                 table: table.to_string(),
                 columns: vec![column.to_string()],
+                include_columns: Vec::new(),
                 ordered_encoding: false,
             })
         }
+    }
+
+    pub(crate) async fn load_single_column_index_includes_for_table(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        txn: &mut dyn Transaction,
+    ) -> Result<HashMap<usize, Vec<usize>>> {
+        let entries = txn.scan_prefix(b"index_meta:", None).await?;
+        let mut includes_by_column = HashMap::new();
+
+        for (key, value) in entries {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            let Some(index_name) = key_str.strip_prefix("index_meta:") else {
+                continue;
+            };
+
+            let meta_str = String::from_utf8(value).unwrap_or_default();
+            let Some(meta) = Self::parse_index_meta(index_name, &meta_str) else {
+                continue;
+            };
+
+            if meta.table != table_name
+                || meta.columns.len() != 1
+                || meta.include_columns.is_empty()
+            {
+                continue;
+            }
+
+            let Some(key_idx) = schema.get_column_index(&meta.columns[0]) else {
+                continue;
+            };
+            let mut include_indices = Vec::with_capacity(meta.include_columns.len());
+            for include_column in &meta.include_columns {
+                if let Some(include_idx) = schema.get_column_index(include_column) {
+                    include_indices.push(include_idx);
+                }
+            }
+            if include_indices.len() == meta.include_columns.len() {
+                includes_by_column.insert(key_idx, include_indices);
+            }
+        }
+
+        Ok(includes_by_column)
+    }
+
+    pub(crate) fn secondary_index_payload_for_row(
+        row: &[Value],
+        include_indices: &[usize],
+    ) -> Vec<u8> {
+        if include_indices.is_empty() {
+            return Vec::new();
+        }
+
+        let mut values = Vec::with_capacity(include_indices.len());
+        for &idx in include_indices {
+            values.push(row.get(idx).cloned().unwrap_or(Value::Null));
+        }
+        crate::common::encoding::RowEncoder::encode(&values)
+    }
+
+    pub(crate) fn secondary_index_payload_values(
+        payload: &[u8],
+        include_indices: &[usize],
+    ) -> Option<Vec<Value>> {
+        if include_indices.is_empty() {
+            return Some(Vec::new());
+        }
+        if payload.is_empty() {
+            return None;
+        }
+
+        let values = crate::common::encoding::RowDecoder::decode(payload).ok()?;
+        (values.len() == include_indices.len()).then_some(values)
+    }
+
+    pub(crate) fn single_column_index_payload_touched(
+        old_row: &[Value],
+        new_row: &[Value],
+        include_indices: &[usize],
+    ) -> bool {
+        include_indices
+            .iter()
+            .any(|&idx| old_row.get(idx) != new_row.get(idx))
     }
 
     pub(crate) async fn load_composite_indexes_for_table(
@@ -296,8 +607,12 @@ impl Executor {
     ) -> Result<()> {
         let prefix = Self::composite_index_table_prefix(table_name);
         let existing_entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
-        for (key, _) in existing_entries {
-            txn.delete(&key).await?;
+        for (key, value) in existing_entries {
+            if Self::composite_index_table_directory_entry_belongs_to_table(
+                table_name, &key, &value,
+            ) {
+                txn.delete(&key).await?;
+            }
         }
 
         self.ensure_composite_index_directory_marker(table_name, txn)
@@ -323,6 +638,27 @@ impl Executor {
         }
 
         Ok(())
+    }
+
+    fn composite_index_table_directory_entry_belongs_to_table(
+        table_name: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> bool {
+        let marker_key = Self::composite_index_table_marker_key(table_name);
+        if key == marker_key.as_bytes() {
+            return true;
+        }
+
+        let prefix = Self::composite_index_table_prefix(table_name);
+        let Ok(key_str) = std::str::from_utf8(key) else {
+            return false;
+        };
+        let Some(index_name) = key_str.strip_prefix(&prefix) else {
+            return false;
+        };
+        let meta_str = String::from_utf8_lossy(value);
+        Self::parse_index_meta(index_name, &meta_str).is_some_and(|meta| meta.table == table_name)
     }
 
     #[cfg(test)]
@@ -533,6 +869,180 @@ impl Executor {
         })
     }
 
+    fn ordered_index_component_value(component: &str, data_type: &str) -> Option<Value> {
+        let (prefix, encoded) = component.split_at(1);
+        match prefix {
+            "i" if Self::is_integer_type_name(data_type) => {
+                crate::common::encoding::decode_i64_comparable(encoded).map(Value::Integer)
+            }
+            "d" if Self::is_date_type_name(data_type) => {
+                crate::common::encoding::decode_i64_comparable(encoded)
+                    .map(|days| Value::Date(days as i32))
+            }
+            "t" if Self::is_timestamp_type_name(data_type) => {
+                crate::common::encoding::decode_i64_comparable(encoded).map(Value::Timestamp)
+            }
+            "v" if Self::is_interval_type_name(data_type) => {
+                crate::common::encoding::decode_i64_comparable(encoded).map(Value::Interval)
+            }
+            "b" if Self::is_boolean_type_name(data_type) => match encoded {
+                "0" => Some(Value::Boolean(false)),
+                "1" => Some(Value::Boolean(true)),
+                _ => None,
+            },
+            "s" if matches!(
+                data_type.to_ascii_lowercase().as_str(),
+                "text" | "string" | "varchar" | "char"
+            ) =>
+            {
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded.as_bytes())
+                    .ok()?;
+                String::from_utf8(bytes).ok().map(Value::String)
+            }
+            "n" if Self::is_decimal_type_name(data_type) => {
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded.as_bytes())
+                    .ok()?;
+                String::from_utf8(bytes).ok().map(Value::Decimal)
+            }
+            _ => None,
+        }
+    }
+
+    fn ordered_composite_component_values(
+        schema: &TableSchema,
+        index: &CompositeIndexMeta,
+        components: &[String],
+    ) -> Option<Vec<Value>> {
+        if !index.ordered_encoding || components.len() > index.columns.len() {
+            return None;
+        }
+
+        let mut values = Vec::with_capacity(components.len());
+        for (component, column_name) in components.iter().zip(&index.columns) {
+            let column_idx = schema.get_column_index(column_name)?;
+            let data_type = schema.columns.get(column_idx)?.data_type.as_str();
+            values.push(Self::ordered_index_component_value(component, data_type)?);
+        }
+        Some(values)
+    }
+
+    fn ordered_composite_component_from_key<'a>(key: &'a [u8], prefix: &str) -> Option<&'a str> {
+        let suffix = key.strip_prefix(prefix.as_bytes())?;
+        let component_end = suffix.iter().position(|byte| *byte == b':')?;
+        std::str::from_utf8(&suffix[..component_end]).ok()
+    }
+
+    fn ordered_composite_component_values_for_key(
+        schema: &TableSchema,
+        index: &CompositeIndexMeta,
+        leading_component_values: &[Value],
+        range_component_index: Option<usize>,
+        key: &[u8],
+        range_prefix: &str,
+    ) -> Option<Vec<Value>> {
+        let mut values = leading_component_values.to_vec();
+        let Some(component_index) = range_component_index else {
+            return Some(values);
+        };
+        let component = Self::ordered_composite_component_from_key(key, range_prefix)?;
+        let column_name = index.columns.get(component_index)?;
+        let column_idx = schema.get_column_index(column_name)?;
+        let data_type = schema.columns.get(column_idx)?.data_type.as_str();
+        values.push(Self::ordered_index_component_value(component, data_type)?);
+        Some(values)
+    }
+
+    fn composite_index_covered_column_indices(
+        schema: &TableSchema,
+        pk_index: Option<usize>,
+        index: &CompositeIndexMeta,
+        component_count: usize,
+        include_indices: &[usize],
+    ) -> Vec<usize> {
+        let mut indices = Vec::with_capacity(1 + component_count + include_indices.len());
+        if let Some(pk_idx) = pk_index {
+            indices.push(pk_idx);
+        }
+        for column_name in index.columns.iter().take(component_count) {
+            if let Some(column_idx) = schema.get_column_index(column_name) {
+                if !indices.contains(&column_idx) {
+                    indices.push(column_idx);
+                }
+            }
+        }
+        for &include_idx in include_indices {
+            if !indices.contains(&include_idx) {
+                indices.push(include_idx);
+            }
+        }
+        indices
+    }
+
+    fn composite_index_covered_row(
+        schema: &TableSchema,
+        pk_index: Option<usize>,
+        row_id: &str,
+        index: &CompositeIndexMeta,
+        component_values: &[Value],
+        include_indices: &[usize],
+        include_values: Option<Vec<Value>>,
+    ) -> Vec<Value> {
+        let mut row = Self::primary_key_row_from_id(schema, pk_index, row_id);
+        for (column_name, component_value) in index.columns.iter().zip(component_values) {
+            if let Some(column_idx) = schema.get_column_index(column_name) {
+                if let Some(value) = row.get_mut(column_idx) {
+                    *value = component_value.clone();
+                }
+            }
+        }
+        if let Some(include_values) = include_values {
+            for (&include_idx, include_value) in include_indices.iter().zip(include_values) {
+                if let Some(value) = row.get_mut(include_idx) {
+                    *value = include_value;
+                }
+            }
+        }
+        row
+    }
+
+    fn composite_index_include_indices(
+        schema: &TableSchema,
+        index: &CompositeIndexMeta,
+    ) -> Option<Vec<usize>> {
+        let mut include_indices = Vec::with_capacity(index.include_columns.len());
+        for include_column in &index.include_columns {
+            let include_idx = schema.get_column_index(include_column)?;
+            if include_indices.contains(&include_idx) {
+                return None;
+            }
+            include_indices.push(include_idx);
+        }
+        Some(include_indices)
+    }
+
+    fn composite_index_payload_for_row(
+        schema: &TableSchema,
+        index: &CompositeIndexMeta,
+        row: &[Value],
+    ) -> Option<Vec<u8>> {
+        let include_indices = Self::composite_index_include_indices(schema, index)?;
+        Some(Self::secondary_index_payload_for_row(row, &include_indices))
+    }
+
+    fn composite_index_payload_values(
+        payload: &[u8],
+        include_indices: &[usize],
+        include_payloads_complete: &mut bool,
+    ) -> Option<Vec<Value>> {
+        let include_values = Self::secondary_index_payload_values(payload, include_indices);
+        if !include_indices.is_empty() && include_values.is_none() {
+            *include_payloads_complete = false;
+        }
+        include_values
+    }
+
     fn index_component_for_meta(&self, value: &Value, meta: &CompositeIndexMeta) -> Option<String> {
         if meta.ordered_encoding {
             self.ordered_index_component(value)
@@ -554,7 +1064,9 @@ impl Executor {
             if let Some(index_key) =
                 self.composite_index_key_for_meta(index, table_name, row, schema, row_id)
             {
-                txn.put(index_key.as_bytes(), &[]).await?;
+                let payload =
+                    Self::composite_index_payload_for_row(schema, index, row).unwrap_or_default();
+                txn.put(index_key.as_bytes(), &payload).await?;
             }
         }
         Ok(())
@@ -653,26 +1165,34 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<()> {
         for index in indexes {
-            let touches_index = index.columns.iter().any(|column| {
+            let touches_index_key = index.columns.iter().any(|column| {
                 schema
                     .get_column_index(column)
                     .is_some_and(|idx| old_row.get(idx) != new_row.get(idx))
             });
+            let include_indices =
+                Self::composite_index_include_indices(schema, index).unwrap_or_default();
+            let touches_payload = !include_indices.is_empty()
+                && Self::single_column_index_payload_touched(old_row, new_row, &include_indices);
 
-            if !touches_index {
+            if !touches_index_key && !touches_payload {
                 continue;
             }
 
-            if let Some(old_key) =
-                self.composite_index_key_for_meta(index, table_name, old_row, schema, row_id)
-            {
-                txn.delete(old_key.as_bytes()).await?;
+            if touches_index_key {
+                if let Some(old_key) =
+                    self.composite_index_key_for_meta(index, table_name, old_row, schema, row_id)
+                {
+                    txn.delete(old_key.as_bytes()).await?;
+                }
             }
 
             if let Some(new_key) =
                 self.composite_index_key_for_meta(index, table_name, new_row, schema, row_id)
             {
-                txn.put(new_key.as_bytes(), &[]).await?;
+                let payload = Self::composite_index_payload_for_row(schema, index, new_row)
+                    .unwrap_or_default();
+                txn.put(new_key.as_bytes(), &payload).await?;
             }
         }
         Ok(())
@@ -757,10 +1277,12 @@ impl Executor {
             && range_column_orderable
         {
             Self::composite_order_next_column_direction(order_by, range_column.map(String::as_str))
+                .filter(|direction| *direction || txn.supports_bounded_scan_range_reverse())
         } else {
             None
         };
         let order_matches = order_direction.is_some();
+        let scan_descending = matches!(order_direction, Some(false));
 
         let component_key =
             join_composite_index_parts(&components, Self::composite_index_component_separator());
@@ -784,10 +1306,42 @@ impl Executor {
             None
         };
 
-        let mut index_entries = Vec::new();
+        let mut row_ids = std::collections::HashSet::new();
+        let mut ordered_row_ids = if order_matches {
+            Some(Vec::new())
+        } else {
+            None
+        };
+        let pk_index = schema.get_primary_key_index();
+        let range_component_index =
+            (range.is_some() && components.len() < index.columns.len()).then_some(components.len());
+        let covered_component_count =
+            components.len() + usize::from(range_component_index.is_some());
+        let leading_component_values =
+            Self::ordered_composite_component_values(schema, &index, &components);
+        let include_indices = Self::composite_index_include_indices(schema, &index);
+        let include_indices_for_coverage = include_indices.as_deref().unwrap_or(&[]);
+        let covered_column_indices = leading_component_values
+            .as_ref()
+            .map(|_| {
+                Self::composite_index_covered_column_indices(
+                    schema,
+                    pk_index,
+                    &index,
+                    covered_component_count,
+                    include_indices_for_coverage,
+                )
+            })
+            .filter(|indices| !indices.is_empty());
+        let mut covered_rows = covered_column_indices
+            .as_ref()
+            .map(|_| HashMap::with_capacity(scan_limit.unwrap_or(0).max(16)));
+        let mut include_payloads_complete = true;
+        let mut entry_visit_count = 0usize;
+
         if let Some(range) = range {
             for index_prefix in index_prefixes {
-                let remaining = scan_limit.map(|limit| limit.saturating_sub(index_entries.len()));
+                let remaining = scan_limit.map(|limit| limit.saturating_sub(entry_visit_count));
                 if remaining == Some(0) {
                     break;
                 }
@@ -798,19 +1352,90 @@ impl Executor {
                 } else {
                     range_prefix.clone()
                 };
-                let mut scanned = if let Some(upper) = range.upper.as_ref() {
+
+                let mut visitor = |key: &[u8], payload: &[u8]| {
+                    if let Some(row_id) = Self::row_id_from_key(key) {
+                        let row_id = row_id.to_string();
+                        if row_ids.insert(row_id.clone()) {
+                            if let Some(ordered) = &mut ordered_row_ids {
+                                ordered.push(row_id.clone());
+                            }
+                            if let (Some(rows), Some(leading_values)) =
+                                (&mut covered_rows, leading_component_values.as_ref())
+                            {
+                                if let Some(component_values) =
+                                    Self::ordered_composite_component_values_for_key(
+                                        schema,
+                                        &index,
+                                        leading_values,
+                                        range_component_index,
+                                        key,
+                                        &range_prefix,
+                                    )
+                                    .filter(|values| values.len() == covered_component_count)
+                                {
+                                    let include_values = Self::composite_index_payload_values(
+                                        payload,
+                                        include_indices_for_coverage,
+                                        &mut include_payloads_complete,
+                                    );
+                                    rows.insert(
+                                        row_id.clone(),
+                                        Self::composite_index_covered_row(
+                                            schema,
+                                            pk_index,
+                                            &row_id,
+                                            &index,
+                                            &component_values,
+                                            include_indices_for_coverage,
+                                            include_values,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    true
+                };
+                let visited = if let Some(upper) = range.upper.as_ref() {
                     let suffix = if upper.inclusive { "\u{0}" } else { "" };
                     let end =
                         Self::composite_index_range_bound(&range_prefix, &upper.component, suffix);
-                    txn.scan_range(start.as_bytes(), end.as_bytes(), remaining)
+                    if scan_descending {
+                        txn.scan_range_reverse_for_each(
+                            start.as_bytes(),
+                            end.as_bytes(),
+                            remaining,
+                            &mut visitor,
+                        )
                         .await?
+                    } else {
+                        txn.scan_range_for_each(
+                            start.as_bytes(),
+                            end.as_bytes(),
+                            remaining,
+                            &mut visitor,
+                        )
+                        .await?
+                    }
                 } else {
-                    let mut end = range_prefix.into_bytes();
+                    let mut end = range_prefix.clone().into_bytes();
                     end.push(0xFF);
-                    txn.scan_range(start.as_bytes(), &end, remaining).await?
+                    if scan_descending {
+                        txn.scan_range_reverse_for_each(
+                            start.as_bytes(),
+                            &end,
+                            remaining,
+                            &mut visitor,
+                        )
+                        .await?
+                    } else {
+                        txn.scan_range_for_each(start.as_bytes(), &end, remaining, &mut visitor)
+                            .await?
+                    }
                 };
-                index_entries.append(&mut scanned);
-                if scan_limit.is_some_and(|limit| index_entries.len() >= limit) {
+                entry_visit_count += visited;
+                if scan_limit.is_some_and(|limit| entry_visit_count >= limit) {
                     break;
                 }
             }
@@ -824,27 +1449,132 @@ impl Executor {
                 }
                 prefixes.push(prefix);
             }
-            index_entries = self.scan_routed_prefixes(prefixes, txn, scan_limit).await?;
-        }
-
-        let mut row_ids = std::collections::HashSet::with_capacity(index_entries.len());
-        let mut ordered_row_ids = if order_matches {
-            Some(Vec::with_capacity(index_entries.len()))
-        } else {
-            None
-        };
-        for (key, _) in index_entries {
-            if let Some(row_id) = Self::row_id_from_key(&key) {
-                let row_id = row_id.to_string();
-                if row_ids.insert(row_id.clone()) {
-                    if let Some(ordered) = &mut ordered_row_ids {
-                        ordered.push(row_id);
+            if scan_descending {
+                for prefix in prefixes {
+                    let remaining = scan_limit.map(|limit| limit.saturating_sub(entry_visit_count));
+                    if remaining == Some(0) {
+                        break;
+                    }
+                    let mut end = prefix.as_bytes().to_vec();
+                    end.push(0xFF);
+                    let mut visitor = |key: &[u8], payload: &[u8]| {
+                        if let Some(row_id) = Self::row_id_from_key(key) {
+                            let row_id = row_id.to_string();
+                            if row_ids.insert(row_id.clone()) {
+                                if let Some(ordered) = &mut ordered_row_ids {
+                                    ordered.push(row_id.clone());
+                                }
+                                if let (Some(rows), Some(leading_values)) =
+                                    (&mut covered_rows, leading_component_values.as_ref())
+                                {
+                                    if let Some(component_values) =
+                                        Self::ordered_composite_component_values_for_key(
+                                            schema,
+                                            &index,
+                                            leading_values,
+                                            range_component_index,
+                                            key,
+                                            &prefix,
+                                        )
+                                        .filter(|values| values.len() == covered_component_count)
+                                    {
+                                        let include_values = Self::composite_index_payload_values(
+                                            payload,
+                                            include_indices_for_coverage,
+                                            &mut include_payloads_complete,
+                                        );
+                                        rows.insert(
+                                            row_id.clone(),
+                                            Self::composite_index_covered_row(
+                                                schema,
+                                                pk_index,
+                                                &row_id,
+                                                &index,
+                                                &component_values,
+                                                include_indices_for_coverage,
+                                                include_values,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        true
+                    };
+                    let visited = txn
+                        .scan_range_reverse_for_each(
+                            prefix.as_bytes(),
+                            &end,
+                            remaining,
+                            &mut visitor,
+                        )
+                        .await?;
+                    entry_visit_count += visited;
+                    if scan_limit.is_some_and(|limit| entry_visit_count >= limit) {
+                        break;
                     }
                 }
+            } else {
+                let mut visitor = |key: &[u8], payload: &[u8]| {
+                    if let Some(row_id) = Self::row_id_from_key(key) {
+                        let row_id = row_id.to_string();
+                        if row_ids.insert(row_id.clone()) {
+                            if let Some(ordered) = &mut ordered_row_ids {
+                                ordered.push(row_id.clone());
+                            }
+                            if let (Some(rows), Some(leading_values)) =
+                                (&mut covered_rows, leading_component_values.as_ref())
+                            {
+                                if let Some(component_values) =
+                                    Self::ordered_composite_component_values_for_key(
+                                        schema,
+                                        &index,
+                                        leading_values,
+                                        range_component_index,
+                                        key,
+                                        "",
+                                    )
+                                    .filter(|values| values.len() == covered_component_count)
+                                {
+                                    let include_values = Self::composite_index_payload_values(
+                                        payload,
+                                        include_indices_for_coverage,
+                                        &mut include_payloads_complete,
+                                    );
+                                    rows.insert(
+                                        row_id.clone(),
+                                        Self::composite_index_covered_row(
+                                            schema,
+                                            pk_index,
+                                            &row_id,
+                                            &index,
+                                            &component_values,
+                                            include_indices_for_coverage,
+                                            include_values,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    true
+                };
+                entry_visit_count = self
+                    .scan_routed_prefixes_for_each(prefixes, txn, scan_limit, &mut visitor)
+                    .await?;
             }
         }
-        if let (Some(ordered), Some(asc)) = (&mut ordered_row_ids, order_direction) {
+        let ordered_topk_counted = order_direction.filter(|_| can_cover_predicates).is_some()
+            && ordered_limit.or(limit).is_some();
+        if let (Some(asc), true) = (order_direction, ordered_topk_counted) {
+            crate::monitor::inc_index_ordered_topk_scan();
             if !asc {
+                crate::monitor::inc_index_ordered_topk_reverse_scan();
+            }
+            crate::monitor::add_index_ordered_topk_entry_visits(entry_visit_count as u64);
+        }
+        if let (Some(ordered), Some(asc)) = (&mut ordered_row_ids, order_direction) {
+            if !asc && !scan_descending {
                 ordered.reverse();
             }
             if can_cover_predicates {
@@ -858,6 +1588,129 @@ impl Executor {
             row_ids,
             ordered_row_ids,
             exact: can_cover_predicates,
+            ordered_topk_counted,
+            covered: covered_rows.and_then(|rows| {
+                (!rows.is_empty()).then(|| super::scan::CoveredIndexRows {
+                    column_indices: if include_payloads_complete {
+                        covered_column_indices.unwrap_or_default()
+                    } else {
+                        Self::composite_index_covered_column_indices(
+                            schema,
+                            pk_index,
+                            &index,
+                            covered_component_count,
+                            &[],
+                        )
+                    },
+                    rows,
+                })
+            }),
+        }))
+    }
+
+    pub(crate) async fn composite_ordered_index_for_explain(
+        &self,
+        expr: &Expr,
+        table_name: &str,
+        schema: &TableSchema,
+        txn: &mut dyn Transaction,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+        ordered_limit: usize,
+    ) -> Result<Option<CompositeOrderedIndexAccess>> {
+        if self.shard_router.is_some() {
+            return Ok(None);
+        }
+
+        let indexes = self
+            .load_composite_indexes_for_table(table_name, txn)
+            .await?;
+        if indexes.is_empty() {
+            return Ok(None);
+        }
+
+        let predicates = Self::collect_conjunctive_predicates(expr);
+        let equality_values =
+            match self.composite_index_equality_values_by_column_index(&predicates, schema, &[]) {
+                Ok(values) => values,
+                Err(_) => return Ok(None),
+            };
+
+        let mut best: Option<(CompositeIndexMeta, Vec<String>, bool)> = None;
+        for index in indexes {
+            let mut components = Vec::with_capacity(index.columns.len());
+            for column in &index.columns {
+                let Some(column_idx) = schema.get_column_index(column) else {
+                    break;
+                };
+                let Some(value) = equality_values.get(&column_idx) else {
+                    break;
+                };
+                let Some(component) = self.index_component_for_meta(value, &index) else {
+                    break;
+                };
+                components.push(component);
+            }
+
+            if components.is_empty() {
+                continue;
+            }
+
+            let exact = components.len() == index.columns.len();
+            if best.as_ref().is_none_or(|(_, current_components, _)| {
+                components.len() > current_components.len()
+            }) {
+                best = Some((index, components, exact));
+            }
+        }
+
+        let Some((index, components, all_index_columns_matched)) = best else {
+            return Ok(None);
+        };
+        if !index.ordered_encoding {
+            return Ok(None);
+        }
+
+        let Some(range_column) = index.columns.get(components.len()) else {
+            return Ok(None);
+        };
+        let range_column_orderable = schema.get_column_index(range_column).is_some_and(|idx| {
+            Self::composite_column_type_is_orderable(&schema.columns[idx].data_type)
+        });
+        if !range_column_orderable {
+            return Ok(None);
+        }
+
+        let Some(range) =
+            (match self.composite_index_range_bounds(&predicates, schema, &[], range_column) {
+                Ok(range) => range,
+                Err(_) => return Ok(None),
+            })
+        else {
+            return Ok(None);
+        };
+        let range_predicate_count =
+            usize::from(range.lower.is_some()) + usize::from(range.upper.is_some());
+        let can_cover_predicates = (all_index_columns_matched
+            && predicates.len() == index.columns.len())
+            || predicates.len() == components.len().saturating_add(range_predicate_count);
+        if !can_cover_predicates {
+            return Ok(None);
+        }
+
+        let Some(ascending) =
+            Self::composite_order_next_column_direction(order_by, Some(range_column.as_str()))
+        else {
+            return Ok(None);
+        };
+        if !ascending && !txn.supports_bounded_scan_range_reverse() {
+            return Ok(None);
+        }
+
+        Ok(Some(CompositeOrderedIndexAccess {
+            index_name: index.name,
+            order_column: range_column.clone(),
+            ascending,
+            row_limit: ordered_limit,
         }))
     }
 
@@ -1119,8 +1972,12 @@ impl Executor {
 
         let table_prefix = Self::composite_index_table_prefix(table_name);
         let table_entries = txn.scan_prefix(table_prefix.as_bytes(), None).await?;
-        for (key, _) in table_entries {
-            txn.delete(&key).await?;
+        for (key, value) in table_entries {
+            if Self::composite_index_table_directory_entry_belongs_to_table(
+                table_name, &key, &value,
+            ) {
+                txn.delete(&key).await?;
+            }
         }
 
         Ok(())
@@ -1138,9 +1995,12 @@ impl Executor {
 mod tests {
     use super::{join_composite_index_parts, CompositeIndexMeta, Executor};
     use crate::catalog::{Column, IndexType, TableSchema};
-    use crate::common::Value;
+    use crate::common::{FusionError, Result, Value};
     use crate::storage::memory::MemoryStorage;
+    use crate::storage::{ScanVisitor, Transaction};
+    use async_trait::async_trait;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     fn test_column(name: &str, data_type: &str) -> Column {
         Column {
@@ -1160,6 +2020,221 @@ mod tests {
         let wal_path = format!("test_composite_index_{}.wal", uuid::Uuid::new_v4());
         let storage = Arc::new(MemoryStorage::new(&wal_path).unwrap());
         Executor::new(storage)
+    }
+
+    struct RecordingCompositeTxn {
+        marker_key: Vec<u8>,
+        table_meta_prefix: Vec<u8>,
+        table_meta_entry: (Vec<u8>, Vec<u8>),
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+        supports_reverse: bool,
+        range_calls: Arc<Mutex<usize>>,
+        reverse_calls: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>, Option<usize>)>>>,
+        range_for_each_calls: Arc<Mutex<usize>>,
+        reverse_for_each_calls: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>, Option<usize>)>>>,
+    }
+
+    impl RecordingCompositeTxn {
+        fn new(
+            marker_key: Vec<u8>,
+            table_meta_prefix: Vec<u8>,
+            table_meta_entry: (Vec<u8>, Vec<u8>),
+            mut entries: Vec<(Vec<u8>, Vec<u8>)>,
+        ) -> Self {
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Self {
+                marker_key,
+                table_meta_prefix,
+                table_meta_entry,
+                entries,
+                supports_reverse: true,
+                range_calls: Arc::new(Mutex::new(0)),
+                reverse_calls: Arc::new(Mutex::new(Vec::new())),
+                range_for_each_calls: Arc::new(Mutex::new(0)),
+                reverse_for_each_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn without_bounded_reverse(mut self) -> Self {
+            self.supports_reverse = false;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Transaction for RecordingCompositeTxn {
+        async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            if key == self.marker_key.as_slice() {
+                Ok(Some(Vec::new()))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn put(&mut self, _key: &[u8], _value: &[u8]) -> Result<()> {
+            Err(FusionError::Execution(
+                "unused recording transaction put".into(),
+            ))
+        }
+
+        async fn delete(&mut self, _key: &[u8]) -> Result<()> {
+            Err(FusionError::Execution(
+                "unused recording transaction delete".into(),
+            ))
+        }
+
+        async fn scan_prefix(
+            &self,
+            prefix: &[u8],
+            _limit: Option<usize>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            if prefix == self.table_meta_prefix.as_slice() {
+                Ok(vec![self.table_meta_entry.clone()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn scan_prefix_for_each(
+            &self,
+            _prefix: &[u8],
+            _limit: Option<usize>,
+            _visitor: &mut dyn ScanVisitor,
+        ) -> Result<usize> {
+            Err(FusionError::Execution(
+                "unused recording transaction prefix visitor".into(),
+            ))
+        }
+
+        async fn scan_range(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: Option<usize>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            *self.range_calls.lock().unwrap() += 1;
+            let mut rows = self
+                .entries
+                .iter()
+                .filter(|(key, _)| key.as_slice() >= start && key.as_slice() < end)
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(limit) = limit {
+                rows.truncate(limit);
+            }
+            Ok(rows)
+        }
+
+        async fn scan_range_for_each(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: Option<usize>,
+            visitor: &mut dyn ScanVisitor,
+        ) -> Result<usize> {
+            *self.range_for_each_calls.lock().unwrap() += 1;
+            let mut visited = 0usize;
+            for (key, value) in self
+                .entries
+                .iter()
+                .filter(|(key, _)| key.as_slice() >= start && key.as_slice() < end)
+            {
+                if limit.is_some_and(|limit| visited >= limit) {
+                    break;
+                }
+                visited += 1;
+                if !visitor.visit(key, value) {
+                    break;
+                }
+            }
+            Ok(visited)
+        }
+
+        fn supports_bounded_scan_range_reverse(&self) -> bool {
+            self.supports_reverse
+        }
+
+        async fn scan_range_reverse(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: Option<usize>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            self.reverse_calls
+                .lock()
+                .unwrap()
+                .push((start.to_vec(), end.to_vec(), limit));
+            let mut rows = self
+                .entries
+                .iter()
+                .filter(|(key, _)| key.as_slice() >= start && key.as_slice() < end)
+                .cloned()
+                .collect::<Vec<_>>();
+            rows.reverse();
+            if let Some(limit) = limit {
+                rows.truncate(limit);
+            }
+            Ok(rows)
+        }
+
+        async fn scan_range_reverse_for_each(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: Option<usize>,
+            visitor: &mut dyn ScanVisitor,
+        ) -> Result<usize> {
+            self.reverse_for_each_calls
+                .lock()
+                .unwrap()
+                .push((start.to_vec(), end.to_vec(), limit));
+            let mut visited = 0usize;
+            for (key, value) in self
+                .entries
+                .iter()
+                .filter(|(key, _)| key.as_slice() >= start && key.as_slice() < end)
+                .rev()
+            {
+                if limit.is_some_and(|limit| visited >= limit) {
+                    break;
+                }
+                visited += 1;
+                if !visitor.visit(key, value) {
+                    break;
+                }
+            }
+            Ok(visited)
+        }
+
+        async fn count_prefix(&self, _prefix: &[u8]) -> Result<usize> {
+            Err(FusionError::Execution(
+                "unused recording transaction count_prefix".into(),
+            ))
+        }
+
+        async fn first(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+            Err(FusionError::Execution(
+                "unused recording transaction first".into(),
+            ))
+        }
+
+        async fn last(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+            Err(FusionError::Execution(
+                "unused recording transaction last".into(),
+            ))
+        }
+
+        async fn commit(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[test]
@@ -1267,6 +2342,184 @@ mod tests {
     }
 
     #[test]
+    fn single_column_index_meta_value_with_include_roundtrips() {
+        let include_columns = vec!["payload".to_string(), "metric".to_string()];
+        let value = Executor::single_column_index_meta_value_with_include(
+            "stock",
+            "score",
+            &include_columns,
+        );
+
+        assert_eq!(value, "s3:5:stock1:5:score2:7:payload6:metric");
+        let meta = Executor::parse_index_meta("idx_stock_score_cover", &value).unwrap();
+        assert_eq!(meta.table, "stock");
+        assert_eq!(meta.columns, vec!["score".to_string()]);
+        assert_eq!(meta.include_columns, include_columns);
+        assert!(!meta.ordered_encoding);
+    }
+
+    #[test]
+    fn single_column_index_meta_value_with_include_preserves_delimiter_identifiers() {
+        let include_columns = vec!["payload:text".to_string(), "metric,value".to_string()];
+        let value = Executor::single_column_index_meta_value_with_include(
+            "stock:west,1",
+            "score:rank",
+            &include_columns,
+        );
+
+        assert!(value.starts_with("s3:"));
+        let meta = Executor::parse_index_meta("idx_stock_score_cover", &value).unwrap();
+        assert_eq!(meta.table, "stock:west,1");
+        assert_eq!(meta.columns, vec!["score:rank".to_string()]);
+        assert_eq!(meta.include_columns, include_columns);
+        assert!(!meta.ordered_encoding);
+    }
+
+    #[test]
+    fn single_column_index_meta_value_with_include_reads_legacy_s2() {
+        let meta =
+            Executor::parse_index_meta("idx_stock_score_cover", "s2:stock:score:payload,metric")
+                .unwrap();
+
+        assert_eq!(meta.table, "stock");
+        assert_eq!(meta.columns, vec!["score".to_string()]);
+        assert_eq!(
+            meta.include_columns,
+            vec!["payload".to_string(), "metric".to_string()]
+        );
+        assert!(!meta.ordered_encoding);
+    }
+
+    #[test]
+    fn single_column_index_meta_value_with_include_rejects_malformed_s3() {
+        for meta in [
+            "s3:",
+            "s3:5:stock0:1:7:payload",
+            "s3:5:stock2:5:score5:other1:7:payload",
+            "s3:5:stock1:5:score0:",
+            "s3:5:stock1:5:score1:7:payloadjunk",
+            "s3:10:stock",
+            "s3:5:stock999999999999:5:score1:7:payload",
+        ] {
+            assert!(
+                Executor::parse_index_meta("idx_bad", meta).is_none(),
+                "{meta} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_index_meta_value_with_include_roundtrips() {
+        let columns = vec!["warehouse_id".to_string(), "district_id".to_string()];
+        let include_columns = vec!["payload".to_string(), "metric".to_string()];
+        let value =
+            Executor::composite_index_meta_value_with_include("stock", &columns, &include_columns);
+
+        assert_eq!(
+            value,
+            "c5:5:stock2:12:warehouse_id11:district_id2:7:payload6:metric"
+        );
+        let meta = Executor::parse_index_meta("idx_stock_cover", &value).unwrap();
+        assert_eq!(meta.table, "stock");
+        assert_eq!(meta.columns, columns);
+        assert_eq!(meta.include_columns, include_columns);
+        assert!(meta.ordered_encoding);
+    }
+
+    #[test]
+    fn composite_index_meta_value_with_include_preserves_delimiter_identifiers() {
+        let columns = vec!["warehouse,id".to_string(), "district:id".to_string()];
+        let include_columns = vec!["payload:text".to_string(), "metric,value".to_string()];
+        let value = Executor::composite_index_meta_value_with_include(
+            "stock:west,1",
+            &columns,
+            &include_columns,
+        );
+
+        assert!(value.starts_with("c5:"));
+        let meta = Executor::parse_index_meta("idx_stock_cover", &value).unwrap();
+        assert_eq!(meta.table, "stock:west,1");
+        assert_eq!(meta.columns, columns);
+        assert_eq!(meta.include_columns, include_columns);
+        assert!(meta.ordered_encoding);
+    }
+
+    #[test]
+    fn composite_index_meta_value_with_include_reads_legacy_c4() {
+        let meta = Executor::parse_index_meta(
+            "idx_stock_cover",
+            "c4:stock:warehouse_id,district_id:payload,metric",
+        )
+        .unwrap();
+
+        assert_eq!(meta.table, "stock");
+        assert_eq!(
+            meta.columns,
+            vec!["warehouse_id".to_string(), "district_id".to_string()]
+        );
+        assert_eq!(
+            meta.include_columns,
+            vec!["payload".to_string(), "metric".to_string()]
+        );
+        assert!(meta.ordered_encoding);
+    }
+
+    #[test]
+    fn composite_index_meta_value_with_include_rejects_malformed_c5() {
+        for meta in [
+            "c5:",
+            "c5:5:stock0:1:7:payload",
+            "c5:5:stock1:12:warehouse_id0:",
+            "c5:5:stock1:12:warehouse_id1:7:payloadjunk",
+            "c5:10:stock",
+            "c5:5:stock999999999999:12:warehouse_id1:7:payload",
+        ] {
+            assert!(
+                Executor::parse_index_meta("idx_bad", meta).is_none(),
+                "{meta} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_index_table_directory_filter_avoids_colon_prefix_collisions() {
+        let table_a_key = Executor::composite_index_table_meta_key("a", "idx_a");
+        let table_ab_key = Executor::composite_index_table_meta_key("a:b", "idx_ab");
+        let table_a_value = Executor::composite_index_meta_value_with_include(
+            "a",
+            &["host_id".to_string(), "ts".to_string()],
+            &["payload".to_string()],
+        );
+        let table_ab_value = Executor::composite_index_meta_value_with_include(
+            "a:b",
+            &["host_id".to_string(), "ts".to_string()],
+            &["payload".to_string()],
+        );
+
+        assert!(
+            Executor::composite_index_table_directory_entry_belongs_to_table(
+                "a",
+                table_a_key.as_bytes(),
+                table_a_value.as_bytes()
+            )
+        );
+        assert!(
+            !Executor::composite_index_table_directory_entry_belongs_to_table(
+                "a",
+                table_ab_key.as_bytes(),
+                table_ab_value.as_bytes()
+            )
+        );
+        assert!(
+            Executor::composite_index_table_directory_entry_belongs_to_table(
+                "a",
+                Executor::composite_index_table_marker_key("a").as_bytes(),
+                b"v1"
+            )
+        );
+    }
+
+    #[test]
     fn composite_unique_meta_value_preallocates_exact_value() {
         let columns = vec!["warehouse_id".to_string(), "district_id".to_string()];
         let value = Executor::composite_unique_meta_value("stock", &columns);
@@ -1307,6 +2560,7 @@ mod tests {
             name: "idx_stock_warehouse_district".to_string(),
             table: "stock".to_string(),
             columns: vec!["warehouse_id".to_string(), "district_id".to_string()],
+            include_columns: Vec::new(),
             ordered_encoding: true,
         };
         let encoded = meta.encoded_columns();
@@ -1347,6 +2601,458 @@ mod tests {
         assert_eq!(values.get(&0), Some(&Value::Integer(7)));
         assert_eq!(values.get(&1), Some(&Value::String("open".to_string())));
         assert!(!values.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn composite_desc_ordered_scan_uses_bounded_reverse_range() {
+        let executor = test_executor();
+        let schema = TableSchema::new(
+            "tsbs".to_string(),
+            vec![
+                test_column("id", "INTEGER"),
+                test_column("host_id", "INTEGER"),
+                test_column("ts", "INTEGER"),
+            ],
+        );
+        let meta = CompositeIndexMeta {
+            name: "idx_tsbs_host_ts".to_string(),
+            table: "tsbs".to_string(),
+            columns: vec!["host_id".to_string(), "ts".to_string()],
+            include_columns: Vec::new(),
+            ordered_encoding: true,
+        };
+        let entries = [1000_i64, 2000, 3000, 4000]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, ts)| {
+                let value_key = executor
+                    .composite_index_value_key_for_meta_values(
+                        &meta,
+                        &[Value::Integer(1), Value::Integer(ts)],
+                    )
+                    .unwrap();
+                let row_id = (idx + 1).to_string();
+                (
+                    executor
+                        .routed_composite_index_entry_key(
+                            "tsbs",
+                            &meta.columns,
+                            &value_key,
+                            &row_id,
+                        )
+                        .into_bytes(),
+                    Vec::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_meta_key = Executor::composite_index_table_meta_key("tsbs", &meta.name);
+        let table_meta_value = Executor::composite_index_meta_value("tsbs", &meta.columns);
+        let mut txn = RecordingCompositeTxn::new(
+            Executor::composite_index_table_marker_key("tsbs").into_bytes(),
+            Executor::composite_index_table_prefix("tsbs").into_bytes(),
+            (table_meta_key.into_bytes(), table_meta_value.into_bytes()),
+            entries,
+        );
+        let reverse_calls = txn.reverse_calls.clone();
+        let reverse_for_each_calls = txn.reverse_for_each_calls.clone();
+        let range_calls = txn.range_calls.clone();
+
+        let statement = crate::parser::parse_sql(
+            "SELECT id FROM tsbs WHERE host_id = 1 AND ts >= 0 ORDER BY ts DESC LIMIT 2",
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let (selection, order_by) = match statement {
+            sqlparser::ast::Statement::Query(query) => {
+                let order_by = query.order_by.clone().unwrap();
+                let selection = match *query.body {
+                    sqlparser::ast::SetExpr::Select(select) => select.selection.unwrap(),
+                    _ => panic!("expected SELECT"),
+                };
+                (selection, order_by)
+            }
+            _ => panic!("expected query"),
+        };
+
+        let plan = executor
+            .try_composite_index_scan(
+                &selection,
+                "tsbs",
+                &schema,
+                &mut txn,
+                &[],
+                Some(2),
+                Some(&order_by),
+                Some(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(*range_calls.lock().unwrap(), 0);
+        assert!(reverse_calls.lock().unwrap().is_empty());
+        let calls = reverse_for_each_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, Some(2));
+        assert_eq!(
+            plan.ordered_row_ids.unwrap(),
+            vec!["4".to_string(), "3".to_string()]
+        );
+        assert!(plan.exact);
+    }
+
+    #[tokio::test]
+    async fn composite_ordered_scan_covers_primary_key_and_index_columns() {
+        let executor = test_executor();
+        let mut id_column = test_column("id", "INTEGER");
+        id_column.is_primary = true;
+        let schema = TableSchema::new(
+            "tsbs".to_string(),
+            vec![
+                id_column,
+                test_column("host_id", "INTEGER"),
+                test_column("ts", "INTEGER"),
+            ],
+        );
+        let meta = CompositeIndexMeta {
+            name: "idx_tsbs_host_ts".to_string(),
+            table: "tsbs".to_string(),
+            columns: vec!["host_id".to_string(), "ts".to_string()],
+            include_columns: Vec::new(),
+            ordered_encoding: true,
+        };
+        let row_ids = [1_i64, 2, 3, 4]
+            .into_iter()
+            .zip([1000_i64, 2000, 3000, 4000])
+            .map(|(id, ts)| {
+                (
+                    Executor::value_to_primary_row_id(&Value::Integer(id)).unwrap(),
+                    ts,
+                )
+            })
+            .collect::<Vec<_>>();
+        let entries = row_ids
+            .iter()
+            .map(|(row_id, ts)| {
+                let value_key = executor
+                    .composite_index_value_key_for_meta_values(
+                        &meta,
+                        &[Value::Integer(1), Value::Integer(*ts)],
+                    )
+                    .unwrap();
+                (
+                    executor
+                        .routed_composite_index_entry_key(
+                            "tsbs",
+                            &meta.columns,
+                            &value_key,
+                            &row_id,
+                        )
+                        .into_bytes(),
+                    Vec::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_meta_key = Executor::composite_index_table_meta_key("tsbs", &meta.name);
+        let table_meta_value = Executor::composite_index_meta_value("tsbs", &meta.columns);
+        let mut txn = RecordingCompositeTxn::new(
+            Executor::composite_index_table_marker_key("tsbs").into_bytes(),
+            Executor::composite_index_table_prefix("tsbs").into_bytes(),
+            (table_meta_key.into_bytes(), table_meta_value.into_bytes()),
+            entries,
+        );
+
+        let statement = crate::parser::parse_sql(
+            "SELECT id, host_id, ts FROM tsbs WHERE host_id = 1 AND ts >= 0 ORDER BY ts ASC LIMIT 2",
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let (selection, order_by) = match statement {
+            sqlparser::ast::Statement::Query(query) => {
+                let order_by = query.order_by.clone().unwrap();
+                let selection = match *query.body {
+                    sqlparser::ast::SetExpr::Select(select) => select.selection.unwrap(),
+                    _ => panic!("expected SELECT"),
+                };
+                (selection, order_by)
+            }
+            _ => panic!("expected query"),
+        };
+
+        let plan = executor
+            .try_composite_index_scan(
+                &selection,
+                "tsbs",
+                &schema,
+                &mut txn,
+                &[],
+                Some(2),
+                Some(&order_by),
+                Some(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            plan.ordered_row_ids.as_ref().unwrap(),
+            &vec![row_ids[0].0.clone(), row_ids[1].0.clone()]
+        );
+        assert!(plan.exact);
+        let covered = plan.covered.unwrap();
+        assert_eq!(covered.column_indices, vec![0, 1, 2]);
+        assert_eq!(
+            covered.rows.get(&row_ids[0].0).unwrap(),
+            &vec![Value::Integer(1), Value::Integer(1), Value::Integer(1000)]
+        );
+        assert_eq!(
+            covered.rows.get(&row_ids[1].0).unwrap(),
+            &vec![Value::Integer(2), Value::Integer(1), Value::Integer(2000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_include_ordered_scan_covers_payload_columns() {
+        let executor = test_executor();
+        let mut id_column = test_column("id", "INTEGER");
+        id_column.is_primary = true;
+        let schema = TableSchema::new(
+            "tsbs".to_string(),
+            vec![
+                id_column,
+                test_column("host_id", "INTEGER"),
+                test_column("ts", "INTEGER"),
+                test_column("payload", "TEXT"),
+                test_column("metric", "INTEGER"),
+            ],
+        );
+        let meta = CompositeIndexMeta {
+            name: "idx_tsbs_host_ts_cover".to_string(),
+            table: "tsbs".to_string(),
+            columns: vec!["host_id".to_string(), "ts".to_string()],
+            include_columns: vec!["payload".to_string(), "metric".to_string()],
+            ordered_encoding: true,
+        };
+        let include_indices = vec![3, 4];
+        let rows = [
+            (
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(1000),
+                Value::String("alpha".to_string()),
+                Value::Integer(11),
+            ),
+            (
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(2000),
+                Value::String("beta".to_string()),
+                Value::Integer(22),
+            ),
+        ];
+        let row_ids = rows
+            .iter()
+            .map(|row| Executor::value_to_primary_row_id(&row.0).unwrap())
+            .collect::<Vec<_>>();
+        let entries = rows
+            .iter()
+            .zip(&row_ids)
+            .map(|(row, row_id)| {
+                let full_row = vec![
+                    row.0.clone(),
+                    row.1.clone(),
+                    row.2.clone(),
+                    row.3.clone(),
+                    row.4.clone(),
+                ];
+                let value_key = executor
+                    .composite_index_value_key_for_meta_values(
+                        &meta,
+                        &[row.1.clone(), row.2.clone()],
+                    )
+                    .unwrap();
+                let payload =
+                    Executor::secondary_index_payload_for_row(&full_row, &include_indices);
+                (
+                    executor
+                        .routed_composite_index_entry_key("tsbs", &meta.columns, &value_key, row_id)
+                        .into_bytes(),
+                    payload,
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_meta_key = Executor::composite_index_table_meta_key("tsbs", &meta.name);
+        let table_meta_value = Executor::composite_index_meta_value_with_include(
+            "tsbs",
+            &meta.columns,
+            &meta.include_columns,
+        );
+        let mut txn = RecordingCompositeTxn::new(
+            Executor::composite_index_table_marker_key("tsbs").into_bytes(),
+            Executor::composite_index_table_prefix("tsbs").into_bytes(),
+            (table_meta_key.into_bytes(), table_meta_value.into_bytes()),
+            entries,
+        );
+
+        let statement = crate::parser::parse_sql(
+            "SELECT id, host_id, ts, payload, metric FROM tsbs WHERE host_id = 1 AND ts >= 0 ORDER BY ts ASC LIMIT 2",
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let (selection, order_by) = match statement {
+            sqlparser::ast::Statement::Query(query) => {
+                let order_by = query.order_by.clone().unwrap();
+                let selection = match *query.body {
+                    sqlparser::ast::SetExpr::Select(select) => select.selection.unwrap(),
+                    _ => panic!("expected SELECT"),
+                };
+                (selection, order_by)
+            }
+            _ => panic!("expected query"),
+        };
+
+        let plan = executor
+            .try_composite_index_scan(
+                &selection,
+                "tsbs",
+                &schema,
+                &mut txn,
+                &[],
+                Some(2),
+                Some(&order_by),
+                Some(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(plan.exact);
+        let covered = plan.covered.unwrap();
+        assert_eq!(covered.column_indices, vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            covered.rows.get(&row_ids[0]).unwrap(),
+            &vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(1000),
+                Value::String("alpha".to_string()),
+                Value::Integer(11),
+            ]
+        );
+        assert_eq!(
+            covered.rows.get(&row_ids[1]).unwrap(),
+            &vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(2000),
+                Value::String("beta".to_string()),
+                Value::Integer(22),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_desc_ordered_scan_requires_bounded_reverse_capability() {
+        let executor = test_executor();
+        let schema = TableSchema::new(
+            "tsbs".to_string(),
+            vec![
+                test_column("id", "INTEGER"),
+                test_column("host_id", "INTEGER"),
+                test_column("ts", "INTEGER"),
+            ],
+        );
+        let meta = CompositeIndexMeta {
+            name: "idx_tsbs_host_ts".to_string(),
+            table: "tsbs".to_string(),
+            columns: vec!["host_id".to_string(), "ts".to_string()],
+            include_columns: Vec::new(),
+            ordered_encoding: true,
+        };
+        let entries = [1000_i64, 2000, 3000, 4000]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, ts)| {
+                let value_key = executor
+                    .composite_index_value_key_for_meta_values(
+                        &meta,
+                        &[Value::Integer(1), Value::Integer(ts)],
+                    )
+                    .unwrap();
+                let row_id = (idx + 1).to_string();
+                (
+                    executor
+                        .routed_composite_index_entry_key(
+                            "tsbs",
+                            &meta.columns,
+                            &value_key,
+                            &row_id,
+                        )
+                        .into_bytes(),
+                    Vec::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_meta_key = Executor::composite_index_table_meta_key("tsbs", &meta.name);
+        let table_meta_value = Executor::composite_index_meta_value("tsbs", &meta.columns);
+        let mut txn = RecordingCompositeTxn::new(
+            Executor::composite_index_table_marker_key("tsbs").into_bytes(),
+            Executor::composite_index_table_prefix("tsbs").into_bytes(),
+            (table_meta_key.into_bytes(), table_meta_value.into_bytes()),
+            entries,
+        )
+        .without_bounded_reverse();
+        let reverse_calls = txn.reverse_calls.clone();
+        let range_calls = txn.range_calls.clone();
+        let range_for_each_calls = txn.range_for_each_calls.clone();
+        let reverse_for_each_calls = txn.reverse_for_each_calls.clone();
+
+        let statement = crate::parser::parse_sql(
+            "SELECT id FROM tsbs WHERE host_id = 1 AND ts >= 0 ORDER BY ts DESC LIMIT 2",
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let (selection, order_by) = match statement {
+            sqlparser::ast::Statement::Query(query) => {
+                let order_by = query.order_by.clone().unwrap();
+                let selection = match *query.body {
+                    sqlparser::ast::SetExpr::Select(select) => select.selection.unwrap(),
+                    _ => panic!("expected SELECT"),
+                };
+                (selection, order_by)
+            }
+            _ => panic!("expected query"),
+        };
+
+        let plan = executor
+            .try_composite_index_scan(
+                &selection,
+                "tsbs",
+                &schema,
+                &mut txn,
+                &[],
+                Some(2),
+                Some(&order_by),
+                Some(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(*range_calls.lock().unwrap(), 0);
+        assert_eq!(*range_for_each_calls.lock().unwrap(), 1);
+        assert!(reverse_calls.lock().unwrap().is_empty());
+        assert!(reverse_for_each_calls.lock().unwrap().is_empty());
+        assert!(plan.ordered_row_ids.is_none());
+        assert!(plan.exact);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use crate::common::{FusionError, Result, Value};
 use crate::monitor;
 use crate::storage::Transaction;
 use sqlparser::ast::Expr;
+use std::collections::HashMap;
 
 use super::super::{Executor, QueryResult};
 
@@ -84,6 +85,7 @@ impl Executor {
         index_name: &Option<sqlparser::ast::ObjectName>,
         table_name: &sqlparser::ast::ObjectName,
         columns: &[sqlparser::ast::IndexColumn],
+        include: &[sqlparser::ast::Ident],
         _unique: bool,
         index_options: &[sqlparser::ast::IndexOption],
         txn: &mut dyn Transaction,
@@ -155,6 +157,27 @@ impl Executor {
             ));
         }
 
+        if !include.is_empty() && index_type != IndexType::BTree {
+            return Err(FusionError::Execution(
+                "INCLUDE columns currently support BTree indexes only".to_string(),
+            ));
+        }
+        let mut include_col_indices = Vec::with_capacity(include.len());
+        let mut include_col_names = Vec::with_capacity(include.len());
+        for ident in include {
+            let idx = schema.get_column_index(&ident.value).ok_or_else(|| {
+                FusionError::Execution(format!("Column {} not found", ident.value))
+            })?;
+            if target_col_indices.contains(&idx) || include_col_indices.contains(&idx) {
+                return Err(FusionError::Execution(format!(
+                    "Duplicate INCLUDE column {}",
+                    ident.value
+                )));
+            }
+            include_col_indices.push(idx);
+            include_col_names.push(schema.columns[idx].name.clone());
+        }
+
         if target_col_indices.len() == 1 {
             let col_idx = target_col_indices[0];
             let col_name = schema.columns[col_idx].name.clone();
@@ -172,8 +195,18 @@ impl Executor {
             .map_err(|e| FusionError::Execution(format!("Schema serialization error: {}", e)))?;
         txn.put(schema_key.as_bytes(), &new_schema_value).await?;
 
+        let maintain_count_summary = target_col_indices.len() == 1
+            && Self::index_count_summary_maintained_for_column(
+                &schema.columns[target_col_indices[0]],
+            );
+        let mut index_count_summary = HashMap::new();
         let kv_pairs = self
-            .scan_routed_data_prefixes_for_table(&table_name_str, txn, None)
+            .scan_routed_data_prefixes_for_table_with_options(
+                &table_name_str,
+                txn,
+                None,
+                self.bulk_scan_options(),
+            )
             .await?;
 
         let mut count = 0;
@@ -186,10 +219,15 @@ impl Executor {
                 .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?;
 
             let row = if target_col_indices.len() > 1 {
-                crate::common::encoding::RowDecoder::decode_partial(&v, &target_col_indices)
-                    .map_err(|e| {
-                        FusionError::Execution(format!("Data deserialization error: {}", e))
-                    })?
+                let mut decode_indices = target_col_indices.clone();
+                for &include_idx in &include_col_indices {
+                    if !decode_indices.contains(&include_idx) {
+                        decode_indices.push(include_idx);
+                    }
+                }
+                crate::common::encoding::RowDecoder::decode_partial(&v, &decode_indices).map_err(
+                    |e| FusionError::Execution(format!("Data deserialization error: {}", e)),
+                )?
             } else {
                 Vec::new()
             };
@@ -202,7 +240,8 @@ impl Executor {
                     &schema,
                     row_id,
                 ) {
-                    txn.put(index_key.as_bytes(), &[]).await?;
+                    let payload = Self::secondary_index_payload_for_row(&row, &include_col_indices);
+                    txn.put(index_key.as_bytes(), &payload).await?;
                     count += 1;
                 }
                 continue;
@@ -210,13 +249,28 @@ impl Executor {
 
             let col_idx = target_col_indices[0];
             let col_name = &target_col_names[0];
-            let val = if let Some(row) = self.row_cache.get(key_str) {
-                monitor::inc_row_cache_hit();
-                row.get(col_idx).cloned()
+            let (val, payload) = if include_col_indices.is_empty() {
+                let val = if let Some(row) = self.row_cache.get(key_str) {
+                    monitor::inc_row_cache_hit();
+                    row.get(col_idx).cloned()
+                } else {
+                    crate::common::encoding::RowDecoder::decode_column(&v, col_idx).map_err(
+                        |e| FusionError::Execution(format!("Data deserialization error: {}", e)),
+                    )?
+                };
+                (val, Vec::new())
             } else {
-                crate::common::encoding::RowDecoder::decode_column(&v, col_idx).map_err(|e| {
-                    FusionError::Execution(format!("Data deserialization error: {}", e))
-                })?
+                let row = if let Some(row) = self.row_cache.get(key_str) {
+                    monitor::inc_row_cache_hit();
+                    row
+                } else {
+                    crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
+                        FusionError::Execution(format!("Data deserialization error: {}", e))
+                    })?
+                };
+                let val = row.get(col_idx).cloned();
+                let payload = Self::secondary_index_payload_for_row(&row, &include_col_indices);
+                (val, payload)
             };
             let Some(val) = val else {
                 continue;
@@ -249,7 +303,10 @@ impl Executor {
                         &val_str,
                         row_id,
                     );
-                    txn.put(index_key.as_bytes(), &[]).await?;
+                    txn.put(index_key.as_bytes(), &payload).await?;
+                    if maintain_count_summary {
+                        *index_count_summary.entry(val_str).or_insert(0) += 1;
+                    }
                 } else {
                     continue;
                 }
@@ -258,11 +315,29 @@ impl Executor {
             count += 1;
         }
 
+        if maintain_count_summary {
+            self.replace_index_count_summary_for_column(
+                &table_name_str,
+                &target_col_names[0],
+                &index_count_summary,
+                txn,
+            )
+            .await?;
+        }
+
         // Store index metadata for DROP INDEX support
         let meta_val = if target_col_names.len() == 1 {
-            Self::single_column_index_meta_value(&table_name_str, &target_col_names[0])
+            Self::single_column_index_meta_value_with_include(
+                &table_name_str,
+                &target_col_names[0],
+                &include_col_names,
+            )
         } else {
-            Self::composite_index_meta_value(&table_name_str, &target_col_names)
+            Self::composite_index_meta_value_with_include(
+                &table_name_str,
+                &target_col_names,
+                &include_col_names,
+            )
         };
         txn.put(meta_key.as_bytes(), meta_val.as_bytes()).await?;
         if target_col_names.len() > 1 {
@@ -329,6 +404,14 @@ impl Executor {
                     };
                     for (k, _) in index_entries {
                         txn.delete(&k).await?;
+                    }
+                    if meta.columns.len() == 1 {
+                        self.delete_index_count_summary_for_column(
+                            &table_name,
+                            &meta.columns[0],
+                            txn,
+                        )
+                        .await?;
                     }
 
                     // Update schema: mark column as not indexed

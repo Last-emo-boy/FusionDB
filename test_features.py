@@ -3,6 +3,11 @@ import json
 import time
 import os
 
+AUTH = (
+    os.environ.get("FUSIONDB_HTTP_USER", "postgres"),
+    os.environ.get("FUSIONDB_HTTP_PASSWORD", "fusiondb"),
+)
+
 def get_base_url():
     port_file = "server_port.txt"
     print(f"Looking for {port_file}...")
@@ -17,14 +22,14 @@ def get_base_url():
             except:
                 pass
         time.sleep(0.5)
-    print("WARNING: Could not read server_port.txt, defaulting to 8000")
-    return "http://127.0.0.1:8000/query"
+    print("WARNING: Could not read server_port.txt, defaulting to 8091")
+    return "http://127.0.0.1:8091/query"
 
 BASE_URL = get_base_url()
 
 def execute_sql(sql):
     try:
-        response = requests.post(BASE_URL, json={"sql": sql})
+        response = requests.post(BASE_URL, json={"sql": sql}, auth=AUTH)
         if response.status_code != 200:
              print(f"HTTP Error {response.status_code}: {response.text}")
         
@@ -57,14 +62,14 @@ def test_features():
     print("\nTest COUNT(*)...")
     res = execute_sql("SELECT COUNT(*) FROM products")
     print(json.dumps(res, indent=2))
-    assert res['result'][0]['rows'][0][0] == 5
+    assert res['data'][0]['rows'][0][0] == 5
 
     # 3. Test LIMIT / OFFSET
     print("\nTest LIMIT 2 OFFSET 1...")
     # Note: Previously this returned all columns. Now it should only return 'name'.
     res = execute_sql("SELECT name FROM products ORDER BY id LIMIT 2 OFFSET 1")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     assert len(rows) == 2
     # Name is now at index 0 because only 'name' was selected
     assert rows[0][0] == 'Banana'
@@ -76,14 +81,14 @@ def test_features():
     res = execute_sql("SELECT price FROM products WHERE name = 'Apple'")
     print(json.dumps(res, indent=2))
     # Only 'price' selected, so index 0
-    assert res['result'][0]['rows'][0][0] == 15
+    assert res['data'][0]['rows'][0][0] == 15
 
     # 4.1 Verify Index Maintenance after Update
     # Apple price changed from 10 to 15. Searching for 10 should not find Apple.
     print("\nVerify Index Maintenance (Old Value)...")
     res = execute_sql("SELECT name FROM products WHERE price = 10")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     # Should only find Elderberry (5)
     assert len(rows) == 1 
     # Elderberry name is at index 0
@@ -95,18 +100,18 @@ def test_features():
     res = execute_sql("SELECT COUNT(*) FROM products")
     print(json.dumps(res, indent=2))
     # Original 5, Deleted 2 (Banana, Date), Remaining 3
-    assert res['result'][0]['rows'][0][0] == 3
+    assert res['data'][0]['rows'][0][0] == 3
 
     # 6. Test Projection (New)
     print("\nTest Projection SELECT name, price FROM products...")
     res = execute_sql("SELECT name, price FROM products WHERE price < 30")
     print(json.dumps(res, indent=2))
     # Should contain columns ["name", "price"] only
-    cols = res['result'][0]['columns']
+    cols = res['data'][0]['columns']
     assert len(cols) == 2
     assert cols[0] == "name"
     assert cols[1] == "price"
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     # Check row content
     assert len(rows[0]) == 2
     
@@ -117,7 +122,7 @@ def test_features():
     # Let's test simple alias on column first.
     res = execute_sql("SELECT name AS n FROM products")
     print(json.dumps(res, indent=2))
-    cols = res['result'][0]['columns']
+    cols = res['data'][0]['columns']
     assert cols[0] == "n"
 
     # 8. Test GROUP BY and Aggregation
@@ -135,7 +140,7 @@ def test_features():
     
     res = execute_sql("SELECT name, COUNT(*) AS count, SUM(price) AS total_price FROM products GROUP BY name ORDER BY name")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     # Expected groups:
     # Apple: 2 rows (15+20=35)
     # Banana: 1 row (30)
@@ -159,7 +164,7 @@ def test_features():
     print("\nTest HAVING COUNT(*) > 1...")
     res = execute_sql("SELECT name, COUNT(*) as c FROM products GROUP BY name HAVING COUNT(*) > 1")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     # Only Apple should remain (count=2)
     assert len(rows) == 1
     assert rows[0][0] == 'Apple'
@@ -182,7 +187,7 @@ def test_features():
     # Join t1 and t2 on t1.id = t2.t1_id
     res = execute_sql("SELECT t1.id, t1.v1, t2.v2 FROM t1 JOIN t2 ON t1.id = t2.t1_id")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     
     # Expected results:
     # t1(1, 'A') matches t2(100, 1, 'X') -> (1, 'A', 'X')
@@ -212,7 +217,7 @@ def test_features():
     # Select Apple (id=1): price(15) * 2 = 30, price(15) + 5 = 20
     res = execute_sql("SELECT name, price * 2 AS double_price, price + 5 AS price_plus_5 FROM products WHERE id = 1")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     assert len(rows) == 1
     # Check double_price (index 1)
     assert rows[0][1] == 30
@@ -228,7 +233,7 @@ def test_features():
     # 2 -> No Match -> (2, B, NULL)
     res = execute_sql("SELECT t1.id, t1.v1, t2.v2 FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     assert len(rows) == 3 
     
     # Check for (2, B, NULL)

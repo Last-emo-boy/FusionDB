@@ -47,6 +47,57 @@ async fn test_select_with_where_eq() {
 }
 
 #[tokio::test]
+async fn test_select_conjunctive_primary_key_range() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_range_and (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO pk_range_and VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, name FROM pk_range_and WHERE id >= 2 AND id < 4",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "name"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(2), Value::String("b".to_string())],
+            vec![Value::Integer(3), Value::String("c".to_string())],
+        ]
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM pk_range_and WHERE id >= 3 AND id < 3",
+    )
+    .await;
+    assert!(rows.is_empty());
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM pk_range_and WHERE 2 <= id AND id <= 4",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(4)],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_select_with_where_gt() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -369,6 +420,104 @@ async fn test_null_handling() {
     exec_ok(&executor, "INSERT INTO data VALUES (1, NULL)").await;
     let (_, rows) = query(&executor, "SELECT * FROM data WHERE id = 1").await;
     assert_eq!(rows[0][1], Value::Null);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_sql_three_valued_logic_where_predicates() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE tvl (id INTEGER PRIMARY KEY, flag BOOLEAN, val INTEGER, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO tvl VALUES
+            (1, TRUE, 5, 'alpha'),
+            (2, FALSE, NULL, NULL),
+            (3, NULL, 10, 'beta')",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM tvl WHERE FALSE OR flag ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM tvl WHERE TRUE OR flag ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ]
+    );
+
+    let (_, rows) = query(&executor, "SELECT id FROM tvl WHERE NOT flag ORDER BY id").await;
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM tvl WHERE flag OR id = 3 ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM tvl WHERE flag AND id = 3 ORDER BY id",
+    )
+    .await;
+    assert!(rows.is_empty());
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM tvl WHERE val BETWEEN NULL AND 20 ORDER BY id",
+    )
+    .await;
+    assert!(rows.is_empty());
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_sql_three_valued_logic_projection_results() {
+    let (executor, wal) = setup().await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT
+            NULL = NULL,
+            NOT (NULL = 1),
+            1 IN (2, NULL),
+            1 NOT IN (2, NULL),
+            3 BETWEEN NULL AND 2,
+            1 LIKE NULL,
+            NULL IS UNKNOWN,
+            NULL IS NOT TRUE",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Boolean(false),
+            Value::Null,
+            Value::Boolean(true),
+            Value::Boolean(true),
+        ]]
+    );
     cleanup(&wal);
 }
 

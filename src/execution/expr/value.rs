@@ -7,7 +7,7 @@ use sqlparser::ast::{
 use std::cmp::Ordering;
 use std::fmt::Write as _;
 
-use super::Executor;
+use super::{Executor, SqlTruth};
 
 fn decimal_index_string_for_value(decimal: &str) -> String {
     let mut value = String::with_capacity("dec:".len() + decimal.len());
@@ -131,12 +131,22 @@ impl Executor {
         match expr {
             Expr::Identifier(ident) => {
                 let idx = self.resolve_column_index(&ident.value, schema)?;
-                Ok(row[idx].clone())
+                row.get(idx).cloned().ok_or_else(|| {
+                    FusionError::Execution(format!(
+                        "Column {} is not available in the current row",
+                        ident.value
+                    ))
+                })
             }
             Expr::CompoundIdentifier(idents) => {
                 let col_name = Self::compound_identifier_name(idents);
                 let idx = self.resolve_column_index(&col_name, schema)?;
-                Ok(row[idx].clone())
+                row.get(idx).cloned().ok_or_else(|| {
+                    FusionError::Execution(format!(
+                        "Column {} is not available in the current row",
+                        col_name
+                    ))
+                })
             }
             Expr::CompoundFieldAccess { root, access_chain } => {
                 let mut value = self.evaluate_value(root, row, schema, params)?;
@@ -207,10 +217,9 @@ impl Executor {
                         _ => Ok(Value::Null),
                     },
                     sqlparser::ast::UnaryOperator::Plus => Ok(val),
-                    sqlparser::ast::UnaryOperator::Not => match val {
-                        Value::Boolean(b) => Ok(Value::Boolean(!b)),
-                        _ => Ok(Value::Null),
-                    },
+                    sqlparser::ast::UnaryOperator::Not => {
+                        Ok(SqlTruth::from_value(val, expr)?.not().into_value())
+                    }
                     _ => Err(FusionError::Execution(format!(
                         "Unsupported unary op: {}",
                         op
@@ -312,6 +321,28 @@ impl Executor {
                 let left_val = self.evaluate_value(left, row, schema, params)?;
                 let right_val = self.evaluate_value(right, row, schema, params)?;
                 match op {
+                    BinaryOperator::And => {
+                        let left_truth = SqlTruth::from_value(left_val, left)?;
+                        let right_truth = SqlTruth::from_value(right_val, right)?;
+                        Ok(left_truth.and(right_truth).into_value())
+                    }
+                    BinaryOperator::Or => {
+                        let left_truth = SqlTruth::from_value(left_val, left)?;
+                        let right_truth = SqlTruth::from_value(right_val, right)?;
+                        Ok(left_truth.or(right_truth).into_value())
+                    }
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Lt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::LtEq => {
+                        let (left_val, right_val) =
+                            self.align_comparison_values(left, left_val, right, right_val, schema)?;
+                        Ok(self
+                            .compare_binary_predicate_truth(&left_val, op, &right_val)?
+                            .into_value())
+                    }
                     BinaryOperator::Plus => self.compute_add_op(&left_val, &right_val),
                     BinaryOperator::Minus => self.compute_subtract_op(&left_val, &right_val),
                     BinaryOperator::Multiply => self.compute_multiply_op(&left_val, &right_val),
@@ -413,18 +444,28 @@ impl Executor {
                     self.align_comparison_values(expr, val, low, low_val, schema)?;
                 let (val, high_val) =
                     self.align_comparison_values(expr, val, high, high_val, schema)?;
-                let ge = self.compare_values(&val, &low_val, |l, r| l >= r)?;
-                let le = self.compare_values(&val, &high_val, |l, r| l <= r)?;
-                let result = ge && le;
-                Ok(Value::Boolean(if *negated { !result } else { result }))
+                let ge =
+                    self.compare_binary_predicate_truth(&val, &BinaryOperator::GtEq, &low_val)?;
+                let le =
+                    self.compare_binary_predicate_truth(&val, &BinaryOperator::LtEq, &high_val)?;
+                let result = ge.and(le);
+                Ok(if *negated { result.not() } else { result }.into_value())
             }
             Expr::IsFalse(inner) => {
-                let val = self.evaluate_value(inner, row, schema, params)?;
-                Ok(Value::Boolean(val == Value::Boolean(false)))
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(Value::Boolean(matches!(truth, SqlTruth::False)))
+            }
+            Expr::IsNotFalse(inner) => {
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(Value::Boolean(!matches!(truth, SqlTruth::False)))
             }
             Expr::IsTrue(inner) => {
-                let val = self.evaluate_value(inner, row, schema, params)?;
-                Ok(Value::Boolean(val == Value::Boolean(true)))
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(Value::Boolean(matches!(truth, SqlTruth::True)))
+            }
+            Expr::IsNotTrue(inner) => {
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(Value::Boolean(!matches!(truth, SqlTruth::True)))
             }
             Expr::IsNull(inner) => {
                 let val = self.evaluate_value(inner, row, schema, params)?;
@@ -434,21 +475,36 @@ impl Executor {
                 let val = self.evaluate_value(inner, row, schema, params)?;
                 Ok(Value::Boolean(val != Value::Null))
             }
+            Expr::IsUnknown(inner) => {
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(Value::Boolean(matches!(truth, SqlTruth::Unknown)))
+            }
+            Expr::IsNotUnknown(inner) => {
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(Value::Boolean(!matches!(truth, SqlTruth::Unknown)))
+            }
             Expr::AnyOp {
                 left,
                 compare_op,
                 right,
                 ..
-            } => Ok(Value::Boolean(self.evaluate_quantified_array_comparison(
-                left, compare_op, right, false, row, schema, params,
-            )?)),
+            } => Ok(self
+                .evaluate_quantified_array_comparison_truth(
+                    left, compare_op, right, false, row, schema, params,
+                )?
+                .into_value()),
             Expr::AllOp {
                 left,
                 compare_op,
                 right,
-            } => Ok(Value::Boolean(self.evaluate_quantified_array_comparison(
-                left, compare_op, right, true, row, schema, params,
-            )?)),
+            } => Ok(self
+                .evaluate_quantified_array_comparison_truth(
+                    left, compare_op, right, true, row, schema, params,
+                )?
+                .into_value()),
+            Expr::InList { .. } | Expr::Like { .. } | Expr::ILike { .. } => Ok(self
+                .evaluate_expr_truth(expr, row, schema, params)?
+                .into_value()),
             _ => Err(FusionError::Execution(format!(
                 "Unsupported value expression: {:?}",
                 expr
@@ -546,24 +602,36 @@ impl Executor {
                     "Type mismatch in division".to_string(),
                 )),
             },
-            BinaryOperator::Eq => Ok(Value::Boolean(
-                left_val.compare(&right_val) == Ordering::Equal,
-            )),
-            BinaryOperator::NotEq => Ok(Value::Boolean(
-                left_val.compare(&right_val) != Ordering::Equal,
-            )),
-            BinaryOperator::Gt => Ok(Value::Boolean(
-                left_val.compare(&right_val) == Ordering::Greater,
-            )),
-            BinaryOperator::Lt => Ok(Value::Boolean(
-                left_val.compare(&right_val) == Ordering::Less,
-            )),
-            BinaryOperator::GtEq => Ok(Value::Boolean(
-                left_val.compare(&right_val) != Ordering::Less,
-            )),
-            BinaryOperator::LtEq => Ok(Value::Boolean(
-                left_val.compare(&right_val) != Ordering::Greater,
-            )),
+            BinaryOperator::And => {
+                let left_truth = SqlTruth::from_boolean_value(
+                    left_val,
+                    "Type mismatch in boolean AND expression",
+                )?;
+                let right_truth = SqlTruth::from_boolean_value(
+                    right_val,
+                    "Type mismatch in boolean AND expression",
+                )?;
+                Ok(left_truth.and(right_truth).into_value())
+            }
+            BinaryOperator::Or => {
+                let left_truth = SqlTruth::from_boolean_value(
+                    left_val,
+                    "Type mismatch in boolean OR expression",
+                )?;
+                let right_truth = SqlTruth::from_boolean_value(
+                    right_val,
+                    "Type mismatch in boolean OR expression",
+                )?;
+                Ok(left_truth.or(right_truth).into_value())
+            }
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Gt
+            | BinaryOperator::Lt
+            | BinaryOperator::GtEq
+            | BinaryOperator::LtEq => Ok(self
+                .compare_binary_predicate_truth(&left_val, op, &right_val)?
+                .into_value()),
             _ => Err(FusionError::Execution(format!(
                 "Unsupported operator: {}",
                 op
@@ -762,29 +830,33 @@ impl Executor {
         }
     }
 
-    pub(crate) fn compare_binary_predicate(
+    pub(crate) fn compare_binary_predicate_truth(
         &self,
         left: &Value,
         op: &BinaryOperator,
         right: &Value,
-    ) -> Result<bool> {
+    ) -> Result<SqlTruth> {
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(SqlTruth::Unknown);
+        }
+
         match op {
-            BinaryOperator::Eq => {
-                if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                    return Ok(false);
-                }
-                Ok(left.compare(right) == Ordering::Equal)
-            }
+            BinaryOperator::Eq => Ok(SqlTruth::from_bool(left.compare(right) == Ordering::Equal)),
             BinaryOperator::NotEq => {
-                if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                    return Ok(false);
-                }
-                Ok(left.compare(right) != Ordering::Equal)
+                Ok(SqlTruth::from_bool(left.compare(right) != Ordering::Equal))
             }
-            BinaryOperator::Gt => self.compare_values(left, right, |l, r| l > r),
-            BinaryOperator::Lt => self.compare_values(left, right, |l, r| l < r),
-            BinaryOperator::GtEq => self.compare_values(left, right, |l, r| l >= r),
-            BinaryOperator::LtEq => self.compare_values(left, right, |l, r| l <= r),
+            BinaryOperator::Gt => self
+                .compare_values(left, right, |l, r| l > r)
+                .map(SqlTruth::from_bool),
+            BinaryOperator::Lt => self
+                .compare_values(left, right, |l, r| l < r)
+                .map(SqlTruth::from_bool),
+            BinaryOperator::GtEq => self
+                .compare_values(left, right, |l, r| l >= r)
+                .map(SqlTruth::from_bool),
+            BinaryOperator::LtEq => self
+                .compare_values(left, right, |l, r| l <= r)
+                .map(SqlTruth::from_bool),
             _ => Err(FusionError::Execution(format!(
                 "Unsupported quantified comparison operator: {}",
                 op
@@ -792,7 +864,7 @@ impl Executor {
         }
     }
 
-    pub(crate) fn evaluate_quantified_array_comparison(
+    pub(crate) fn evaluate_quantified_array_comparison_truth(
         &self,
         left_expr: &Expr,
         compare_op: &BinaryOperator,
@@ -801,7 +873,7 @@ impl Executor {
         row: &[Value],
         schema: &TableSchema,
         params: &[Value],
-    ) -> Result<bool> {
+    ) -> Result<SqlTruth> {
         let left_value = self.evaluate_value(left_expr, row, schema, params)?;
         let right_value = self.evaluate_value(right_expr, row, schema, params)?;
         let Value::Array(values) = right_value else {
@@ -812,9 +884,10 @@ impl Executor {
         };
 
         if values.is_empty() {
-            return Ok(require_all);
+            return Ok(SqlTruth::from_bool(require_all));
         }
 
+        let mut saw_unknown = false;
         for value in values {
             let (left, right) = self.align_comparison_values(
                 left_expr,
@@ -823,16 +896,19 @@ impl Executor {
                 value,
                 schema,
             )?;
-            let matched = self.compare_binary_predicate(&left, compare_op, &right)?;
-            if require_all && !matched {
-                return Ok(false);
-            }
-            if !require_all && matched {
-                return Ok(true);
+            match self.compare_binary_predicate_truth(&left, compare_op, &right)? {
+                SqlTruth::True if !require_all => return Ok(SqlTruth::True),
+                SqlTruth::False if require_all => return Ok(SqlTruth::False),
+                SqlTruth::Unknown => saw_unknown = true,
+                _ => {}
             }
         }
 
-        Ok(require_all)
+        if saw_unknown {
+            Ok(SqlTruth::Unknown)
+        } else {
+            Ok(SqlTruth::from_bool(require_all))
+        }
     }
 
     pub(crate) fn sql_value_to_fusion_value(&self, v: &SqlValue) -> Value {

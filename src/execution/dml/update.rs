@@ -111,6 +111,9 @@ impl Executor {
         let composite_unique_indexes = self
             .load_composite_unique_indexes_for_table(&table_name_str, txn)
             .await?;
+        let single_column_index_includes = self
+            .load_single_column_index_includes_for_table(&table_name_str, &schema, txn)
+            .await?;
         let child_foreign_keys = self.load_child_foreign_keys(&table_name_str, txn).await?;
         let parent_foreign_keys = self.load_parent_foreign_keys(&table_name_str, txn).await?;
         let trigram_column_indices = Self::indexed_trigram_text_columns(&schema);
@@ -252,9 +255,22 @@ impl Executor {
                     if col.is_indexed {
                         let old_val = &old_row[idx];
                         let new_val = &row[idx];
+                        let include_indices = single_column_index_includes
+                            .get(&idx)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        let key_changed = old_val != new_val;
+                        let include_changed = Self::single_column_index_payload_touched(
+                            &old_row,
+                            &row,
+                            include_indices,
+                        );
 
-                        if old_val != new_val {
+                        if key_changed || include_changed {
                             if col.index_type == IndexType::FTS {
+                                if !key_changed {
+                                    continue;
+                                }
                                 if let Value::String(text) = old_val {
                                     for token in Self::tokenize_unique(text) {
                                         let index_key = self.routed_fts_index_key_for_row(
@@ -278,6 +294,9 @@ impl Executor {
                                     }
                                 }
                             } else if col.index_type == IndexType::HNSW {
+                                if !key_changed {
+                                    continue;
+                                }
                                 let idx_name =
                                     Self::hnsw_index_name_for_column(&table_name_str, &col.name);
                                 if matches!(old_val, Value::Vector(_)) {
@@ -291,24 +310,52 @@ impl Executor {
                                     )?;
                                 }
                             } else {
-                                if let Some(old_val_str) = self.value_to_index_string(old_val) {
+                                let old_val_str = self.value_to_index_string(old_val);
+                                if let Some(old_val_str) = old_val_str.as_deref() {
                                     let old_index_key = self.routed_index_key_for_value(
                                         &table_name_str,
                                         &col.name,
-                                        &old_val_str,
+                                        old_val_str,
                                         row_id,
                                     );
                                     txn.delete(old_index_key.as_bytes()).await?;
                                 }
 
-                                if let Some(new_val_str) = self.value_to_index_string(new_val) {
+                                let new_val_str = self.value_to_index_string(new_val);
+                                if let Some(new_val_str) = new_val_str.as_deref() {
                                     let new_index_key = self.routed_index_key_for_value(
                                         &table_name_str,
                                         &col.name,
-                                        &new_val_str,
+                                        new_val_str,
                                         row_id,
                                     );
-                                    txn.put(new_index_key.as_bytes(), &[]).await?;
+                                    let payload = Self::secondary_index_payload_for_row(
+                                        &row,
+                                        include_indices,
+                                    );
+                                    txn.put(new_index_key.as_bytes(), &payload).await?;
+                                }
+                                if old_val_str != new_val_str {
+                                    if let Some(old_val_str) = old_val_str.as_deref() {
+                                        self.adjust_index_count_summary(
+                                            &table_name_str,
+                                            &col.name,
+                                            old_val_str,
+                                            -1,
+                                            txn,
+                                        )
+                                        .await?;
+                                    }
+                                    if let Some(new_val_str) = new_val_str.as_deref() {
+                                        self.adjust_index_count_summary(
+                                            &table_name_str,
+                                            &col.name,
+                                            new_val_str,
+                                            1,
+                                            txn,
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
                         }
@@ -380,6 +427,19 @@ impl Executor {
                 return Ok(None);
             }
             assignment_indices.push(col_idx);
+        }
+        let single_column_index_includes = self
+            .load_single_column_index_includes_for_table(table_name, schema, txn)
+            .await?;
+        if single_column_index_includes
+            .values()
+            .any(|include_indices| {
+                include_indices
+                    .iter()
+                    .any(|include_idx| assignment_indices.contains(include_idx))
+            })
+        {
+            return Ok(None);
         }
         let metadata_cache_key = table_name.to_string();
         let metadata_allows_fast_path = if let Some(cached) = self

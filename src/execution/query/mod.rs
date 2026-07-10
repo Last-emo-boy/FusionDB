@@ -765,7 +765,10 @@ impl Executor {
     /// Whether any projection item contains an aggregate or window function. Used to decide
     /// whether a LIMIT may be pushed into a filtered scan as an early-break: aggregates and
     /// window functions must observe the full row set, so the limit must NOT short-circuit them.
-    fn projection_contains_aggregate_or_window(&self, projection: &[SelectItem]) -> bool {
+    pub(crate) fn projection_contains_aggregate_or_window(
+        &self,
+        projection: &[SelectItem],
+    ) -> bool {
         for item in projection {
             let expr = match item {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
@@ -781,6 +784,153 @@ impl Executor {
             }
         }
         false
+    }
+
+    fn join_limit_pushdown_supported(
+        &self,
+        select: &sqlparser::ast::Select,
+        selection: &Option<Expr>,
+    ) -> bool {
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || self.projection_contains_aggregate_or_window(&select.projection)
+        {
+            return false;
+        }
+
+        let is_group_by_none = matches!(
+            select.group_by,
+            sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty()
+        );
+        if !is_group_by_none {
+            return false;
+        }
+
+        let [table] = select.from.as_slice() else {
+            return false;
+        };
+        if table.joins.is_empty() {
+            return false;
+        };
+
+        if !Self::join_limit_table_factor_supported(&table.relation) {
+            return false;
+        }
+
+        let mut relation_names = Vec::with_capacity(table.joins.len() + 1);
+        relation_names.push(self.relation_names(&table.relation));
+        for join in &table.joins {
+            if !Self::join_limit_table_factor_supported(&join.relation) {
+                return false;
+            }
+            relation_names.push(self.relation_names(&join.relation));
+        }
+        if relation_names.iter().any(HashSet::is_empty) {
+            return false;
+        }
+
+        if table.joins.len() == 1 {
+            if !Self::join_limit_binary_operator_supported(&table.joins[0].join_operator) {
+                return false;
+            }
+        } else {
+            for (join_index, join) in table.joins.iter().enumerate() {
+                let Some(on_expr) = Self::join_limit_inner_on_expr(&join.join_operator) else {
+                    return false;
+                };
+                if !self.predicate_connects_join_relation(
+                    on_expr,
+                    &relation_names[..=join_index + 1],
+                    join_index + 1,
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        let Some(selection) = selection else {
+            return true;
+        };
+        Self::collect_conjunctive_predicates(selection)
+            .iter()
+            .all(|predicate| self.predicate_uses_single_join_relation(predicate, &relation_names))
+    }
+
+    fn join_limit_table_factor_supported(relation: &TableFactor) -> bool {
+        matches!(relation, TableFactor::Table { args, .. } if args.is_none())
+    }
+
+    fn join_limit_binary_operator_supported(join_operator: &JoinOperator) -> bool {
+        matches!(
+            join_operator,
+            JoinOperator::Inner(JoinConstraint::On(_))
+                | JoinOperator::Join(JoinConstraint::On(_))
+                | JoinOperator::CrossJoin(_)
+        )
+    }
+
+    fn join_limit_inner_on_expr(join_operator: &JoinOperator) -> Option<&Expr> {
+        match join_operator {
+            JoinOperator::Inner(JoinConstraint::On(expr))
+            | JoinOperator::Join(JoinConstraint::On(expr)) => Some(expr),
+            _ => None,
+        }
+    }
+
+    fn predicate_connects_join_relation(
+        &self,
+        expr: &Expr,
+        relation_names: &[HashSet<String>],
+        join_index: usize,
+    ) -> bool {
+        self.predicate_join_relation_members(expr, relation_names)
+            .is_some_and(|members| members.len() >= 2 && members.contains(&join_index))
+    }
+
+    fn predicate_uses_single_join_relation(
+        &self,
+        expr: &Expr,
+        relation_names: &[HashSet<String>],
+    ) -> bool {
+        self.predicate_join_relation_members(expr, relation_names)
+            .is_some_and(|members| members.len() == 1)
+    }
+
+    fn predicate_join_relation_members(
+        &self,
+        expr: &Expr,
+        relation_names: &[HashSet<String>],
+    ) -> Option<HashSet<usize>> {
+        let mut columns = HashSet::with_capacity(relation_names.len());
+        self.extract_columns_from_expr(expr, &mut columns);
+        if columns.is_empty() {
+            return None;
+        }
+
+        let mut members = HashSet::with_capacity(relation_names.len());
+        for column in columns {
+            let Some(prefix) = column.split('.').next().filter(|prefix| *prefix != column) else {
+                return None;
+            };
+            let mut column_relation = None;
+            for (index, names) in relation_names.iter().enumerate() {
+                if names.iter().any(|name| name.eq_ignore_ascii_case(prefix)) {
+                    if column_relation.replace(index).is_some() {
+                        return None;
+                    }
+                }
+            }
+            let Some(column_relation) = column_relation else {
+                return None;
+            };
+            members.insert(column_relation);
+        }
+
+        if members.is_empty() {
+            None
+        } else {
+            Some(members)
+        }
     }
 
     fn expr_contains_window_function(expr: &Expr) -> bool {
@@ -1776,6 +1926,7 @@ impl Executor {
                 None,
                 None,
                 None,
+                None,
             )
             .await?;
         let (_, right_rows, _) = self
@@ -1785,6 +1936,7 @@ impl Executor {
                 &Some(right_projection),
                 txn,
                 params,
+                None,
                 None,
                 None,
                 None,
@@ -2080,6 +2232,7 @@ impl Executor {
                                     .distinct_column_scan(
                                         &table_name_str,
                                         column_index,
+                                        &schema,
                                         predicate.as_ref(),
                                         txn,
                                     )
@@ -2170,6 +2323,7 @@ impl Executor {
                                     .count_distinct_column_scan(
                                         &table_name_str,
                                         column_index,
+                                        &schema,
                                         Some(&predicate),
                                         txn,
                                     )
@@ -2211,6 +2365,7 @@ impl Executor {
                                         .count_distinct_column_scan(
                                             &table_name_str,
                                             column_index,
+                                            &schema,
                                             None,
                                             txn,
                                         )
@@ -2406,6 +2561,7 @@ impl Executor {
                                             .group_by_count_column_scan(
                                                 &table_name_str,
                                                 group_column_index,
+                                                &schema,
                                                 predicate.as_ref(),
                                                 txn,
                                             )
@@ -2442,6 +2598,7 @@ impl Executor {
                                                 &group_column_indices,
                                                 &aggregate_plans,
                                                 predicate.as_ref(),
+                                                &schema,
                                                 txn,
                                             )
                                             .await?;
@@ -2503,11 +2660,20 @@ impl Executor {
             } else {
                 primary_key_order_limit
             };
-            let order_limit_window = if !filter_requires_deferred_subquery
+            let plain_row_order_limit = !filter_requires_deferred_subquery
                 && is_group_by_none
+                && select.distinct.is_none()
                 && query.order_by.is_some()
-            {
+                && !self.projection_contains_aggregate_or_window(&select.projection);
+            let order_limit_window = if plain_row_order_limit {
                 limit.map(|l| l + offset)
+            } else {
+                None
+            };
+            let streaming_order_limit = if order_limit_window.is_some()
+                && self.order_by_allows_streaming_topk(query.order_by.as_ref(), &select.projection)
+            {
+                order_limit_window
             } else {
                 None
             };
@@ -2628,12 +2794,21 @@ impl Executor {
                 } else {
                     projection_hint
                 };
+            let projection_hint = if is_join
+                && is_group_by_none
+                && self.projection_contains_aggregate_or_window(&select.projection)
+            {
+                None
+            } else {
+                projection_hint
+            };
             let sel_option = effective_selection.cloned();
 
             let join_limit = if is_join
-                && effective_selection.is_none()
                 && !filter_requires_deferred_subquery
+                && materialized_selection.is_none()
                 && query.order_by.is_none()
+                && self.join_limit_pushdown_supported(select, &sel_option)
             {
                 push_down_limit
             } else {
@@ -2666,7 +2841,8 @@ impl Executor {
                         push_down_limit
                     },
                     query.order_by.as_ref(),
-                    order_limit_window,
+                    streaming_order_limit,
+                    streaming_order_limit,
                 )
                 .await?
             } else {
@@ -3005,6 +3181,7 @@ impl Executor {
                         rows_still_satisfy_order_by = false;
                     }
                     if !rows_still_satisfy_order_by {
+                        crate::monitor::inc_query_sort_fallback();
                         self.sort_rows_by_order_keys(
                             &mut rows,
                             &sort_keys,
@@ -3329,6 +3506,7 @@ impl Executor {
                         a.0.cmp(&b.0)
                     };
 
+                    crate::monitor::inc_query_sort_fallback();
                     if let Some(limit) = set_limit {
                         let window = if limit == 0 {
                             0

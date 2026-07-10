@@ -42,11 +42,12 @@ use crate::execution::{
 };
 use crate::monitor;
 use crate::parser::parse_sql;
+use crate::server::security::{
+    ForwardingAuth, FORWARDED_HEADER, FORWARDED_USER_HEADER, FORWARDED_VALUE,
+};
 use crate::storage::{Storage, Transaction};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 100;
-const SHARD_OWNER_FORWARD_HEADER: &str = "x-fusiondb-forwarded";
-const SHARD_OWNER_FORWARD_VALUE: &str = "shard-owner";
 
 fn effective_max_connections(max_connections: usize) -> usize {
     max_connections.max(1)
@@ -137,6 +138,8 @@ pub struct PgHandler {
     query_parser: Arc<NoopQueryParser>,
     session: Arc<Mutex<Session>>,
     http_client: reqwest::Client,
+    forwarding_auth: Option<ForwardingAuth>,
+    peer_scheme: String,
 }
 
 enum PgShardWriteRouteAction {
@@ -238,6 +241,15 @@ impl PgHandler {
     const POSTGRES_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
     pub fn new(executor: Arc<Executor>, storage: Arc<dyn Storage>) -> Self {
+        Self::new_with_forwarding_security(executor, storage, "", "http")
+    }
+
+    fn new_with_forwarding_security(
+        executor: Arc<Executor>,
+        storage: Arc<dyn Storage>,
+        forwarding_secret: &str,
+        peer_scheme: &str,
+    ) -> Self {
         Self {
             executor,
             storage,
@@ -250,6 +262,8 @@ impl PgHandler {
                 copy_in: None,
             })),
             http_client: reqwest::Client::new(),
+            forwarding_auth: ForwardingAuth::new(forwarding_secret.as_bytes()),
+            peer_scheme: peer_scheme.to_string(),
         }
     }
 
@@ -516,15 +530,13 @@ impl PgHandler {
         decision: &SqlShardRoutingDecision,
     ) -> PgWireResult<Vec<Response>> {
         let route_conflict = Self::shard_route_conflict_message(decision);
-        let url = format!("http://{}/query", decision.route.owner_addr);
-        let mut request = self
-            .http_client
-            .post(&url)
-            .header(SHARD_OWNER_FORWARD_HEADER, SHARD_OWNER_FORWARD_VALUE)
-            .json(&ForwardQueryRequest { sql: query });
-        if !username.is_empty() {
-            request = request.header("x-fusiondb-user", username);
-        }
+        let url = format!("{}://{}/query", self.peer_scheme, decision.route.owner_addr);
+        let request = self.apply_forwarding_headers(
+            self.http_client
+                .post(&url)
+                .json(&ForwardQueryRequest { sql: query }),
+            username,
+        );
 
         let response = match request.send().await {
             Ok(response) => response,
@@ -588,10 +600,17 @@ impl PgHandler {
         decision: &SqlShardRoutingDecision,
     ) -> PgWireResult<std::result::Result<Vec<ForwardQueryResultJson>, pgwire::error::ErrorInfo>>
     {
-        let prepare_url = format!("http://{}/prepare", decision.route.owner_addr);
+        let prepare_url = format!(
+            "{}://{}/prepare",
+            self.peer_scheme, decision.route.owner_addr
+        );
         let prepare_response = match self
-            .apply_forwarding_headers(self.http_client.post(&prepare_url), username)
-            .json(&ForwardPrepareRequest { sql: query })
+            .apply_forwarding_headers(
+                self.http_client
+                    .post(&prepare_url)
+                    .json(&ForwardPrepareRequest { sql: query }),
+                username,
+            )
             .send()
             .await
         {
@@ -633,15 +652,20 @@ impl PgHandler {
             )));
         };
 
-        let execute_url = format!("http://{}/execute", decision.route.owner_addr);
+        let execute_url = format!(
+            "{}://{}/execute",
+            self.peer_scheme, decision.route.owner_addr
+        );
         let execute_payload = ForwardExecuteRequest {
             statement_id: prepared.statement_id.clone(),
             params: params.iter().map(Value::to_json).collect(),
             return_results: Some(true),
         };
         let execute_response = match self
-            .apply_forwarding_headers(self.http_client.post(&execute_url), username)
-            .json(&execute_payload)
+            .apply_forwarding_headers(
+                self.http_client.post(&execute_url).json(&execute_payload),
+                username,
+            )
             .send()
             .await
         {
@@ -700,14 +724,16 @@ impl PgHandler {
         username: &str,
         decision: &SqlShardRoutingDecision,
     ) -> PgWireResult<std::result::Result<usize, pgwire::error::ErrorInfo>> {
-        let url = format!("http://{}/copy_stdin", decision.route.owner_addr);
+        let url = format!(
+            "{}://{}/copy_stdin",
+            self.peer_scheme, decision.route.owner_addr
+        );
         let request = ForwardCopyRequest {
             sql: query,
             payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
         };
         let response = match self
-            .apply_forwarding_headers(self.http_client.post(&url), username)
-            .json(&request)
+            .apply_forwarding_headers(self.http_client.post(&url).json(&request), username)
             .send()
             .await
         {
@@ -2898,10 +2924,14 @@ impl PgHandler {
         owner: &SqlShardOwner,
     ) -> PgWireResult<std::result::Result<Vec<ForwardQueryResultJson>, pgwire::error::ErrorInfo>>
     {
-        let url = format!("http://{}/query", owner.addr);
+        let url = format!("{}://{}/query", self.peer_scheme, owner.addr);
         let response = match self
-            .apply_forwarding_headers(self.http_client.post(&url), username)
-            .json(&ForwardQueryRequest { sql: query })
+            .apply_forwarding_headers(
+                self.http_client
+                    .post(&url)
+                    .json(&ForwardQueryRequest { sql: query }),
+                username,
+            )
             .send()
             .await
         {
@@ -2953,10 +2983,14 @@ impl PgHandler {
         owner: &SqlShardOwner,
     ) -> PgWireResult<std::result::Result<Vec<ForwardQueryResultJson>, pgwire::error::ErrorInfo>>
     {
-        let prepare_url = format!("http://{}/prepare", owner.addr);
+        let prepare_url = format!("{}://{}/prepare", self.peer_scheme, owner.addr);
         let prepare_response = match self
-            .apply_forwarding_headers(self.http_client.post(&prepare_url), username)
-            .json(&ForwardPrepareRequest { sql: query })
+            .apply_forwarding_headers(
+                self.http_client
+                    .post(&prepare_url)
+                    .json(&ForwardPrepareRequest { sql: query }),
+                username,
+            )
             .send()
             .await
         {
@@ -2998,15 +3032,17 @@ impl PgHandler {
             ))));
         };
 
-        let execute_url = format!("http://{}/execute", owner.addr);
+        let execute_url = format!("{}://{}/execute", self.peer_scheme, owner.addr);
         let execute_payload = ForwardExecuteRequest {
             statement_id: prepared.statement_id.clone(),
             params: params.iter().map(Value::to_json).collect(),
             return_results: Some(true),
         };
         let execute_response = match self
-            .apply_forwarding_headers(self.http_client.post(&execute_url), username)
-            .json(&execute_payload)
+            .apply_forwarding_headers(
+                self.http_client.post(&execute_url).json(&execute_payload),
+                username,
+            )
             .send()
             .await
         {
@@ -3788,11 +3824,17 @@ impl PgHandler {
         request: reqwest::RequestBuilder,
         username: &str,
     ) -> reqwest::RequestBuilder {
-        let request = request.header(SHARD_OWNER_FORWARD_HEADER, SHARD_OWNER_FORWARD_VALUE);
-        if username.is_empty() {
-            request
+        let username = if username.is_empty() {
+            "postgres"
         } else {
-            request.header("x-fusiondb-user", username)
+            username
+        };
+        if let Some(auth) = self.forwarding_auth.as_ref() {
+            auth.apply(request, username)
+        } else {
+            request
+                .header(FORWARDED_HEADER, FORWARDED_VALUE)
+                .header(FORWARDED_USER_HEADER, username)
         }
     }
 
@@ -3803,8 +3845,8 @@ impl PgHandler {
         prepared: &ForwardPreparedStatementInfo,
     ) {
         let url = format!(
-            "http://{}/prepare/{}",
-            decision.route.owner_addr, prepared.statement_id
+            "{}://{}/prepare/{}",
+            self.peer_scheme, decision.route.owner_addr, prepared.statement_id
         );
         let _ = self
             .apply_forwarding_headers(self.http_client.delete(url), username)
@@ -3818,7 +3860,10 @@ impl PgHandler {
         owner: &SqlShardOwner,
         prepared: &ForwardPreparedStatementInfo,
     ) {
-        let url = format!("http://{}/prepare/{}", owner.addr, prepared.statement_id);
+        let url = format!(
+            "{}://{}/prepare/{}",
+            self.peer_scheme, owner.addr, prepared.statement_id
+        );
         let _ = self
             .apply_forwarding_headers(self.http_client.delete(url), username)
             .send()
@@ -8932,7 +8977,10 @@ impl std::fmt::Debug for FusionAuthSource {
 impl FusionAuthSource {
     async fn authenticate(&self, login: &LoginInfo<'_>, password: &str) -> PgWireResult<()> {
         let username = login.user().unwrap_or_default();
-        if username.is_empty() || username.eq_ignore_ascii_case("postgres") {
+        if username.is_empty() {
+            return Err(PgWireError::UserNameRequired);
+        }
+        if username.eq_ignore_ascii_case("postgres") {
             return if self.password == password {
                 Ok(())
             } else {
@@ -8965,6 +9013,7 @@ impl FusionAuthSource {
 struct FusionStartupHandler {
     auth_source: Arc<FusionAuthSource>,
     parameter_provider: DefaultServerParameterProvider,
+    require_tls: bool,
 }
 
 #[async_trait::async_trait]
@@ -8981,6 +9030,15 @@ impl StartupHandler for FusionStartupHandler {
     {
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
+                if self.require_tls && !client.is_secure() {
+                    return Err(PgWireError::UserError(Box::new(
+                        pgwire::error::ErrorInfo::new(
+                            "FATAL".to_string(),
+                            "08004".to_string(),
+                            "TLS is required for this server".to_string(),
+                        ),
+                    )));
+                }
                 protocol_negotiation(client, startup).await?;
                 save_startup_parameters_to_metadata(client, startup);
                 client.set_state(PgWireConnectionState::AuthenticationInProgress);
@@ -10677,7 +10735,7 @@ pub async fn start_pg_server(
     bind: &str,
     port: u16,
     password: &str,
-    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
     start_pg_server_with_connection_limit(
         executor,
@@ -10685,7 +10743,7 @@ pub async fn start_pg_server(
         bind,
         port,
         password,
-        _tls_acceptor,
+        tls_acceptor,
         DEFAULT_MAX_CONNECTIONS,
     )
     .await
@@ -10697,8 +10755,37 @@ pub async fn start_pg_server_with_connection_limit(
     bind: &str,
     port: u16,
     password: &str,
-    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     max_connections: usize,
+) {
+    let require_tls = tls_acceptor.is_some();
+    start_pg_server_with_connection_limit_and_security(
+        executor,
+        storage,
+        bind,
+        port,
+        password,
+        tls_acceptor,
+        max_connections,
+        "",
+        "http",
+        require_tls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_pg_server_with_connection_limit_and_security(
+    executor: Arc<Executor>,
+    storage: Arc<dyn Storage>,
+    bind: &str,
+    port: u16,
+    password: &str,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    max_connections: usize,
+    forwarding_secret: &str,
+    peer_scheme: &str,
+    require_tls: bool,
 ) {
     let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).await.unwrap();
@@ -10711,6 +10798,8 @@ pub async fn start_pg_server_with_connection_limit(
     );
 
     let password = password.to_string();
+    let forwarding_secret = forwarding_secret.to_string();
+    let peer_scheme = peer_scheme.to_string();
 
     loop {
         let (stream, peer_addr) = listener.accept().await.unwrap();
@@ -10726,20 +10815,27 @@ pub async fn start_pg_server_with_connection_limit(
         let executor = executor.clone();
         let storage = storage.clone();
         let password = password.clone();
+        let tls_acceptor = tls_acceptor.clone();
+        let forwarding_secret = forwarding_secret.clone();
+        let peer_scheme = peer_scheme.clone();
 
         tokio::spawn(async move {
             let _connection_slot = connection_slot;
-            let handler = Arc::new(PgHandler::new(executor, storage.clone()));
+            let handler = Arc::new(PgHandler::new_with_forwarding_security(
+                executor,
+                storage.clone(),
+                &forwarding_secret,
+                &peer_scheme,
+            ));
             let auth_source = Arc::new(FusionAuthSource { password, storage });
             let startup = Arc::new(FusionStartupHandler {
                 auth_source,
                 parameter_provider: DefaultServerParameterProvider::default(),
+                require_tls,
             });
             let factory = PgServerFactory { startup, handler };
 
-            // pgwire 0.37 does not natively support TLS negotiation.
-            // TLS for pgwire requires a TLS-terminating proxy (e.g., stunnel, HAProxy).
-            let _ = pgwire::tokio::process_socket(stream, None, factory).await;
+            let _ = pgwire::tokio::process_socket(stream, tls_acceptor, factory).await;
         });
     }
 }

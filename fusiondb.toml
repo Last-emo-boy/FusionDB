@@ -19,6 +19,12 @@ slow_query_threshold_ms = 100
 [auth]
 password = "fusiondb"
 scram_sha256 = false
+http_legacy_unsafe = false
+
+[tls]
+enabled = false
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
 
 [distributed]
 enabled = false
@@ -26,6 +32,7 @@ node_id = 1
 advertise_addr = ""
 bootstrap = true
 cluster_name = "fusiondb"
+forwarding_secret = ""
 initial_members = []
 
 [distributed.sharding]

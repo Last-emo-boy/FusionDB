@@ -1,8 +1,11 @@
 use axum::{
     extract::{Extension, Path, Query, Request, State},
-    http::{header::AUTHORIZATION, StatusCode},
+    http::{
+        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+        HeaderValue, StatusCode,
+    },
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -12,7 +15,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 
 use crate::catalog::TableSchema;
@@ -27,11 +29,24 @@ use crate::execution::{
 use crate::parser::parse_sql;
 use crate::storage::Storage;
 
+use crate::server::security::{
+    ForwardingAuth, FORWARDED_HEADER, FORWARDED_USER_HEADER, FORWARDED_VALUE,
+};
 use crate::storage::fusion::{CdcEvent, FusionStorage};
 use crate::storage::memory::MemoryStorage;
 
-const SHARD_OWNER_FORWARD_HEADER: &str = "x-fusiondb-forwarded";
-const SHARD_OWNER_FORWARD_VALUE: &str = "shard-owner";
+const DISABLE_SQL_BLOCK_ZONE_MAP_PRUNE_HINT: &str =
+    "/*+ FUSIONDB_DISABLE_SQL_BLOCK_ZONE_MAP_PRUNE */";
+const MAX_FORWARDED_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn strip_sql_block_zone_map_prune_hint(sql: &str) -> (&str, bool) {
+    let trimmed = sql.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(DISABLE_SQL_BLOCK_ZONE_MAP_PRUNE_HINT) {
+        (rest.trim_start(), true)
+    } else {
+        (sql, false)
+    }
+}
 
 // Zero-Copy Vector Search
 // Bypass SQL parser and plan, call FusionStorage::vector_search directly
@@ -61,8 +76,7 @@ pub struct VectorSearchResult {
 }
 
 fn build_router(state: AppState) -> Router {
-    let mut app = Router::new()
-        .route("/health", get(health_check))
+    let protected = Router::new()
         .route("/query", post(handle_query))
         .route("/copy_stdin", post(handle_copy_stdin))
         .route("/prepare", post(handle_prepare).get(handle_list_prepared))
@@ -81,36 +95,99 @@ fn build_router(state: AppState) -> Router {
         .route("/capabilities", get(handle_capabilities))
         .route("/auth/context", get(handle_auth_context))
         .route("/vector_search", post(handle_vector_search))
-        .route("/hybrid_search", post(handle_hybrid_search))
-        .layer(middleware::from_fn(auth_context_middleware))
-        .layer(CorsLayer::permissive())
-        .with_state(state.clone());
+        .route("/hybrid_search", post(handle_hybrid_search));
+
+    let mut protected = protected
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_context_middleware,
+        ))
+        .with_state::<()>(state.clone());
 
     if let Some(raft) = state.raft.clone() {
-        app = app.merge(raft_routes(RaftAppState {
-            raft,
-            executor: state.executor.clone(),
-            client: state.raft_client.clone(),
-            shard_router: state.shard_router.clone(),
-        }));
+        protected = protected.merge(
+            raft_routes(RaftAppState {
+                raft,
+                executor: state.executor.clone(),
+                client: state.raft_client.clone(),
+                shard_router: state.shard_router.clone(),
+                forwarding_auth: state.forwarding_auth.clone(),
+                peer_scheme: state.peer_scheme.clone(),
+            })
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_context_middleware,
+            )),
+        );
     }
 
-    app
+    Router::new()
+        .route("/health", get(health_check))
+        .merge(protected)
+        .layer(CorsLayer::permissive())
+}
+
+#[derive(Clone)]
+pub struct HttpServerSecurity {
+    pub postgres_password: String,
+    pub http_legacy_unsafe: bool,
+    pub forwarding_secret: String,
+    pub peer_scheme: String,
+}
+
+impl HttpServerSecurity {
+    fn legacy_unsafe() -> Self {
+        Self {
+            postgres_password: "fusiondb".to_string(),
+            http_legacy_unsafe: true,
+            forwarding_secret: String::new(),
+            peer_scheme: "http".to_string(),
+        }
+    }
 }
 
 #[deprecated(
-    note = "Use TCP Server for high performance. HTTP is kept only for backward compatibility and basic testing."
+    note = "Legacy unauthenticated HTTP entry point. Use start_http_server_with_security."
 )]
 pub async fn start_http_server(
     executor: Arc<Executor>,
     storage: Arc<dyn Storage>,
     bind: &str,
     start_port: u16,
-    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
     raft: Option<FusionRaft>,
     distributed_mode: String,
     shard_router: Option<ShardRouter>,
 ) {
+    if let Err(e) = start_http_server_with_security(
+        executor,
+        storage,
+        bind,
+        start_port,
+        tls_config,
+        raft,
+        distributed_mode,
+        shard_router,
+        HttpServerSecurity::legacy_unsafe(),
+    )
+    .await
+    {
+        eprintln!("FusionDB HTTP server stopped: {}", e);
+    }
+}
+
+pub async fn start_http_server_with_security(
+    executor: Arc<Executor>,
+    storage: Arc<dyn Storage>,
+    bind: &str,
+    start_port: u16,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    raft: Option<FusionRaft>,
+    distributed_mode: String,
+    shard_router: Option<ShardRouter>,
+    security: HttpServerSecurity,
+) -> std::io::Result<()> {
+    let forwarding_auth = ForwardingAuth::new(security.forwarding_secret.as_bytes());
     let state = AppState {
         executor,
         storage,
@@ -119,6 +196,10 @@ pub async fn start_http_server(
         distributed_mode,
         shard_router,
         shard_owner_forwarding_enabled: true,
+        postgres_password: Arc::from(security.postgres_password),
+        http_legacy_unsafe: security.http_legacy_unsafe,
+        forwarding_auth,
+        peer_scheme: security.peer_scheme,
     };
 
     let app = build_router(state);
@@ -126,19 +207,25 @@ pub async fn start_http_server(
     let mut port = start_port;
     let listener = loop {
         let addr = format!("{}:{}", bind, port);
-        match TcpListener::bind(&addr).await {
+        match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => break l,
-            Err(_) => {
+            Err(e) => {
                 if port >= start_port + 100 {
-                    panic!("Could not bind to any port from {} to {}", start_port, port);
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Could not bind to any port from {} to {}: {}",
+                            start_port, port, e
+                        ),
+                    ));
                 }
                 port += 1;
             }
         }
     };
 
-    let addr = listener.local_addr().unwrap();
-    let scheme = if _tls_acceptor.is_some() {
+    let addr = listener.local_addr()?;
+    let scheme = if tls_config.is_some() {
         "https"
     } else {
         "http"
@@ -151,36 +238,175 @@ pub async fn start_http_server(
         let _ = write!(file, "{}", addr.port());
     }
 
-    // TLS support: if acceptor provided, use axum-server with rustls
-    // For now, we fall back to plain axum::serve since axum-server API differs.
-    // TLS is primarily used for pgwire; HTTP can be put behind a reverse proxy.
-    axum::serve(listener, app).await.unwrap();
+    if let Some(tls_config) = tls_config {
+        let listener = listener.into_std()?;
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+        axum_server::from_tcp_rustls(listener, tls_config)
+            .serve(app.into_make_service())
+            .await
+    } else {
+        axum::serve(listener, app).await
+    }
 }
 
-async fn auth_context_middleware(mut request: Request, next: Next) -> Response {
+async fn auth_context_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let has_forwarded_marker = request.headers().contains_key(FORWARDED_HEADER);
+    let internal_username = if has_forwarded_marker {
+        let (parts, body) = request.into_parts();
+        let body = match axum::body::to_bytes(body, MAX_FORWARDED_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(_) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "forwarded request body exceeds the authentication limit",
+                )
+                    .into_response();
+            }
+        };
+        let request_target = parts
+            .uri
+            .path_and_query()
+            .map(|target| target.as_str())
+            .unwrap_or(parts.uri.path());
+        let username = state
+            .forwarding_auth
+            .as_ref()
+            .and_then(|auth| auth.verify(&parts.headers, &parts.method, request_target, &body));
+        request = Request::from_parts(parts, axum::body::Body::from(body));
+        username
+    } else {
+        None
+    };
     let headers = request.headers();
-    let username = headers
+
+    let (username, shard_forwarded, auth_mode) = if let Some(username) = internal_username {
+        (Some(username), true, "internal_hmac")
+    } else if has_forwarded_marker && !state.http_legacy_unsafe {
+        return unauthorized_response();
+    } else if let Some((username, password)) = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(extract_bearer_username)
-        .or_else(|| {
-            headers
-                .get("x-fusiondb-user")
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        });
-    let shard_forwarded = headers
-        .get(SHARD_OWNER_FORWARD_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.eq_ignore_ascii_case(SHARD_OWNER_FORWARD_VALUE))
-        .unwrap_or(false);
+        .and_then(extract_basic_credentials)
+    {
+        let Some(username) = authenticate_http_user(&state, &username, &password).await else {
+            return unauthorized_response();
+        };
+        (Some(username), false, "basic")
+    } else if state.http_legacy_unsafe {
+        let username = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(extract_bearer_username)
+            .or_else(|| {
+                headers
+                    .get(FORWARDED_USER_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            });
+        let shard_forwarded = headers
+            .get(FORWARDED_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.eq_ignore_ascii_case(FORWARDED_VALUE))
+            .unwrap_or(false);
+        let auth_mode = if username.is_some() {
+            "explicit_user"
+        } else {
+            "legacy_anonymous"
+        };
+        (username, shard_forwarded, auth_mode)
+    } else {
+        return unauthorized_response();
+    };
+
+    if !management_access_allowed(
+        &state,
+        username.as_deref().unwrap_or_default(),
+        request.uri().path(),
+        auth_mode == "internal_hmac",
+    )
+    .await
+    {
+        return (StatusCode::FORBIDDEN, "superuser access required").into_response();
+    }
 
     request.extensions_mut().insert(RequestContext {
         username,
         shard_forwarded,
+        auth_mode,
+        forwarding_auth: state.forwarding_auth.clone(),
+        legacy_unsafe: state.http_legacy_unsafe,
     });
     next.run(request).await
+}
+
+async fn management_access_allowed(
+    state: &AppState,
+    username: &str,
+    path: &str,
+    internal_hmac: bool,
+) -> bool {
+    if internal_hmac || !is_management_path(path) {
+        return true;
+    }
+    state.executor.require_superuser(username).await.is_ok()
+}
+
+fn is_management_path(path: &str) -> bool {
+    path.starts_with("/raft/")
+        || matches!(
+            path,
+            "/checkpoint" | "/compact" | "/slow_queries" | "/cdc/events"
+        )
+}
+
+async fn authenticate_http_user(
+    state: &AppState,
+    username: &str,
+    password: &str,
+) -> Option<String> {
+    if username.is_empty() {
+        return None;
+    }
+    if username.eq_ignore_ascii_case("postgres") {
+        return (state.postgres_password.as_ref() == password).then(|| "postgres".to_string());
+    }
+
+    let mut txn = state.storage.begin_transaction().await.ok()?;
+    let user = crate::auth::get_user(&mut *txn, username).await.ok()?;
+    let _ = txn.rollback().await;
+    user.filter(|user| user.verify_password(password))
+        .map(|_| username.to_string())
+}
+
+fn extract_basic_credentials(header: &str) -> Option<(String, String)> {
+    let (scheme, encoded) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    if username.is_empty() {
+        None
+    } else {
+        Some((username.to_string(), password.to_string()))
+    }
+}
+
+fn unauthorized_response() -> Response {
+    let mut response = (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    response.headers_mut().insert(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"FusionDB\", charset=\"UTF-8\""),
+    );
+    response
 }
 
 fn extract_bearer_username(header: &str) -> Option<String> {
@@ -232,12 +458,438 @@ async fn handle_prometheus() -> String {
          # HELP fusiondb_row_cache_hit_count Row cache hits\n\
          # TYPE fusiondb_row_cache_hit_count counter\n\
          fusiondb_row_cache_hit_count {}\n\
+         # HELP fusiondb_query_result_cache_eligible_count Query-result cache eligible lookups\n\
+         # TYPE fusiondb_query_result_cache_eligible_count counter\n\
+         fusiondb_query_result_cache_eligible_count {}\n\
+         # HELP fusiondb_query_result_cache_hit_count Query-result cache hits\n\
+         # TYPE fusiondb_query_result_cache_hit_count counter\n\
+         fusiondb_query_result_cache_hit_count {}\n\
+         # HELP fusiondb_query_result_cache_miss_count Query-result cache misses\n\
+         # TYPE fusiondb_query_result_cache_miss_count counter\n\
+         fusiondb_query_result_cache_miss_count {}\n\
+         # HELP fusiondb_query_result_cache_stale_count Query-result cache stale-entry misses\n\
+         # TYPE fusiondb_query_result_cache_stale_count counter\n\
+         fusiondb_query_result_cache_stale_count {}\n\
+         # HELP fusiondb_query_result_cache_insert_count Query-result cache inserts\n\
+         # TYPE fusiondb_query_result_cache_insert_count counter\n\
+         fusiondb_query_result_cache_insert_count {}\n\
+         # HELP fusiondb_query_result_cache_invalidation_count Query-result cache invalidations\n\
+         # TYPE fusiondb_query_result_cache_invalidation_count counter\n\
+         fusiondb_query_result_cache_invalidation_count {}\n\
+         # HELP fusiondb_block_cache_hit_count SSTable block cache hits\n\
+         # TYPE fusiondb_block_cache_hit_count counter\n\
+         fusiondb_block_cache_hit_count {}\n\
+         # HELP fusiondb_block_cache_miss_count SSTable block cache misses\n\
+         # TYPE fusiondb_block_cache_miss_count counter\n\
+         fusiondb_block_cache_miss_count {}\n\
+         # HELP fusiondb_block_cache_insert_count SSTable block cache inserts\n\
+         # TYPE fusiondb_block_cache_insert_count counter\n\
+         fusiondb_block_cache_insert_count {}\n\
+         # HELP fusiondb_block_cache_insert_bytes SSTable block cache inserted bytes\n\
+         # TYPE fusiondb_block_cache_insert_bytes counter\n\
+         fusiondb_block_cache_insert_bytes {}\n\
+         # HELP fusiondb_block_cache_fill_skip_count SSTable block cache fills skipped by no-fill reads\n\
+         # TYPE fusiondb_block_cache_fill_skip_count counter\n\
+         fusiondb_block_cache_fill_skip_count {}\n\
+         # HELP fusiondb_block_cache_eviction_count SSTable block cache evictions\n\
+         # TYPE fusiondb_block_cache_eviction_count counter\n\
+         fusiondb_block_cache_eviction_count {}\n\
+         # HELP fusiondb_block_cache_eviction_bytes SSTable block cache evicted bytes\n\
+         # TYPE fusiondb_block_cache_eviction_bytes counter\n\
+         fusiondb_block_cache_eviction_bytes {}\n\
+         # HELP fusiondb_sstable_block_file_open_count SSTable data block file opens\n\
+         # TYPE fusiondb_sstable_block_file_open_count counter\n\
+         fusiondb_sstable_block_file_open_count {}\n\
+         # HELP fusiondb_sstable_block_read_bytes SSTable data block bytes read from files\n\
+         # TYPE fusiondb_sstable_block_read_bytes counter\n\
+         fusiondb_sstable_block_read_bytes {}\n\
+         # HELP fusiondb_sstable_open_count SSTable files opened\n\
+         # TYPE fusiondb_sstable_open_count counter\n\
+         fusiondb_sstable_open_count {}\n\
+         # HELP fusiondb_sstable_open_total_us Total SSTable open time in microseconds\n\
+         # TYPE fusiondb_sstable_open_total_us counter\n\
+         fusiondb_sstable_open_total_us {}\n\
+         # HELP fusiondb_sstable_open_index_bytes SSTable index bytes read during open\n\
+         # TYPE fusiondb_sstable_open_index_bytes counter\n\
+         fusiondb_sstable_open_index_bytes {}\n\
+         # HELP fusiondb_sstable_open_index_read_us SSTable index read time during open in microseconds\n\
+         # TYPE fusiondb_sstable_open_index_read_us counter\n\
+         fusiondb_sstable_open_index_read_us {}\n\
+         # HELP fusiondb_sstable_open_index_decode_us SSTable index decode time during open in microseconds\n\
+         # TYPE fusiondb_sstable_open_index_decode_us counter\n\
+         fusiondb_sstable_open_index_decode_us {}\n\
+         # HELP fusiondb_sstable_open_filter_bytes SSTable filter bytes read during open\n\
+         # TYPE fusiondb_sstable_open_filter_bytes counter\n\
+         fusiondb_sstable_open_filter_bytes {}\n\
+         # HELP fusiondb_sstable_open_filter_read_us SSTable filter read time during open in microseconds\n\
+         # TYPE fusiondb_sstable_open_filter_read_us counter\n\
+         fusiondb_sstable_open_filter_read_us {}\n\
+         # HELP fusiondb_sstable_open_filter_decode_us SSTable filter decode time during open in microseconds\n\
+         # TYPE fusiondb_sstable_open_filter_decode_us counter\n\
+         fusiondb_sstable_open_filter_decode_us {}\n\
+         # HELP fusiondb_sstable_open_meta_bytes SSTable metadata bytes read during open\n\
+         # TYPE fusiondb_sstable_open_meta_bytes counter\n\
+         fusiondb_sstable_open_meta_bytes {}\n\
+         # HELP fusiondb_sstable_open_meta_read_us SSTable metadata read time during open in microseconds\n\
+         # TYPE fusiondb_sstable_open_meta_read_us counter\n\
+         fusiondb_sstable_open_meta_read_us {}\n\
+         # HELP fusiondb_sstable_open_meta_decode_us SSTable metadata decode time during open in microseconds\n\
+         # TYPE fusiondb_sstable_open_meta_decode_us counter\n\
+         fusiondb_sstable_open_meta_decode_us {}\n\
+         # HELP fusiondb_sstable_open_index_entries SSTable index entries decoded during open\n\
+         # TYPE fusiondb_sstable_open_index_entries counter\n\
+         fusiondb_sstable_open_index_entries {}\n\
+         # HELP fusiondb_sstable_open_block_property_count SSTable block property entries decoded during open\n\
+         # TYPE fusiondb_sstable_open_block_property_count counter\n\
+         fusiondb_sstable_open_block_property_count {}\n\
+         # HELP fusiondb_sstable_index_cache_hit_count SSTable index sidecar cache hits during open\n\
+         # TYPE fusiondb_sstable_index_cache_hit_count counter\n\
+         fusiondb_sstable_index_cache_hit_count {}\n\
+         # HELP fusiondb_sstable_index_cache_miss_count SSTable index sidecar cache misses during open\n\
+         # TYPE fusiondb_sstable_index_cache_miss_count counter\n\
+         fusiondb_sstable_index_cache_miss_count {}\n\
+         # HELP fusiondb_sstable_index_cache_stale_count SSTable index sidecar cache stale entries during open\n\
+         # TYPE fusiondb_sstable_index_cache_stale_count counter\n\
+         fusiondb_sstable_index_cache_stale_count {}\n\
+         # HELP fusiondb_sstable_index_cache_invalid_count SSTable index sidecar cache invalid entries during open\n\
+         # TYPE fusiondb_sstable_index_cache_invalid_count counter\n\
+         fusiondb_sstable_index_cache_invalid_count {}\n\
+         # HELP fusiondb_sstable_index_cache_write_count SSTable index sidecar cache writes\n\
+         # TYPE fusiondb_sstable_index_cache_write_count counter\n\
+         fusiondb_sstable_index_cache_write_count {}\n\
+         # HELP fusiondb_sstable_index_cache_write_error_count SSTable index sidecar cache write errors\n\
+         # TYPE fusiondb_sstable_index_cache_write_error_count counter\n\
+         fusiondb_sstable_index_cache_write_error_count {}\n\
+         # HELP fusiondb_sstable_prefix_filter_check_count SSTable prefix Bloom filter probes\n\
+         # TYPE fusiondb_sstable_prefix_filter_check_count counter\n\
+         fusiondb_sstable_prefix_filter_check_count {}\n\
+         # HELP fusiondb_sstable_prefix_filter_positive_count SSTable prefix Bloom filter positive probes\n\
+         # TYPE fusiondb_sstable_prefix_filter_positive_count counter\n\
+         fusiondb_sstable_prefix_filter_positive_count {}\n\
+         # HELP fusiondb_sstable_prefix_filter_skip_count SSTable prefix Bloom filter negative skips\n\
+         # TYPE fusiondb_sstable_prefix_filter_skip_count counter\n\
+         fusiondb_sstable_prefix_filter_skip_count {}\n\
+         # HELP fusiondb_sstable_prefix_filter_fail_open_count SSTable prefix Bloom filter fail-open probes\n\
+         # TYPE fusiondb_sstable_prefix_filter_fail_open_count counter\n\
+         fusiondb_sstable_prefix_filter_fail_open_count {}\n\
+         # HELP fusiondb_sstable_index_prefix_filter_check_count SSTable SQL index-prefix Bloom filter probes\n\
+         # TYPE fusiondb_sstable_index_prefix_filter_check_count counter\n\
+         fusiondb_sstable_index_prefix_filter_check_count {}\n\
+         # HELP fusiondb_sstable_index_prefix_filter_positive_count SSTable SQL index-prefix Bloom filter positive probes\n\
+         # TYPE fusiondb_sstable_index_prefix_filter_positive_count counter\n\
+         fusiondb_sstable_index_prefix_filter_positive_count {}\n\
+         # HELP fusiondb_sstable_index_prefix_filter_skip_count SSTable SQL index-prefix Bloom filter negative skips\n\
+         # TYPE fusiondb_sstable_index_prefix_filter_skip_count counter\n\
+         fusiondb_sstable_index_prefix_filter_skip_count {}\n\
+         # HELP fusiondb_sstable_index_prefix_filter_fail_open_count SSTable SQL index-prefix Bloom filter fail-open probes\n\
+         # TYPE fusiondb_sstable_index_prefix_filter_fail_open_count counter\n\
+         fusiondb_sstable_index_prefix_filter_fail_open_count {}\n\
+         # HELP fusiondb_sstable_user_key_filter_check_count SSTable MVCC user-key Bloom filter probes\n\
+         # TYPE fusiondb_sstable_user_key_filter_check_count counter\n\
+         fusiondb_sstable_user_key_filter_check_count {}\n\
+         # HELP fusiondb_sstable_user_key_filter_positive_count SSTable MVCC user-key Bloom filter positive probes\n\
+         # TYPE fusiondb_sstable_user_key_filter_positive_count counter\n\
+         fusiondb_sstable_user_key_filter_positive_count {}\n\
+         # HELP fusiondb_sstable_user_key_filter_skip_count SSTable MVCC user-key Bloom filter negative skips\n\
+         # TYPE fusiondb_sstable_user_key_filter_skip_count counter\n\
+         fusiondb_sstable_user_key_filter_skip_count {}\n\
+         # HELP fusiondb_sstable_user_key_filter_fail_open_count SSTable MVCC user-key Bloom filter fail-open probes\n\
+         # TYPE fusiondb_sstable_user_key_filter_fail_open_count counter\n\
+         fusiondb_sstable_user_key_filter_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_prefix_filter_check_count SSTable block table-prefix property probes\n\
+         # TYPE fusiondb_sstable_block_prefix_filter_check_count counter\n\
+         fusiondb_sstable_block_prefix_filter_check_count {}\n\
+         # HELP fusiondb_sstable_block_prefix_filter_positive_count SSTable block table-prefix property positive probes\n\
+         # TYPE fusiondb_sstable_block_prefix_filter_positive_count counter\n\
+         fusiondb_sstable_block_prefix_filter_positive_count {}\n\
+         # HELP fusiondb_sstable_block_prefix_filter_skip_count SSTable block table-prefix property negative skips\n\
+         # TYPE fusiondb_sstable_block_prefix_filter_skip_count counter\n\
+         fusiondb_sstable_block_prefix_filter_skip_count {}\n\
+         # HELP fusiondb_sstable_block_prefix_filter_fail_open_count SSTable block table-prefix property fail-open probes\n\
+         # TYPE fusiondb_sstable_block_prefix_filter_fail_open_count counter\n\
+         fusiondb_sstable_block_prefix_filter_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_index_prefix_filter_check_count SSTable block SQL index-prefix property probes\n\
+         # TYPE fusiondb_sstable_block_index_prefix_filter_check_count counter\n\
+         fusiondb_sstable_block_index_prefix_filter_check_count {}\n\
+         # HELP fusiondb_sstable_block_index_prefix_filter_positive_count SSTable block SQL index-prefix property positive probes\n\
+         # TYPE fusiondb_sstable_block_index_prefix_filter_positive_count counter\n\
+         fusiondb_sstable_block_index_prefix_filter_positive_count {}\n\
+         # HELP fusiondb_sstable_block_index_prefix_filter_skip_count SSTable block SQL index-prefix property negative skips\n\
+         # TYPE fusiondb_sstable_block_index_prefix_filter_skip_count counter\n\
+         fusiondb_sstable_block_index_prefix_filter_skip_count {}\n\
+         # HELP fusiondb_sstable_block_index_prefix_filter_fail_open_count SSTable block SQL index-prefix property fail-open probes\n\
+         # TYPE fusiondb_sstable_block_index_prefix_filter_fail_open_count counter\n\
+         fusiondb_sstable_block_index_prefix_filter_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_filter_check_count SSTable block SQL zone-map property probes\n\
+         # TYPE fusiondb_sstable_block_zone_map_filter_check_count counter\n\
+         fusiondb_sstable_block_zone_map_filter_check_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_filter_positive_count SSTable block SQL zone-map property positive probes\n\
+         # TYPE fusiondb_sstable_block_zone_map_filter_positive_count counter\n\
+         fusiondb_sstable_block_zone_map_filter_positive_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_filter_skip_count SSTable block SQL zone-map property negative skips\n\
+         # TYPE fusiondb_sstable_block_zone_map_filter_skip_count counter\n\
+         fusiondb_sstable_block_zone_map_filter_skip_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_filter_fail_open_count SSTable block SQL zone-map property fail-open probes\n\
+         # TYPE fusiondb_sstable_block_zone_map_filter_fail_open_count counter\n\
+         fusiondb_sstable_block_zone_map_filter_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_metadata_bytes SSTable block SQL zone-map metadata bytes observed\n\
+         # TYPE fusiondb_sstable_block_zone_map_metadata_bytes counter\n\
+         fusiondb_sstable_block_zone_map_metadata_bytes {}\n\
+         # HELP fusiondb_sstable_block_zone_map_mvcc_overlap_fail_open_count SSTable block SQL zone-map fail-opens caused by MVCC overlap risk\n\
+         # TYPE fusiondb_sstable_block_zone_map_mvcc_overlap_fail_open_count counter\n\
+         fusiondb_sstable_block_zone_map_mvcc_overlap_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_mvcc_boundary_split_fail_open_count SSTable block SQL zone-map MVCC fail-opens caused by same-user-key block boundary splits\n\
+         # TYPE fusiondb_sstable_block_zone_map_mvcc_boundary_split_fail_open_count counter\n\
+         fusiondb_sstable_block_zone_map_mvcc_boundary_split_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count SSTable block SQL zone-map MVCC fail-opens caused by write-buffer overlap risk\n\
+         # TYPE fusiondb_sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count counter\n\
+         fusiondb_sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count SSTable block SQL zone-map MVCC fail-opens caused by memtable overlap risk\n\
+         # TYPE fusiondb_sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count counter\n\
+         fusiondb_sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count SSTable block SQL zone-map MVCC fail-opens caused by overlapping SSTables\n\
+         # TYPE fusiondb_sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count counter\n\
+         fusiondb_sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count {}\n\
+         # HELP fusiondb_sstable_block_zone_map_schema_fail_open_count SSTable block SQL zone-map fail-opens caused by schema or type mismatch\n\
+         # TYPE fusiondb_sstable_block_zone_map_schema_fail_open_count counter\n\
+         fusiondb_sstable_block_zone_map_schema_fail_open_count {}\n\
+         # HELP fusiondb_sstable_point_probe_count SSTable point-read probes\n\
+         # TYPE fusiondb_sstable_point_probe_count counter\n\
+         fusiondb_sstable_point_probe_count {}\n\
+         # HELP fusiondb_sstable_point_overlap_skip_count SSTable point probes skipped by key-range overlap\n\
+         # TYPE fusiondb_sstable_point_overlap_skip_count counter\n\
+         fusiondb_sstable_point_overlap_skip_count {}\n\
+         # HELP fusiondb_sstable_range_probe_count SSTable range-read probes\n\
+         # TYPE fusiondb_sstable_range_probe_count counter\n\
+         fusiondb_sstable_range_probe_count {}\n\
+         # HELP fusiondb_sstable_range_overlap_skip_count SSTable range probes skipped by key-range overlap\n\
+         # TYPE fusiondb_sstable_range_overlap_skip_count counter\n\
+         fusiondb_sstable_range_overlap_skip_count {}\n\
+         # HELP fusiondb_sstable_iterator_open_count SSTable iterators opened for reads\n\
+         # TYPE fusiondb_sstable_iterator_open_count counter\n\
+         fusiondb_sstable_iterator_open_count {}\n\
+         # HELP fusiondb_sstable_reverse_iterator_open_count SSTable reverse iterators opened for reads\n\
+         # TYPE fusiondb_sstable_reverse_iterator_open_count counter\n\
+         fusiondb_sstable_reverse_iterator_open_count {}\n\
+         # HELP fusiondb_sstable_reverse_block_read_count SSTable data blocks read by reverse iterators\n\
+         # TYPE fusiondb_sstable_reverse_block_read_count counter\n\
+         fusiondb_sstable_reverse_block_read_count {}\n\
+         # HELP fusiondb_sstable_reverse_block_entry_decode_count SSTable entries decoded inside reverse iterator blocks\n\
+         # TYPE fusiondb_sstable_reverse_block_entry_decode_count counter\n\
+         fusiondb_sstable_reverse_block_entry_decode_count {}\n\
+         # HELP fusiondb_sstable_reverse_block_entry_yield_count SSTable entries yielded by reverse iterator block bounds\n\
+         # TYPE fusiondb_sstable_reverse_block_entry_yield_count counter\n\
+         fusiondb_sstable_reverse_block_entry_yield_count {}\n\
+         # HELP fusiondb_sstable_reverse_block_span_scan_count SSTable reverse iterator blocks parsed by runtime span scanning\n\
+         # TYPE fusiondb_sstable_reverse_block_span_scan_count counter\n\
+         fusiondb_sstable_reverse_block_span_scan_count {}\n\
+         # HELP fusiondb_sstable_reverse_block_span_scan_entry_count SSTable reverse iterator entries parsed into runtime block spans\n\
+         # TYPE fusiondb_sstable_reverse_block_span_scan_entry_count counter\n\
+         fusiondb_sstable_reverse_block_span_scan_entry_count {}\n\
+         # HELP fusiondb_sstable_reverse_block_span_materialize_entry_count SSTable reverse iterator entries materialized after runtime span scanning\n\
+         # TYPE fusiondb_sstable_reverse_block_span_materialize_entry_count counter\n\
+         fusiondb_sstable_reverse_block_span_materialize_entry_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_hit_count SSTable reverse seek sidecar cache hits\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_hit_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_hit_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_miss_count SSTable reverse seek sidecar cache misses\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_miss_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_miss_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_stale_count SSTable reverse seek sidecar stale files\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_stale_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_stale_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_invalid_count SSTable reverse seek sidecar invalid files\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_invalid_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_invalid_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_write_count SSTable reverse seek sidecar writes\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_write_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_write_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_write_error_count SSTable reverse seek sidecar write errors\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_write_error_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_write_error_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_use_count SSTable reverse iterator blocks served by reverse seek sidecars\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_use_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_use_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_fail_open_count SSTable reverse seek sidecar block-level fail-open fallbacks\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_fail_open_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_fail_open_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_index_entry_count SSTable reverse seek sidecar indexed entries covered by successful block uses\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_index_entry_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_index_entry_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_entry_materialize_count SSTable reverse seek sidecar entries materialized by successful block uses\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_entry_materialize_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_entry_materialize_count {}\n\
+         # HELP fusiondb_sstable_reverse_seek_sidecar_offset_probe_count SSTable reverse seek sidecar entry-offset probes used for block bounds\n\
+         # TYPE fusiondb_sstable_reverse_seek_sidecar_offset_probe_count counter\n\
+         fusiondb_sstable_reverse_seek_sidecar_offset_probe_count {}\n\
+         # HELP fusiondb_fusion_reverse_scan_count Fusion visible reverse range scans\n\
+         # TYPE fusiondb_fusion_reverse_scan_count counter\n\
+         fusiondb_fusion_reverse_scan_count {}\n\
+         # HELP fusiondb_fusion_reverse_source_open_count Sources opened by Fusion reverse range merges\n\
+         # TYPE fusiondb_fusion_reverse_source_open_count counter\n\
+         fusiondb_fusion_reverse_source_open_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_frontier_probe_count SSTables probed for Fusion reverse range-local frontier after overlap and Bloom filters\n\
+         # TYPE fusiondb_fusion_reverse_sstable_frontier_probe_count counter\n\
+         fusiondb_fusion_reverse_sstable_frontier_probe_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_frontier_in_range_count Fusion reverse SSTable frontiers derived from aligned in-range block properties\n\
+         # TYPE fusiondb_fusion_reverse_sstable_frontier_in_range_count counter\n\
+         fusiondb_fusion_reverse_sstable_frontier_in_range_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_frontier_file_count Fusion reverse SSTable frontiers using file-level fail-open fallback\n\
+         # TYPE fusiondb_fusion_reverse_sstable_frontier_file_count counter\n\
+         fusiondb_fusion_reverse_sstable_frontier_file_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_frontier_tighten_count Fusion reverse SSTable frontiers lower than the file-level max user key\n\
+         # TYPE fusiondb_fusion_reverse_sstable_frontier_tighten_count counter\n\
+         fusiondb_fusion_reverse_sstable_frontier_tighten_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_frontier_empty_skip_count Fusion reverse SSTables skipped because range-local frontier proved no in-range key\n\
+         # TYPE fusiondb_fusion_reverse_sstable_frontier_empty_skip_count counter\n\
+         fusiondb_fusion_reverse_sstable_frontier_empty_skip_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_frontier_fail_open_count Fusion reverse SSTable frontier probes that failed open to file-level frontier\n\
+         # TYPE fusiondb_fusion_reverse_sstable_frontier_fail_open_count counter\n\
+         fusiondb_fusion_reverse_sstable_frontier_fail_open_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_pending_count SSTables queued in Fusion reverse lazy pending heap\n\
+         # TYPE fusiondb_fusion_reverse_sstable_pending_count counter\n\
+         fusiondb_fusion_reverse_sstable_pending_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_activation_count SSTables activated from Fusion reverse lazy pending heap\n\
+         # TYPE fusiondb_fusion_reverse_sstable_activation_count counter\n\
+         fusiondb_fusion_reverse_sstable_activation_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_deferred_unopened_count SSTables left unopened in Fusion reverse pending heap when the scan stopped\n\
+         # TYPE fusiondb_fusion_reverse_sstable_deferred_unopened_count counter\n\
+         fusiondb_fusion_reverse_sstable_deferred_unopened_count {}\n\
+         # HELP fusiondb_fusion_reverse_sstable_activation_equal_frontier_count SSTable activations where pending frontier equaled active top user key\n\
+         # TYPE fusiondb_fusion_reverse_sstable_activation_equal_frontier_count counter\n\
+         fusiondb_fusion_reverse_sstable_activation_equal_frontier_count {}\n\
+         # HELP fusiondb_fusion_reverse_raw_entry_read_count Raw internal entries read by Fusion reverse merges\n\
+         # TYPE fusiondb_fusion_reverse_raw_entry_read_count counter\n\
+         fusiondb_fusion_reverse_raw_entry_read_count {}\n\
+         # HELP fusiondb_fusion_reverse_visible_candidate_count Visible per-user-key candidates produced by Fusion reverse sources\n\
+         # TYPE fusiondb_fusion_reverse_visible_candidate_count counter\n\
+         fusiondb_fusion_reverse_visible_candidate_count {}\n\
+         # HELP fusiondb_fusion_reverse_visible_put_count Visible PUT rows emitted by Fusion reverse merges\n\
+         # TYPE fusiondb_fusion_reverse_visible_put_count counter\n\
+         fusiondb_fusion_reverse_visible_put_count {}\n\
+         # HELP fusiondb_index_key_stream_entry_visit_count Secondary index entries visited by tight SQL key-stream scans\n\
+         # TYPE fusiondb_index_key_stream_entry_visit_count counter\n\
+         fusiondb_index_key_stream_entry_visit_count {}\n\
+         # HELP fusiondb_index_ordered_topk_scan_count SQL ordered index Top-K scans\n\
+         # TYPE fusiondb_index_ordered_topk_scan_count counter\n\
+         fusiondb_index_ordered_topk_scan_count {}\n\
+         # HELP fusiondb_index_ordered_topk_entry_visit_count Index entries visited by SQL ordered Top-K scans\n\
+         # TYPE fusiondb_index_ordered_topk_entry_visit_count counter\n\
+         fusiondb_index_ordered_topk_entry_visit_count {}\n\
+         # HELP fusiondb_index_ordered_topk_reverse_scan_count SQL ordered index Top-K scans using reverse range scan\n\
+         # TYPE fusiondb_index_ordered_topk_reverse_scan_count counter\n\
+         fusiondb_index_ordered_topk_reverse_scan_count {}\n\
+         # HELP fusiondb_index_ordered_topk_index_only_row_count Rows materialized directly from SQL ordered index Top-K scans without base-row lookup\n\
+         # TYPE fusiondb_index_ordered_topk_index_only_row_count counter\n\
+         fusiondb_index_ordered_topk_index_only_row_count {}\n\
+         # HELP fusiondb_index_ordered_topk_base_row_fetch_count Base rows looked up by SQL ordered index Top-K scans\n\
+         # TYPE fusiondb_index_ordered_topk_base_row_fetch_count counter\n\
+         fusiondb_index_ordered_topk_base_row_fetch_count {}\n\
+         # HELP fusiondb_index_group_count_summary_entry_visit_count Secondary index count-summary entries visited by GROUP BY COUNT scans\n\
+         # TYPE fusiondb_index_group_count_summary_entry_visit_count counter\n\
+         fusiondb_index_group_count_summary_entry_visit_count {}\n\
+         # HELP fusiondb_index_loose_seek_count Secondary index first() seeks issued by SQL loose scans\n\
+         # TYPE fusiondb_index_loose_seek_count counter\n\
+         fusiondb_index_loose_seek_count {}\n\
+         # HELP fusiondb_index_loose_value_count Distinct secondary index value groups emitted by SQL loose scans\n\
+         # TYPE fusiondb_index_loose_value_count counter\n\
+         fusiondb_index_loose_value_count {}\n\
+         # HELP fusiondb_index_loose_run_skip_count Secondary index advances to the next value run by SQL loose scans\n\
+         # TYPE fusiondb_index_loose_run_skip_count counter\n\
+         fusiondb_index_loose_run_skip_count {}\n\
+         # HELP fusiondb_compaction_run_count Completed SSTable compaction runs\n\
+         # TYPE fusiondb_compaction_run_count counter\n\
+         fusiondb_compaction_run_count {}\n\
+         # HELP fusiondb_compaction_input_bytes SSTable bytes read as compaction input\n\
+         # TYPE fusiondb_compaction_input_bytes counter\n\
+         fusiondb_compaction_input_bytes {}\n\
+         # HELP fusiondb_compaction_output_bytes SSTable bytes written as compaction output\n\
+         # TYPE fusiondb_compaction_output_bytes counter\n\
+         fusiondb_compaction_output_bytes {}\n\
+         # HELP fusiondb_compaction_dropped_version_count MVCC versions dropped during compaction\n\
+         # TYPE fusiondb_compaction_dropped_version_count counter\n\
+         fusiondb_compaction_dropped_version_count {}\n\
+         # HELP fusiondb_live_sstable_count Live SSTable files currently registered\n\
+         # TYPE fusiondb_live_sstable_count gauge\n\
+         fusiondb_live_sstable_count {}\n\
+         # HELP fusiondb_sstable_manifest_load_count SSTable manifest load attempts during startup\n\
+         # TYPE fusiondb_sstable_manifest_load_count counter\n\
+         fusiondb_sstable_manifest_load_count {}\n\
+         # HELP fusiondb_sstable_manifest_load_total_us Total SSTable manifest load time in microseconds\n\
+         # TYPE fusiondb_sstable_manifest_load_total_us counter\n\
+         fusiondb_sstable_manifest_load_total_us {}\n\
+         # HELP fusiondb_sstable_manifest_load_error_count SSTable manifest load validation failures\n\
+         # TYPE fusiondb_sstable_manifest_load_error_count counter\n\
+         fusiondb_sstable_manifest_load_error_count {}\n\
+         # HELP fusiondb_sstable_manifest_live_file_count SSTable files listed by the startup manifest\n\
+         # TYPE fusiondb_sstable_manifest_live_file_count gauge\n\
+         fusiondb_sstable_manifest_live_file_count {}\n\
+         # HELP fusiondb_sstable_manifest_legacy_scan_count Legacy SSTable directory scans during startup\n\
+         # TYPE fusiondb_sstable_manifest_legacy_scan_count counter\n\
+         fusiondb_sstable_manifest_legacy_scan_count {}\n\
+         # HELP fusiondb_sstable_manifest_legacy_scan_candidate_count SSTable candidates found by legacy startup scans\n\
+         # TYPE fusiondb_sstable_manifest_legacy_scan_candidate_count counter\n\
+         fusiondb_sstable_manifest_legacy_scan_candidate_count {}\n\
+         # HELP fusiondb_sstable_manifest_open_error_count SSTable open failures for startup manifest or legacy scan candidates\n\
+         # TYPE fusiondb_sstable_manifest_open_error_count counter\n\
+         fusiondb_sstable_manifest_open_error_count {}\n\
          # HELP fusiondb_wal_write_count WAL syncs\n\
          # TYPE fusiondb_wal_write_count counter\n\
          fusiondb_wal_write_count {}\n\
          # HELP fusiondb_wal_write_bytes WAL bytes written\n\
          # TYPE fusiondb_wal_write_bytes counter\n\
          fusiondb_wal_write_bytes {}\n\
+         # HELP fusiondb_wal_replay_count WAL replay attempts during startup\n\
+         # TYPE fusiondb_wal_replay_count counter\n\
+         fusiondb_wal_replay_count {}\n\
+         # HELP fusiondb_wal_replay_total_us Total WAL replay read time in microseconds\n\
+         # TYPE fusiondb_wal_replay_total_us counter\n\
+         fusiondb_wal_replay_total_us {}\n\
+         # HELP fusiondb_wal_replay_segment_count WAL segments observed during replay\n\
+         # TYPE fusiondb_wal_replay_segment_count counter\n\
+         fusiondb_wal_replay_segment_count {}\n\
+         # HELP fusiondb_wal_replay_bytes WAL bytes observed during replay\n\
+         # TYPE fusiondb_wal_replay_bytes counter\n\
+         fusiondb_wal_replay_bytes {}\n\
+         # HELP fusiondb_wal_replay_valid_bytes WAL bytes through the last complete replayed record\n\
+         # TYPE fusiondb_wal_replay_valid_bytes counter\n\
+         fusiondb_wal_replay_valid_bytes {}\n\
+         # HELP fusiondb_wal_replay_last_segment_id Last WAL segment ID observed during replay\n\
+         # TYPE fusiondb_wal_replay_last_segment_id gauge\n\
+         fusiondb_wal_replay_last_segment_id {}\n\
+         # HELP fusiondb_wal_replay_last_valid_offset Last valid WAL replay offset in the last observed segment\n\
+         # TYPE fusiondb_wal_replay_last_valid_offset gauge\n\
+         fusiondb_wal_replay_last_valid_offset {}\n\
+         # HELP fusiondb_wal_replay_entry_count WAL entries decoded during replay\n\
+         # TYPE fusiondb_wal_replay_entry_count counter\n\
+         fusiondb_wal_replay_entry_count {}\n\
+         # HELP fusiondb_wal_replay_put_count WAL put entries decoded during replay\n\
+         # TYPE fusiondb_wal_replay_put_count counter\n\
+         fusiondb_wal_replay_put_count {}\n\
+         # HELP fusiondb_wal_replay_delete_count WAL delete entries decoded during replay\n\
+         # TYPE fusiondb_wal_replay_delete_count counter\n\
+         fusiondb_wal_replay_delete_count {}\n\
+         # HELP fusiondb_wal_replay_partial_tail_count WAL partial tails found during replay\n\
+         # TYPE fusiondb_wal_replay_partial_tail_count counter\n\
+         fusiondb_wal_replay_partial_tail_count {}\n\
+         # HELP fusiondb_wal_replay_truncate_count WAL files truncated after partial-tail replay\n\
+         # TYPE fusiondb_wal_replay_truncate_count counter\n\
+         fusiondb_wal_replay_truncate_count {}\n\
+         # HELP fusiondb_wal_replay_error_count WAL replay errors\n\
+         # TYPE fusiondb_wal_replay_error_count counter\n\
+         fusiondb_wal_replay_error_count {}\n\
+         # HELP fusiondb_wal_replay_apply_count WAL replay apply passes during startup\n\
+         # TYPE fusiondb_wal_replay_apply_count counter\n\
+         fusiondb_wal_replay_apply_count {}\n\
+         # HELP fusiondb_wal_replay_apply_total_us Total WAL replay apply time in microseconds\n\
+         # TYPE fusiondb_wal_replay_apply_total_us counter\n\
+         fusiondb_wal_replay_apply_total_us {}\n\
+         # HELP fusiondb_wal_replay_max_ts Last startup WAL replay max MVCC timestamp\n\
+         # TYPE fusiondb_wal_replay_max_ts gauge\n\
+         fusiondb_wal_replay_max_ts {}\n\
+         # HELP fusiondb_query_sort_fallback_count SQL ORDER BY operations that sorted rows after scan\n\
+         # TYPE fusiondb_query_sort_fallback_count counter\n\
+         fusiondb_query_sort_fallback_count {}\n\
          # HELP fusiondb_pg_active_connections Active PostgreSQL wire protocol connections\n\
          # TYPE fusiondb_pg_active_connections gauge\n\
          fusiondb_pg_active_connections {}\n\
@@ -253,8 +905,181 @@ async fn handle_prometheus() -> String {
         m.row_read_count.load(Relaxed),
         m.row_write_count.load(Relaxed),
         m.row_cache_hit_count.load(Relaxed),
+        m.query_result_cache_eligible_count.load(Relaxed),
+        m.query_result_cache_hit_count.load(Relaxed),
+        m.query_result_cache_miss_count.load(Relaxed),
+        m.query_result_cache_stale_count.load(Relaxed),
+        m.query_result_cache_insert_count.load(Relaxed),
+        m.query_result_cache_invalidation_count.load(Relaxed),
+        m.block_cache_hit_count.load(Relaxed),
+        m.block_cache_miss_count.load(Relaxed),
+        m.block_cache_insert_count.load(Relaxed),
+        m.block_cache_insert_bytes.load(Relaxed),
+        m.block_cache_fill_skip_count.load(Relaxed),
+        m.block_cache_eviction_count.load(Relaxed),
+        m.block_cache_eviction_bytes.load(Relaxed),
+        m.sstable_block_file_open_count.load(Relaxed),
+        m.sstable_block_read_bytes.load(Relaxed),
+        m.sstable_open_count.load(Relaxed),
+        m.sstable_open_total_us.load(Relaxed),
+        m.sstable_open_index_bytes.load(Relaxed),
+        m.sstable_open_index_read_us.load(Relaxed),
+        m.sstable_open_index_decode_us.load(Relaxed),
+        m.sstable_open_filter_bytes.load(Relaxed),
+        m.sstable_open_filter_read_us.load(Relaxed),
+        m.sstable_open_filter_decode_us.load(Relaxed),
+        m.sstable_open_meta_bytes.load(Relaxed),
+        m.sstable_open_meta_read_us.load(Relaxed),
+        m.sstable_open_meta_decode_us.load(Relaxed),
+        m.sstable_open_index_entries.load(Relaxed),
+        m.sstable_open_block_property_count.load(Relaxed),
+        m.sstable_index_cache_hit_count.load(Relaxed),
+        m.sstable_index_cache_miss_count.load(Relaxed),
+        m.sstable_index_cache_stale_count.load(Relaxed),
+        m.sstable_index_cache_invalid_count.load(Relaxed),
+        m.sstable_index_cache_write_count.load(Relaxed),
+        m.sstable_index_cache_write_error_count.load(Relaxed),
+        m.sstable_prefix_filter_check_count.load(Relaxed),
+        m.sstable_prefix_filter_positive_count.load(Relaxed),
+        m.sstable_prefix_filter_skip_count.load(Relaxed),
+        m.sstable_prefix_filter_fail_open_count.load(Relaxed),
+        m.sstable_index_prefix_filter_check_count.load(Relaxed),
+        m.sstable_index_prefix_filter_positive_count.load(Relaxed),
+        m.sstable_index_prefix_filter_skip_count.load(Relaxed),
+        m.sstable_index_prefix_filter_fail_open_count
+            .load(Relaxed),
+        m.sstable_user_key_filter_check_count.load(Relaxed),
+        m.sstable_user_key_filter_positive_count.load(Relaxed),
+        m.sstable_user_key_filter_skip_count.load(Relaxed),
+        m.sstable_user_key_filter_fail_open_count.load(Relaxed),
+        m.sstable_block_prefix_filter_check_count.load(Relaxed),
+        m.sstable_block_prefix_filter_positive_count.load(Relaxed),
+        m.sstable_block_prefix_filter_skip_count.load(Relaxed),
+        m.sstable_block_prefix_filter_fail_open_count
+            .load(Relaxed),
+        m.sstable_block_index_prefix_filter_check_count
+            .load(Relaxed),
+        m.sstable_block_index_prefix_filter_positive_count
+            .load(Relaxed),
+        m.sstable_block_index_prefix_filter_skip_count
+            .load(Relaxed),
+        m.sstable_block_index_prefix_filter_fail_open_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_filter_check_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_filter_positive_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_filter_skip_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_filter_fail_open_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_metadata_bytes.load(Relaxed),
+        m.sstable_block_zone_map_mvcc_overlap_fail_open_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_mvcc_boundary_split_fail_open_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count
+            .load(Relaxed),
+        m.sstable_block_zone_map_schema_fail_open_count
+            .load(Relaxed),
+        m.sstable_point_probe_count.load(Relaxed),
+        m.sstable_point_overlap_skip_count.load(Relaxed),
+        m.sstable_range_probe_count.load(Relaxed),
+        m.sstable_range_overlap_skip_count.load(Relaxed),
+        m.sstable_iterator_open_count.load(Relaxed),
+        m.sstable_reverse_iterator_open_count.load(Relaxed),
+        m.sstable_reverse_block_read_count.load(Relaxed),
+        m.sstable_reverse_block_entry_decode_count.load(Relaxed),
+        m.sstable_reverse_block_entry_yield_count.load(Relaxed),
+        m.sstable_reverse_block_span_scan_count.load(Relaxed),
+        m.sstable_reverse_block_span_scan_entry_count
+            .load(Relaxed),
+        m.sstable_reverse_block_span_materialize_entry_count
+            .load(Relaxed),
+        m.sstable_reverse_seek_sidecar_hit_count.load(Relaxed),
+        m.sstable_reverse_seek_sidecar_miss_count.load(Relaxed),
+        m.sstable_reverse_seek_sidecar_stale_count.load(Relaxed),
+        m.sstable_reverse_seek_sidecar_invalid_count.load(Relaxed),
+        m.sstable_reverse_seek_sidecar_write_count.load(Relaxed),
+        m.sstable_reverse_seek_sidecar_write_error_count.load(Relaxed),
+        m.sstable_reverse_seek_sidecar_use_count.load(Relaxed),
+        m.sstable_reverse_seek_sidecar_fail_open_count.load(Relaxed),
+        m.sstable_reverse_seek_sidecar_index_entry_count
+            .load(Relaxed),
+        m.sstable_reverse_seek_sidecar_entry_materialize_count
+            .load(Relaxed),
+        m.sstable_reverse_seek_sidecar_offset_probe_count
+            .load(Relaxed),
+        m.fusion_reverse_scan_count.load(Relaxed),
+        m.fusion_reverse_source_open_count.load(Relaxed),
+        m.fusion_reverse_sstable_frontier_probe_count
+            .load(Relaxed),
+        m.fusion_reverse_sstable_frontier_in_range_count
+            .load(Relaxed),
+        m.fusion_reverse_sstable_frontier_file_count
+            .load(Relaxed),
+        m.fusion_reverse_sstable_frontier_tighten_count
+            .load(Relaxed),
+        m.fusion_reverse_sstable_frontier_empty_skip_count
+            .load(Relaxed),
+        m.fusion_reverse_sstable_frontier_fail_open_count
+            .load(Relaxed),
+        m.fusion_reverse_sstable_pending_count.load(Relaxed),
+        m.fusion_reverse_sstable_activation_count.load(Relaxed),
+        m.fusion_reverse_sstable_deferred_unopened_count
+            .load(Relaxed),
+        m.fusion_reverse_sstable_activation_equal_frontier_count
+            .load(Relaxed),
+        m.fusion_reverse_raw_entry_read_count.load(Relaxed),
+        m.fusion_reverse_visible_candidate_count.load(Relaxed),
+        m.fusion_reverse_visible_put_count.load(Relaxed),
+        m.index_key_stream_entry_visit_count.load(Relaxed),
+        m.index_ordered_topk_scan_count.load(Relaxed),
+        m.index_ordered_topk_entry_visit_count.load(Relaxed),
+        m.index_ordered_topk_reverse_scan_count.load(Relaxed),
+        m.index_ordered_topk_index_only_row_count.load(Relaxed),
+        m.index_ordered_topk_base_row_fetch_count.load(Relaxed),
+        m.index_group_count_summary_entry_visit_count
+            .load(Relaxed),
+        m.index_loose_seek_count.load(Relaxed),
+        m.index_loose_value_count.load(Relaxed),
+        m.index_loose_run_skip_count.load(Relaxed),
+        m.compaction_run_count.load(Relaxed),
+        m.compaction_input_bytes.load(Relaxed),
+        m.compaction_output_bytes.load(Relaxed),
+        m.compaction_dropped_version_count.load(Relaxed),
+        m.live_sstable_count.load(Relaxed),
+        m.sstable_manifest_load_count.load(Relaxed),
+        m.sstable_manifest_load_total_us.load(Relaxed),
+        m.sstable_manifest_load_error_count.load(Relaxed),
+        m.sstable_manifest_live_file_count.load(Relaxed),
+        m.sstable_manifest_legacy_scan_count.load(Relaxed),
+        m.sstable_manifest_legacy_scan_candidate_count
+            .load(Relaxed),
+        m.sstable_manifest_open_error_count.load(Relaxed),
         m.wal_write_count.load(Relaxed),
         m.wal_write_bytes.load(Relaxed),
+        m.wal_replay_count.load(Relaxed),
+        m.wal_replay_total_us.load(Relaxed),
+        m.wal_replay_segment_count.load(Relaxed),
+        m.wal_replay_bytes.load(Relaxed),
+        m.wal_replay_valid_bytes.load(Relaxed),
+        m.wal_replay_last_segment_id.load(Relaxed),
+        m.wal_replay_last_valid_offset.load(Relaxed),
+        m.wal_replay_entry_count.load(Relaxed),
+        m.wal_replay_put_count.load(Relaxed),
+        m.wal_replay_delete_count.load(Relaxed),
+        m.wal_replay_partial_tail_count.load(Relaxed),
+        m.wal_replay_truncate_count.load(Relaxed),
+        m.wal_replay_error_count.load(Relaxed),
+        m.wal_replay_apply_count.load(Relaxed),
+        m.wal_replay_apply_total_us.load(Relaxed),
+        m.wal_replay_max_ts.load(Relaxed),
+        m.query_sort_fallback_count.load(Relaxed),
         m.pg_active_connection_count.load(Relaxed),
         m.pg_connection_limit.load(Relaxed),
         m.pg_connection_rejected_count.load(Relaxed),
@@ -408,13 +1233,14 @@ async fn handle_query(
     Json(payload): Json<QueryRequest>,
 ) -> ApiResponse<Vec<QueryResultJson>> {
     let username = context.username.clone().unwrap_or_default();
+    let (sql, disable_sql_block_zone_map_pruning) =
+        strip_sql_block_zone_map_prune_hint(&payload.sql);
 
-    if let Err(e) = state.executor.authorize_sql(&username, &payload.sql).await {
+    if let Err(e) = state.executor.authorize_sql(&username, sql).await {
         return json_error(StatusCode::FORBIDDEN, format!("{:?}", e));
     }
 
-    match shard_write_route_action_for_sql(&state, &payload.sql, &[], context.shard_forwarded).await
-    {
+    match shard_write_route_action_for_sql(&state, sql, &[], context.shard_forwarded).await {
         Ok(ShardWriteRouteAction::Local) => {}
         Ok(ShardWriteRouteAction::Forward(decision)) => {
             return forward_query_to_shard_owner(&state, &context, &payload, &decision).await;
@@ -425,8 +1251,7 @@ async fn handle_query(
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     }
 
-    match shard_read_route_action_for_sql(&state, &payload.sql, &[], context.shard_forwarded).await
-    {
+    match shard_read_route_action_for_sql(&state, sql, &[], context.shard_forwarded).await {
         Ok(ShardReadRouteAction::Local) => {}
         Ok(ShardReadRouteAction::Forward(decision)) => {
             return forward_query_to_shard_owner(&state, &context, &payload, &decision).await;
@@ -437,86 +1262,83 @@ async fn handle_query(
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     }
 
+    if let Some(response) = try_fanout_count_query_to_shard_owners(&state, &context, sql).await {
+        return response;
+    }
+
     if let Some(response) =
-        try_fanout_count_query_to_shard_owners(&state, &context, &payload.sql).await
+        try_fanout_group_count_query_to_shard_owners(&state, &context, sql).await
     {
         return response;
     }
 
     if let Some(response) =
-        try_fanout_group_count_query_to_shard_owners(&state, &context, &payload.sql).await
+        try_fanout_group_aggregate_query_to_shard_owners(&state, &context, sql).await
+    {
+        return response;
+    }
+
+    if let Some(response) = try_fanout_group_avg_query_to_shard_owners(&state, &context, sql).await
     {
         return response;
     }
 
     if let Some(response) =
-        try_fanout_group_aggregate_query_to_shard_owners(&state, &context, &payload.sql).await
+        try_fanout_group_multi_aggregate_query_to_shard_owners(&state, &context, sql).await
+    {
+        return response;
+    }
+
+    if let Some(response) = try_unsupported_group_by_fanout_error(&state, &context, sql).await {
+        return response;
+    }
+
+    if let Some(response) =
+        try_fanout_count_distinct_query_to_shard_owners(&state, &context, sql).await
     {
         return response;
     }
 
     if let Some(response) =
-        try_fanout_group_avg_query_to_shard_owners(&state, &context, &payload.sql).await
+        try_fanout_sum_distinct_query_to_shard_owners(&state, &context, sql).await
     {
         return response;
     }
 
     if let Some(response) =
-        try_fanout_group_multi_aggregate_query_to_shard_owners(&state, &context, &payload.sql).await
+        try_fanout_avg_distinct_query_to_shard_owners(&state, &context, sql).await
     {
         return response;
     }
 
-    if let Some(response) =
-        try_unsupported_group_by_fanout_error(&state, &context, &payload.sql).await
-    {
+    if let Some(response) = try_fanout_sum_query_to_shard_owners(&state, &context, sql).await {
         return response;
     }
 
-    if let Some(response) =
-        try_fanout_count_distinct_query_to_shard_owners(&state, &context, &payload.sql).await
-    {
+    if let Some(response) = try_fanout_min_max_query_to_shard_owners(&state, &context, sql).await {
         return response;
     }
 
-    if let Some(response) =
-        try_fanout_sum_distinct_query_to_shard_owners(&state, &context, &payload.sql).await
-    {
+    if let Some(response) = try_fanout_avg_query_to_shard_owners(&state, &context, sql).await {
         return response;
     }
 
-    if let Some(response) =
-        try_fanout_avg_distinct_query_to_shard_owners(&state, &context, &payload.sql).await
-    {
-        return response;
-    }
-
-    if let Some(response) =
-        try_fanout_sum_query_to_shard_owners(&state, &context, &payload.sql).await
-    {
-        return response;
-    }
-
-    if let Some(response) =
-        try_fanout_min_max_query_to_shard_owners(&state, &context, &payload.sql).await
-    {
-        return response;
-    }
-
-    if let Some(response) =
-        try_fanout_avg_query_to_shard_owners(&state, &context, &payload.sql).await
-    {
-        return response;
-    }
-
-    if let Some(response) = try_fanout_query_to_shard_owners(&state, &context, &payload.sql).await {
+    if let Some(response) = try_fanout_query_to_shard_owners(&state, &context, sql).await {
         return response;
     }
 
     if let Some(raft) = &state.raft {
-        match state.executor.sql_requires_raft_write(&payload.sql) {
+        match state.executor.sql_requires_raft_write(sql) {
             Ok(true) => {
-                return match submit_raft_write(raft, &state.raft_client, payload.sql).await {
+                return match submit_raft_write(
+                    raft,
+                    &state.raft_client,
+                    sql.to_string(),
+                    state.forwarding_auth.as_ref(),
+                    &state.peer_scheme,
+                )
+                .await
+                {
                     Ok(resp) => json_ok(vec![QueryResultJson::Success {
                         r#type: "success".to_string(),
                         message: resp.message,
@@ -529,7 +1351,16 @@ async fn handle_query(
         }
     }
 
-    match state.executor.execute_sql(&payload.sql).await {
+    let execution_result = if disable_sql_block_zone_map_pruning {
+        state
+            .executor
+            .execute_sql_with_sql_block_zone_map_pruning(sql, false)
+            .await
+    } else {
+        state.executor.execute_sql(sql).await
+    };
+
+    match execution_result {
         Ok(results) => json_ok(results.into_iter().map(|r| r.into()).collect()),
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{:?}", e)),
     }
@@ -766,15 +1597,11 @@ async fn forward_query_to_shard_owner(
     payload: &QueryRequest,
     decision: &SqlShardRoutingDecision,
 ) -> ApiResponse<Vec<QueryResultJson>> {
-    let url = format!("http://{}/query", decision.route.owner_addr);
-    let mut request = state
-        .raft_client
-        .post(&url)
-        .header(SHARD_OWNER_FORWARD_HEADER, SHARD_OWNER_FORWARD_VALUE)
-        .json(payload);
-    if let Some(username) = context.username.as_deref() {
-        request = request.header("x-fusiondb-user", username);
-    }
+    let url = format!(
+        "{}://{}/query",
+        state.peer_scheme, decision.route.owner_addr
+    );
+    let request = apply_forwarding_headers(state.raft_client.post(&url).json(payload), context);
 
     let response = match request.send().await {
         Ok(response) => response,
@@ -1881,12 +2708,11 @@ async fn query_remote_shard_owner(
     sql: &str,
     owner: &SqlShardOwner,
 ) -> std::result::Result<Vec<QueryResultJson>, (StatusCode, String)> {
-    let url = format!("http://{}/query", owner.addr);
+    let url = format!("{}://{}/query", state.peer_scheme, owner.addr);
     let payload = QueryRequest {
         sql: sql.to_string(),
     };
-    let response = apply_forwarding_headers(state.raft_client.post(&url), context)
-        .json(&payload)
+    let response = apply_forwarding_headers(state.raft_client.post(&url).json(&payload), context)
         .send()
         .await
         .map_err(|e| {
@@ -4156,23 +4982,25 @@ async fn query_remote_prepared_sql_shard_owner(
     payload: &ExecuteRequest,
     owner: &SqlShardOwner,
 ) -> std::result::Result<Vec<QueryResultJson>, (StatusCode, String)> {
-    let prepare_url = format!("http://{}/prepare", owner.addr);
+    let prepare_url = format!("{}://{}/prepare", state.peer_scheme, owner.addr);
     let prepare_payload = PrepareRequest {
         sql: sql.to_string(),
     };
-    let prepare_response = apply_forwarding_headers(state.raft_client.post(&prepare_url), context)
-        .json(&prepare_payload)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "Shard select fan-out prepare error: forwarding to node {} at {} failed: {}",
-                    owner.node_id, owner.addr, e
-                ),
-            )
-        })?;
+    let prepare_response = apply_forwarding_headers(
+        state.raft_client.post(&prepare_url).json(&prepare_payload),
+        context,
+    )
+    .send()
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Shard select fan-out prepare error: forwarding to node {} at {} failed: {}",
+                owner.node_id, owner.addr, e
+            ),
+        )
+    })?;
     let prepare_status = prepare_response.status();
     let prepare_envelope = prepare_response
         .json::<Envelope<PreparedStatementInfo>>()
@@ -4209,30 +5037,31 @@ async fn query_remote_prepared_sql_shard_owner(
         )
     })?;
 
-    let execute_url = format!("http://{}/execute", owner.addr);
+    let execute_url = format!("{}://{}/execute", state.peer_scheme, owner.addr);
     let execute_payload = ExecuteRequest {
         statement_id: prepared.statement_id.clone(),
         params: payload.params.clone(),
         return_results: Some(true),
     };
-    let execute_response =
-        match apply_forwarding_headers(state.raft_client.post(&execute_url), context)
-            .json(&execute_payload)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                best_effort_deallocate_statement_on_owner(state, context, owner, &prepared).await;
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    format!(
+    let execute_response = match apply_forwarding_headers(
+        state.raft_client.post(&execute_url).json(&execute_payload),
+        context,
+    )
+    .send()
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            best_effort_deallocate_statement_on_owner(state, context, owner, &prepared).await;
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
                     "Shard select fan-out execute error: forwarding to node {} at {} failed: {}",
                     owner.node_id, owner.addr, e
                 ),
-                ));
-            }
-        };
+            ));
+        }
+    };
     let execute_status = execute_response.status();
     let execute_envelope = match execute_response
         .json::<Envelope<Vec<QueryResultJson>>>()
@@ -4283,24 +5112,28 @@ async fn forward_execute_to_shard_owner(
     payload: &ExecuteRequest,
     decision: &SqlShardRoutingDecision,
 ) -> ApiResponse<Vec<QueryResultJson>> {
-    let prepare_url = format!("http://{}/prepare", decision.route.owner_addr);
+    let prepare_url = format!(
+        "{}://{}/prepare",
+        state.peer_scheme, decision.route.owner_addr
+    );
     let prepare_payload = PrepareRequest {
         sql: record.sql.clone(),
     };
-    let prepare_response =
-        match apply_forwarding_headers(state.raft_client.post(&prepare_url), context)
-            .json(&prepare_payload)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    shard_forwarding_transport_error(decision, "prepare", e),
-                );
-            }
-        };
+    let prepare_response = match apply_forwarding_headers(
+        state.raft_client.post(&prepare_url).json(&prepare_payload),
+        context,
+    )
+    .send()
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                shard_forwarding_transport_error(decision, "prepare", e),
+            );
+        }
+    };
     let prepare_status = prepare_response.status();
     let prepare_envelope = match prepare_response
         .json::<Envelope<PreparedStatementInfo>>()
@@ -4335,28 +5168,31 @@ async fn forward_execute_to_shard_owner(
         );
     };
 
-    let execute_url = format!("http://{}/execute", decision.route.owner_addr);
+    let execute_url = format!(
+        "{}://{}/execute",
+        state.peer_scheme, decision.route.owner_addr
+    );
     let execute_payload = ExecuteRequest {
         statement_id: prepared.statement_id.clone(),
         params: payload.params.clone(),
         return_results: payload.return_results,
     };
-    let execute_response =
-        match apply_forwarding_headers(state.raft_client.post(&execute_url), context)
-            .json(&execute_payload)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                best_effort_deallocate_forwarded_statement(state, context, decision, &prepared)
-                    .await;
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    shard_forwarding_transport_error(decision, "execute", e),
-                );
-            }
-        };
+    let execute_response = match apply_forwarding_headers(
+        state.raft_client.post(&execute_url).json(&execute_payload),
+        context,
+    )
+    .send()
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            best_effort_deallocate_forwarded_statement(state, context, decision, &prepared).await;
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                shard_forwarding_transport_error(decision, "execute", e),
+            );
+        }
+    };
     let execute_status = execute_response.status();
     let execute_envelope = match execute_response
         .json::<Envelope<Vec<QueryResultJson>>>()
@@ -4382,9 +5218,13 @@ fn apply_forwarding_headers(
     request: reqwest::RequestBuilder,
     context: &RequestContext,
 ) -> reqwest::RequestBuilder {
-    let request = request.header(SHARD_OWNER_FORWARD_HEADER, SHARD_OWNER_FORWARD_VALUE);
-    if let Some(username) = context.username.as_deref() {
-        request.header("x-fusiondb-user", username)
+    let username = context.username.as_deref().unwrap_or("postgres");
+    if let Some(auth) = context.forwarding_auth.as_ref() {
+        auth.apply(request, username)
+    } else if context.legacy_unsafe {
+        request
+            .header(FORWARDED_HEADER, FORWARDED_VALUE)
+            .header(FORWARDED_USER_HEADER, username)
     } else {
         request
     }
@@ -4413,8 +5253,8 @@ async fn best_effort_deallocate_forwarded_statement(
     prepared: &PreparedStatementInfo,
 ) {
     let url = format!(
-        "http://{}/prepare/{}",
-        decision.route.owner_addr, prepared.statement_id
+        "{}://{}/prepare/{}",
+        state.peer_scheme, decision.route.owner_addr, prepared.statement_id
     );
     let _ = apply_forwarding_headers(state.raft_client.delete(url), context)
         .send()
@@ -4427,7 +5267,10 @@ async fn best_effort_deallocate_statement_on_owner(
     owner: &SqlShardOwner,
     prepared: &PreparedStatementInfo,
 ) {
-    let url = format!("http://{}/prepare/{}", owner.addr, prepared.statement_id);
+    let url = format!(
+        "{}://{}/prepare/{}",
+        state.peer_scheme, owner.addr, prepared.statement_id
+    );
     let _ = apply_forwarding_headers(state.raft_client.delete(url), context)
         .send()
         .await;
@@ -4442,12 +5285,31 @@ pub struct AppState {
     distributed_mode: String,
     shard_router: Option<ShardRouter>,
     shard_owner_forwarding_enabled: bool,
+    postgres_password: Arc<str>,
+    http_legacy_unsafe: bool,
+    forwarding_auth: Option<ForwardingAuth>,
+    peer_scheme: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct RequestContext {
     username: Option<String>,
     shard_forwarded: bool,
+    auth_mode: &'static str,
+    forwarding_auth: Option<ForwardingAuth>,
+    legacy_unsafe: bool,
+}
+
+impl Default for RequestContext {
+    fn default() -> Self {
+        Self {
+            username: None,
+            shard_forwarded: false,
+            auth_mode: "legacy_unsafe",
+            forwarding_auth: None,
+            legacy_unsafe: true,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -4483,14 +5345,156 @@ pub struct MetricsSnapshot {
     sql_plan_count: u64,
     row_read_count: u64,
     row_cache_hit_count: u64,
+    query_result_cache_eligible_count: u64,
+    query_result_cache_hit_count: u64,
+    query_result_cache_miss_count: u64,
+    query_result_cache_stale_count: u64,
+    query_result_cache_insert_count: u64,
+    query_result_cache_invalidation_count: u64,
+    block_cache_hit_count: u64,
+    block_cache_miss_count: u64,
+    block_cache_insert_count: u64,
+    block_cache_insert_bytes: u64,
+    block_cache_fill_skip_count: u64,
+    block_cache_eviction_count: u64,
+    block_cache_eviction_bytes: u64,
+    sstable_block_file_open_count: u64,
+    sstable_block_read_bytes: u64,
+    sstable_open_count: u64,
+    sstable_open_total_us: u64,
+    sstable_open_index_bytes: u64,
+    sstable_open_index_read_us: u64,
+    sstable_open_index_decode_us: u64,
+    sstable_open_filter_bytes: u64,
+    sstable_open_filter_read_us: u64,
+    sstable_open_filter_decode_us: u64,
+    sstable_open_meta_bytes: u64,
+    sstable_open_meta_read_us: u64,
+    sstable_open_meta_decode_us: u64,
+    sstable_open_index_entries: u64,
+    sstable_open_block_property_count: u64,
+    sstable_index_cache_hit_count: u64,
+    sstable_index_cache_miss_count: u64,
+    sstable_index_cache_stale_count: u64,
+    sstable_index_cache_invalid_count: u64,
+    sstable_index_cache_write_count: u64,
+    sstable_index_cache_write_error_count: u64,
+    sstable_prefix_filter_check_count: u64,
+    sstable_prefix_filter_positive_count: u64,
+    sstable_prefix_filter_skip_count: u64,
+    sstable_prefix_filter_fail_open_count: u64,
+    sstable_index_prefix_filter_check_count: u64,
+    sstable_index_prefix_filter_positive_count: u64,
+    sstable_index_prefix_filter_skip_count: u64,
+    sstable_index_prefix_filter_fail_open_count: u64,
+    sstable_user_key_filter_check_count: u64,
+    sstable_user_key_filter_positive_count: u64,
+    sstable_user_key_filter_skip_count: u64,
+    sstable_user_key_filter_fail_open_count: u64,
+    sstable_block_prefix_filter_check_count: u64,
+    sstable_block_prefix_filter_positive_count: u64,
+    sstable_block_prefix_filter_skip_count: u64,
+    sstable_block_prefix_filter_fail_open_count: u64,
+    sstable_block_index_prefix_filter_check_count: u64,
+    sstable_block_index_prefix_filter_positive_count: u64,
+    sstable_block_index_prefix_filter_skip_count: u64,
+    sstable_block_index_prefix_filter_fail_open_count: u64,
+    sstable_block_zone_map_filter_check_count: u64,
+    sstable_block_zone_map_filter_positive_count: u64,
+    sstable_block_zone_map_filter_skip_count: u64,
+    sstable_block_zone_map_filter_fail_open_count: u64,
+    sstable_block_zone_map_metadata_bytes: u64,
+    sstable_block_zone_map_mvcc_overlap_fail_open_count: u64,
+    sstable_block_zone_map_mvcc_boundary_split_fail_open_count: u64,
+    sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count: u64,
+    sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count: u64,
+    sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count: u64,
+    sstable_block_zone_map_schema_fail_open_count: u64,
+    sstable_point_probe_count: u64,
+    sstable_point_overlap_skip_count: u64,
+    sstable_range_probe_count: u64,
+    sstable_range_overlap_skip_count: u64,
+    sstable_iterator_open_count: u64,
+    sstable_reverse_iterator_open_count: u64,
+    sstable_reverse_block_read_count: u64,
+    sstable_reverse_block_entry_decode_count: u64,
+    sstable_reverse_block_entry_yield_count: u64,
+    sstable_reverse_block_span_scan_count: u64,
+    sstable_reverse_block_span_scan_entry_count: u64,
+    sstable_reverse_block_span_materialize_entry_count: u64,
+    sstable_reverse_seek_sidecar_hit_count: u64,
+    sstable_reverse_seek_sidecar_miss_count: u64,
+    sstable_reverse_seek_sidecar_stale_count: u64,
+    sstable_reverse_seek_sidecar_invalid_count: u64,
+    sstable_reverse_seek_sidecar_write_count: u64,
+    sstable_reverse_seek_sidecar_write_error_count: u64,
+    sstable_reverse_seek_sidecar_use_count: u64,
+    sstable_reverse_seek_sidecar_fail_open_count: u64,
+    sstable_reverse_seek_sidecar_index_entry_count: u64,
+    sstable_reverse_seek_sidecar_entry_materialize_count: u64,
+    sstable_reverse_seek_sidecar_offset_probe_count: u64,
+    fusion_reverse_scan_count: u64,
+    fusion_reverse_source_open_count: u64,
+    fusion_reverse_sstable_frontier_probe_count: u64,
+    fusion_reverse_sstable_frontier_in_range_count: u64,
+    fusion_reverse_sstable_frontier_file_count: u64,
+    fusion_reverse_sstable_frontier_tighten_count: u64,
+    fusion_reverse_sstable_frontier_empty_skip_count: u64,
+    fusion_reverse_sstable_frontier_fail_open_count: u64,
+    fusion_reverse_sstable_pending_count: u64,
+    fusion_reverse_sstable_activation_count: u64,
+    fusion_reverse_sstable_deferred_unopened_count: u64,
+    fusion_reverse_sstable_activation_equal_frontier_count: u64,
+    fusion_reverse_raw_entry_read_count: u64,
+    fusion_reverse_visible_candidate_count: u64,
+    fusion_reverse_visible_put_count: u64,
+    index_key_stream_entry_visit_count: u64,
+    index_ordered_topk_scan_count: u64,
+    index_ordered_topk_entry_visit_count: u64,
+    index_ordered_topk_reverse_scan_count: u64,
+    index_ordered_topk_index_only_row_count: u64,
+    index_ordered_topk_base_row_fetch_count: u64,
+    index_group_count_summary_entry_visit_count: u64,
+    index_loose_seek_count: u64,
+    index_loose_value_count: u64,
+    index_loose_run_skip_count: u64,
+    compaction_run_count: u64,
+    compaction_input_bytes: u64,
+    compaction_output_bytes: u64,
+    compaction_dropped_version_count: u64,
+    live_sstable_count: u64,
+    sstable_manifest_load_count: u64,
+    sstable_manifest_load_total_us: u64,
+    sstable_manifest_load_error_count: u64,
+    sstable_manifest_live_file_count: u64,
+    sstable_manifest_legacy_scan_count: u64,
+    sstable_manifest_legacy_scan_candidate_count: u64,
+    sstable_manifest_open_error_count: u64,
     row_write_count: u64,
     fts_search_count: u64,
     fts_doc_hits: u64,
     wal_write_count: u64,
     wal_write_bytes: u64,
+    wal_replay_count: u64,
+    wal_replay_total_us: u64,
+    wal_replay_segment_count: u64,
+    wal_replay_bytes: u64,
+    wal_replay_valid_bytes: u64,
+    wal_replay_last_segment_id: u64,
+    wal_replay_last_valid_offset: u64,
+    wal_replay_entry_count: u64,
+    wal_replay_put_count: u64,
+    wal_replay_delete_count: u64,
+    wal_replay_partial_tail_count: u64,
+    wal_replay_truncate_count: u64,
+    wal_replay_error_count: u64,
+    wal_replay_apply_count: u64,
+    wal_replay_apply_total_us: u64,
+    wal_replay_max_ts: u64,
     query_count: u64,
     slow_query_count: u64,
     query_total_us: u64,
+    query_sort_fallback_count: u64,
     pg_active_connection_count: u64,
     pg_connection_rejected_count: u64,
     pg_connection_limit: u64,
@@ -4642,11 +5646,7 @@ impl AuthContextInfo {
         Self {
             username,
             authenticated,
-            mode: if authenticated {
-                "explicit_user".to_string()
-            } else {
-                "legacy_anonymous".to_string()
-            },
+            mode: context.auth_mode.to_string(),
         }
     }
 }
@@ -4661,14 +5661,320 @@ impl MetricsSnapshot {
             sql_plan_count: metrics.sql_plan_count.load(Relaxed),
             row_read_count: metrics.row_read_count.load(Relaxed),
             row_cache_hit_count: metrics.row_cache_hit_count.load(Relaxed),
+            query_result_cache_eligible_count: metrics
+                .query_result_cache_eligible_count
+                .load(Relaxed),
+            query_result_cache_hit_count: metrics.query_result_cache_hit_count.load(Relaxed),
+            query_result_cache_miss_count: metrics.query_result_cache_miss_count.load(Relaxed),
+            query_result_cache_stale_count: metrics.query_result_cache_stale_count.load(Relaxed),
+            query_result_cache_insert_count: metrics.query_result_cache_insert_count.load(Relaxed),
+            query_result_cache_invalidation_count: metrics
+                .query_result_cache_invalidation_count
+                .load(Relaxed),
+            block_cache_hit_count: metrics.block_cache_hit_count.load(Relaxed),
+            block_cache_miss_count: metrics.block_cache_miss_count.load(Relaxed),
+            block_cache_insert_count: metrics.block_cache_insert_count.load(Relaxed),
+            block_cache_insert_bytes: metrics.block_cache_insert_bytes.load(Relaxed),
+            block_cache_fill_skip_count: metrics.block_cache_fill_skip_count.load(Relaxed),
+            block_cache_eviction_count: metrics.block_cache_eviction_count.load(Relaxed),
+            block_cache_eviction_bytes: metrics.block_cache_eviction_bytes.load(Relaxed),
+            sstable_block_file_open_count: metrics.sstable_block_file_open_count.load(Relaxed),
+            sstable_block_read_bytes: metrics.sstable_block_read_bytes.load(Relaxed),
+            sstable_open_count: metrics.sstable_open_count.load(Relaxed),
+            sstable_open_total_us: metrics.sstable_open_total_us.load(Relaxed),
+            sstable_open_index_bytes: metrics.sstable_open_index_bytes.load(Relaxed),
+            sstable_open_index_read_us: metrics.sstable_open_index_read_us.load(Relaxed),
+            sstable_open_index_decode_us: metrics.sstable_open_index_decode_us.load(Relaxed),
+            sstable_open_filter_bytes: metrics.sstable_open_filter_bytes.load(Relaxed),
+            sstable_open_filter_read_us: metrics.sstable_open_filter_read_us.load(Relaxed),
+            sstable_open_filter_decode_us: metrics.sstable_open_filter_decode_us.load(Relaxed),
+            sstable_open_meta_bytes: metrics.sstable_open_meta_bytes.load(Relaxed),
+            sstable_open_meta_read_us: metrics.sstable_open_meta_read_us.load(Relaxed),
+            sstable_open_meta_decode_us: metrics.sstable_open_meta_decode_us.load(Relaxed),
+            sstable_open_index_entries: metrics.sstable_open_index_entries.load(Relaxed),
+            sstable_open_block_property_count: metrics
+                .sstable_open_block_property_count
+                .load(Relaxed),
+            sstable_index_cache_hit_count: metrics.sstable_index_cache_hit_count.load(Relaxed),
+            sstable_index_cache_miss_count: metrics.sstable_index_cache_miss_count.load(Relaxed),
+            sstable_index_cache_stale_count: metrics.sstable_index_cache_stale_count.load(Relaxed),
+            sstable_index_cache_invalid_count: metrics
+                .sstable_index_cache_invalid_count
+                .load(Relaxed),
+            sstable_index_cache_write_count: metrics.sstable_index_cache_write_count.load(Relaxed),
+            sstable_index_cache_write_error_count: metrics
+                .sstable_index_cache_write_error_count
+                .load(Relaxed),
+            sstable_prefix_filter_check_count: metrics
+                .sstable_prefix_filter_check_count
+                .load(Relaxed),
+            sstable_prefix_filter_positive_count: metrics
+                .sstable_prefix_filter_positive_count
+                .load(Relaxed),
+            sstable_prefix_filter_skip_count: metrics
+                .sstable_prefix_filter_skip_count
+                .load(Relaxed),
+            sstable_prefix_filter_fail_open_count: metrics
+                .sstable_prefix_filter_fail_open_count
+                .load(Relaxed),
+            sstable_index_prefix_filter_check_count: metrics
+                .sstable_index_prefix_filter_check_count
+                .load(Relaxed),
+            sstable_index_prefix_filter_positive_count: metrics
+                .sstable_index_prefix_filter_positive_count
+                .load(Relaxed),
+            sstable_index_prefix_filter_skip_count: metrics
+                .sstable_index_prefix_filter_skip_count
+                .load(Relaxed),
+            sstable_index_prefix_filter_fail_open_count: metrics
+                .sstable_index_prefix_filter_fail_open_count
+                .load(Relaxed),
+            sstable_user_key_filter_check_count: metrics
+                .sstable_user_key_filter_check_count
+                .load(Relaxed),
+            sstable_user_key_filter_positive_count: metrics
+                .sstable_user_key_filter_positive_count
+                .load(Relaxed),
+            sstable_user_key_filter_skip_count: metrics
+                .sstable_user_key_filter_skip_count
+                .load(Relaxed),
+            sstable_user_key_filter_fail_open_count: metrics
+                .sstable_user_key_filter_fail_open_count
+                .load(Relaxed),
+            sstable_block_prefix_filter_check_count: metrics
+                .sstable_block_prefix_filter_check_count
+                .load(Relaxed),
+            sstable_block_prefix_filter_positive_count: metrics
+                .sstable_block_prefix_filter_positive_count
+                .load(Relaxed),
+            sstable_block_prefix_filter_skip_count: metrics
+                .sstable_block_prefix_filter_skip_count
+                .load(Relaxed),
+            sstable_block_prefix_filter_fail_open_count: metrics
+                .sstable_block_prefix_filter_fail_open_count
+                .load(Relaxed),
+            sstable_block_index_prefix_filter_check_count: metrics
+                .sstable_block_index_prefix_filter_check_count
+                .load(Relaxed),
+            sstable_block_index_prefix_filter_positive_count: metrics
+                .sstable_block_index_prefix_filter_positive_count
+                .load(Relaxed),
+            sstable_block_index_prefix_filter_skip_count: metrics
+                .sstable_block_index_prefix_filter_skip_count
+                .load(Relaxed),
+            sstable_block_index_prefix_filter_fail_open_count: metrics
+                .sstable_block_index_prefix_filter_fail_open_count
+                .load(Relaxed),
+            sstable_block_zone_map_filter_check_count: metrics
+                .sstable_block_zone_map_filter_check_count
+                .load(Relaxed),
+            sstable_block_zone_map_filter_positive_count: metrics
+                .sstable_block_zone_map_filter_positive_count
+                .load(Relaxed),
+            sstable_block_zone_map_filter_skip_count: metrics
+                .sstable_block_zone_map_filter_skip_count
+                .load(Relaxed),
+            sstable_block_zone_map_filter_fail_open_count: metrics
+                .sstable_block_zone_map_filter_fail_open_count
+                .load(Relaxed),
+            sstable_block_zone_map_metadata_bytes: metrics
+                .sstable_block_zone_map_metadata_bytes
+                .load(Relaxed),
+            sstable_block_zone_map_mvcc_overlap_fail_open_count: metrics
+                .sstable_block_zone_map_mvcc_overlap_fail_open_count
+                .load(Relaxed),
+            sstable_block_zone_map_mvcc_boundary_split_fail_open_count: metrics
+                .sstable_block_zone_map_mvcc_boundary_split_fail_open_count
+                .load(Relaxed),
+            sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count: metrics
+                .sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count
+                .load(Relaxed),
+            sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count: metrics
+                .sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count
+                .load(Relaxed),
+            sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count: metrics
+                .sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count
+                .load(Relaxed),
+            sstable_block_zone_map_schema_fail_open_count: metrics
+                .sstable_block_zone_map_schema_fail_open_count
+                .load(Relaxed),
+            sstable_point_probe_count: metrics.sstable_point_probe_count.load(Relaxed),
+            sstable_point_overlap_skip_count: metrics
+                .sstable_point_overlap_skip_count
+                .load(Relaxed),
+            sstable_range_probe_count: metrics.sstable_range_probe_count.load(Relaxed),
+            sstable_range_overlap_skip_count: metrics
+                .sstable_range_overlap_skip_count
+                .load(Relaxed),
+            sstable_iterator_open_count: metrics.sstable_iterator_open_count.load(Relaxed),
+            sstable_reverse_iterator_open_count: metrics
+                .sstable_reverse_iterator_open_count
+                .load(Relaxed),
+            sstable_reverse_block_read_count: metrics
+                .sstable_reverse_block_read_count
+                .load(Relaxed),
+            sstable_reverse_block_entry_decode_count: metrics
+                .sstable_reverse_block_entry_decode_count
+                .load(Relaxed),
+            sstable_reverse_block_entry_yield_count: metrics
+                .sstable_reverse_block_entry_yield_count
+                .load(Relaxed),
+            sstable_reverse_block_span_scan_count: metrics
+                .sstable_reverse_block_span_scan_count
+                .load(Relaxed),
+            sstable_reverse_block_span_scan_entry_count: metrics
+                .sstable_reverse_block_span_scan_entry_count
+                .load(Relaxed),
+            sstable_reverse_block_span_materialize_entry_count: metrics
+                .sstable_reverse_block_span_materialize_entry_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_hit_count: metrics
+                .sstable_reverse_seek_sidecar_hit_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_miss_count: metrics
+                .sstable_reverse_seek_sidecar_miss_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_stale_count: metrics
+                .sstable_reverse_seek_sidecar_stale_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_invalid_count: metrics
+                .sstable_reverse_seek_sidecar_invalid_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_write_count: metrics
+                .sstable_reverse_seek_sidecar_write_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_write_error_count: metrics
+                .sstable_reverse_seek_sidecar_write_error_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_use_count: metrics
+                .sstable_reverse_seek_sidecar_use_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_fail_open_count: metrics
+                .sstable_reverse_seek_sidecar_fail_open_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_index_entry_count: metrics
+                .sstable_reverse_seek_sidecar_index_entry_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_entry_materialize_count: metrics
+                .sstable_reverse_seek_sidecar_entry_materialize_count
+                .load(Relaxed),
+            sstable_reverse_seek_sidecar_offset_probe_count: metrics
+                .sstable_reverse_seek_sidecar_offset_probe_count
+                .load(Relaxed),
+            fusion_reverse_scan_count: metrics.fusion_reverse_scan_count.load(Relaxed),
+            fusion_reverse_source_open_count: metrics
+                .fusion_reverse_source_open_count
+                .load(Relaxed),
+            fusion_reverse_sstable_frontier_probe_count: metrics
+                .fusion_reverse_sstable_frontier_probe_count
+                .load(Relaxed),
+            fusion_reverse_sstable_frontier_in_range_count: metrics
+                .fusion_reverse_sstable_frontier_in_range_count
+                .load(Relaxed),
+            fusion_reverse_sstable_frontier_file_count: metrics
+                .fusion_reverse_sstable_frontier_file_count
+                .load(Relaxed),
+            fusion_reverse_sstable_frontier_tighten_count: metrics
+                .fusion_reverse_sstable_frontier_tighten_count
+                .load(Relaxed),
+            fusion_reverse_sstable_frontier_empty_skip_count: metrics
+                .fusion_reverse_sstable_frontier_empty_skip_count
+                .load(Relaxed),
+            fusion_reverse_sstable_frontier_fail_open_count: metrics
+                .fusion_reverse_sstable_frontier_fail_open_count
+                .load(Relaxed),
+            fusion_reverse_sstable_pending_count: metrics
+                .fusion_reverse_sstable_pending_count
+                .load(Relaxed),
+            fusion_reverse_sstable_activation_count: metrics
+                .fusion_reverse_sstable_activation_count
+                .load(Relaxed),
+            fusion_reverse_sstable_deferred_unopened_count: metrics
+                .fusion_reverse_sstable_deferred_unopened_count
+                .load(Relaxed),
+            fusion_reverse_sstable_activation_equal_frontier_count: metrics
+                .fusion_reverse_sstable_activation_equal_frontier_count
+                .load(Relaxed),
+            fusion_reverse_raw_entry_read_count: metrics
+                .fusion_reverse_raw_entry_read_count
+                .load(Relaxed),
+            fusion_reverse_visible_candidate_count: metrics
+                .fusion_reverse_visible_candidate_count
+                .load(Relaxed),
+            fusion_reverse_visible_put_count: metrics
+                .fusion_reverse_visible_put_count
+                .load(Relaxed),
+            index_key_stream_entry_visit_count: metrics
+                .index_key_stream_entry_visit_count
+                .load(Relaxed),
+            index_ordered_topk_scan_count: metrics.index_ordered_topk_scan_count.load(Relaxed),
+            index_ordered_topk_entry_visit_count: metrics
+                .index_ordered_topk_entry_visit_count
+                .load(Relaxed),
+            index_ordered_topk_reverse_scan_count: metrics
+                .index_ordered_topk_reverse_scan_count
+                .load(Relaxed),
+            index_ordered_topk_index_only_row_count: metrics
+                .index_ordered_topk_index_only_row_count
+                .load(Relaxed),
+            index_ordered_topk_base_row_fetch_count: metrics
+                .index_ordered_topk_base_row_fetch_count
+                .load(Relaxed),
+            index_group_count_summary_entry_visit_count: metrics
+                .index_group_count_summary_entry_visit_count
+                .load(Relaxed),
+            index_loose_seek_count: metrics.index_loose_seek_count.load(Relaxed),
+            index_loose_value_count: metrics.index_loose_value_count.load(Relaxed),
+            index_loose_run_skip_count: metrics.index_loose_run_skip_count.load(Relaxed),
+            compaction_run_count: metrics.compaction_run_count.load(Relaxed),
+            compaction_input_bytes: metrics.compaction_input_bytes.load(Relaxed),
+            compaction_output_bytes: metrics.compaction_output_bytes.load(Relaxed),
+            compaction_dropped_version_count: metrics
+                .compaction_dropped_version_count
+                .load(Relaxed),
+            live_sstable_count: metrics.live_sstable_count.load(Relaxed),
+            sstable_manifest_load_count: metrics.sstable_manifest_load_count.load(Relaxed),
+            sstable_manifest_load_total_us: metrics.sstable_manifest_load_total_us.load(Relaxed),
+            sstable_manifest_load_error_count: metrics
+                .sstable_manifest_load_error_count
+                .load(Relaxed),
+            sstable_manifest_live_file_count: metrics
+                .sstable_manifest_live_file_count
+                .load(Relaxed),
+            sstable_manifest_legacy_scan_count: metrics
+                .sstable_manifest_legacy_scan_count
+                .load(Relaxed),
+            sstable_manifest_legacy_scan_candidate_count: metrics
+                .sstable_manifest_legacy_scan_candidate_count
+                .load(Relaxed),
+            sstable_manifest_open_error_count: metrics
+                .sstable_manifest_open_error_count
+                .load(Relaxed),
             row_write_count: metrics.row_write_count.load(Relaxed),
             fts_search_count: metrics.fts_search_count.load(Relaxed),
             fts_doc_hits: metrics.fts_doc_hits.load(Relaxed),
             wal_write_count: metrics.wal_write_count.load(Relaxed),
             wal_write_bytes: metrics.wal_write_bytes.load(Relaxed),
+            wal_replay_count: metrics.wal_replay_count.load(Relaxed),
+            wal_replay_total_us: metrics.wal_replay_total_us.load(Relaxed),
+            wal_replay_segment_count: metrics.wal_replay_segment_count.load(Relaxed),
+            wal_replay_bytes: metrics.wal_replay_bytes.load(Relaxed),
+            wal_replay_valid_bytes: metrics.wal_replay_valid_bytes.load(Relaxed),
+            wal_replay_last_segment_id: metrics.wal_replay_last_segment_id.load(Relaxed),
+            wal_replay_last_valid_offset: metrics.wal_replay_last_valid_offset.load(Relaxed),
+            wal_replay_entry_count: metrics.wal_replay_entry_count.load(Relaxed),
+            wal_replay_put_count: metrics.wal_replay_put_count.load(Relaxed),
+            wal_replay_delete_count: metrics.wal_replay_delete_count.load(Relaxed),
+            wal_replay_partial_tail_count: metrics.wal_replay_partial_tail_count.load(Relaxed),
+            wal_replay_truncate_count: metrics.wal_replay_truncate_count.load(Relaxed),
+            wal_replay_error_count: metrics.wal_replay_error_count.load(Relaxed),
+            wal_replay_apply_count: metrics.wal_replay_apply_count.load(Relaxed),
+            wal_replay_apply_total_us: metrics.wal_replay_apply_total_us.load(Relaxed),
+            wal_replay_max_ts: metrics.wal_replay_max_ts.load(Relaxed),
             query_count: metrics.query_count.load(Relaxed),
             slow_query_count: metrics.slow_query_count.load(Relaxed),
             query_total_us: metrics.query_total_us.load(Relaxed),
+            query_sort_fallback_count: metrics.query_sort_fallback_count.load(Relaxed),
             pg_active_connection_count: metrics.pg_active_connection_count.load(Relaxed),
             pg_connection_rejected_count: metrics.pg_connection_rejected_count.load(Relaxed),
             pg_connection_limit: metrics.pg_connection_limit.load(Relaxed),
@@ -4748,6 +6054,18 @@ mod tests {
     use tower::util::ServiceExt;
 
     #[test]
+    fn strips_sql_block_zone_map_prune_hint_from_leading_comment() {
+        let sql = "  /*+ FUSIONDB_DISABLE_SQL_BLOCK_ZONE_MAP_PRUNE */ SELECT id FROM metrics";
+        let (stripped, disabled) = strip_sql_block_zone_map_prune_hint(sql);
+        assert!(disabled);
+        assert_eq!(stripped, "SELECT id FROM metrics");
+
+        let (plain, disabled) = strip_sql_block_zone_map_prune_hint("SELECT id FROM metrics");
+        assert!(!disabled);
+        assert_eq!(plain, "SELECT id FROM metrics");
+    }
+
+    #[test]
     fn fanout_extremum_compares_decimal_strings_numerically() {
         use serde_json::json;
         // MIN/MAX over a DECIMAL column return the value as a JSON string. The merge must compare them
@@ -4810,7 +6128,39 @@ mod tests {
             distributed_mode: "isolated".to_string(),
             shard_router: None,
             shard_owner_forwarding_enabled: false,
+            postgres_password: Arc::from("fusiondb"),
+            http_legacy_unsafe: true,
+            forwarding_auth: None,
+            peer_scheme: "http".to_string(),
         })
+    }
+
+    fn secure_test_state(storage: Arc<dyn Storage>, forwarding_secret: &str) -> AppState {
+        let executor = Arc::new(Executor::new(storage.clone()));
+        AppState {
+            executor,
+            storage,
+            raft: None,
+            raft_client: reqwest::Client::new(),
+            distributed_mode: "isolated".to_string(),
+            shard_router: None,
+            shard_owner_forwarding_enabled: false,
+            postgres_password: Arc::from("secure-password"),
+            http_legacy_unsafe: false,
+            forwarding_auth: ForwardingAuth::new(forwarding_secret.as_bytes()),
+            peer_scheme: "http".to_string(),
+        }
+    }
+
+    fn secure_test_app(storage: Arc<dyn Storage>, forwarding_secret: &str) -> Router {
+        build_router(secure_test_state(storage, forwarding_secret))
+    }
+
+    fn basic_authorization(username: &str, password: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, password))
+        )
     }
 
     fn test_app_with_distributed_mode(storage: Arc<dyn Storage>, distributed_mode: &str) -> Router {
@@ -4823,6 +6173,10 @@ mod tests {
             distributed_mode: distributed_mode.to_string(),
             shard_router: None,
             shard_owner_forwarding_enabled: false,
+            postgres_password: Arc::from("fusiondb"),
+            http_legacy_unsafe: true,
+            forwarding_auth: None,
+            peer_scheme: "http".to_string(),
         })
     }
 
@@ -4848,6 +6202,10 @@ mod tests {
             distributed_mode: "raft(node_id=1)".to_string(),
             shard_router: Some(shard_router),
             shard_owner_forwarding_enabled,
+            postgres_password: Arc::from("fusiondb"),
+            http_legacy_unsafe: true,
+            forwarding_auth: None,
+            peer_scheme: "http".to_string(),
         })
     }
 
@@ -4940,6 +6298,155 @@ mod tests {
             .body(Body::from(serde_json::json!({ "sql": sql }).to_string()))
             .expect("query request");
         app.clone().oneshot(request).await.expect("query response")
+    }
+
+    #[tokio::test]
+    async fn secure_http_keeps_health_public_and_requires_basic_auth_elsewhere() {
+        let wal_path = format!("test_http_secure_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = secure_test_app(storage, "cluster-forwarding-secret");
+
+        let health = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        for request in [
+            HttpRequest::builder()
+                .uri("/auth/context")
+                .body(Body::empty())
+                .unwrap(),
+            HttpRequest::builder()
+                .uri("/auth/context")
+                .header(AUTHORIZATION, "Bearer postgres")
+                .body(Body::empty())
+                .unwrap(),
+            HttpRequest::builder()
+                .uri("/auth/context")
+                .header(FORWARDED_USER_HEADER, "postgres")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().contains_key(WWW_AUTHENTICATE));
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/context")
+                    .header(
+                        AUTHORIZATION,
+                        basic_authorization("postgres", "secure-password"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let envelope: Envelope<AuthContextInfo> = response_json(response).await;
+        let context = envelope.data.unwrap();
+        assert_eq!(context.username.as_deref(), Some("postgres"));
+        assert!(context.authenticated);
+        assert_eq!(context.mode, "basic");
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn secure_http_authenticates_rbac_hash_and_signed_forwarding() {
+        let wal_path = format!("test_http_secure_rbac_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let mut txn = storage.begin_transaction().await.unwrap();
+        save_user(
+            &mut *txn,
+            "alice",
+            &UserRecord::new("alice-password", false),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let secret = "cluster-forwarding-secret";
+        let state = secure_test_state(storage, secret);
+        assert!(is_management_path("/raft/change-membership"));
+        assert!(
+            !management_access_allowed(&state, "alice", "/raft/change-membership", false,).await
+        );
+        assert!(!management_access_allowed(&state, "alice", "/compact", false).await);
+        assert!(management_access_allowed(&state, "alice", "/raft/change-membership", true,).await);
+        let app = build_router(state);
+        let basic_response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/context")
+                    .header(
+                        AUTHORIZATION,
+                        basic_authorization("alice", "alice-password"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(basic_response.status(), StatusCode::OK);
+
+        let compact_response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/compact")
+                    .header(
+                        AUTHORIZATION,
+                        basic_authorization("alice", "alice-password"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compact_response.status(), StatusCode::FORBIDDEN);
+
+        let signed = ForwardingAuth::new(secret)
+            .unwrap()
+            .apply(
+                reqwest::Client::new().get("http://127.0.0.1/auth/context"),
+                "alice",
+            )
+            .build()
+            .unwrap();
+        let mut internal_request = HttpRequest::builder()
+            .uri("/auth/context")
+            .body(Body::empty())
+            .unwrap();
+        *internal_request.headers_mut() = signed.headers().clone();
+        let internal_response = app.clone().oneshot(internal_request).await.unwrap();
+        let envelope: Envelope<AuthContextInfo> = response_json(internal_response).await;
+        assert_eq!(envelope.data.unwrap().mode, "internal_hmac");
+
+        let forged = HttpRequest::builder()
+            .uri("/auth/context")
+            .header(FORWARDED_HEADER, FORWARDED_VALUE)
+            .header(FORWARDED_USER_HEADER, "postgres")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(forged).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let _ = std::fs::remove_file(wal_path);
     }
 
     #[tokio::test]
@@ -7792,6 +9299,240 @@ mod tests {
         assert_eq!(data["pg_connection_limit"], serde_json::json!(123));
         assert!(data.get("pg_active_connection_count").is_some());
         assert!(data.get("pg_connection_rejected_count").is_some());
+        assert!(data.get("query_result_cache_eligible_count").is_some());
+        assert!(data.get("query_result_cache_hit_count").is_some());
+        assert!(data.get("query_result_cache_miss_count").is_some());
+        assert!(data.get("query_result_cache_stale_count").is_some());
+        assert!(data.get("query_result_cache_insert_count").is_some());
+        assert!(data.get("query_result_cache_invalidation_count").is_some());
+        assert!(data.get("block_cache_hit_count").is_some());
+        assert!(data.get("block_cache_miss_count").is_some());
+        assert!(data.get("block_cache_insert_count").is_some());
+        assert!(data.get("block_cache_fill_skip_count").is_some());
+        assert!(data.get("block_cache_eviction_count").is_some());
+        assert!(data.get("sstable_block_file_open_count").is_some());
+        assert!(data.get("sstable_block_read_bytes").is_some());
+        assert!(data.get("sstable_open_count").is_some());
+        assert!(data.get("sstable_open_total_us").is_some());
+        assert!(data.get("sstable_open_index_bytes").is_some());
+        assert!(data.get("sstable_open_index_read_us").is_some());
+        assert!(data.get("sstable_open_index_decode_us").is_some());
+        assert!(data.get("sstable_open_filter_bytes").is_some());
+        assert!(data.get("sstable_open_filter_read_us").is_some());
+        assert!(data.get("sstable_open_filter_decode_us").is_some());
+        assert!(data.get("sstable_open_meta_bytes").is_some());
+        assert!(data.get("sstable_open_meta_read_us").is_some());
+        assert!(data.get("sstable_open_meta_decode_us").is_some());
+        assert!(data.get("sstable_open_index_entries").is_some());
+        assert!(data.get("sstable_open_block_property_count").is_some());
+        assert!(data.get("sstable_index_cache_hit_count").is_some());
+        assert!(data.get("sstable_index_cache_miss_count").is_some());
+        assert!(data.get("sstable_index_cache_stale_count").is_some());
+        assert!(data.get("sstable_index_cache_invalid_count").is_some());
+        assert!(data.get("sstable_index_cache_write_count").is_some());
+        assert!(data.get("sstable_index_cache_write_error_count").is_some());
+        assert!(data.get("sstable_prefix_filter_check_count").is_some());
+        assert!(data.get("sstable_prefix_filter_positive_count").is_some());
+        assert!(data.get("sstable_prefix_filter_skip_count").is_some());
+        assert!(data.get("sstable_prefix_filter_fail_open_count").is_some());
+        assert!(data
+            .get("sstable_index_prefix_filter_check_count")
+            .is_some());
+        assert!(data
+            .get("sstable_index_prefix_filter_positive_count")
+            .is_some());
+        assert!(data.get("sstable_index_prefix_filter_skip_count").is_some());
+        assert!(data
+            .get("sstable_index_prefix_filter_fail_open_count")
+            .is_some());
+        assert!(data.get("sstable_user_key_filter_check_count").is_some());
+        assert!(data.get("sstable_user_key_filter_positive_count").is_some());
+        assert!(data.get("sstable_user_key_filter_skip_count").is_some());
+        assert!(data
+            .get("sstable_user_key_filter_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_prefix_filter_check_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_prefix_filter_positive_count")
+            .is_some());
+        assert!(data.get("sstable_block_prefix_filter_skip_count").is_some());
+        assert!(data
+            .get("sstable_block_prefix_filter_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_index_prefix_filter_check_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_index_prefix_filter_positive_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_index_prefix_filter_skip_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_index_prefix_filter_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_filter_check_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_filter_positive_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_filter_skip_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_filter_fail_open_count")
+            .is_some());
+        assert!(data.get("sstable_block_zone_map_metadata_bytes").is_some());
+        assert!(data
+            .get("sstable_block_zone_map_mvcc_overlap_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_mvcc_boundary_split_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_block_zone_map_schema_fail_open_count")
+            .is_some());
+        assert!(data.get("sstable_point_probe_count").is_some());
+        assert!(data.get("sstable_point_overlap_skip_count").is_some());
+        assert!(data.get("sstable_range_probe_count").is_some());
+        assert!(data.get("sstable_range_overlap_skip_count").is_some());
+        assert!(data.get("sstable_iterator_open_count").is_some());
+        assert!(data.get("sstable_reverse_iterator_open_count").is_some());
+        assert!(data.get("sstable_reverse_block_read_count").is_some());
+        assert!(data
+            .get("sstable_reverse_block_entry_decode_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_block_entry_yield_count")
+            .is_some());
+        assert!(data.get("sstable_reverse_block_span_scan_count").is_some());
+        assert!(data
+            .get("sstable_reverse_block_span_scan_entry_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_block_span_materialize_entry_count")
+            .is_some());
+        assert!(data.get("sstable_reverse_seek_sidecar_hit_count").is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_miss_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_stale_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_invalid_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_write_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_write_error_count")
+            .is_some());
+        assert!(data.get("sstable_reverse_seek_sidecar_use_count").is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_fail_open_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_index_entry_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_entry_materialize_count")
+            .is_some());
+        assert!(data
+            .get("sstable_reverse_seek_sidecar_offset_probe_count")
+            .is_some());
+        assert!(data.get("fusion_reverse_scan_count").is_some());
+        assert!(data.get("fusion_reverse_source_open_count").is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_frontier_probe_count")
+            .is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_frontier_in_range_count")
+            .is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_frontier_file_count")
+            .is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_frontier_tighten_count")
+            .is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_frontier_empty_skip_count")
+            .is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_frontier_fail_open_count")
+            .is_some());
+        assert!(data.get("fusion_reverse_sstable_pending_count").is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_activation_count")
+            .is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_deferred_unopened_count")
+            .is_some());
+        assert!(data
+            .get("fusion_reverse_sstable_activation_equal_frontier_count")
+            .is_some());
+        assert!(data.get("fusion_reverse_raw_entry_read_count").is_some());
+        assert!(data.get("fusion_reverse_visible_candidate_count").is_some());
+        assert!(data.get("fusion_reverse_visible_put_count").is_some());
+        assert!(data.get("index_key_stream_entry_visit_count").is_some());
+        assert!(data.get("index_ordered_topk_scan_count").is_some());
+        assert!(data.get("index_ordered_topk_entry_visit_count").is_some());
+        assert!(data.get("index_ordered_topk_reverse_scan_count").is_some());
+        assert!(data
+            .get("index_ordered_topk_index_only_row_count")
+            .is_some());
+        assert!(data
+            .get("index_ordered_topk_base_row_fetch_count")
+            .is_some());
+        assert!(data
+            .get("index_group_count_summary_entry_visit_count")
+            .is_some());
+        assert!(data.get("index_loose_seek_count").is_some());
+        assert!(data.get("index_loose_value_count").is_some());
+        assert!(data.get("index_loose_run_skip_count").is_some());
+        assert!(data.get("compaction_run_count").is_some());
+        assert!(data.get("compaction_input_bytes").is_some());
+        assert!(data.get("compaction_output_bytes").is_some());
+        assert!(data.get("compaction_dropped_version_count").is_some());
+        assert!(data.get("live_sstable_count").is_some());
+        assert!(data.get("sstable_manifest_load_count").is_some());
+        assert!(data.get("sstable_manifest_load_total_us").is_some());
+        assert!(data.get("sstable_manifest_load_error_count").is_some());
+        assert!(data.get("sstable_manifest_live_file_count").is_some());
+        assert!(data.get("sstable_manifest_legacy_scan_count").is_some());
+        assert!(data
+            .get("sstable_manifest_legacy_scan_candidate_count")
+            .is_some());
+        assert!(data.get("sstable_manifest_open_error_count").is_some());
+        assert!(data.get("wal_replay_count").is_some());
+        assert!(data.get("wal_replay_total_us").is_some());
+        assert!(data.get("wal_replay_segment_count").is_some());
+        assert!(data.get("wal_replay_bytes").is_some());
+        assert!(data.get("wal_replay_valid_bytes").is_some());
+        assert!(data.get("wal_replay_last_segment_id").is_some());
+        assert!(data.get("wal_replay_last_valid_offset").is_some());
+        assert!(data.get("wal_replay_entry_count").is_some());
+        assert!(data.get("wal_replay_put_count").is_some());
+        assert!(data.get("wal_replay_delete_count").is_some());
+        assert!(data.get("wal_replay_partial_tail_count").is_some());
+        assert!(data.get("wal_replay_truncate_count").is_some());
+        assert!(data.get("wal_replay_error_count").is_some());
+        assert!(data.get("wal_replay_apply_count").is_some());
+        assert!(data.get("wal_replay_apply_total_us").is_some());
+        assert!(data.get("wal_replay_max_ts").is_some());
+        assert!(data.get("query_sort_fallback_count").is_some());
 
         let prometheus_request = HttpRequest::builder()
             .method("GET")
@@ -7806,6 +9547,154 @@ mod tests {
         assert!(prometheus.contains("fusiondb_pg_active_connections"));
         assert!(prometheus.contains("fusiondb_pg_connection_limit 123"));
         assert!(prometheus.contains("fusiondb_pg_connection_rejected_count"));
+        assert!(prometheus.contains("fusiondb_query_result_cache_eligible_count"));
+        assert!(prometheus.contains("fusiondb_query_result_cache_hit_count"));
+        assert!(prometheus.contains("fusiondb_query_result_cache_miss_count"));
+        assert!(prometheus.contains("fusiondb_query_result_cache_stale_count"));
+        assert!(prometheus.contains("fusiondb_query_result_cache_insert_count"));
+        assert!(prometheus.contains("fusiondb_query_result_cache_invalidation_count"));
+        assert!(prometheus.contains("fusiondb_block_cache_hit_count"));
+        assert!(prometheus.contains("fusiondb_block_cache_miss_count"));
+        assert!(prometheus.contains("fusiondb_block_cache_insert_count"));
+        assert!(prometheus.contains("fusiondb_block_cache_fill_skip_count"));
+        assert!(prometheus.contains("fusiondb_block_cache_eviction_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_file_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_read_bytes"));
+        assert!(prometheus.contains("fusiondb_sstable_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_open_total_us"));
+        assert!(prometheus.contains("fusiondb_sstable_open_index_bytes"));
+        assert!(prometheus.contains("fusiondb_sstable_open_index_read_us"));
+        assert!(prometheus.contains("fusiondb_sstable_open_index_decode_us"));
+        assert!(prometheus.contains("fusiondb_sstable_open_filter_bytes"));
+        assert!(prometheus.contains("fusiondb_sstable_open_filter_read_us"));
+        assert!(prometheus.contains("fusiondb_sstable_open_filter_decode_us"));
+        assert!(prometheus.contains("fusiondb_sstable_open_meta_bytes"));
+        assert!(prometheus.contains("fusiondb_sstable_open_meta_read_us"));
+        assert!(prometheus.contains("fusiondb_sstable_open_meta_decode_us"));
+        assert!(prometheus.contains("fusiondb_sstable_open_index_entries"));
+        assert!(prometheus.contains("fusiondb_sstable_open_block_property_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_cache_hit_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_cache_miss_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_cache_stale_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_cache_invalid_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_cache_write_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_cache_write_error_count"));
+        assert!(prometheus.contains("fusiondb_sstable_prefix_filter_check_count"));
+        assert!(prometheus.contains("fusiondb_sstable_prefix_filter_positive_count"));
+        assert!(prometheus.contains("fusiondb_sstable_prefix_filter_skip_count"));
+        assert!(prometheus.contains("fusiondb_sstable_prefix_filter_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_prefix_filter_check_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_prefix_filter_positive_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_prefix_filter_skip_count"));
+        assert!(prometheus.contains("fusiondb_sstable_index_prefix_filter_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_user_key_filter_check_count"));
+        assert!(prometheus.contains("fusiondb_sstable_user_key_filter_positive_count"));
+        assert!(prometheus.contains("fusiondb_sstable_user_key_filter_skip_count"));
+        assert!(prometheus.contains("fusiondb_sstable_user_key_filter_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_prefix_filter_check_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_prefix_filter_positive_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_prefix_filter_skip_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_prefix_filter_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_index_prefix_filter_check_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_index_prefix_filter_positive_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_index_prefix_filter_skip_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_index_prefix_filter_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_zone_map_filter_check_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_zone_map_filter_positive_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_zone_map_filter_skip_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_zone_map_filter_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_zone_map_metadata_bytes"));
+        assert!(prometheus.contains("fusiondb_sstable_block_zone_map_mvcc_overlap_fail_open_count"));
+        assert!(prometheus
+            .contains("fusiondb_sstable_block_zone_map_mvcc_boundary_split_fail_open_count"));
+        assert!(prometheus
+            .contains("fusiondb_sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count"));
+        assert!(prometheus
+            .contains("fusiondb_sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count"));
+        assert!(prometheus
+            .contains("fusiondb_sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_block_zone_map_schema_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_point_probe_count"));
+        assert!(prometheus.contains("fusiondb_sstable_point_overlap_skip_count"));
+        assert!(prometheus.contains("fusiondb_sstable_range_probe_count"));
+        assert!(prometheus.contains("fusiondb_sstable_range_overlap_skip_count"));
+        assert!(prometheus.contains("fusiondb_sstable_iterator_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_iterator_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_block_read_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_block_entry_decode_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_block_entry_yield_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_block_span_scan_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_block_span_scan_entry_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_block_span_materialize_entry_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_hit_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_miss_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_stale_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_invalid_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_write_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_write_error_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_use_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_index_entry_count"));
+        assert!(
+            prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_entry_materialize_count")
+        );
+        assert!(prometheus.contains("fusiondb_sstable_reverse_seek_sidecar_offset_probe_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_scan_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_source_open_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_frontier_probe_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_frontier_in_range_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_frontier_file_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_frontier_tighten_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_frontier_empty_skip_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_frontier_fail_open_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_pending_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_activation_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_sstable_deferred_unopened_count"));
+        assert!(
+            prometheus.contains("fusiondb_fusion_reverse_sstable_activation_equal_frontier_count")
+        );
+        assert!(prometheus.contains("fusiondb_fusion_reverse_raw_entry_read_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_visible_candidate_count"));
+        assert!(prometheus.contains("fusiondb_fusion_reverse_visible_put_count"));
+        assert!(prometheus.contains("fusiondb_index_key_stream_entry_visit_count"));
+        assert!(prometheus.contains("fusiondb_index_ordered_topk_scan_count"));
+        assert!(prometheus.contains("fusiondb_index_ordered_topk_entry_visit_count"));
+        assert!(prometheus.contains("fusiondb_index_ordered_topk_reverse_scan_count"));
+        assert!(prometheus.contains("fusiondb_index_ordered_topk_index_only_row_count"));
+        assert!(prometheus.contains("fusiondb_index_ordered_topk_base_row_fetch_count"));
+        assert!(prometheus.contains("fusiondb_index_group_count_summary_entry_visit_count"));
+        assert!(prometheus.contains("fusiondb_index_loose_seek_count"));
+        assert!(prometheus.contains("fusiondb_index_loose_value_count"));
+        assert!(prometheus.contains("fusiondb_index_loose_run_skip_count"));
+        assert!(prometheus.contains("fusiondb_compaction_run_count"));
+        assert!(prometheus.contains("fusiondb_compaction_input_bytes"));
+        assert!(prometheus.contains("fusiondb_compaction_output_bytes"));
+        assert!(prometheus.contains("fusiondb_compaction_dropped_version_count"));
+        assert!(prometheus.contains("fusiondb_live_sstable_count"));
+        assert!(prometheus.contains("fusiondb_sstable_manifest_load_count"));
+        assert!(prometheus.contains("fusiondb_sstable_manifest_load_total_us"));
+        assert!(prometheus.contains("fusiondb_sstable_manifest_load_error_count"));
+        assert!(prometheus.contains("fusiondb_sstable_manifest_live_file_count"));
+        assert!(prometheus.contains("fusiondb_sstable_manifest_legacy_scan_count"));
+        assert!(prometheus.contains("fusiondb_sstable_manifest_legacy_scan_candidate_count"));
+        assert!(prometheus.contains("fusiondb_sstable_manifest_open_error_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_total_us"));
+        assert!(prometheus.contains("fusiondb_wal_replay_segment_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_bytes"));
+        assert!(prometheus.contains("fusiondb_wal_replay_valid_bytes"));
+        assert!(prometheus.contains("fusiondb_wal_replay_last_segment_id"));
+        assert!(prometheus.contains("fusiondb_wal_replay_last_valid_offset"));
+        assert!(prometheus.contains("fusiondb_wal_replay_entry_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_put_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_delete_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_partial_tail_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_truncate_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_error_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_apply_count"));
+        assert!(prometheus.contains("fusiondb_wal_replay_apply_total_us"));
+        assert!(prometheus.contains("fusiondb_wal_replay_max_ts"));
+        assert!(prometheus.contains("fusiondb_query_sort_fallback_count"));
 
         let _ = std::fs::remove_file(&wal_path);
     }

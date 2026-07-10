@@ -1,17 +1,25 @@
 use super::columnar::ColumnarVectorStore;
+use super::manifest_edit::{
+    ManifestEdit, ManifestSstableEntry as ManifestV2SstableEntry,
+    ManifestSstableFingerprint as ManifestV2SstableFingerprint,
+};
+use super::manifest_log;
 use super::wal::{WalEntry, WalManager};
-use super::{ScanVisitor, Storage, Transaction};
+use super::{
+    ScanVisitor, SqlBlockZoneMapFailOpenReason, SqlBlockZoneMapPruningDecision,
+    SqlBlockZoneMapPruningPlan, Storage, StorageScanOptions, Transaction,
+};
+use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result};
 use crate::config::StorageConfig;
 use async_trait::async_trait;
 use base64::Engine as _;
 use crossbeam_skiplist::SkipMap;
-use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 
 // Fusion Storage Engine
 // Combines:
@@ -26,6 +34,53 @@ const CDC_KEY_PREFIX: &str = "__fusiondb_cdc:";
 const CDC_KEY_END: &str = "__fusiondb_cdc;";
 const CDC_SEQUENCE_EVENT_BITS: u32 = 20;
 const CDC_MAX_EVENT_INDEX: usize = (1usize << CDC_SEQUENCE_EVENT_BITS) - 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlBlockZoneMapMvccFailOpenReason {
+    BoundarySplit,
+    WriteBufferOverlap,
+    MemtableOverlap,
+    SstableOverlap,
+}
+
+fn sstable_read_options(options: &StorageScanOptions) -> SsTableReadOptions {
+    if options.fill_cache {
+        SsTableReadOptions::fill_cache()
+    } else {
+        SsTableReadOptions::no_fill_cache()
+    }
+}
+
+#[cfg(test)]
+mod reverse_activation_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REVERSE_SSTABLE_ACTIVATION_COUNT: Cell<u64> = Cell::new(0);
+        static REVERSE_SOURCE_OPEN_COUNT: Cell<u64> = Cell::new(0);
+    }
+
+    pub fn reset() {
+        REVERSE_SSTABLE_ACTIVATION_COUNT.with(|count| count.set(0));
+        REVERSE_SOURCE_OPEN_COUNT.with(|count| count.set(0));
+    }
+
+    pub fn inc() {
+        REVERSE_SSTABLE_ACTIVATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+    }
+
+    pub fn inc_source_open() {
+        REVERSE_SOURCE_OPEN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+    }
+
+    pub fn get() -> u64 {
+        REVERSE_SSTABLE_ACTIVATION_COUNT.with(Cell::get)
+    }
+
+    pub fn get_source_open() -> u64 {
+        REVERSE_SOURCE_OPEN_COUNT.with(Cell::get)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CdcBytes {
@@ -84,7 +139,7 @@ fn obsolete_sstable_path_buffer(capacity: usize) -> Vec<PathBuf> {
     Vec::with_capacity(capacity)
 }
 
-fn sstable_file_candidate_buffer() -> Vec<(u64, PathBuf)> {
+fn sstable_live_file_buffer() -> Vec<SstableLiveFile> {
     Vec::with_capacity(1)
 }
 
@@ -110,6 +165,20 @@ fn u64_decimal_len(mut value: u64) -> usize {
 
 fn obsolete_sstable_buffer() -> Vec<Arc<SsTable>> {
     Vec::with_capacity(1)
+}
+
+fn block_cache_weight(_key: &BlockCacheKey, value: &BlockCacheValue) -> u32 {
+    u32::try_from(value.len()).unwrap_or(u32::MAX)
+}
+
+fn build_block_cache(config: &StorageConfig) -> BlockCache {
+    BlockCache::builder()
+        .max_capacity(config.block_cache_capacity_bytes())
+        .weigher(block_cache_weight)
+        .eviction_listener(|_key, value, _cause| {
+            crate::monitor::inc_block_cache_eviction(value.len() as u64);
+        })
+        .build()
 }
 
 // --- Data Structures ---
@@ -224,11 +293,604 @@ fn vector_rebuild_hnsw_index_name_for_column(table_name: &str, column_name: &str
 }
 
 use crate::storage::inverted_index::InvertedIndex;
-use crate::storage::sstable::{SsTable, SsTableBuilder};
+use crate::storage::sstable::{
+    BlockCache, BlockCacheKey, BlockCacheValue, SsTable, SsTableBlockProperties, SsTableBuilder,
+    SsTableOpenDescriptor, SsTablePrefixFilterProbe, SsTableReadOptions,
+    SsTableReverseFrontierKind, SsTableReverseIterator,
+};
 use crate::storage::vector_index::VectorIndex;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::time::{Instant, UNIX_EPOCH};
+
+const SSTABLE_TIMESTAMP_CACHE_VERSION: u32 = 1;
+const SSTABLE_TIMESTAMP_CACHE_FILE: &str = "_fusiondb_sstable_ts_cache.json";
+const SSTABLE_DESCRIPTOR_CACHE_VERSION: u32 = 1;
+const SSTABLE_DESCRIPTOR_CACHE_FILE: &str = "_fusiondb_sstable_descriptor_cache.json";
+const SSTABLE_MANIFEST_VERSION: u32 = 1;
+const SSTABLE_MANIFEST_CURRENT_FILE: &str = "CURRENT";
+const SSTABLE_MANIFEST_FILE: &str = "MANIFEST-000001";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SstableTimestampFingerprint {
+    file_len: u64,
+    modified_unix_secs: u64,
+    modified_subsec_nanos: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SstableTimestampCacheEntry {
+    fingerprint: SstableTimestampFingerprint,
+    max_ts: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SstableTimestampCache {
+    version: u32,
+    entries: BTreeMap<u64, SstableTimestampCacheEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SstableDescriptorCacheEntry {
+    fingerprint: SstableTimestampFingerprint,
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+    format_version: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SstableDescriptorCache {
+    version: u32,
+    entries: BTreeMap<u64, SstableDescriptorCacheEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SstableManifestEntry {
+    id: u64,
+    file_name: String,
+    fingerprint: SstableTimestampFingerprint,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SstableManifest {
+    version: u32,
+    files: Vec<SstableManifestEntry>,
+}
+
+struct SstableLiveFile {
+    id: u64,
+    path: PathBuf,
+    descriptor: Option<SsTableOpenDescriptor>,
+}
+
+impl Default for SstableTimestampCache {
+    fn default() -> Self {
+        Self {
+            version: SSTABLE_TIMESTAMP_CACHE_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl SstableTimestampCache {
+    fn load(path: &Path) -> Self {
+        let Ok(bytes) = std::fs::read(path) else {
+            return Self::default();
+        };
+        let Ok(cache) = serde_json::from_slice::<Self>(&bytes) else {
+            return Self::default();
+        };
+        if cache.version == SSTABLE_TIMESTAMP_CACHE_VERSION {
+            cache
+        } else {
+            Self::default()
+        }
+    }
+
+    fn max_ts_for(
+        &self,
+        sstable_id: u64,
+        fingerprint: &SstableTimestampFingerprint,
+    ) -> Option<u64> {
+        self.entries.get(&sstable_id).and_then(|entry| {
+            if &entry.fingerprint == fingerprint {
+                Some(entry.max_ts)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn set(&mut self, sstable_id: u64, fingerprint: SstableTimestampFingerprint, max_ts: u64) {
+        self.entries.insert(
+            sstable_id,
+            SstableTimestampCacheEntry {
+                fingerprint,
+                max_ts,
+            },
+        );
+    }
+
+    fn retain_live_sstables(&mut self, sstables: &[Arc<SsTable>]) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|id, _| sstables.iter().any(|sstable| sstable.id == *id));
+        self.entries.len() != before
+    }
+
+    fn persist(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(SSTABLE_TIMESTAMP_CACHE_FILE);
+        let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        std::fs::write(&tmp_path, bytes)?;
+        std::fs::rename(tmp_path, path)
+    }
+}
+
+impl Default for SstableDescriptorCache {
+    fn default() -> Self {
+        Self {
+            version: SSTABLE_DESCRIPTOR_CACHE_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl SstableDescriptorCache {
+    fn load(path: &Path) -> Self {
+        let Ok(bytes) = std::fs::read(path) else {
+            return Self::default();
+        };
+        let Ok(cache) = serde_json::from_slice::<Self>(&bytes) else {
+            return Self::default();
+        };
+        if cache.version == SSTABLE_DESCRIPTOR_CACHE_VERSION {
+            cache
+        } else {
+            Self::default()
+        }
+    }
+
+    fn descriptor_for(
+        &self,
+        sstable_id: u64,
+        fingerprint: &SstableTimestampFingerprint,
+    ) -> Option<SsTableOpenDescriptor> {
+        self.entries.get(&sstable_id).and_then(|entry| {
+            if &entry.fingerprint == fingerprint {
+                Some(SsTableOpenDescriptor {
+                    first_key: entry.first_key.clone(),
+                    last_key: entry.last_key.clone(),
+                    format_version: entry.format_version,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    fn set_from_sstable(
+        &mut self,
+        sstable_id: u64,
+        fingerprint: SstableTimestampFingerprint,
+        sstable: &SsTable,
+    ) {
+        self.entries.insert(
+            sstable_id,
+            SstableDescriptorCacheEntry {
+                fingerprint,
+                first_key: sstable.meta.first_key.clone(),
+                last_key: sstable.meta.last_key.clone(),
+                format_version: sstable.meta.format_version,
+            },
+        );
+    }
+
+    fn retain_live_sstables(&mut self, sstables: &[Arc<SsTable>]) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|id, _| sstables.iter().any(|sstable| sstable.id == *id));
+        self.entries.len() != before
+    }
+
+    fn persist(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(SSTABLE_DESCRIPTOR_CACHE_FILE);
+        let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        std::fs::write(&tmp_path, bytes)?;
+        std::fs::rename(tmp_path, path)
+    }
+}
+
+impl SstableManifest {
+    #[cfg(test)]
+    fn from_sstables(sstables: &[Arc<SsTable>]) -> std::io::Result<Self> {
+        let mut files = Vec::with_capacity(sstables.len());
+        for sstable in sstables {
+            let fingerprint = sstable_timestamp_fingerprint(&sstable.path).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "live SSTable {} is missing or has invalid metadata",
+                        sstable.path.display()
+                    ),
+                )
+            })?;
+            files.push(SstableManifestEntry {
+                id: sstable.id,
+                file_name: sstable_file_name_for_id(sstable.id),
+                fingerprint,
+            });
+        }
+        files.sort_by_key(|entry| entry.id);
+        Ok(Self {
+            version: SSTABLE_MANIFEST_VERSION,
+            files,
+        })
+    }
+
+    fn load_live_files(sstable_dir: &Path) -> Option<Vec<SstableLiveFile>> {
+        Self::load_live_files_v2(sstable_dir)
+            .or_else(|| Self::load_live_files_legacy_json(sstable_dir))
+    }
+
+    fn load_live_files_v2(sstable_dir: &Path) -> Option<Vec<SstableLiveFile>> {
+        let replay = manifest_log::recover_current_manifest_with_rollover(sstable_dir).ok()?;
+        let mut files = Vec::with_capacity(replay.edit_replay.state.files.len());
+        for entry in replay.edit_replay.state.files.values() {
+            let path = sstable_dir.join(&entry.file_name);
+            let fingerprint = sstable_timestamp_fingerprint(&path)?;
+            if fingerprint.file_len != entry.fingerprint.file_len
+                || fingerprint.modified_unix_secs != entry.fingerprint.modified_unix_secs
+                || fingerprint.modified_subsec_nanos != entry.fingerprint.modified_subsec_nanos
+            {
+                return None;
+            }
+            files.push(SstableLiveFile {
+                id: entry.id,
+                path,
+                descriptor: Some(SsTableOpenDescriptor {
+                    first_key: entry.first_key.clone(),
+                    last_key: entry.last_key.clone(),
+                    format_version: entry.format_version,
+                }),
+            });
+        }
+        Some(files)
+    }
+
+    fn load_live_files_legacy_json(sstable_dir: &Path) -> Option<Vec<SstableLiveFile>> {
+        let current_path = sstable_manifest_current_path(sstable_dir);
+        let manifest_name = std::fs::read_to_string(current_path).ok()?;
+        let manifest_name = manifest_name.trim();
+        if manifest_name != SSTABLE_MANIFEST_FILE {
+            return None;
+        }
+
+        let manifest_path = sstable_dir.join(manifest_name);
+        let bytes = std::fs::read(manifest_path).ok()?;
+        let manifest = serde_json::from_slice::<Self>(&bytes).ok()?;
+        if manifest.version != SSTABLE_MANIFEST_VERSION {
+            return None;
+        }
+
+        let mut files = Vec::with_capacity(manifest.files.len());
+        let mut previous_id = None;
+        for entry in manifest.files {
+            if entry.file_name != sstable_file_name_for_id(entry.id) {
+                return None;
+            }
+            if previous_id.is_some_and(|id| id >= entry.id) {
+                return None;
+            }
+            previous_id = Some(entry.id);
+
+            let path = sstable_dir.join(&entry.file_name);
+            let fingerprint = sstable_timestamp_fingerprint(&path)?;
+            if fingerprint != entry.fingerprint {
+                return None;
+            }
+            files.push(SstableLiveFile {
+                id: entry.id,
+                path,
+                descriptor: None,
+            });
+        }
+        Some(files)
+    }
+
+    fn persist_sstables(sstable_dir: &Path, sstables: &[Arc<SsTable>]) -> std::io::Result<()> {
+        let files = Self::v2_entries_from_sstables(sstable_dir, sstables)?;
+        if !sstable_manifest_current_path(sstable_dir).exists() {
+            return Self::write_v2_snapshot(sstable_dir, files);
+        }
+
+        match manifest_log::recover_current_manifest_with_rollover(sstable_dir) {
+            Ok(replay) => Self::append_v2_version_edit(sstable_dir, replay, files),
+            Err(_) if Self::load_live_files_legacy_json(sstable_dir).is_some() => {
+                Self::write_v2_snapshot(sstable_dir, files)
+            }
+            Err(error) => Err(fusion_error_to_io(error)),
+        }
+    }
+
+    fn write_v2_snapshot(
+        sstable_dir: &Path,
+        files: Vec<ManifestV2SstableEntry>,
+    ) -> std::io::Result<()> {
+        let snapshot = Self::v2_snapshot_from_entries(files);
+        let file_number = next_sstable_manifest_file_number(sstable_dir)?;
+        manifest_log::write_manifest_file(sstable_dir, file_number, &snapshot)
+            .map_err(fusion_error_to_io)?;
+        manifest_log::install_current_file(
+            sstable_dir,
+            &manifest_log::manifest_file_name(file_number),
+        )
+        .map_err(fusion_error_to_io)?;
+        Ok(())
+    }
+
+    fn append_v2_version_edit(
+        _sstable_dir: &Path,
+        replay: manifest_log::ManifestLogReplay,
+        files: Vec<ManifestV2SstableEntry>,
+    ) -> std::io::Result<()> {
+        let current = replay.current.ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, "manifest replay missing CURRENT")
+        })?;
+        let mut next_files = BTreeMap::new();
+        for mut entry in files {
+            if let Some(existing) = replay.edit_replay.state.files.get(&entry.id) {
+                if manifest_entries_share_stable_descriptor(existing, &entry)
+                    && entry.max_ts == 0
+                    && existing.max_ts > 0
+                {
+                    entry.max_ts = existing.max_ts;
+                    entry.content_fingerprint = existing.content_fingerprint;
+                }
+            }
+            next_files.insert(entry.id, entry);
+        }
+
+        let mut delete_ids = Vec::new();
+        let mut add_files = Vec::new();
+        for (id, current_entry) in &replay.edit_replay.state.files {
+            match next_files.get(id) {
+                Some(next_entry) if next_entry == current_entry => {}
+                Some(next_entry) => {
+                    delete_ids.push(*id);
+                    add_files.push(next_entry.clone());
+                }
+                None => delete_ids.push(*id),
+            }
+        }
+        for (id, next_entry) in &next_files {
+            if !replay.edit_replay.state.files.contains_key(id) {
+                add_files.push(next_entry.clone());
+            }
+        }
+
+        let next_file_number = replay
+            .edit_replay
+            .state
+            .next_file_number
+            .max(min_next_file_number_for_entries(next_files.values()));
+        let high_watermark = replay
+            .edit_replay
+            .state
+            .high_watermark
+            .max(max_ts_for_entries(next_files.values()));
+        if delete_ids.is_empty()
+            && add_files.is_empty()
+            && next_file_number == replay.edit_replay.state.next_file_number
+            && high_watermark == replay.edit_replay.state.high_watermark
+        {
+            return Ok(());
+        }
+
+        let edit = ManifestEdit::VersionEdit {
+            delete_ids,
+            add_files,
+            next_file_number: Some(next_file_number),
+            high_watermark: Some(high_watermark),
+            wal_replay_floor: None,
+        };
+        manifest_log::append_manifest_edit_file(&current.path, &edit)
+            .map_err(fusion_error_to_io)?;
+        Ok(())
+    }
+
+    fn v2_entries_from_sstables(
+        sstable_dir: &Path,
+        sstables: &[Arc<SsTable>],
+    ) -> std::io::Result<Vec<ManifestV2SstableEntry>> {
+        let timestamp_cache =
+            SstableTimestampCache::load(&sstable_timestamp_cache_path(sstable_dir));
+        let mut files = Vec::with_capacity(sstables.len());
+        for sstable in sstables {
+            let fingerprint = sstable_timestamp_fingerprint(&sstable.path).ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "live SSTable {} is missing or has invalid metadata",
+                        sstable.path.display()
+                    ),
+                )
+            })?;
+            let max_ts = timestamp_cache
+                .max_ts_for(sstable.id, &fingerprint)
+                .unwrap_or(0);
+            files.push(ManifestV2SstableEntry {
+                id: sstable.id,
+                file_name: sstable_file_name_for_id(sstable.id),
+                fingerprint: ManifestV2SstableFingerprint {
+                    file_len: fingerprint.file_len,
+                    modified_unix_secs: fingerprint.modified_unix_secs,
+                    modified_subsec_nanos: fingerprint.modified_subsec_nanos,
+                },
+                first_key: sstable.meta.first_key.clone(),
+                last_key: sstable.meta.last_key.clone(),
+                format_version: sstable.meta.format_version,
+                max_ts,
+                content_fingerprint: sstable_manifest_content_fingerprint(&fingerprint, max_ts),
+            });
+        }
+        files.sort_by_key(|entry| entry.id);
+        Ok(files)
+    }
+
+    fn v2_snapshot_from_entries(files: Vec<ManifestV2SstableEntry>) -> ManifestEdit {
+        let next_file_number = min_next_file_number_for_entries(files.iter());
+        let high_watermark = max_ts_for_entries(files.iter());
+        ManifestEdit::Snapshot {
+            files,
+            next_file_number,
+            high_watermark,
+            wal_replay_floor: None,
+        }
+    }
+}
+
+fn sstable_timestamp_cache_path(sstable_dir: &Path) -> PathBuf {
+    sstable_dir.join(SSTABLE_TIMESTAMP_CACHE_FILE)
+}
+
+fn sstable_descriptor_cache_path(sstable_dir: &Path) -> PathBuf {
+    sstable_dir.join(SSTABLE_DESCRIPTOR_CACHE_FILE)
+}
+
+fn sstable_manifest_current_path(sstable_dir: &Path) -> PathBuf {
+    sstable_dir.join(SSTABLE_MANIFEST_CURRENT_FILE)
+}
+
+fn sstable_manifest_path(sstable_dir: &Path) -> PathBuf {
+    sstable_dir.join(SSTABLE_MANIFEST_FILE)
+}
+
+fn next_sstable_manifest_file_number(sstable_dir: &Path) -> std::io::Result<u64> {
+    let mut next = manifest_log::read_current_file(sstable_dir)
+        .ok()
+        .and_then(|current| current.file_number.checked_add(1))
+        .unwrap_or(1);
+
+    if let Ok(entries) = std::fs::read_dir(sstable_dir) {
+        for entry in entries.flatten() {
+            let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(file_number) = manifest_log::parse_manifest_file_name(&file_name) else {
+                continue;
+            };
+            let candidate = file_number.checked_add(1).ok_or_else(|| {
+                IoError::new(ErrorKind::InvalidData, "manifest file number overflow")
+            })?;
+            next = next.max(candidate);
+        }
+    }
+
+    loop {
+        let file_name = manifest_log::manifest_file_name(next);
+        if !sstable_dir.join(file_name).exists() {
+            return Ok(next);
+        }
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "manifest file number overflow"))?;
+    }
+}
+
+fn sstable_timestamp_fingerprint(path: &Path) -> Option<SstableTimestampFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some(SstableTimestampFingerprint {
+        file_len: metadata.len(),
+        modified_unix_secs: modified.as_secs(),
+        modified_subsec_nanos: modified.subsec_nanos(),
+    })
+}
+
+fn sstable_manifest_content_fingerprint(
+    fingerprint: &SstableTimestampFingerprint,
+    max_ts: u64,
+) -> u64 {
+    fingerprint.file_len
+        ^ fingerprint.modified_unix_secs.rotate_left(13)
+        ^ u64::from(fingerprint.modified_subsec_nanos).rotate_left(29)
+        ^ max_ts.rotate_left(41)
+}
+
+fn min_next_file_number_for_entries<'a>(
+    entries: impl Iterator<Item = &'a ManifestV2SstableEntry>,
+) -> u64 {
+    entries
+        .map(|entry| entry.id.saturating_add(1))
+        .max()
+        .unwrap_or(1)
+}
+
+fn max_ts_for_entries<'a>(entries: impl Iterator<Item = &'a ManifestV2SstableEntry>) -> u64 {
+    entries.map(|entry| entry.max_ts).max().unwrap_or(0)
+}
+
+fn manifest_entries_share_stable_descriptor(
+    left: &ManifestV2SstableEntry,
+    right: &ManifestV2SstableEntry,
+) -> bool {
+    left.file_name == right.file_name
+        && left.fingerprint.file_len == right.fingerprint.file_len
+        && left.fingerprint.modified_unix_secs == right.fingerprint.modified_unix_secs
+        && left.fingerprint.modified_subsec_nanos == right.fingerprint.modified_subsec_nanos
+        && left.first_key == right.first_key
+        && left.last_key == right.last_key
+        && left.format_version == right.format_version
+}
+
+fn fusion_error_to_io(error: FusionError) -> IoError {
+    IoError::new(ErrorKind::InvalidData, error.to_string())
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn scan_sstable_files(sst_dir: &Path) -> Vec<SstableLiveFile> {
+    let mut files = sstable_live_file_buffer();
+    let Ok(mut entries) = std::fs::read_dir(sst_dir) else {
+        return files;
+    };
+    while let Some(Ok(entry)) = entries.next() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "sst") {
+            if let Some(stem) = path.file_stem() {
+                if let Ok(id) = stem.to_string_lossy().parse::<u64>() {
+                    files.push(SstableLiveFile {
+                        id,
+                        path,
+                        descriptor: None,
+                    });
+                }
+            }
+        }
+    }
+    files.sort_by_key(|entry| entry.id);
+    files
+}
 
 struct MergeItem {
     key: Vec<u8>,
@@ -261,6 +923,313 @@ fn merge_heap(capacity: usize) -> BinaryHeap<MergeItem> {
     BinaryHeap::with_capacity(capacity)
 }
 
+struct ReverseMergeItem {
+    user_key: Vec<u8>,
+    source_idx: usize,
+}
+
+impl PartialEq for ReverseMergeItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.user_key == other.user_key && self.source_idx == other.source_idx
+    }
+}
+
+impl Eq for ReverseMergeItem {}
+
+impl PartialOrd for ReverseMergeItem {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReverseMergeItem {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.user_key
+            .cmp(&other.user_key)
+            .then_with(|| other.source_idx.cmp(&self.source_idx))
+    }
+}
+
+struct ReverseCandidate {
+    user_key: Vec<u8>,
+    ts: u64,
+    is_put: bool,
+    value: Vec<u8>,
+    is_write_buffer: bool,
+    source_order: usize,
+}
+
+impl ReverseCandidate {
+    fn wins_over(&self, other: &Self) -> bool {
+        if self.is_write_buffer != other.is_write_buffer {
+            return self.is_write_buffer;
+        }
+        self.ts > other.ts || (self.ts == other.ts && self.source_order < other.source_order)
+    }
+}
+
+enum ReverseSource<'a> {
+    Buffered {
+        entries: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send + 'a>,
+        pending: Option<(Vec<u8>, Vec<u8>)>,
+        is_write_buffer: bool,
+        source_order: usize,
+    },
+    SsTable {
+        iter: SsTableReverseIterator,
+        pending: Option<(Vec<u8>, Vec<u8>)>,
+        source_order: usize,
+    },
+}
+
+impl<'a> ReverseSource<'a> {
+    async fn next_raw(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            ReverseSource::Buffered {
+                entries, pending, ..
+            } => {
+                if pending.is_some() {
+                    Ok(pending.take())
+                } else {
+                    let next = entries.next();
+                    if next.is_some() {
+                        crate::monitor::inc_fusion_reverse_raw_entry_read();
+                    }
+                    Ok(next)
+                }
+            }
+            ReverseSource::SsTable { iter, pending, .. } => {
+                if pending.is_some() {
+                    Ok(pending.take())
+                } else {
+                    let next = iter.next().await?;
+                    if next.is_some() {
+                        crate::monitor::inc_fusion_reverse_raw_entry_read();
+                    }
+                    Ok(next)
+                }
+            }
+        }
+    }
+
+    fn stash_raw(&mut self, raw: (Vec<u8>, Vec<u8>)) {
+        match self {
+            ReverseSource::Buffered { pending, .. } | ReverseSource::SsTable { pending, .. } => {
+                debug_assert!(pending.is_none());
+                *pending = Some(raw);
+            }
+        }
+    }
+
+    fn is_write_buffer(&self) -> bool {
+        matches!(
+            self,
+            ReverseSource::Buffered {
+                is_write_buffer: true,
+                ..
+            }
+        )
+    }
+
+    fn source_order(&self) -> usize {
+        match self {
+            ReverseSource::Buffered { source_order, .. }
+            | ReverseSource::SsTable { source_order, .. } => *source_order,
+        }
+    }
+
+    async fn next_candidate(&mut self, read_ts: u64) -> Result<Option<ReverseCandidate>> {
+        loop {
+            let Some((first_key, first_value)) = self.next_raw().await? else {
+                return Ok(None);
+            };
+            let (first_user_key, first_ts) = FusionStorage::decode_key(&first_key);
+            let group_user_key = first_user_key.to_vec();
+            let is_write_buffer = self.is_write_buffer();
+            let source_order = self.source_order();
+            let mut best = visible_reverse_candidate(
+                &group_user_key,
+                first_ts,
+                &first_value,
+                is_write_buffer,
+                source_order,
+                read_ts,
+            );
+
+            loop {
+                let Some((next_key, next_value)) = self.next_raw().await? else {
+                    break;
+                };
+                let (next_user_key, next_ts) = FusionStorage::decode_key(&next_key);
+                if next_user_key != group_user_key.as_slice() {
+                    self.stash_raw((next_key, next_value));
+                    break;
+                }
+
+                if let Some(candidate) = visible_reverse_candidate(
+                    &group_user_key,
+                    next_ts,
+                    &next_value,
+                    is_write_buffer,
+                    source_order,
+                    read_ts,
+                ) {
+                    if best
+                        .as_ref()
+                        .map_or(true, |current| candidate.wins_over(current))
+                    {
+                        best = Some(candidate);
+                    }
+                }
+            }
+
+            if best.is_some() {
+                crate::monitor::inc_fusion_reverse_visible_candidate();
+                return Ok(best);
+            }
+        }
+    }
+}
+
+fn visible_reverse_candidate(
+    user_key: &[u8],
+    ts: u64,
+    encoded_value: &[u8],
+    is_write_buffer: bool,
+    source_order: usize,
+    read_ts: u64,
+) -> Option<ReverseCandidate> {
+    if !is_write_buffer && ts > read_ts {
+        return None;
+    }
+    let (is_put, value) = FusionStorage::decode_value(encoded_value);
+    Some(ReverseCandidate {
+        user_key: user_key.to_vec(),
+        ts,
+        is_put,
+        value: value.to_vec(),
+        is_write_buffer,
+        source_order,
+    })
+}
+
+async fn add_reverse_source<'a>(
+    sources: &mut Vec<ReverseSource<'a>>,
+    current: &mut Vec<Option<ReverseCandidate>>,
+    heap: &mut BinaryHeap<ReverseMergeItem>,
+    read_ts: u64,
+    mut source: ReverseSource<'a>,
+) -> Result<()> {
+    let source_idx = sources.len();
+    crate::monitor::inc_fusion_reverse_source_open();
+    #[cfg(test)]
+    reverse_activation_test_hooks::inc_source_open();
+    let candidate = source.next_candidate(read_ts).await?;
+    sources.push(source);
+    if let Some(candidate) = candidate {
+        heap.push(ReverseMergeItem {
+            user_key: candidate.user_key.clone(),
+            source_idx,
+        });
+        current.push(Some(candidate));
+    } else {
+        current.push(None);
+    }
+    Ok(())
+}
+
+struct PendingReverseSstable {
+    frontier_user_key: Vec<u8>,
+    source_order: usize,
+    sst: Arc<SsTable>,
+}
+
+impl PartialEq for PendingReverseSstable {
+    fn eq(&self, other: &Self) -> bool {
+        self.frontier_user_key == other.frontier_user_key && self.source_order == other.source_order
+    }
+}
+
+impl Eq for PendingReverseSstable {}
+
+impl PartialOrd for PendingReverseSstable {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingReverseSstable {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.frontier_user_key
+            .cmp(&other.frontier_user_key)
+            .then_with(|| other.source_order.cmp(&self.source_order))
+    }
+}
+
+async fn activate_pending_reverse_sstables<'a>(
+    pending_sstables: &mut BinaryHeap<PendingReverseSstable>,
+    sources: &mut Vec<ReverseSource<'a>>,
+    current: &mut Vec<Option<ReverseCandidate>>,
+    heap: &mut BinaryHeap<ReverseMergeItem>,
+    read_ts: u64,
+    start: &[u8],
+    end: &[u8],
+    read_options: SsTableReadOptions,
+) -> Result<()> {
+    loop {
+        let activation_reason_equal_frontier = match (heap.peek(), pending_sstables.peek()) {
+            (Some(active_top), Some(pending_top)) => {
+                pending_top.frontier_user_key.as_slice() == active_top.user_key.as_slice()
+            }
+            _ => false,
+        };
+        let should_activate = match (heap.peek(), pending_sstables.peek()) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(active_top), Some(pending_top)) => {
+                pending_top.frontier_user_key.as_slice() >= active_top.user_key.as_slice()
+            }
+        };
+        if !should_activate {
+            break;
+        }
+
+        let pending = pending_sstables
+            .pop()
+            .expect("peeked pending SSTable exists");
+        let iter = pending
+            .sst
+            .new_user_key_range_reverse_iterator_with_options(
+                Some(start),
+                Some(end),
+                TS_SIZE,
+                read_options,
+            )
+            .await?;
+        crate::monitor::inc_sstable_iterator_open();
+        crate::monitor::inc_sstable_reverse_iterator_open();
+        crate::monitor::inc_fusion_reverse_sstable_activation();
+        if activation_reason_equal_frontier {
+            crate::monitor::inc_fusion_reverse_sstable_activation_equal_frontier();
+        }
+        #[cfg(test)]
+        reverse_activation_test_hooks::inc();
+        add_reverse_source(
+            sources,
+            current,
+            heap,
+            read_ts,
+            ReverseSource::SsTable {
+                iter,
+                pending: None,
+                source_order: pending.source_order,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct FusionStoragePaths {
     sstable_dir: PathBuf,
@@ -278,6 +1247,7 @@ pub struct FusionStorage {
 
     // Global Clock for MVCC
     current_ts: Arc<AtomicU64>,
+    active_read_timestamps: Arc<StdMutex<BTreeMap<u64, usize>>>,
 
     // ID Generator for MemTables
     next_memtable_id: Arc<AtomicU64>,
@@ -297,9 +1267,11 @@ pub struct FusionStorage {
     // Trigram Index (In-Memory Prototype)
     pub trigram_index: Arc<RwLock<crate::storage::trigram::TrigramIndex>>,
 
-    // Block Cache for SSTables (SST ID, Offset) -> Block Data
-    block_cache: Arc<Cache<(u64, u64), Vec<u8>>>,
+    // Block Cache for SSTables (SST ID, Offset) -> shared block data
+    block_cache: Arc<BlockCache>,
     memtable_threshold: usize,
+    commit_lock: Arc<AsyncMutex<()>>,
+    flush_lock: Arc<AsyncMutex<()>>,
     compaction_lock: Arc<AsyncMutex<()>>,
     paths: Arc<FusionStoragePaths>,
 }
@@ -327,36 +1299,117 @@ impl FusionStorage {
         std::fs::create_dir_all(&config.data_dir).ok();
         std::fs::create_dir_all(&sstable_dir).ok();
 
-        // Block Cache (e.g. 100MB capacity)
-        // Note: moka Cache size is number of entries by default.
-        // To limit by bytes, we need weigher.
-        // Let's assume average block 4KB. 100MB = 25,000 blocks.
-        let block_cache = Arc::new(Cache::new(config.block_cache_capacity));
+        let block_cache = Arc::new(build_block_cache(config));
 
         // Load existing SSTables
         let mut sstables_vec = sstable_handle_buffer();
         let sst_dir = sstable_dir.as_path();
         if sst_dir.exists() {
-            if let Ok(mut entries) = std::fs::read_dir(sst_dir) {
-                let mut files = sstable_file_candidate_buffer();
-                while let Some(Ok(entry)) = entries.next() {
-                    let path = entry.path();
-                    if let Some(ext) = path.extension() {
-                        if ext == "sst" {
-                            if let Some(stem) = path.file_stem() {
-                                if let Ok(id) = stem.to_string_lossy().parse::<u64>() {
-                                    files.push((id, path));
+            let manifest_current_path = sstable_manifest_current_path(sst_dir);
+            let manifest_present = manifest_current_path.exists();
+            let files = if manifest_present {
+                let manifest_load_start = Instant::now();
+                match SstableManifest::load_live_files(sst_dir) {
+                    Some(files) => {
+                        let manifest_load_us =
+                            u64::try_from(manifest_load_start.elapsed().as_micros())
+                                .unwrap_or(u64::MAX);
+                        crate::monitor::record_sstable_manifest_load(
+                            manifest_load_us,
+                            files.len() as u64,
+                        );
+                        files
+                    }
+                    None => {
+                        crate::monitor::inc_sstable_manifest_load_error();
+                        return Err(FusionError::Storage(format!(
+                            "SSTable manifest is corrupt or references stale files: {}",
+                            manifest_current_path.display()
+                        )));
+                    }
+                }
+            } else {
+                let files = scan_sstable_files(sst_dir);
+                crate::monitor::record_sstable_manifest_legacy_scan(files.len() as u64);
+                files
+            };
+
+            if !files.is_empty() {
+                sstables_vec.reserve(files.len());
+                let descriptor_cache_path = sstable_descriptor_cache_path(sst_dir);
+                let mut descriptor_cache = SstableDescriptorCache::load(&descriptor_cache_path);
+                let mut descriptor_cache_dirty = false;
+                let mut open_failures = 0usize;
+                let mut open_tasks = Vec::with_capacity(files.len());
+                for live_file in files {
+                    let block_cache = block_cache.clone();
+                    let id = live_file.id;
+                    let path = live_file.path;
+                    let fingerprint = sstable_timestamp_fingerprint(&path);
+                    let descriptor = live_file.descriptor.or_else(|| {
+                        fingerprint.as_ref().and_then(|fingerprint| {
+                            descriptor_cache.descriptor_for(id, fingerprint)
+                        })
+                    });
+                    let used_descriptor = descriptor.is_some();
+                    open_tasks.push(tokio::spawn(async move {
+                        (
+                            id,
+                            fingerprint,
+                            used_descriptor,
+                            SsTable::open_with_descriptor(path, id, block_cache, descriptor).await,
+                        )
+                    }));
+                }
+                for task in open_tasks {
+                    match task.await {
+                        Ok((id, fingerprint, used_descriptor, Ok(sst))) => {
+                            if !used_descriptor {
+                                if let Some(fingerprint) = fingerprint {
+                                    descriptor_cache.set_from_sstable(id, fingerprint, &sst);
+                                    descriptor_cache_dirty = true;
                                 }
                             }
+                            sstables_vec.push(Arc::new(sst));
+                        }
+                        Ok((_id, _fingerprint, _used_descriptor, Err(_))) => {
+                            crate::monitor::inc_sstable_manifest_open_error();
+                            if manifest_present {
+                                return Err(FusionError::Storage(
+                                    "manifest-referenced SSTable failed to open".to_string(),
+                                ));
+                            }
+                            open_failures += 1;
+                        }
+                        Err(_) => {
+                            crate::monitor::inc_sstable_manifest_open_error();
+                            if manifest_present {
+                                return Err(FusionError::Storage(
+                                    "manifest-referenced SSTable open task failed".to_string(),
+                                ));
+                            }
+                            open_failures += 1;
                         }
                     }
                 }
-                files.sort_by_key(|k| k.0);
-
-                sstables_vec.reserve(files.len());
-                for (id, path) in files {
-                    if let Ok(sst) = SsTable::open(path, id, block_cache.clone()).await {
-                        sstables_vec.push(Arc::new(sst));
+                sstables_vec.sort_by_key(|sst| sst.id);
+                descriptor_cache_dirty |= descriptor_cache.retain_live_sstables(&sstables_vec);
+                if descriptor_cache_dirty {
+                    if let Err(error) = descriptor_cache.persist(&descriptor_cache_path) {
+                        eprintln!(
+                            "Warning: failed to persist SSTable descriptor cache {}: {}",
+                            descriptor_cache_path.display(),
+                            error
+                        );
+                    }
+                }
+                if open_failures == 0 {
+                    if let Err(error) = SstableManifest::persist_sstables(sst_dir, &sstables_vec) {
+                        eprintln!(
+                            "Warning: failed to persist SSTable manifest {}: {}",
+                            sstable_manifest_path(sst_dir).display(),
+                            error
+                        );
                     }
                 }
             }
@@ -368,29 +1421,11 @@ impl FusionStorage {
             .unwrap_or(1);
         let next_id = active_memtable_id.saturating_add(1);
         let active = MemTable::new(active_memtable_id);
-        let mut max_sstable_ts = 0;
-        for sst in &sstables_vec {
-            match sst.new_iterator(None).await {
-                Ok(mut iter) => {
-                    while let Ok(Some((key, _))) = iter.next().await {
-                        if key.len() >= TS_SIZE {
-                            let (_, ts) = Self::decode_key(&key);
-                            max_sstable_ts = max_sstable_ts.max(ts);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to scan SSTable {} for timestamp restore: {:?}",
-                        sst.id, e
-                    );
-                }
-            }
-        }
+        let max_sstable_ts = Self::restore_max_sstable_timestamp(&sstables_vec, sst_dir).await;
 
         // Replay WAL
         // We need to replay committed transactions into the active memtable.
-        let replay_entries = wal.replay().expect("Critical: Failed to replay WAL");
+        let replay_entries = wal.replay()?;
         let memtable_threshold = config.memtable_flush_threshold_bytes().max(1);
         let paths = Arc::new(FusionStoragePaths {
             sstable_dir,
@@ -405,6 +1440,7 @@ impl FusionStorage {
             obsolete_sstables: Arc::new(RwLock::new(obsolete_sstable_buffer())),
             wal: Arc::new(wal),
             current_ts: Arc::new(AtomicU64::new(0)), // Will be updated by replay
+            active_read_timestamps: Arc::new(StdMutex::new(BTreeMap::new())),
             next_memtable_id: Arc::new(AtomicU64::new(next_id)),
             flush_notify: Arc::new(Notify::new()),
             columnar_store: Arc::new(RwLock::new(None)),
@@ -423,11 +1459,17 @@ impl FusionStorage {
             )),
             block_cache,
             memtable_threshold,
+            commit_lock: Arc::new(AsyncMutex::new(())),
+            flush_lock: Arc::new(AsyncMutex::new(())),
             compaction_lock: Arc::new(AsyncMutex::new(())),
             paths,
         };
 
+        // Publish startup SSTable shape before WAL replay may add immutable memtables.
+        crate::monitor::set_live_sstable_count(storage.sstables.read().unwrap().len() as u64);
+
         // Apply Replay
+        let replay_apply_start = Instant::now();
         let mut max_replay_ts = 0;
         if !replay_entries.is_empty() {
             println!("Replaying {} WAL entries...", replay_entries.len());
@@ -479,6 +1521,10 @@ impl FusionStorage {
             }
             println!("WAL Replay complete. Restored TS: {}", max_replay_ts);
         }
+        crate::monitor::record_wal_replay_apply(
+            u64::try_from(replay_apply_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            max_replay_ts,
+        );
         let restored_ts = max_sstable_ts.max(max_replay_ts);
         storage.current_ts.store(restored_ts, Ordering::SeqCst);
 
@@ -497,10 +1543,44 @@ impl FusionStorage {
         // Rebuild Vector Index in background
         let s3 = storage.clone();
         tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             s3.rebuild_vector_index().await;
         });
 
+        let s4 = storage.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let sstables = s4.sstables.read().unwrap().clone();
+            for sstable in sstables {
+                sstable.preload_block_properties().await;
+            }
+        });
+
         Ok(storage)
+    }
+
+    fn register_active_read_ts(&self, read_ts: u64) {
+        let mut active = self.active_read_timestamps.lock().unwrap();
+        *active.entry(read_ts).or_insert(0) += 1;
+    }
+
+    fn unregister_active_read_ts(&self, read_ts: u64) {
+        let mut active = self.active_read_timestamps.lock().unwrap();
+        if let Some(count) = active.get_mut(&read_ts) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&read_ts);
+            }
+        }
+    }
+
+    fn oldest_active_read_ts(&self) -> Option<u64> {
+        self.active_read_timestamps
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .copied()
     }
 
     pub async fn cdc_events_since(&self, since: u64, limit: usize) -> Result<Vec<CdcEvent>> {
@@ -660,6 +1740,258 @@ impl FusionStorage {
         self.paths.sstable_dir.join(sstable_file_name_for_id(id))
     }
 
+    fn sstable_staging_path_for(&self, id: u64) -> PathBuf {
+        self.paths
+            .sstable_dir
+            .join(format!("{}.building", sstable_file_name_for_id(id)))
+    }
+
+    async fn publish_staged_sstable(&self, staging_path: &Path, final_path: &Path) -> Result<()> {
+        tokio::fs::rename(staging_path, final_path).await?;
+        sync_directory(&self.paths.sstable_dir)?;
+        SsTable::remove_reverse_seek_file_for_path(staging_path).await;
+        SsTable::remove_index_cache_file_for_path(staging_path).await;
+        Ok(())
+    }
+
+    async fn restore_max_sstable_timestamp(sstables: &[Arc<SsTable>], sstable_dir: &Path) -> u64 {
+        if sstables.is_empty() {
+            return 0;
+        }
+
+        let cache_path = sstable_timestamp_cache_path(sstable_dir);
+        let mut cache = SstableTimestampCache::load(&cache_path);
+        let mut cache_dirty = cache.retain_live_sstables(sstables);
+        let mut max_sstable_ts = 0;
+        let mut cache_hits = 0usize;
+        let mut scanned = 0usize;
+
+        for sst in sstables {
+            let fingerprint = sstable_timestamp_fingerprint(&sst.path);
+            if let Some(fingerprint) = fingerprint.as_ref() {
+                if let Some(max_ts) = cache.max_ts_for(sst.id, fingerprint) {
+                    cache_hits += 1;
+                    max_sstable_ts = max_sstable_ts.max(max_ts);
+                    continue;
+                }
+            }
+
+            match Self::scan_sstable_max_timestamp(sst).await {
+                Ok(max_ts) => {
+                    scanned += 1;
+                    max_sstable_ts = max_sstable_ts.max(max_ts);
+                    if let Some(fingerprint) = fingerprint {
+                        cache.set(sst.id, fingerprint, max_ts);
+                        cache_dirty = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to scan SSTable {} for timestamp restore: {:?}",
+                        sst.id, e
+                    );
+                }
+            }
+        }
+
+        if cache_dirty {
+            if let Err(error) = cache.persist(&cache_path) {
+                eprintln!(
+                    "Warning: failed to persist SSTable timestamp cache {}: {}",
+                    cache_path.display(),
+                    error
+                );
+            }
+        }
+
+        println!(
+            "Restored SSTable max timestamp {} ({} cached, {} scanned).",
+            max_sstable_ts, cache_hits, scanned
+        );
+        max_sstable_ts
+    }
+
+    async fn scan_sstable_max_timestamp(sst: &SsTable) -> Result<u64> {
+        let mut max_ts = 0;
+        let mut iter = sst
+            .new_iterator_with_options(None, SsTableReadOptions::no_fill_cache())
+            .await?;
+        while let Some((key, _)) = iter.next().await? {
+            if key.len() >= TS_SIZE {
+                let (_, ts) = Self::decode_key(&key);
+                max_ts = max_ts.max(ts);
+            }
+        }
+        Ok(max_ts)
+    }
+
+    fn persist_sstable_timestamp_cache_entry(
+        sstable_dir: &Path,
+        sstable_path: &Path,
+        sstable_id: u64,
+        max_ts: u64,
+    ) {
+        let Some(fingerprint) = sstable_timestamp_fingerprint(sstable_path) else {
+            return;
+        };
+        let cache_path = sstable_timestamp_cache_path(sstable_dir);
+        let mut cache = SstableTimestampCache::load(&cache_path);
+        cache.set(sstable_id, fingerprint, max_ts);
+        if let Err(error) = cache.persist(&cache_path) {
+            eprintln!(
+                "Warning: failed to persist SSTable timestamp cache {}: {}",
+                cache_path.display(),
+                error
+            );
+        }
+    }
+
+    fn persist_sstable_descriptor_cache_entry(sstable_dir: &Path, sstable: &SsTable) {
+        let Some(fingerprint) = sstable_timestamp_fingerprint(&sstable.path) else {
+            return;
+        };
+        let cache_path = sstable_descriptor_cache_path(sstable_dir);
+        let mut cache = SstableDescriptorCache::load(&cache_path);
+        cache.set_from_sstable(sstable.id, fingerprint, sstable);
+        if let Err(error) = cache.persist(&cache_path) {
+            eprintln!(
+                "Warning: failed to persist SSTable descriptor cache {}: {}",
+                cache_path.display(),
+                error
+            );
+        }
+    }
+
+    fn latest_memtable_timestamp(
+        memtable: &MemTable,
+        search_key: &[u8],
+        user_key: &[u8],
+    ) -> Option<u64> {
+        memtable
+            .map
+            .range(search_key.to_vec()..)
+            .next()
+            .and_then(|entry| {
+                let (entry_user_key, timestamp) = Self::decode_key(entry.key());
+                (entry_user_key == user_key).then_some(timestamp)
+            })
+    }
+
+    async fn latest_committed_timestamp(&self, user_key: &[u8]) -> Result<Option<u64>> {
+        let search_key = Self::encode_key(user_key, u64::MAX);
+        let mut latest = {
+            let active = self.active_memtable.read().unwrap();
+            Self::latest_memtable_timestamp(&active, &search_key, user_key)
+        };
+
+        {
+            let immutable = self.immutable_memtables.read().unwrap();
+            for memtable in immutable.iter().rev() {
+                if let Some(timestamp) =
+                    Self::latest_memtable_timestamp(memtable, &search_key, user_key)
+                {
+                    latest = Some(latest.map_or(timestamp, |current| current.max(timestamp)));
+                }
+            }
+        }
+
+        // Flush publishes the replacement SSTable before removing its immutable MemTable, and
+        // compaction publishes its output before retiring inputs. Taking the SSTable snapshot
+        // after the MemTable probes therefore cannot miss a version while a source is moving.
+        let sstables = self.sstables.read().unwrap().clone();
+        for sstable in sstables {
+            if sstable.meta.first_key.len() < TS_SIZE || sstable.meta.last_key.len() < TS_SIZE {
+                return Err(FusionError::Storage(format!(
+                    "SSTable {} has malformed MVCC key bounds",
+                    sstable.id
+                )));
+            }
+            let (first_user_key, _) = Self::decode_key(&sstable.meta.first_key);
+            let (last_user_key, _) = Self::decode_key(&sstable.meta.last_key);
+            if user_key < first_user_key || user_key > last_user_key {
+                continue;
+            }
+            if matches!(
+                sstable.probe_user_key_filter(user_key, TS_SIZE),
+                SsTablePrefixFilterProbe::NoMatch
+            ) {
+                continue;
+            }
+
+            if let Some((internal_key, _)) = sstable.find_ge(&search_key).await? {
+                let (found_user_key, timestamp) = Self::decode_key(&internal_key);
+                if found_user_key == user_key {
+                    latest = Some(latest.map_or(timestamp, |current| current.max(timestamp)));
+                }
+            }
+        }
+
+        Ok(latest)
+    }
+
+    async fn sstable_matches_memtable(sstable: &SsTable, memtable: &MemTable) -> Result<bool> {
+        let expected = memtable
+            .map
+            .iter()
+            .filter(|entry| entry.key().len() >= TS_SIZE)
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        let mut iterator = sstable
+            .new_iterator_with_options(None, SsTableReadOptions::no_fill_cache())
+            .await?;
+        let mut expected = expected.into_iter();
+
+        loop {
+            match (expected.next(), iterator.next().await?) {
+                (Some(expected_entry), Some(actual_entry)) if expected_entry == actual_entry => {}
+                (None, None) => return Ok(true),
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    fn register_live_sstable(&self, sstable: SsTable) -> std::io::Result<()> {
+        let new_sstable = Arc::new(sstable);
+        let mut sstables = self.sstables.write().unwrap();
+        if sstables
+            .iter()
+            .any(|existing| existing.id == new_sstable.id)
+        {
+            crate::monitor::set_live_sstable_count(sstables.len() as u64);
+            return Ok(());
+        }
+        let mut next_sstables = Vec::with_capacity(sstables.len().saturating_add(1));
+        next_sstables.extend(sstables.iter().cloned());
+        next_sstables.push(new_sstable);
+        next_sstables.sort_by_key(|sstable| sstable.id);
+        SstableManifest::persist_sstables(&self.paths.sstable_dir, &next_sstables)?;
+        *sstables = next_sstables;
+        crate::monitor::set_live_sstable_count(sstables.len() as u64);
+        Ok(())
+    }
+
+    fn install_compacted_sstable(
+        &self,
+        new_sstable: SsTable,
+        candidate_ids: &[u64; COMPACTION_FANIN],
+    ) -> std::io::Result<()> {
+        let new_sstable = Arc::new(new_sstable);
+        let mut sstables = self.sstables.write().unwrap();
+        let mut next_sstables = Vec::with_capacity(sstables.len().saturating_add(1));
+        next_sstables.extend(
+            sstables
+                .iter()
+                .filter(|sstable| !candidate_ids.contains(&sstable.id))
+                .cloned(),
+        );
+        next_sstables.push(new_sstable);
+        next_sstables.sort_by_key(|sstable| sstable.id);
+        SstableManifest::persist_sstables(&self.paths.sstable_dir, &next_sstables)?;
+        *sstables = next_sstables;
+        crate::monitor::set_live_sstable_count(sstables.len() as u64);
+        Ok(())
+    }
+
     fn persist_secondary_indexes(&self, log_prefix: &str) {
         if let Ok(guard) = self.inverted_index.read() {
             if let Err(e) = guard.save(&self.paths.inverted_index_path) {
@@ -673,25 +2005,26 @@ impl FusionStorage {
         }
     }
 
-    async fn flush_all_immutable_memtables(&self) {
-        loop {
-            let memtable_to_flush = {
-                let mut imm = self.immutable_memtables.write().unwrap();
-                imm.pop()
-            };
-            match memtable_to_flush {
-                Some(mem) => {
-                    self.flush_memtable_sync(&mem).await;
-                }
-                None => break,
-            }
+    async fn flush_all_immutable_memtables(&self) -> Result<()> {
+        let _guard = self.flush_lock.lock().await;
+        self.flush_all_immutable_memtables_locked().await
+    }
+
+    async fn flush_all_immutable_memtables_locked(&self) -> Result<()> {
+        while let Some(memtable) = self.next_memtable_to_flush() {
+            self.flush_memtable_sync(&memtable).await?;
+            self.mark_memtable_flushed(memtable.id);
         }
+        Ok(())
     }
 
     pub async fn create_snapshot_now(&self) -> Result<()> {
+        let _commit_guard = self.commit_lock.lock().await;
         self.rotate_memtable().await;
-        self.flush_all_immutable_memtables().await;
+        self.flush_all_immutable_memtables().await?;
         self.persist_secondary_indexes("[snapshot]");
+        // Commits are blocked from the rotation through WAL reset. Every entry accepted before
+        // the barrier is now in a manifest-listed SSTable, and no later active entry can be lost.
         self.wal.truncate()?;
         Ok(())
     }
@@ -702,46 +2035,49 @@ impl FusionStorage {
         end: &[u8],
         entries: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<()> {
-        let read_ts = self.current_ts.load(Ordering::SeqCst);
-        let snapshot_txn = FusionTransaction {
-            storage: self.clone(),
-            write_buffer: transaction_write_buffer(),
-            read_ts,
-        };
-        let existing = snapshot_txn.scan_range(start, end, None).await?;
-        let commit_ts = self.current_ts.fetch_add(1, Ordering::SeqCst) + 1;
-        let total_entries = existing.len().saturating_add(entries.len());
-        let mut wal_entries = Vec::with_capacity(total_entries);
-        let mut mem_entries = Vec::with_capacity(total_entries);
-
-        for (key, _) in existing {
-            let encoded_key = FusionStorage::encode_key(&key, commit_ts);
-            let encoded_value = FusionStorage::encode_value(false, &[]);
-            wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
-            mem_entries.push((encoded_key, encoded_value));
-        }
-        for (key, value) in entries {
-            let encoded_key = FusionStorage::encode_key(key, commit_ts);
-            let encoded_value = FusionStorage::encode_value(true, value);
-            wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
-            mem_entries.push((encoded_key, encoded_value));
-        }
-
-        if !wal_entries.is_empty() {
-            self.wal.append_batch_async(wal_entries).await?;
-            {
-                let active = self.active_memtable.read().unwrap();
-                for (key, value) in mem_entries {
-                    active.insert(key, value);
-                }
-            }
-
-            let needs_rotate = {
-                let active = self.active_memtable.read().unwrap();
-                active.size.load(Ordering::Relaxed) > self.memtable_threshold as u64
+        {
+            let _commit_guard = self.commit_lock.lock().await;
+            let read_ts = self.current_ts.load(Ordering::SeqCst);
+            let snapshot_txn = FusionTransaction {
+                storage: self.clone(),
+                write_buffer: transaction_write_buffer(),
+                read_ts,
+                read_ts_registered: false,
             };
-            if needs_rotate {
-                self.rotate_memtable().await;
+            let existing = snapshot_txn.scan_range(start, end, None).await?;
+            let total_entries = existing.len().saturating_add(entries.len());
+            if total_entries > 0 {
+                let commit_ts = read_ts
+                    .checked_add(1)
+                    .ok_or_else(|| FusionError::Storage("MVCC timestamp exhausted".to_string()))?;
+                let mut wal_entries = Vec::with_capacity(total_entries);
+                let mut mem_entries = Vec::with_capacity(total_entries);
+
+                for (key, _) in existing {
+                    let encoded_key = FusionStorage::encode_key(&key, commit_ts);
+                    let encoded_value = FusionStorage::encode_value(false, &[]);
+                    wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
+                    mem_entries.push((encoded_key, encoded_value));
+                }
+                for (key, value) in entries {
+                    let encoded_key = FusionStorage::encode_key(key, commit_ts);
+                    let encoded_value = FusionStorage::encode_value(true, value);
+                    wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
+                    mem_entries.push((encoded_key, encoded_value));
+                }
+
+                self.wal.append_batch_async(wal_entries).await?;
+                let needs_rotate = {
+                    let active = self.active_memtable.write().unwrap();
+                    for (key, value) in mem_entries {
+                        active.insert(key, value);
+                    }
+                    active.size.load(Ordering::Relaxed) > self.memtable_threshold as u64
+                };
+                if needs_rotate {
+                    self.rotate_memtable().await;
+                }
+                self.current_ts.store(commit_ts, Ordering::SeqCst);
             }
         }
 
@@ -830,7 +2166,7 @@ impl FusionStorage {
 
     fn next_memtable_to_flush(&self) -> Option<MemTable> {
         let imm = self.immutable_memtables.read().unwrap();
-        imm.last().cloned()
+        imm.first().cloned()
     }
 
     fn mark_memtable_flushed(&self, memtable_id: u64) {
@@ -840,111 +2176,54 @@ impl FusionStorage {
         }
     }
 
+    async fn sql_zone_map_schema_snapshot(&self) -> Arc<BTreeMap<String, TableSchema>> {
+        let txn = match self.begin_transaction().await {
+            Ok(txn) => txn,
+            Err(_) => return Arc::new(BTreeMap::new()),
+        };
+        let entries = match txn.scan_prefix(b"schema:", None).await {
+            Ok(entries) => entries,
+            Err(_) => return Arc::new(BTreeMap::new()),
+        };
+
+        let mut schemas = BTreeMap::new();
+        for (key, value) in entries {
+            let Some(table_name) = std::str::from_utf8(&key)
+                .ok()
+                .and_then(|key| key.strip_prefix("schema:"))
+            else {
+                continue;
+            };
+            if let Ok(schema) = bincode::deserialize::<TableSchema>(&value) {
+                schemas.insert(table_name.to_string(), schema);
+            }
+        }
+        Arc::new(schemas)
+    }
+
+    async fn sstable_builder_with_zone_maps(&self, path: PathBuf) -> SsTableBuilder {
+        let mut builder = SsTableBuilder::new(path);
+        builder.enable_user_key_prefix_filter(TS_SIZE);
+        builder.enable_sql_zone_map_collection(self.sql_zone_map_schema_snapshot().await);
+        builder
+    }
+
     async fn flush_loop(&self) {
         let _ = tokio::fs::create_dir_all(&self.paths.sstable_dir).await;
 
         loop {
             self.flush_notify.notified().await;
-
-            let memtable_to_flush = self.next_memtable_to_flush();
-
-            if let Some(mem) = memtable_to_flush {
-                let sst_path = self.sstable_path_for(mem.id);
-                let mut builder = SsTableBuilder::new(sst_path.clone());
-
-                // Write memtable to builder
-                // We reuse the logic from lsm.rs but applied to Fusion's MemTable
-                // Fusion's MemTable stores Key+TS -> Value
-                // SSTable doesn't care about encoding, just bytes.
-
-                let mut block_count = 0;
-                let mut block_buffer = Vec::with_capacity(SSTABLE_BLOCK_BUFFER_CAPACITY);
-                let mut first_key = None;
-
-                for entry in mem.map.iter() {
-                    let key = entry.key();
-                    let val = entry.value();
-
-                    if key.len() < TS_SIZE {
-                        continue;
-                    }
-
-                    if first_key.is_none() {
-                        first_key = Some(key.clone());
-                    }
-
-                    builder.add_key(key); // Add to Bloom Filter
-
-                    block_buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    block_buffer.extend_from_slice(key);
-                    block_buffer.extend_from_slice(&(val.len() as u32).to_le_bytes());
-                    block_buffer.extend_from_slice(val);
-                    block_count += 1;
-
-                    if block_buffer.len() >= SSTABLE_BLOCK_BUFFER_CAPACITY {
-                        if let Err(e) = builder
-                            .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
-                            .await
-                        {
-                            eprintln!("Failed to flush block: {:?}", e);
-                            break;
-                        }
-                        block_buffer.clear();
-                        block_count = 0;
-                    }
-                }
-
-                if !block_buffer.is_empty() {
-                    if let Err(e) = builder
-                        .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
-                        .await
-                    {
-                        eprintln!("Failed to flush last block: {:?}", e);
-                    }
-                }
-
-                if let Err(e) = builder.finish().await {
-                    eprintln!("Failed to flush sstable {}: {:?}", mem.id, e);
-                    continue;
-                }
-
-                // Add a small delay and retry loop to allow file system to settle
-                let mut attempts = 0;
-                loop {
-                    match SsTable::open(sst_path.clone(), mem.id, self.block_cache.clone()).await {
-                        Ok(sst) => {
-                            {
-                                let mut sstables = self.sstables.write().unwrap();
-                                sstables.push(Arc::new(sst));
-                            }
-                            self.mark_memtable_flushed(mem.id);
-                            break;
-                        }
-                        Err(e) => {
-                            attempts += 1;
-                            if attempts >= 10 {
-                                panic!("Critical: Failed to open flushed sstable {} after {} attempts: {:?}", mem.id, attempts, e);
-                            }
-                            eprintln!("Warning: Failed to open sstable {} (attempt {}): {:?}. Retrying...", mem.id, attempts, e);
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-
-                self.persist_secondary_indexes("[flush]");
-
-                // WAL Truncation: if no more immutable memtables remain,
-                // all data is persisted to SSTables, so we can truncate WAL.
-                let remaining = {
-                    let imm = self.immutable_memtables.read().unwrap();
-                    imm.len()
-                };
-                if remaining == 0 {
-                    if let Err(e) = self.wal.truncate() {
-                        eprintln!("Failed to truncate WAL after flush: {:?}", e);
-                    }
-                }
+            let flush_result = {
+                let _guard = self.flush_lock.lock().await;
+                self.flush_all_immutable_memtables_locked().await
+            };
+            if let Err(error) = flush_result {
+                eprintln!("Background MemTable flush failed; WAL and source retained: {error}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                self.flush_notify.notify_one();
+                continue;
             }
+            self.persist_secondary_indexes("[flush]");
         }
     }
 
@@ -979,7 +2258,9 @@ impl FusionStorage {
         };
 
         for path in ready_to_delete {
-            let _ = tokio::fs::remove_file(path).await;
+            let _ = tokio::fs::remove_file(&path).await;
+            SsTable::remove_index_cache_file_for_path(&path).await;
+            SsTable::remove_reverse_seek_file_for_path(&path).await;
         }
     }
 
@@ -989,10 +2270,14 @@ impl FusionStorage {
         let Some(candidates) = self.compaction_candidates() else {
             return Ok(false);
         };
+        let compaction_input_bytes = candidates.iter().map(|sst| sst.file_len).sum::<u64>();
 
         let mut iterators = Vec::with_capacity(COMPACTION_FANIN);
         for sst in &candidates {
-            iterators.push(sst.new_iterator(None).await?);
+            iterators.push(
+                sst.new_iterator_with_options(None, SsTableReadOptions::no_fill_cache())
+                    .await?,
+            );
         }
 
         if iterators.is_empty() {
@@ -1002,7 +2287,13 @@ impl FusionStorage {
         // Output builder
         let new_id = self.next_memtable_id.fetch_add(1, Ordering::Relaxed);
         let out_path = self.sstable_path_for(new_id);
-        let mut builder = SsTableBuilder::new(out_path.clone());
+        let staging_path = self.sstable_staging_path_for(new_id);
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        SsTable::remove_reverse_seek_file_for_path(&staging_path).await;
+        SsTable::remove_index_cache_file_for_path(&staging_path).await;
+        let mut builder = self
+            .sstable_builder_with_zone_maps(staging_path.clone())
+            .await;
 
         // Merge Logic
         let mut heap = merge_heap(iterators.len());
@@ -1021,8 +2312,11 @@ impl FusionStorage {
         let mut block_buffer = Vec::with_capacity(SSTABLE_BLOCK_BUFFER_CAPACITY);
         let mut block_count = 0;
         let mut first_key = None;
+        let oldest_active_read_ts = self.oldest_active_read_ts();
         let mut last_base_key: Option<Vec<u8>> = None;
-        let mut dedup_count: u64 = 0;
+        let mut kept_floor_version_for_base = false;
+        let mut dropped_version_count: u64 = 0;
+        let mut max_output_ts = 0;
 
         while let Some(item) = heap.pop() {
             let k = item.key;
@@ -1040,14 +2334,31 @@ impl FusionStorage {
                 continue;
             }
 
-            // Dedup: for the same base key (without timestamp), keep only the latest version.
-            // Keys come out of the min-heap sorted by [base_key][timestamp].
-            // The first occurrence for a base key is the latest version (highest ts).
+            // Keep exactly the versions needed by current and future snapshots. Without active
+            // readers, only the latest version is needed. With active readers, keep all versions
+            // newer than the oldest reader plus the first floor version visible to that reader.
             let base_key = k[..k.len() - TS_SIZE].to_vec();
-            let is_dup = last_base_key.as_ref() == Some(&base_key);
-            if is_dup {
-                dedup_count += 1;
-                // Skip this older version, but still advance the iterator
+            let is_new_base_key = last_base_key.as_ref() != Some(&base_key);
+            if is_new_base_key {
+                last_base_key = Some(base_key);
+                kept_floor_version_for_base = false;
+            }
+            let (_, ts) = FusionStorage::decode_key(&k);
+            let keep_version = match oldest_active_read_ts {
+                None => is_new_base_key,
+                Some(oldest_read_ts) => {
+                    if is_new_base_key || ts > oldest_read_ts {
+                        true
+                    } else if !kept_floor_version_for_base {
+                        kept_floor_version_for_base = true;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if !keep_version {
+                dropped_version_count += 1;
                 if let Some((next_k, next_v)) = iterators[idx].next().await? {
                     heap.push(MergeItem {
                         key: next_k,
@@ -1057,9 +2368,11 @@ impl FusionStorage {
                 }
                 continue;
             }
-            last_base_key = Some(base_key);
+            if oldest_active_read_ts.is_some() && ts <= oldest_active_read_ts.unwrap_or(0) {
+                kept_floor_version_for_base = true;
+            }
+            max_output_ts = max_output_ts.max(ts);
 
-            // Add to Builder
             if first_key.is_none() {
                 first_key = Some(k.clone());
             }
@@ -1095,13 +2408,6 @@ impl FusionStorage {
             }
         }
 
-        if dedup_count > 0 {
-            println!(
-                "[compaction] Deduplicated {} stale key versions",
-                dedup_count
-            );
-        }
-
         if !block_buffer.is_empty() {
             if let Err(e) = builder
                 .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
@@ -1120,20 +2426,34 @@ impl FusionStorage {
                 e
             )));
         }
+        self.publish_staged_sstable(&staging_path, &out_path)
+            .await?;
+        let compaction_output_bytes = tokio::fs::metadata(&out_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
 
         // Open new SST
-        match SsTable::open(out_path, new_id, self.block_cache.clone()).await {
+        match SsTable::open(out_path.clone(), new_id, self.block_cache.clone()).await {
             Ok(new_sst) => {
-                {
-                    let mut sstables = self.sstables.write().unwrap();
-                    // Remove old candidates (by ID)
-                    let candidate_ids = candidates.each_ref().map(|candidate| candidate.id);
-                    sstables.retain(|s| !candidate_ids.contains(&s.id));
-
-                    // Insert new SST (sorted by ID)
-                    sstables.push(Arc::new(new_sst));
-                    sstables.sort_by_key(|s| s.id);
-                } // Drop lock
+                Self::persist_sstable_timestamp_cache_entry(
+                    &self.paths.sstable_dir,
+                    &new_sst.path,
+                    new_sst.id,
+                    max_output_ts,
+                );
+                Self::persist_sstable_descriptor_cache_entry(&self.paths.sstable_dir, &new_sst);
+                let new_sst_path = new_sst.path.clone();
+                let candidate_ids = candidates.each_ref().map(|candidate| candidate.id);
+                if let Err(error) = self.install_compacted_sstable(new_sst, &candidate_ids) {
+                    let _ = tokio::fs::remove_file(&new_sst_path).await;
+                    SsTable::remove_index_cache_file_for_path(&new_sst_path).await;
+                    SsTable::remove_reverse_seek_file_for_path(&new_sst_path).await;
+                    return Err(crate::common::FusionError::Storage(format!(
+                        "Compaction failed to persist SSTable manifest: {}",
+                        error
+                    )));
+                }
 
                 {
                     let mut obsolete = self.obsolete_sstables.write().unwrap();
@@ -1142,13 +2462,22 @@ impl FusionStorage {
                     }
                 }
                 self.collect_obsolete_sstables().await;
+                crate::monitor::inc_compaction_run();
+                crate::monitor::add_compaction_input_bytes(compaction_input_bytes);
+                crate::monitor::add_compaction_output_bytes(compaction_output_bytes);
+                crate::monitor::add_compaction_dropped_versions(dropped_version_count);
 
                 Ok(true)
             }
-            Err(e) => Err(crate::common::FusionError::Storage(format!(
-                "Failed to open compacted SST: {:?}",
-                e
-            ))),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&out_path).await;
+                SsTable::remove_index_cache_file_for_path(&out_path).await;
+                SsTable::remove_reverse_seek_file_for_path(&out_path).await;
+                Err(crate::common::FusionError::Storage(format!(
+                    "Failed to open compacted SST: {:?}",
+                    e
+                )))
+            }
         }
     }
 
@@ -1171,28 +2500,93 @@ impl FusionStorage {
     /// Graceful shutdown: flush active MemTable to SSTable, save indexes, sync WAL.
     pub async fn shutdown(&self) {
         println!("[shutdown] Flushing active MemTable...");
+        let _commit_guard = self.commit_lock.lock().await;
 
-        // 1. Rotate active memtable to immutable
         self.rotate_memtable().await;
-
-        // 2. Flush all immutable memtables
-        self.flush_all_immutable_memtables().await;
-
-        // 3. Save secondary indexes
-        self.persist_secondary_indexes("[shutdown]");
-
-        // 4. Truncate WAL (all data is now in SSTables)
-        if let Err(e) = self.wal.truncate() {
-            eprintln!("[shutdown] Failed to truncate WAL: {:?}", e);
+        match self.flush_all_immutable_memtables().await {
+            Ok(()) => {
+                self.persist_secondary_indexes("[shutdown]");
+                if let Err(error) = self.wal.truncate() {
+                    eprintln!("[shutdown] Failed to truncate WAL: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("[shutdown] Flush failed; WAL and unflushed MemTable retained: {error}");
+            }
         }
 
         println!("[shutdown] FusionDB shut down cleanly.");
     }
 
     /// Flush a single MemTable to SSTable (used during shutdown).
-    async fn flush_memtable_sync(&self, mem: &MemTable) {
+    async fn flush_memtable_sync(&self, mem: &MemTable) -> Result<()> {
+        if mem.map.is_empty() {
+            return Ok(());
+        }
+
         let sst_path = self.sstable_path_for(mem.id);
-        let mut builder = SsTableBuilder::new(sst_path.clone());
+        if self
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .any(|sstable| sstable.id == mem.id)
+        {
+            return Ok(());
+        }
+
+        let max_ts = mem
+            .map
+            .iter()
+            .filter(|entry| entry.key().len() >= TS_SIZE)
+            .map(|entry| Self::decode_key(entry.key()).1)
+            .max()
+            .ok_or_else(|| {
+                FusionError::Storage(format!(
+                    "MemTable {} contains no valid MVCC entries",
+                    mem.id
+                ))
+            })?;
+
+        // A prior manifest update may have failed after the complete SSTable was renamed. Reuse
+        // that durable file instead of replacing a file that recovery might already reference.
+        if sst_path.exists() {
+            let reusable =
+                match SsTable::open(sst_path.clone(), mem.id, self.block_cache.clone()).await {
+                    Ok(sstable) => match Self::sstable_matches_memtable(&sstable, mem).await {
+                        Ok(true) => Some(sstable),
+                        Ok(false) | Err(_) => None,
+                    },
+                    Err(_) => None,
+                };
+            if let Some(sstable) = reusable {
+                Self::persist_sstable_timestamp_cache_entry(
+                    &self.paths.sstable_dir,
+                    &sstable.path,
+                    sstable.id,
+                    max_ts,
+                );
+                Self::persist_sstable_descriptor_cache_entry(&self.paths.sstable_dir, &sstable);
+                self.register_live_sstable(sstable).map_err(|error| {
+                    FusionError::Storage(format!(
+                        "failed to persist SSTable {} in manifest: {}",
+                        mem.id, error
+                    ))
+                })?;
+                return Ok(());
+            }
+            tokio::fs::remove_file(&sst_path).await?;
+            SsTable::remove_index_cache_file_for_path(&sst_path).await;
+            SsTable::remove_reverse_seek_file_for_path(&sst_path).await;
+        }
+
+        let staging_path = self.sstable_staging_path_for(mem.id);
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        SsTable::remove_index_cache_file_for_path(&staging_path).await;
+        SsTable::remove_reverse_seek_file_for_path(&staging_path).await;
+        let mut builder = self
+            .sstable_builder_with_zone_maps(staging_path.clone())
+            .await;
 
         let mut block_count = 0;
         let mut block_buffer = Vec::with_capacity(SSTABLE_BLOCK_BUFFER_CAPACITY);
@@ -1215,13 +2609,9 @@ impl FusionStorage {
             block_count += 1;
 
             if block_buffer.len() >= SSTABLE_BLOCK_BUFFER_CAPACITY {
-                if let Err(e) = builder
+                builder
                     .flush_block(first_key.take().unwrap(), block_count, &block_buffer)
-                    .await
-                {
-                    eprintln!("[shutdown] flush block error: {:?}", e);
-                    return;
-                }
+                    .await?;
                 block_buffer.clear();
                 block_count = 0;
             }
@@ -1229,23 +2619,38 @@ impl FusionStorage {
 
         if !block_buffer.is_empty() {
             if let Some(fk) = first_key.take() {
-                let _ = builder.flush_block(fk, block_count, &block_buffer).await;
+                builder.flush_block(fk, block_count, &block_buffer).await?;
             }
         }
 
-        if let Err(e) = builder.finish().await {
-            eprintln!("[shutdown] SSTable finish error: {:?}", e);
-            return;
-        }
+        builder.finish().await?;
+        self.publish_staged_sstable(&staging_path, &sst_path)
+            .await?;
 
-        // Open and register
-        match SsTable::open(sst_path, mem.id, self.block_cache.clone()).await {
-            Ok(sst) => {
-                let mut sstables = self.sstables.write().unwrap();
-                sstables.push(Arc::new(sst));
+        let sstable = match SsTable::open(sst_path.clone(), mem.id, self.block_cache.clone()).await
+        {
+            Ok(sstable) => sstable,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&sst_path).await;
+                SsTable::remove_index_cache_file_for_path(&sst_path).await;
+                SsTable::remove_reverse_seek_file_for_path(&sst_path).await;
+                return Err(error);
             }
-            Err(e) => eprintln!("[shutdown] Failed to open flushed SST: {:?}", e),
-        }
+        };
+        Self::persist_sstable_timestamp_cache_entry(
+            &self.paths.sstable_dir,
+            &sstable.path,
+            sstable.id,
+            max_ts,
+        );
+        Self::persist_sstable_descriptor_cache_entry(&self.paths.sstable_dir, &sstable);
+        self.register_live_sstable(sstable).map_err(|error| {
+            FusionError::Storage(format!(
+                "failed to persist SSTable {} in manifest: {}",
+                mem.id, error
+            ))
+        })?;
+        Ok(())
     }
 
     async fn rotate_memtable(&self) {
@@ -1269,6 +2674,7 @@ pub struct FusionTransaction {
     pub storage: FusionStorage,
     pub write_buffer: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pub read_ts: u64,
+    read_ts_registered: bool,
 }
 
 impl FusionTransaction {
@@ -1293,6 +2699,25 @@ impl FusionTransaction {
     where
         F: FnMut(&[u8], &[u8]) -> bool + Send,
     {
+        self.for_each_visible_range_with_options(
+            start,
+            end,
+            StorageScanOptions::fill_cache(),
+            &mut visit,
+        )
+        .await
+    }
+
+    async fn for_each_visible_range_with_options<F>(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        scan_options: StorageScanOptions,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool + Send,
+    {
         // Snapshot once (cheap Arc clones), then run the shared merge over the full range.
         let mem_tables = self.snapshot_memtables();
         let sstables = self.storage.sstables.read().unwrap().clone();
@@ -1303,9 +2728,356 @@ impl FusionTransaction {
             self.read_ts,
             start,
             end,
+            scan_options,
             &mut visit,
         )
         .await
+    }
+
+    async fn for_each_visible_range_reverse<F>(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool + Send,
+    {
+        self.for_each_visible_range_reverse_with_options(
+            start,
+            end,
+            StorageScanOptions::fill_cache(),
+            &mut visit,
+        )
+        .await
+    }
+
+    async fn for_each_visible_range_reverse_with_options<F>(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        scan_options: StorageScanOptions,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool + Send,
+    {
+        let mem_tables = self.snapshot_memtables();
+        let sstables = self.storage.sstables.read().unwrap().clone();
+        Self::merge_visible_range_reverse(
+            &mem_tables,
+            &sstables,
+            &self.write_buffer,
+            self.read_ts,
+            start,
+            end,
+            scan_options,
+            &mut visit,
+        )
+        .await
+    }
+
+    fn sql_zone_map_table_prefix_for_range(
+        plan: &SqlBlockZoneMapPruningPlan,
+        start: &[u8],
+        end: &[u8],
+    ) -> Option<Vec<u8>> {
+        if start >= end {
+            return None;
+        }
+
+        let legacy_prefix = format!("data:{}:", plan.table_name);
+        if Self::range_within_prefix(start, end, legacy_prefix.as_bytes()) {
+            return Some(legacy_prefix.into_bytes());
+        }
+
+        let start_text = std::str::from_utf8(start).ok()?;
+        let shard_rest = start_text.strip_prefix("shard:")?;
+        let shard_id_end = shard_rest.find(':')?;
+        let shard_id = &shard_rest[..shard_id_end];
+        let shard_prefix = format!("shard:{shard_id}:data:{}:", plan.table_name);
+        Self::range_within_prefix(start, end, shard_prefix.as_bytes())
+            .then(|| shard_prefix.into_bytes())
+    }
+
+    fn range_within_prefix(start: &[u8], end: &[u8], prefix: &[u8]) -> bool {
+        let Some(prefix_end) = FusionStorage::prefix_end(prefix) else {
+            return false;
+        };
+        start >= prefix && end <= prefix_end.as_slice()
+    }
+
+    fn write_buffer_overlaps_user_key_interval(
+        write_buffer: &[(Vec<u8>, Option<Vec<u8>>)],
+        first_user_key: &[u8],
+        last_user_key: &[u8],
+    ) -> bool {
+        write_buffer
+            .iter()
+            .any(|(key, _)| key.as_slice() >= first_user_key && key.as_slice() <= last_user_key)
+    }
+
+    fn memtables_overlap_user_key_interval(
+        mem_tables: &[MemTable],
+        first_user_key: &[u8],
+        last_user_key: &[u8],
+    ) -> bool {
+        let lower_bound = FusionStorage::encode_key(first_user_key, u64::MAX);
+        for mem in mem_tables {
+            for entry in mem.map.range(lower_bound.clone()..) {
+                let (user_key, _) = FusionStorage::decode_key(entry.key());
+                if user_key > last_user_key {
+                    break;
+                }
+                if user_key >= first_user_key {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn sstable_overlaps_user_key_interval(
+        sstable: &SsTable,
+        first_user_key: &[u8],
+        last_user_key: &[u8],
+    ) -> bool {
+        let (sst_first_user_key, _) = FusionStorage::decode_key(&sstable.meta.first_key);
+        let (sst_last_user_key, _) = FusionStorage::decode_key(&sstable.meta.last_key);
+        !(sst_last_user_key < first_user_key || sst_first_user_key > last_user_key)
+    }
+
+    fn sstable_table_blocks_overlap_user_key_interval(
+        sstable: &SsTable,
+        table_prefix: &[u8],
+        first_user_key: &[u8],
+        last_user_key: &[u8],
+    ) -> Option<bool> {
+        let block_properties = sstable.validated_block_properties_for_zone_maps()?;
+
+        for property in block_properties.iter() {
+            let Some(interval) =
+                SsTable::block_property_table_prefix_interval(property, table_prefix)
+            else {
+                return None;
+            };
+            let Some((block_first_user_key, block_last_user_key)) = interval else {
+                continue;
+            };
+            if !(block_last_user_key.as_slice() < first_user_key
+                || block_first_user_key.as_slice() > last_user_key)
+            {
+                return Some(true);
+            }
+        }
+
+        Some(false)
+    }
+
+    fn other_sstable_overlaps_user_key_interval(
+        current_sstable: &Arc<SsTable>,
+        sstables: &[Arc<SsTable>],
+        table_prefix: &[u8],
+        first_user_key: &[u8],
+        last_user_key: &[u8],
+    ) -> bool {
+        sstables.iter().any(|sstable| {
+            if Arc::ptr_eq(sstable, current_sstable)
+                || !Self::sstable_overlaps_user_key_interval(sstable, first_user_key, last_user_key)
+            {
+                return false;
+            }
+
+            if let Some(overlaps) = Self::sstable_table_blocks_overlap_user_key_interval(
+                sstable,
+                table_prefix,
+                first_user_key,
+                last_user_key,
+            ) {
+                return overlaps;
+            }
+
+            !matches!(
+                sstable.probe_user_key_prefix_filter(table_prefix),
+                SsTablePrefixFilterProbe::NoMatch
+            )
+        })
+    }
+
+    fn block_has_split_user_key_boundary(
+        block_properties: &[SsTableBlockProperties],
+        block_idx: usize,
+        table_prefix: &[u8],
+        first_user_key: &[u8],
+        last_user_key: &[u8],
+    ) -> bool {
+        if block_idx > 0 {
+            match SsTable::block_property_table_prefix_interval(
+                &block_properties[block_idx - 1],
+                table_prefix,
+            ) {
+                Some(Some((_prev_first, prev_last))) => {
+                    if prev_last == first_user_key {
+                        return true;
+                    }
+                }
+                Some(None) => {}
+                None => return true,
+            }
+        }
+
+        if let Some(next_property) = block_properties.get(block_idx + 1) {
+            match SsTable::block_property_table_prefix_interval(next_property, table_prefix) {
+                Some(Some((next_first, _next_last))) => {
+                    if next_first == last_user_key {
+                        return true;
+                    }
+                }
+                Some(None) => {}
+                None => return true,
+            }
+        }
+
+        false
+    }
+
+    fn record_sql_zone_map_fail_open(reason: SqlBlockZoneMapFailOpenReason) {
+        crate::monitor::inc_sstable_block_zone_map_filter_fail_open();
+        if matches!(
+            reason,
+            SqlBlockZoneMapFailOpenReason::MissingColumn
+                | SqlBlockZoneMapFailOpenReason::SchemaMismatch
+                | SqlBlockZoneMapFailOpenReason::ColumnMismatch
+                | SqlBlockZoneMapFailOpenReason::TypeMismatch
+                | SqlBlockZoneMapFailOpenReason::UnsupportedValueEncoding
+        ) {
+            crate::monitor::inc_sstable_block_zone_map_schema_fail_open();
+        }
+    }
+
+    fn record_sql_zone_map_mvcc_fail_open(reason: SqlBlockZoneMapMvccFailOpenReason) {
+        crate::monitor::inc_sstable_block_zone_map_filter_fail_open();
+        crate::monitor::inc_sstable_block_zone_map_mvcc_overlap_fail_open();
+        match reason {
+            SqlBlockZoneMapMvccFailOpenReason::BoundarySplit => {
+                crate::monitor::inc_sstable_block_zone_map_mvcc_boundary_split_fail_open();
+            }
+            SqlBlockZoneMapMvccFailOpenReason::WriteBufferOverlap => {
+                crate::monitor::inc_sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open();
+            }
+            SqlBlockZoneMapMvccFailOpenReason::MemtableOverlap => {
+                crate::monitor::inc_sstable_block_zone_map_mvcc_memtable_overlap_fail_open();
+            }
+            SqlBlockZoneMapMvccFailOpenReason::SstableOverlap => {
+                crate::monitor::inc_sstable_block_zone_map_mvcc_sstable_overlap_fail_open();
+            }
+        }
+    }
+
+    fn sql_zone_map_skip_offsets_for_sstable(
+        plan: &SqlBlockZoneMapPruningPlan,
+        table_prefix: &[u8],
+        sstable: &Arc<SsTable>,
+        sstables: &[Arc<SsTable>],
+        mem_tables: &[MemTable],
+        write_buffer: &[(Vec<u8>, Option<Vec<u8>>)],
+        start: &[u8],
+        end: &[u8],
+    ) -> Option<Arc<BTreeSet<u64>>> {
+        let block_properties = sstable.validated_block_properties_for_zone_maps()?;
+        let mut skip_offsets = BTreeSet::new();
+
+        for (block_idx, property) in block_properties.iter().enumerate() {
+            let (first_user_key, last_user_key) =
+                match SsTable::block_property_table_prefix_interval(property, table_prefix) {
+                    Some(Some(interval)) => interval,
+                    Some(None) => continue,
+                    None => {
+                        let Some((first_user_key, last_user_key)) =
+                            SsTable::block_property_user_key_interval(property, TS_SIZE)
+                        else {
+                            crate::monitor::inc_sstable_block_zone_map_filter_check();
+                            Self::record_sql_zone_map_fail_open(
+                                SqlBlockZoneMapFailOpenReason::IncompleteMetadata,
+                            );
+                            continue;
+                        };
+                        if last_user_key.as_slice() < start || first_user_key.as_slice() >= end {
+                            continue;
+                        }
+                        crate::monitor::inc_sstable_block_zone_map_filter_check();
+                        Self::record_sql_zone_map_fail_open(
+                            SqlBlockZoneMapFailOpenReason::IncompleteMetadata,
+                        );
+                        continue;
+                    }
+                };
+
+            crate::monitor::inc_sstable_block_zone_map_filter_check();
+
+            if first_user_key.as_slice() < start || last_user_key.as_slice() >= end {
+                Self::record_sql_zone_map_fail_open(
+                    SqlBlockZoneMapFailOpenReason::IncompleteMetadata,
+                );
+                continue;
+            }
+
+            let mvcc_fail_open_reason = if Self::block_has_split_user_key_boundary(
+                block_properties.as_ref(),
+                block_idx,
+                table_prefix,
+                &first_user_key,
+                &last_user_key,
+            ) {
+                Some(SqlBlockZoneMapMvccFailOpenReason::BoundarySplit)
+            } else if Self::write_buffer_overlaps_user_key_interval(
+                write_buffer,
+                &first_user_key,
+                &last_user_key,
+            ) {
+                Some(SqlBlockZoneMapMvccFailOpenReason::WriteBufferOverlap)
+            } else if Self::memtables_overlap_user_key_interval(
+                mem_tables,
+                &first_user_key,
+                &last_user_key,
+            ) {
+                Some(SqlBlockZoneMapMvccFailOpenReason::MemtableOverlap)
+            } else if Self::other_sstable_overlaps_user_key_interval(
+                sstable,
+                sstables,
+                table_prefix,
+                &first_user_key,
+                &last_user_key,
+            ) {
+                Some(SqlBlockZoneMapMvccFailOpenReason::SstableOverlap)
+            } else {
+                None
+            };
+
+            if let Some(reason) = mvcc_fail_open_reason {
+                Self::record_sql_zone_map_mvcc_fail_open(reason);
+                continue;
+            }
+
+            match plan.evaluate_block_zone_maps(
+                table_prefix,
+                property.sql_zone_maps_complete,
+                &property.sql_zone_maps,
+            ) {
+                SqlBlockZoneMapPruningDecision::SkipBlock => {
+                    crate::monitor::inc_sstable_block_zone_map_filter_skip();
+                    skip_offsets.insert(property.offset);
+                }
+                SqlBlockZoneMapPruningDecision::ReadBlock => {
+                    crate::monitor::inc_sstable_block_zone_map_filter_positive();
+                }
+                SqlBlockZoneMapPruningDecision::FailOpen(reason) => {
+                    Self::record_sql_zone_map_fail_open(reason);
+                }
+            }
+        }
+
+        (!skip_offsets.is_empty()).then(|| Arc::new(skip_offsets))
     }
 
     /// Core N-way MVCC merge over an owned snapshot (memtables + sstables + write buffer) for the
@@ -1320,9 +3092,22 @@ impl FusionTransaction {
         read_ts: u64,
         start: &[u8],
         end: &[u8],
+        scan_options: StorageScanOptions,
         visit: &mut (dyn FnMut(&[u8], &[u8]) -> bool + Send),
     ) -> Result<()> {
         let start_ik = FusionStorage::encode_key(start, u64::MAX);
+        let read_options = sstable_read_options(&scan_options);
+        let sql_block_zone_map_pruning_plan = scan_options
+            .sql_block_zone_map_pruning_enabled()
+            .then(|| scan_options.sql_block_zone_map_pruning_plan.as_deref())
+            .flatten();
+        let sql_zone_map_table_prefix = sql_block_zone_map_pruning_plan
+            .and_then(|plan| Self::sql_zone_map_table_prefix_for_range(plan, start, end));
+        if sql_block_zone_map_pruning_plan.is_some() && sql_zone_map_table_prefix.is_some() {
+            for sstable in sstables {
+                sstable.preload_block_properties().await;
+            }
+        }
 
         // WriteBuffer
         let mut wb_latest = BTreeMap::new();
@@ -1383,22 +3168,85 @@ impl FusionTransaction {
 
         let mut sst_iters: Vec<Option<crate::storage::sstable::SsTableIterator>> =
             Vec::with_capacity(sstables.len());
-        let end_ik = FusionStorage::encode_key(end, u64::MAX);
-
+        let prefix_filter_probe = FusionStorage::prefix_end(start)
+            .filter(|prefix_end| prefix_end.as_slice() == end)
+            .map(|_| start);
+        let sql_index_prefix_filter_probe =
+            crate::storage::sstable::SsTable::sql_index_prefix_for_range(start, end);
         for (i, sst) in sstables.iter().rev().enumerate() {
             let idx = 1 + mem_tables.len() + i;
+            crate::monitor::inc_sstable_range_probe();
 
             // Check Overlap
             let sst_min = &sst.meta.first_key;
             let sst_max = &sst.meta.last_key;
-            if sst_max.as_slice() < start_ik.as_slice() || sst_min.as_slice() >= end_ik.as_slice() {
+            let (sst_min_user_key, _) = FusionStorage::decode_key(sst_min);
+            let (sst_max_user_key, _) = FusionStorage::decode_key(sst_max);
+            if sst_max_user_key < start || sst_min_user_key >= end {
+                crate::monitor::inc_sstable_range_overlap_skip();
                 sst_iters.push(None);
                 continue;
             }
+            if let Some(prefix) = prefix_filter_probe {
+                crate::monitor::inc_sstable_prefix_filter_check();
+                match sst.probe_user_key_prefix_filter(prefix) {
+                    SsTablePrefixFilterProbe::MayMatch => {
+                        crate::monitor::inc_sstable_prefix_filter_positive();
+                    }
+                    SsTablePrefixFilterProbe::NoMatch => {
+                        crate::monitor::inc_sstable_prefix_filter_skip();
+                        sst_iters.push(None);
+                        continue;
+                    }
+                    SsTablePrefixFilterProbe::FailOpen => {
+                        crate::monitor::inc_sstable_prefix_filter_fail_open();
+                    }
+                }
+            }
+            if let Some(prefix) = sql_index_prefix_filter_probe.as_deref() {
+                crate::monitor::inc_sstable_index_prefix_filter_check();
+                match sst.probe_sql_index_prefix_filter(prefix) {
+                    SsTablePrefixFilterProbe::MayMatch => {
+                        crate::monitor::inc_sstable_index_prefix_filter_positive();
+                    }
+                    SsTablePrefixFilterProbe::NoMatch => {
+                        crate::monitor::inc_sstable_index_prefix_filter_skip();
+                        sst_iters.push(None);
+                        continue;
+                    }
+                    SsTablePrefixFilterProbe::FailOpen => {
+                        crate::monitor::inc_sstable_index_prefix_filter_fail_open();
+                    }
+                }
+            }
 
-            // Use seek optimization to jump to start key
-            let mut it = sst.new_iterator(Some(&start_ik)).await?;
-            if let Ok(Some((k, v))) = it.next().await {
+            // Use seek/range optimization to jump to start key and avoid reading blocks that
+            // start at or beyond the exclusive range end.
+            let approved_block_skip_offsets = sql_block_zone_map_pruning_plan
+                .zip(sql_zone_map_table_prefix.as_deref())
+                .and_then(|(plan, table_prefix)| {
+                    Self::sql_zone_map_skip_offsets_for_sstable(
+                        plan,
+                        table_prefix,
+                        sst,
+                        sstables,
+                        mem_tables,
+                        write_buffer,
+                        start,
+                        end,
+                    )
+                });
+            let mut it = sst
+                .new_user_key_range_iterator_with_options_and_block_skips(
+                    Some(&start_ik),
+                    Some(end),
+                    TS_SIZE,
+                    read_options,
+                    approved_block_skip_offsets,
+                )
+                .await?;
+            crate::monitor::inc_sstable_iterator_open();
+            if let Some((k, v)) = it.next().await? {
                 let current_k = k;
                 let current_v = v;
                 // Check if the first key we found is already past end
@@ -1515,6 +3363,241 @@ impl FusionTransaction {
         Ok(())
     }
 
+    /// Reverse counterpart of `merge_visible_range` for `[start, end)`.
+    /// Each source yields at most one latest-visible candidate per user key; the global merge then
+    /// resolves write-buffer priority, newest MVCC timestamp, tombstones, and output limit order.
+    async fn merge_visible_range_reverse(
+        mem_tables: &[MemTable],
+        sstables: &[Arc<SsTable>],
+        write_buffer: &[(Vec<u8>, Option<Vec<u8>>)],
+        read_ts: u64,
+        start: &[u8],
+        end: &[u8],
+        scan_options: StorageScanOptions,
+        visit: &mut (dyn FnMut(&[u8], &[u8]) -> bool + Send),
+    ) -> Result<()> {
+        let read_options = sstable_read_options(&scan_options);
+
+        if start >= end {
+            return Ok(());
+        }
+        crate::monitor::inc_fusion_reverse_scan();
+
+        let start_ik = FusionStorage::encode_key(start, u64::MAX);
+        let mut sources = Vec::with_capacity(1 + mem_tables.len() + sstables.len());
+        let mut current: Vec<Option<ReverseCandidate>> =
+            Vec::with_capacity(1 + mem_tables.len() + sstables.len());
+        let mut heap = BinaryHeap::with_capacity(1 + mem_tables.len() + sstables.len());
+        let mut pending_sstables = BinaryHeap::with_capacity(sstables.len());
+        let mut next_source_order = 0usize;
+
+        let mut wb_latest = BTreeMap::new();
+        for (k, v) in write_buffer {
+            if k.as_slice() >= start && k.as_slice() < end {
+                wb_latest.insert(k.clone(), v.clone());
+            }
+        }
+        if !wb_latest.is_empty() {
+            let entries = wb_latest.into_iter().rev().map(|(k, v)| {
+                let ik = FusionStorage::encode_key(&k, u64::MAX);
+                let iv = match v {
+                    Some(val) => FusionStorage::encode_value(true, &val),
+                    None => FusionStorage::encode_value(false, &[]),
+                };
+                (ik, iv)
+            });
+            add_reverse_source(
+                &mut sources,
+                &mut current,
+                &mut heap,
+                read_ts,
+                ReverseSource::Buffered {
+                    entries: Box::new(entries),
+                    pending: None,
+                    is_write_buffer: true,
+                    source_order: next_source_order,
+                },
+            )
+            .await?;
+            next_source_order += 1;
+        }
+
+        for mem in mem_tables {
+            if mem.map.is_empty() {
+                continue;
+            }
+            let entries = mem.map.range(start_ik.clone()..).rev().filter_map(|entry| {
+                let (user_key, _) = FusionStorage::decode_key(entry.key());
+                if user_key < end {
+                    Some((entry.key().clone(), entry.value().clone()))
+                } else {
+                    None
+                }
+            });
+            add_reverse_source(
+                &mut sources,
+                &mut current,
+                &mut heap,
+                read_ts,
+                ReverseSource::Buffered {
+                    entries: Box::new(entries),
+                    pending: None,
+                    is_write_buffer: false,
+                    source_order: next_source_order,
+                },
+            )
+            .await?;
+            next_source_order += 1;
+        }
+
+        let prefix_filter_probe = FusionStorage::prefix_end(start)
+            .filter(|prefix_end| prefix_end.as_slice() == end)
+            .map(|_| start);
+        let sql_index_prefix_filter_probe =
+            crate::storage::sstable::SsTable::sql_index_prefix_for_range(start, end);
+        for sst in sstables.iter().rev() {
+            crate::monitor::inc_sstable_range_probe();
+
+            let (sst_min_user_key, _) = FusionStorage::decode_key(&sst.meta.first_key);
+            let (sst_max_user_key, _) = FusionStorage::decode_key(&sst.meta.last_key);
+            if sst_max_user_key < start || sst_min_user_key >= end {
+                crate::monitor::inc_sstable_range_overlap_skip();
+                continue;
+            }
+            if let Some(prefix) = prefix_filter_probe {
+                crate::monitor::inc_sstable_prefix_filter_check();
+                match sst.probe_user_key_prefix_filter(prefix) {
+                    SsTablePrefixFilterProbe::MayMatch => {
+                        crate::monitor::inc_sstable_prefix_filter_positive();
+                    }
+                    SsTablePrefixFilterProbe::NoMatch => {
+                        crate::monitor::inc_sstable_prefix_filter_skip();
+                        continue;
+                    }
+                    SsTablePrefixFilterProbe::FailOpen => {
+                        crate::monitor::inc_sstable_prefix_filter_fail_open();
+                    }
+                }
+            }
+            if let Some(prefix) = sql_index_prefix_filter_probe.as_deref() {
+                crate::monitor::inc_sstable_index_prefix_filter_check();
+                match sst.probe_sql_index_prefix_filter(prefix) {
+                    SsTablePrefixFilterProbe::MayMatch => {
+                        crate::monitor::inc_sstable_index_prefix_filter_positive();
+                    }
+                    SsTablePrefixFilterProbe::NoMatch => {
+                        crate::monitor::inc_sstable_index_prefix_filter_skip();
+                        continue;
+                    }
+                    SsTablePrefixFilterProbe::FailOpen => {
+                        crate::monitor::inc_sstable_index_prefix_filter_fail_open();
+                    }
+                }
+            }
+
+            crate::monitor::inc_fusion_reverse_sstable_frontier_probe();
+            let Some(frontier) = sst.reverse_frontier_for_range(start, end, TS_SIZE) else {
+                crate::monitor::inc_fusion_reverse_sstable_frontier_empty_skip();
+                crate::monitor::inc_sstable_range_overlap_skip();
+                continue;
+            };
+            match frontier.kind {
+                SsTableReverseFrontierKind::BlockProperty => {
+                    crate::monitor::inc_fusion_reverse_sstable_frontier_in_range();
+                }
+                SsTableReverseFrontierKind::FileFallback => {
+                    crate::monitor::inc_fusion_reverse_sstable_frontier_file();
+                    crate::monitor::inc_fusion_reverse_sstable_frontier_fail_open();
+                }
+            }
+            if frontier.user_key.as_slice() < sst_max_user_key {
+                crate::monitor::inc_fusion_reverse_sstable_frontier_tighten();
+            }
+
+            pending_sstables.push(PendingReverseSstable {
+                frontier_user_key: frontier.user_key,
+                source_order: next_source_order,
+                sst: Arc::clone(sst),
+            });
+            crate::monitor::inc_fusion_reverse_sstable_pending();
+            next_source_order += 1;
+        }
+
+        activate_pending_reverse_sstables(
+            &mut pending_sstables,
+            &mut sources,
+            &mut current,
+            &mut heap,
+            read_ts,
+            start,
+            end,
+            read_options,
+        )
+        .await?;
+
+        while !heap.is_empty() || !pending_sstables.is_empty() {
+            activate_pending_reverse_sstables(
+                &mut pending_sstables,
+                &mut sources,
+                &mut current,
+                &mut heap,
+                read_ts,
+                start,
+                end,
+                read_options,
+            )
+            .await?;
+
+            let Some(item) = heap.pop() else {
+                break;
+            };
+            let user_key = item.user_key;
+            let mut source_indices = vec![item.source_idx];
+            while heap
+                .peek()
+                .is_some_and(|next| next.user_key.as_slice() == user_key.as_slice())
+            {
+                source_indices.push(heap.pop().expect("peeked item exists").source_idx);
+            }
+
+            let mut winner: Option<ReverseCandidate> = None;
+            for source_idx in &source_indices {
+                let Some(candidate) = current[*source_idx].take() else {
+                    continue;
+                };
+                if winner
+                    .as_ref()
+                    .map_or(true, |current| candidate.wins_over(current))
+                {
+                    winner = Some(candidate);
+                }
+            }
+
+            for source_idx in source_indices {
+                if let Some(candidate) = sources[source_idx].next_candidate(read_ts).await? {
+                    heap.push(ReverseMergeItem {
+                        user_key: candidate.user_key.clone(),
+                        source_idx,
+                    });
+                    current[source_idx] = Some(candidate);
+                }
+            }
+
+            if let Some(winner) = winner {
+                if winner.is_put {
+                    crate::monitor::inc_fusion_reverse_visible_put();
+                    if !visit(&winner.user_key, &winner.value) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        crate::monitor::add_fusion_reverse_sstable_deferred_unopened(pending_sstables.len() as u64);
+
+        Ok(())
+    }
+
     /// Parallel equivalent of an unbounded `scan_range` over `[start, end)`: splits the range into
     /// disjoint integer-primary-key sub-ranges and merges them on spawned tasks over one shared
     /// snapshot, then concatenates in key order. Disjoint sub-ranges + a single shared snapshot +
@@ -1525,8 +3608,24 @@ impl FusionTransaction {
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_range_parallel_with_options(start, end, StorageScanOptions::fill_cache())
+            .await
+    }
+
+    async fn scan_range_parallel_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        scan_options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let Some(splits) = self.integer_pk_range_splits(start, end).await? else {
-            return self.scan_range(start, end, None).await;
+            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            self.for_each_visible_range_with_options(start, end, scan_options, |user_k, val| {
+                rows.push((user_k.to_vec(), val.to_vec()));
+                true
+            })
+            .await?;
+            return Ok(rows);
         };
 
         // One consistent snapshot shared (Arc) across all sub-range merges.
@@ -1548,6 +3647,7 @@ impl FusionTransaction {
             let mem_tables = mem_tables.clone();
             let sstables = sstables.clone();
             let write_buffer = write_buffer.clone();
+            let scan_options = scan_options.clone();
             handles.push(tokio::spawn(async move {
                 let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 let mut visit = |user_k: &[u8], val: &[u8]| {
@@ -1561,6 +3661,7 @@ impl FusionTransaction {
                     read_ts,
                     &sub_start,
                     &sub_end,
+                    scan_options,
                     &mut visit,
                 )
                 .await?;
@@ -1576,6 +3677,139 @@ impl FusionTransaction {
             out.extend(part);
         }
         Ok(out)
+    }
+
+    async fn scan_range_parallel_for_each(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<Option<usize>> {
+        self.scan_range_parallel_for_each_with_options(
+            start,
+            end,
+            limit,
+            visitor,
+            StorageScanOptions::fill_cache(),
+        )
+        .await
+    }
+
+    async fn scan_range_parallel_for_each_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        scan_options: StorageScanOptions,
+    ) -> Result<Option<usize>> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 {
+            return Ok(Some(0));
+        }
+
+        let Some(splits) = self.integer_pk_range_splits(start, end).await? else {
+            return Ok(None);
+        };
+
+        let mem_tables = Arc::new(self.snapshot_memtables());
+        let sstables = Arc::new(self.storage.sstables.read().unwrap().clone());
+        let write_buffer = Arc::new(self.write_buffer.clone());
+        let read_ts = self.read_ts;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(splits.len() + 2);
+        bounds.push(start.to_vec());
+        bounds.extend(splits);
+        bounds.push(end.to_vec());
+
+        let mut partitions = Vec::with_capacity(bounds.len() - 1);
+        for pair in bounds.windows(2) {
+            let sub_start = pair[0].clone();
+            let sub_end = pair[1].clone();
+            let mem_tables = mem_tables.clone();
+            let sstables = sstables.clone();
+            let write_buffer = write_buffer.clone();
+            let stop = stop.clone();
+            let scan_options = scan_options.clone();
+            let (sender, receiver) = mpsc::unbounded_channel();
+
+            let handle = tokio::spawn(async move {
+                let mut visit = |user_k: &[u8], val: &[u8]| {
+                    if stop.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    sender.send((user_k.to_vec(), val.to_vec())).is_ok()
+                };
+                FusionTransaction::merge_visible_range(
+                    mem_tables.as_slice(),
+                    sstables.as_slice(),
+                    write_buffer.as_slice(),
+                    read_ts,
+                    &sub_start,
+                    &sub_end,
+                    scan_options,
+                    &mut visit,
+                )
+                .await
+            });
+            partitions.push((receiver, handle));
+        }
+
+        let mut visited = 0usize;
+        let mut stopped_early = false;
+        let mut partitions = partitions.into_iter();
+        while let Some((mut receiver, handle)) = partitions.next() {
+            while let Some((key, value)) = receiver.recv().await {
+                visited += 1;
+                if !visitor.visit(&key, &value) || visited >= safe_limit {
+                    stop.store(true, Ordering::Relaxed);
+                    stopped_early = true;
+                    break;
+                }
+            }
+
+            if stopped_early {
+                handle.abort();
+                match handle.await {
+                    Ok(result) => result?,
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        return Err(FusionError::Storage(format!(
+                            "parallel streaming scan task panicked: {}",
+                            error
+                        )))
+                    }
+                }
+                for (_receiver, handle) in partitions {
+                    handle.abort();
+                    match handle.await {
+                        Ok(result) => result?,
+                        Err(error) if error.is_cancelled() => {}
+                        Err(error) => {
+                            return Err(FusionError::Storage(format!(
+                                "parallel streaming scan task panicked: {}",
+                                error
+                            )))
+                        }
+                    }
+                }
+                break;
+            }
+
+            match handle.await {
+                Ok(result) => result?,
+                Err(error) => {
+                    return Err(FusionError::Storage(format!(
+                        "parallel streaming scan task panicked: {}",
+                        error
+                    )))
+                }
+            }
+        }
+
+        Ok(Some(visited))
     }
 
     /// Derive up to K-1 split keys dividing `[start, end)` into roughly even integer-primary-key
@@ -1642,6 +3876,15 @@ impl FusionTransaction {
             return Ok(None);
         }
         Ok(Some(splits))
+    }
+}
+
+impl Drop for FusionTransaction {
+    fn drop(&mut self) {
+        if self.read_ts_registered {
+            self.storage.unregister_active_read_ts(self.read_ts);
+            self.read_ts_registered = false;
+        }
     }
 }
 
@@ -1713,7 +3956,27 @@ impl Transaction for FusionTransaction {
         };
 
         for sst in &sstables {
-            if let Ok(Some((k_bytes, v_bytes))) = sst.find_ge(&search_key).await {
+            let (sst_min_user_key, _) = FusionStorage::decode_key(&sst.meta.first_key);
+            let (sst_max_user_key, _) = FusionStorage::decode_key(&sst.meta.last_key);
+            if key < sst_min_user_key || key > sst_max_user_key {
+                crate::monitor::inc_sstable_point_overlap_skip();
+                continue;
+            }
+            crate::monitor::inc_sstable_point_probe();
+            crate::monitor::inc_sstable_user_key_filter_check();
+            match sst.probe_user_key_filter(key, TS_SIZE) {
+                crate::storage::sstable::SsTablePrefixFilterProbe::MayMatch => {
+                    crate::monitor::inc_sstable_user_key_filter_positive();
+                }
+                crate::storage::sstable::SsTablePrefixFilterProbe::NoMatch => {
+                    crate::monitor::inc_sstable_user_key_filter_skip();
+                    continue;
+                }
+                crate::storage::sstable::SsTablePrefixFilterProbe::FailOpen => {
+                    crate::monitor::inc_sstable_user_key_filter_fail_open();
+                }
+            }
+            if let Some((k_bytes, v_bytes)) = sst.find_ge(&search_key).await? {
                 let (k, ts) = FusionStorage::decode_key(&k_bytes);
                 if k == key && ts <= self.read_ts {
                     consider(ts, &v_bytes);
@@ -1749,6 +4012,20 @@ impl Transaction for FusionTransaction {
         Ok(Vec::new())
     }
 
+    async fn scan_prefix_with_options(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(end) = FusionStorage::prefix_end(prefix) {
+            return self
+                .scan_range_with_options(prefix, &end, limit, options)
+                .await;
+        }
+        Ok(Vec::new())
+    }
+
     async fn scan_prefix_parallel(
         &self,
         prefix: &[u8],
@@ -1762,6 +4039,22 @@ impl Transaction for FusionTransaction {
             return Ok(Vec::new());
         };
         self.scan_range_parallel(prefix, &end).await
+    }
+
+    async fn scan_prefix_parallel_with_options(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit.is_some() {
+            return self.scan_prefix_with_options(prefix, limit, options).await;
+        }
+        let Some(end) = FusionStorage::prefix_end(prefix) else {
+            return Ok(Vec::new());
+        };
+        self.scan_range_parallel_with_options(prefix, &end, options)
+            .await
     }
 
     async fn scan_prefix_for_each(
@@ -1787,6 +4080,47 @@ impl Transaction for FusionTransaction {
         Ok(visited)
     }
 
+    async fn scan_prefix_for_each_with_options(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<usize> {
+        let Some(end) = FusionStorage::prefix_end(prefix) else {
+            return Ok(0);
+        };
+        self.scan_range_for_each_with_options(prefix, &end, limit, visitor, options)
+            .await
+    }
+
+    async fn scan_prefix_parallel_for_each(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<Option<usize>> {
+        let Some(end) = FusionStorage::prefix_end(prefix) else {
+            return Ok(Some(0));
+        };
+        self.scan_range_parallel_for_each(prefix, &end, limit, visitor)
+            .await
+    }
+
+    async fn scan_prefix_parallel_for_each_with_options(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<Option<usize>> {
+        let Some(end) = FusionStorage::prefix_end(prefix) else {
+            return Ok(Some(0));
+        };
+        self.scan_range_parallel_for_each_with_options(prefix, &end, limit, visitor, options)
+            .await
+    }
+
     async fn scan_range(
         &self,
         start: &[u8],
@@ -1806,6 +4140,161 @@ impl Transaction for FusionTransaction {
         .await?;
 
         Ok(res)
+    }
+
+    async fn scan_range_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut res = Vec::with_capacity(safe_limit.min(4096));
+        self.for_each_visible_range_with_options(start, end, options, |user_k, val| {
+            res.push((user_k.to_vec(), val.to_vec()));
+            res.len() < safe_limit
+        })
+        .await?;
+
+        Ok(res)
+    }
+
+    async fn scan_range_for_each(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(0);
+        }
+
+        let mut visited = 0;
+        self.for_each_visible_range(start, end, |user_k, val| {
+            visited += 1;
+            visitor.visit(user_k, val) && visited < safe_limit
+        })
+        .await?;
+        Ok(visited)
+    }
+
+    async fn scan_range_for_each_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<usize> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(0);
+        }
+
+        let mut visited = 0;
+        self.for_each_visible_range_with_options(start, end, options, |user_k, val| {
+            visited += 1;
+            visitor.visit(user_k, val) && visited < safe_limit
+        })
+        .await?;
+        Ok(visited)
+    }
+
+    async fn scan_range_reverse(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(Vec::new());
+        }
+
+        let mut res = Vec::with_capacity(safe_limit.min(4096));
+        self.for_each_visible_range_reverse(start, end, |user_k, val| {
+            res.push((user_k.to_vec(), val.to_vec()));
+            res.len() < safe_limit
+        })
+        .await?;
+
+        Ok(res)
+    }
+
+    async fn scan_range_reverse_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(Vec::new());
+        }
+
+        let mut res = Vec::with_capacity(safe_limit.min(4096));
+        self.for_each_visible_range_reverse_with_options(start, end, options, |user_k, val| {
+            res.push((user_k.to_vec(), val.to_vec()));
+            res.len() < safe_limit
+        })
+        .await?;
+
+        Ok(res)
+    }
+
+    async fn scan_range_reverse_for_each(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(0);
+        }
+
+        let mut visited = 0;
+        self.for_each_visible_range_reverse(start, end, |user_k, val| {
+            visited += 1;
+            visitor.visit(user_k, val) && visited < safe_limit
+        })
+        .await?;
+        Ok(visited)
+    }
+
+    async fn scan_range_reverse_for_each_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<usize> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(0);
+        }
+
+        let mut visited = 0;
+        self.for_each_visible_range_reverse_with_options(start, end, options, |user_k, val| {
+            visited += 1;
+            visitor.visit(user_k, val) && visited < safe_limit
+        })
+        .await?;
+        Ok(visited)
+    }
+
+    fn supports_bounded_scan_range_reverse(&self) -> bool {
+        true
     }
 
     async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
@@ -1833,279 +4322,50 @@ impl Transaction for FusionTransaction {
     }
 
     async fn last(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        // Optimized last() using metadata
-        let read_ts = self.read_ts;
-
-        // 1. Candidate from MemTables
-        let mut max_key: Option<(Vec<u8>, Vec<u8>, u64)> = None;
-        let update_max =
-            |k: &[u8], v: &[u8], ts: u64, current_max: &mut Option<(Vec<u8>, Vec<u8>, u64)>| {
-                if ts <= read_ts {
-                    if let Some((mk, _, _)) = current_max {
-                        if k > mk.as_slice() {
-                            *current_max = Some((k.to_vec(), v.to_vec(), ts));
-                        }
-                    } else {
-                        *current_max = Some((k.to_vec(), v.to_vec(), ts));
-                    }
-                }
-            };
-
-        // Scan MemTables (Active + Immutable)
-        // Since MemTables are small, we can scan them.
-        // Optimization: Iterate range? SkipMap range is forward only.
-        // We use scan_range logic but scoped to MemTable.
-        let end_ik = FusionStorage::encode_key(end, u64::MAX);
-        let start_ik = FusionStorage::encode_key(start, u64::MAX);
-
-        let check_mem = |mem: &MemTable, current_max: &mut Option<(Vec<u8>, Vec<u8>, u64)>| {
-            for entry in mem.map.range(start_ik.clone()..end_ik.clone()) {
-                let (k, ts) = FusionStorage::decode_key(entry.key());
-                update_max(k, entry.value(), ts, current_max);
-            }
-        };
-
-        {
-            let active = self.storage.active_memtable.read().unwrap();
-            check_mem(&active, &mut max_key);
-        }
-        {
-            let imm = self.storage.immutable_memtables.read().unwrap();
-            for mem in imm.iter() {
-                check_mem(mem, &mut max_key);
-            }
-        }
-
-        // 2. Candidate from SSTables (using Metadata)
-        // We look for the SSTable that *could* contain the largest key.
-        // Since SSTables might overlap, we need to check any SSTable whose range overlaps with (current_max_key..end).
-        // If current_max is None, we check all SSTables in range (start..end).
-
-        let sstables = self.storage.sstables.read().unwrap().clone();
-
-        for sst in sstables.iter() {
-            // Check if SSTable overlaps with [start, end)
-            // SST range: [first_key, last_key] (Internal Keys)
-            // We need to decode them to check User Keys?
-            // Or just compare bytes? Internal Keys are UserKey + TS.
-            // User Key comparison is prefix of Internal Key.
-            // But TS is inverted.
-            // Let's assume metadata stores INTERNAL keys.
-            // We can check if sst.last_key >= start_ik AND sst.first_key < end_ik
-
-            // Wait, SsTableMeta stores whatever we passed to `add_key`.
-            // In flush_loop, we pass `key` which is Internal Key.
-            // So metadata has Internal Keys.
-
-            // Overlap check:
-            // SST: [Min, Max]
-            // Query: [Start, End)
-            // Overlap if Max >= Start AND Min < End
-
-            // Actually, we want the LARGEST key.
-            // We should process SSTables that have the largest `last_key` first?
-            // Not necessarily, `last_key` is just the bound.
-
-            // We process overlapping candidates directly.
-            let sst_min = &sst.meta.first_key;
-            let sst_max = &sst.meta.last_key;
-
-            if sst_max.as_slice() < start_ik.as_slice() || sst_min.as_slice() >= end_ik.as_slice() {
-                continue;
-            }
-
-            // For each relevant SSTable, we want to find the largest key < end.
-            // Optimization: If `sst.last_key` < end, then `sst.last_key` is a candidate!
-            // But `sst.last_key` might be a tombstone or older version.
-            // We still need to check validity.
-            // BUT, we can iterate *that specific block* where `last_key` resides.
-
-            // To be safe and correct without full reverse iterator:
-            // We iterate relevant SSTables.
-            // But we can optimize:
-            // If we find a key `K` in MemTable, we only care about SSTables where `last_key > K`.
-
-            // Read the block containing the largest key <= end_ik
-            // We use `index` to find the offset.
-            // `index` maps StartKey -> Offset.
-            // We want the block that starts <= end_ik.
-
-            // `sst.index` is BTreeMap. `range(..=end_ik).next_back()` gives the block starting before end_ik.
-            // This block *might* contain keys < end_ik.
-            // The *next* block starts > end_ik (or doesn't exist).
-
-            // So we just need to read this ONE block and scan it.
-            // Wait, what if the block contains only keys >= end_ik? (Possible if block start == end_ik)
-            // But we used `..=`.
-
-            // Let's get the block.
-            // If the block contains keys < end, the largest one is our candidate.
-            // If not, we might need the *previous* block.
-            // But `range(..=)` gives the block where `start_key <= end_ik`.
-            // So the keys in that block are `>= start_key`.
-            // They *could* exceed `end_ik`.
-
-            // So we read this block, and iterate it.
-            // Since block is small (4KB), scanning it is cheap.
-            // We find the largest key in this block < end_ik.
-
-            // If this block yields nothing < end_ik, we check the *previous* block?
-            // Yes.
-
-            // Heuristic: Check the last 2 blocks that might overlap.
-            // 1. Block A: `range(..end_ik).next_back()` -> Starts < end_ik.
-            // This is the primary candidate.
-
-            let candidate_idx = match sst
-                .index_keys
-                .binary_search_by(|key| key.as_slice().cmp(end_ik.as_slice()))
-            {
-                Ok(idx) | Err(idx) => idx.checked_sub(1),
-            };
-
-            let Some(candidate_idx) = candidate_idx else {
-                continue;
-            };
-
-            let current_offset = sst.index_offsets[candidate_idx];
-            let previous_offset = candidate_idx
-                .checked_sub(1)
-                .map(|idx| sst.index_offsets[idx]);
-
-            for offset in [Some(current_offset), previous_offset]
-                .into_iter()
-                .flatten()
-            {
-                if let Ok(block_data) = sst.read_block(offset).await {
-                    // Iterate block
-                    let mut cursor = std::io::Cursor::new(block_data);
-                    let mut count_buf = [0u8; 4];
-                    if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_ok() {
-                        let count = u32::from_le_bytes(count_buf);
-                        for _ in 0..count {
-                            // Read KV
-                            // (Simplified manual read to avoid dependency issues)
-                            let mut len_buf = [0u8; 4];
-                            if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
-                                break;
-                            }
-                            let k_len = u32::from_le_bytes(len_buf) as usize;
-                            let mut k = vec![0u8; k_len];
-                            if std::io::Read::read_exact(&mut cursor, &mut k).is_err() {
-                                break;
-                            }
-
-                            if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
-                                break;
-                            }
-                            let v_len = u32::from_le_bytes(len_buf) as usize;
-                            let mut v = vec![0u8; v_len];
-                            if std::io::Read::read_exact(&mut cursor, &mut v).is_err() {
-                                break;
-                            }
-
-                            // Check Range
-                            let (uk, ts) = FusionStorage::decode_key(&k);
-                            // Decode Internal Key to check against end
-                            // `end` is user key bound.
-                            // `k` is Internal.
-                            // `uk` is User Key.
-
-                            if uk < end && uk >= start {
-                                update_max(&uk, &v, ts, &mut max_key);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some((k, v, _)) = max_key {
-            // Check if it's a delete (Tombstone)
-            let (is_put, val) = FusionStorage::decode_value(&v);
-            if is_put {
-                Ok(Some((k, val.to_vec())))
-            } else {
-                Ok(None) // Last value is a delete
-            }
-        } else {
-            Ok(None)
-        }
+        Ok(self
+            .scan_range_reverse(start, end, Some(1))
+            .await?
+            .into_iter()
+            .next())
     }
 
-    async fn commit(self: Box<Self>) -> Result<()> {
+    async fn commit(mut self: Box<Self>) -> Result<()> {
         if self.write_buffer.is_empty() {
             return Ok(());
         }
 
-        // Write Conflict Detection (OCC):
-        // For each key in write_buffer, check if a newer version (ts > read_ts)
-        // was committed by another transaction since we started.
-        let check_mem_conflict =
-            |mem: &MemTable, search_key: &[u8], user_key: &[u8], read_ts: u64| -> Option<u64> {
-                mem.map
-                    .range(search_key.to_vec()..)
-                    .next()
-                    .and_then(|entry| {
-                        let (k, ts) = FusionStorage::decode_key(entry.key());
-                        if k == user_key && ts > read_ts {
-                            Some(ts)
-                        } else {
-                            None
-                        }
-                    })
-            };
-
+        let _commit_guard = self.storage.commit_lock.lock().await;
         for (user_key, _) in &self.write_buffer {
-            let search_key = FusionStorage::encode_key(user_key, u64::MAX);
-
-            // Check active memtable
-            let conflict_ts = {
-                let active = self.storage.active_memtable.read().unwrap();
-                check_mem_conflict(&active, &search_key, user_key, self.read_ts)
-            };
-            if let Some(ts) = conflict_ts {
-                return Err(crate::common::FusionError::Storage(format!(
+            if let Some(timestamp) = self.storage.latest_committed_timestamp(user_key).await? {
+                if timestamp > self.read_ts {
+                    return Err(crate::common::FusionError::Storage(format!(
                     "Write conflict: key modified by another transaction (read_ts={}, conflict_ts={})",
-                    self.read_ts, ts
-                )));
-            }
-
-            // Check immutable memtables
-            let conflict_ts = {
-                let imm = self.storage.immutable_memtables.read().unwrap();
-                let mut found = None;
-                for mem in imm.iter().rev() {
-                    if let Some(ts) = check_mem_conflict(mem, &search_key, user_key, self.read_ts) {
-                        found = Some(ts);
-                        break;
-                    }
+                        self.read_ts, timestamp
+                    )));
                 }
-                found
-            };
-            if let Some(ts) = conflict_ts {
-                return Err(crate::common::FusionError::Storage(format!(
-                    "Write conflict: key modified by another transaction (read_ts={}, conflict_ts={})",
-                    self.read_ts, ts
-                )));
             }
         }
 
-        let commit_ts = self.storage.current_ts.fetch_add(1, Ordering::SeqCst) + 1;
+        let commit_ts = self
+            .storage
+            .current_ts
+            .load(Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| FusionError::Storage("MVCC timestamp exhausted".to_string()))?;
+        let write_buffer = std::mem::take(&mut self.write_buffer);
 
         // Prepare encoded keys/values for both WAL and MemTable
         // We use Put for both Put and Delete (Delete is Put with Tombstone Flag)
-        let cdc_event_count = self
-            .write_buffer
+        let cdc_event_count = write_buffer
             .iter()
             .filter(|(key, _)| cdc_should_capture_key(key))
             .count();
-        let total_entries = self.write_buffer.len().saturating_add(cdc_event_count);
+        let total_entries = write_buffer.len().saturating_add(cdc_event_count);
         let mut wal_entries = Vec::with_capacity(total_entries);
         let mut mem_entries = Vec::with_capacity(total_entries);
         let mut cdc_event_index = 0usize;
 
-        for (k, v) in self.write_buffer {
+        for (k, v) in write_buffer {
             if cdc_should_capture_key(&k) {
                 let sequence = cdc_sequence_for(commit_ts, cdc_event_index)?;
                 cdc_event_index += 1;
@@ -2135,23 +4395,22 @@ impl Transaction for FusionTransaction {
         // 1. WAL Write (Encoded)
         self.storage.wal.append_batch_async(wal_entries).await?;
 
-        // 2. MemTable Insert
-        {
-            let active = self.storage.active_memtable.read().unwrap();
+        // 2. Publish every MemTable entry while readers of the active source are excluded.
+        let needs_rotate = {
+            let active = self.storage.active_memtable.write().unwrap();
             for (key, val) in mem_entries {
                 active.insert(key, val);
             }
-        }
-
-        // Check rotation after insert
-        let needs_rotate = {
-            let active = self.storage.active_memtable.read().unwrap();
             active.size.load(Ordering::Relaxed) > self.storage.memtable_threshold as u64
         };
 
         if needs_rotate {
             self.storage.rotate_memtable().await;
         }
+
+        // current_ts is the public visibility watermark. It must move only after WAL durability
+        // and complete source publication, otherwise a new reader can observe a partial commit.
+        self.storage.current_ts.store(commit_ts, Ordering::SeqCst);
 
         Ok(())
     }
@@ -2169,10 +4428,12 @@ impl Transaction for FusionTransaction {
 impl Storage for FusionStorage {
     async fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
         let read_ts = self.current_ts.load(Ordering::SeqCst);
+        self.register_active_read_ts(read_ts);
         Ok(Box::new(FusionTransaction {
             storage: self.clone(),
             write_buffer: transaction_write_buffer(),
             read_ts,
+            read_ts_registered: true,
         }))
     }
 
@@ -2213,6 +4474,149 @@ mod tests {
         (storage, data_dir)
     }
 
+    fn append_test_sstable_block_entry(block: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+        block.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        block.extend_from_slice(key);
+        block.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        block.extend_from_slice(value);
+    }
+
+    fn zone_map_test_schema() -> crate::catalog::TableSchema {
+        crate::catalog::TableSchema::new(
+            "metrics".to_string(),
+            vec![
+                crate::catalog::Column {
+                    name: "id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    is_primary: true,
+                    is_indexed: true,
+                    index_type: crate::catalog::IndexType::BTree,
+                    default_value: None,
+                    is_nullable: false,
+                    is_unique: true,
+                    check_expr: None,
+                },
+                crate::catalog::Column {
+                    name: "bucket".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    is_primary: false,
+                    is_indexed: false,
+                    index_type: crate::catalog::IndexType::None,
+                    default_value: None,
+                    is_nullable: true,
+                    is_unique: false,
+                    check_expr: None,
+                },
+            ],
+        )
+    }
+
+    fn bucket_eq_zone_map_plan(
+        schema: &crate::catalog::TableSchema,
+        scalar: i64,
+    ) -> crate::storage::SqlBlockZoneMapPruningPlan {
+        let bucket_column = &schema.columns[1];
+        crate::storage::SqlBlockZoneMapPruningPlan {
+            table_name: schema.name.clone(),
+            schema_fingerprint: crate::storage::sql_block_zone_map_schema_fingerprint(schema),
+            terms: vec![crate::storage::SqlBlockZoneMapPredicateTerm {
+                column_index: 1,
+                column_name: bucket_column.name.clone(),
+                type_tag: crate::storage::sql_block_zone_map_type_tag(&bucket_column.data_type)
+                    .expect("bucket column should support zone maps"),
+                value_encoding_version: crate::storage::SQL_BLOCK_ZONE_MAP_VALUE_ENCODING_VERSION,
+                kind: crate::storage::SqlBlockZoneMapPredicateKind::Compare {
+                    op: crate::storage::SqlBlockZoneMapComparisonOp::Eq,
+                    scalar,
+                },
+            }],
+        }
+    }
+
+    fn metric_row(id: i64, bucket: i64) -> Vec<u8> {
+        crate::common::encoding::RowEncoder::encode(&[
+            crate::common::Value::Integer(id),
+            crate::common::Value::Integer(bucket),
+        ])
+    }
+
+    async fn put_metric_rows(storage: &FusionStorage, row_count: usize, bucket: i64) {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for id in 0..row_count {
+            let key = format!("data:metrics:{id:04}");
+            txn.put(key.as_bytes(), &metric_row(id as i64, bucket))
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    fn first_fully_data_zone_map_block_start(storage: &FusionStorage) -> Vec<u8> {
+        let table_prefix = b"data:metrics:";
+        let sstables = storage.sstables.read().unwrap();
+        sstables
+            .iter()
+            .rev()
+            .filter_map(|sstable| sstable.validated_block_properties_for_zone_maps())
+            .flat_map(|properties| {
+                properties
+                    .iter()
+                    .filter_map(|property| {
+                        let has_zone_map = property
+                            .sql_zone_maps
+                            .iter()
+                            .any(|zone_map| zone_map.table_prefix.as_slice() == table_prefix);
+                        if !has_zone_map {
+                            return None;
+                        }
+                        let (first, last) =
+                            SsTable::block_property_user_key_interval(property, TS_SIZE)?;
+                        (first.starts_with(table_prefix) && last.starts_with(table_prefix))
+                            .then_some(first)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .next()
+            .expect("test setup should create a fully data-prefixed zone-map block")
+    }
+
+    async fn build_test_sstable(
+        storage: &FusionStorage,
+        file_id: u64,
+        blocks: &[Vec<(&[u8], &[u8])>],
+    ) -> Arc<SsTable> {
+        let path = storage.sstable_path_for(file_id);
+        let mut builder = SsTableBuilder::new(path.clone());
+        builder.enable_user_key_prefix_filter(TS_SIZE);
+        for block_entries in blocks {
+            let mut block = Vec::new();
+            let mut first_key = None;
+            for (user_key, value) in block_entries {
+                let encoded_key = FusionStorage::encode_key(user_key, 1);
+                let encoded_value = FusionStorage::encode_value(true, value);
+                if first_key.is_none() {
+                    first_key = Some(encoded_key.clone());
+                }
+                builder.add_key(&encoded_key);
+                append_test_sstable_block_entry(&mut block, &encoded_key, &encoded_value);
+            }
+            builder
+                .flush_block(
+                    first_key.expect("test block must not be empty"),
+                    block_entries.len() as u32,
+                    &block,
+                )
+                .await
+                .unwrap();
+        }
+        builder.finish().await.unwrap();
+        Arc::new(
+            SsTable::open(path, file_id, storage.block_cache.clone())
+                .await
+                .unwrap(),
+        )
+    }
+
     #[test]
     fn fusion_transaction_write_buffer_preallocates_first_write() {
         assert!(transaction_write_buffer().capacity() >= 1);
@@ -2222,6 +4626,178 @@ mod tests {
     fn cdc_key_for_sequence_preserves_lexical_order() {
         assert!(cdc_key_for_sequence(9) < cdc_key_for_sequence(10));
         assert!(cdc_key_for_sequence(10) < cdc_key_for_sequence(100));
+    }
+
+    #[tokio::test]
+    async fn fusion_flush_selects_oldest_immutable_memtable_first() {
+        let (storage, data_dir) = test_fusion_storage("flush_oldest_first").await;
+        storage
+            .immutable_memtables
+            .write()
+            .unwrap()
+            .extend([MemTable::new(10), MemTable::new(11)]);
+
+        assert_eq!(storage.next_memtable_to_flush().unwrap().id, 10);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fusion_concurrent_same_key_commits_allow_exactly_one_writer() {
+        let (storage, data_dir) = test_fusion_storage("concurrent_same_key_commit").await;
+        let mut first = storage.begin_transaction().await.unwrap();
+        let mut second = storage.begin_transaction().await.unwrap();
+        first.put(b"data:occ:shared", b"first").await.unwrap();
+        second.put(b"data:occ:shared", b"second").await.unwrap();
+
+        let (first_result, second_result) = tokio::join!(first.commit(), second.commit());
+        assert_eq!(
+            usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+            1,
+            "serialized OCC validation must allow exactly one stale writer"
+        );
+        let conflict = if let Err(error) = first_result {
+            error
+        } else {
+            second_result.unwrap_err()
+        };
+        assert!(conflict.to_string().contains("Write conflict:"));
+
+        let reader = storage.begin_transaction().await.unwrap();
+        let value = reader.get(b"data:occ:shared").await.unwrap().unwrap();
+        assert!(value == b"first" || value == b"second");
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_occ_detects_conflict_after_newer_version_is_flushed() {
+        let (storage, data_dir) = test_fusion_storage("occ_conflict_in_sstable").await;
+        let mut stale_writer = storage.begin_transaction().await.unwrap();
+
+        {
+            let mut winner = storage.begin_transaction().await.unwrap();
+            winner.put(b"data:occ:flushed", b"winner").await.unwrap();
+            winner.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+        assert!(storage.immutable_memtables.read().unwrap().is_empty());
+        assert!(!storage.sstables.read().unwrap().is_empty());
+
+        stale_writer
+            .put(b"data:occ:flushed", b"stale")
+            .await
+            .unwrap();
+        let error = stale_writer.commit().await.unwrap_err();
+        assert!(error.to_string().contains("Write conflict:"));
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fusion_current_ts_is_published_after_complete_memtable_commit() {
+        let (storage, data_dir) = test_fusion_storage("commit_publication").await;
+        let before = storage.current_ts.load(Ordering::SeqCst);
+        let mut writer = storage.begin_transaction().await.unwrap();
+        let entry_count = 256usize;
+        for id in 0..entry_count {
+            let key = format!("data:publication:{id:04}");
+            let value = format!("value-{id:04}");
+            writer.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+        }
+
+        let commit = tokio::spawn(async move { writer.commit().await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while storage.current_ts.load(Ordering::SeqCst) == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit should publish its timestamp");
+
+        let reader = storage.begin_transaction().await.unwrap();
+        for id in 0..entry_count {
+            let key = format!("data:publication:{id:04}");
+            let expected = format!("value-{id:04}").into_bytes();
+            assert_eq!(reader.get(key.as_bytes()).await.unwrap(), Some(expected));
+        }
+        commit.await.unwrap().unwrap();
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fusion_background_flush_keeps_wal_for_active_memtable() {
+        let (storage, data_dir) = test_fusion_storage("background_flush_wal_floor").await;
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:wal_floor:immutable", b"old").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let flush_guard = storage.flush_lock.lock().await;
+        storage.rotate_memtable().await;
+        tokio::task::yield_now().await;
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:wal_floor:active", b"must-replay")
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+        drop(flush_guard);
+        storage.flush_notify.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !storage.immutable_memtables.read().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background flush should drain the immutable MemTable");
+        // Reacquiring the lock waits until the worker has passed its former truncate point.
+        let completed_flush = storage.flush_lock.lock().await;
+        drop(completed_flush);
+        assert!(storage.immutable_memtables.read().unwrap().is_empty());
+
+        let replay_entries = storage.wal.replay().unwrap();
+        assert!(replay_entries.iter().any(|entry| match entry {
+            WalEntry::Put(internal_key, _) | WalEntry::Delete(internal_key) => {
+                FusionStorage::decode_key(internal_key).0 == b"data:wal_floor:active"
+            }
+        }));
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_point_and_range_reads_propagate_sstable_io_errors() {
+        let (storage, data_dir) = test_fusion_storage("sstable_read_error").await;
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:read_error:001", b"value").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+        let mut writer = storage.begin_transaction().await.unwrap();
+        let sstable_path = storage.sstables.read().unwrap()[0].path.clone();
+        storage.block_cache.invalidate_all();
+        storage.block_cache.run_pending_tasks();
+        tokio::fs::remove_file(&sstable_path).await.unwrap();
+
+        let reader = storage.begin_transaction().await.unwrap();
+        assert!(reader.get(b"data:read_error:001").await.is_err());
+        assert!(reader
+            .scan_range(b"data:read_error:", b"data:read_error;", None)
+            .await
+            .is_err());
+        writer
+            .put(b"data:read_error:001", b"replacement")
+            .await
+            .unwrap();
+        assert!(writer.commit().await.is_err());
+
+        cleanup_storage_dir(&data_dir);
     }
 
     #[tokio::test]
@@ -2327,6 +4903,775 @@ mod tests {
     fn merge_heap_reserves_candidate_iterators() {
         let capacity = 1 + COMPACTION_FANIN;
         assert!(merge_heap(capacity).capacity() >= capacity);
+    }
+
+    #[test]
+    fn block_cache_capacity_uses_byte_weighting() {
+        let mut config = StorageConfig::default();
+        config.block_cache_capacity = 1;
+        let cache = build_block_cache(&config);
+        let first_len = 3 * 1024;
+        let first: BlockCacheValue = vec![0; first_len].into();
+
+        cache.insert((1, 0), first);
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_size(), first_len as u64);
+
+        let second: BlockCacheValue = vec![1; first_len].into();
+        cache.insert((1, 4096), second);
+        cache.run_pending_tasks();
+        assert!(
+            cache.weighted_size() <= config.block_cache_capacity_bytes(),
+            "block cache should evict or reject entries by byte weight"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_range_user_key_prefix_boundary_includes_shorter_key_from_sstable() {
+        let data_dir = unique_storage_dir("range_prefix_boundary");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        let mem = MemTable::new(1);
+        mem.insert(
+            FusionStorage::encode_key(b"a", 1),
+            FusionStorage::encode_value(true, b"short-key"),
+        );
+        storage.immutable_memtables.write().unwrap().push(mem);
+        storage.current_ts.store(1, Ordering::SeqCst);
+
+        {
+            let txn = storage.begin_transaction().await.unwrap();
+            let rows = txn.scan_range(b"a", b"a\0", None).await.unwrap();
+            assert_eq!(rows, vec![(b"a".to_vec(), b"short-key".to_vec())]);
+            let reverse = txn.scan_range_reverse(b"a", b"a\0", None).await.unwrap();
+            assert_eq!(reverse, vec![(b"a".to_vec(), b"short-key".to_vec())]);
+        }
+
+        storage.flush_all_immutable_memtables().await.unwrap();
+
+        {
+            let txn = storage.begin_transaction().await.unwrap();
+            let rows = txn.scan_range(b"a", b"a\0", None).await.unwrap();
+            assert_eq!(rows, vec![(b"a".to_vec(), b"short-key".to_vec())]);
+            let reverse = txn.scan_range_reverse(b"a", b"a\0", None).await.unwrap();
+            assert_eq!(reverse, vec![(b"a".to_vec(), b"short-key".to_vec())]);
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_scan_range_reverse_matches_forward_after_mvcc_merge_and_limit() {
+        let (storage, data_dir) = test_fusion_storage("reverse_mvcc_merge").await;
+        let start = b"data:rev:";
+        let end = b"data:rev;";
+
+        let base = MemTable::new(1);
+        for id in 1..=9 {
+            let key = format!("data:rev:{id:03}");
+            let value = format!("old{id}");
+            base.insert(
+                FusionStorage::encode_key(key.as_bytes(), 1),
+                FusionStorage::encode_value(true, value.as_bytes()),
+            );
+        }
+        storage.immutable_memtables.write().unwrap().push(base);
+        storage.current_ts.store(1, Ordering::SeqCst);
+        storage.flush_all_immutable_memtables().await.unwrap();
+
+        let immutable = MemTable::new(2);
+        immutable.insert(
+            FusionStorage::encode_key(b"data:rev:002", 2),
+            FusionStorage::encode_value(true, b"imm2"),
+        );
+        immutable.insert(
+            FusionStorage::encode_key(b"data:rev:004", 2),
+            FusionStorage::encode_value(false, b""),
+        );
+        immutable.insert(
+            FusionStorage::encode_key(b"data:rev:005", 2),
+            FusionStorage::encode_value(true, b"imm5"),
+        );
+        immutable.insert(
+            FusionStorage::encode_key(b"data:rev:011", 2),
+            FusionStorage::encode_value(false, b""),
+        );
+        storage.immutable_memtables.write().unwrap().push(immutable);
+
+        {
+            let active = storage.active_memtable.read().unwrap();
+            active.insert(
+                FusionStorage::encode_key(b"data:rev:003", 3),
+                FusionStorage::encode_value(false, b""),
+            );
+            active.insert(
+                FusionStorage::encode_key(b"data:rev:005", 3),
+                FusionStorage::encode_value(true, b"active5"),
+            );
+            active.insert(
+                FusionStorage::encode_key(b"data:rev:007", 3),
+                FusionStorage::encode_value(true, b"active7"),
+            );
+            active.insert(
+                FusionStorage::encode_key(b"data:rev:008", 5),
+                FusionStorage::encode_value(true, b"future8"),
+            );
+            active.insert(
+                FusionStorage::encode_key(b"data:rev:012", 5),
+                FusionStorage::encode_value(true, b"future12"),
+            );
+        }
+        storage.current_ts.store(3, Ordering::SeqCst);
+
+        let mut txn = FusionTransaction {
+            storage: storage.clone(),
+            write_buffer: transaction_write_buffer(),
+            read_ts: 3,
+            read_ts_registered: false,
+        };
+        txn.put(b"data:rev:009", b"wb9").await.unwrap();
+        txn.delete(b"data:rev:007").await.unwrap();
+        txn.put(b"data:rev:002", b"wb2").await.unwrap();
+        txn.delete(b"data:rev:010").await.unwrap();
+
+        let expected = vec![
+            (b"data:rev:001".to_vec(), b"old1".to_vec()),
+            (b"data:rev:002".to_vec(), b"wb2".to_vec()),
+            (b"data:rev:005".to_vec(), b"active5".to_vec()),
+            (b"data:rev:006".to_vec(), b"old6".to_vec()),
+            (b"data:rev:008".to_vec(), b"old8".to_vec()),
+            (b"data:rev:009".to_vec(), b"wb9".to_vec()),
+        ];
+        let mut expected_reverse = expected.clone();
+        expected_reverse.reverse();
+
+        assert_eq!(txn.scan_range(start, end, None).await.unwrap(), expected);
+        assert_eq!(
+            txn.scan_range_reverse(start, end, None).await.unwrap(),
+            expected_reverse
+        );
+        assert_eq!(
+            txn.scan_range_reverse(start, end, Some(2)).await.unwrap(),
+            expected_reverse.iter().take(2).cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            txn.scan_range_reverse(start, end, Some(0)).await.unwrap(),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            txn.last(start, end).await.unwrap(),
+            expected_reverse.first().cloned()
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_scan_range_reverse_respects_snapshot_read_ts_for_future_sstable_tombstone() {
+        let (storage, data_dir) = test_fusion_storage("reverse_snapshot_sstable").await;
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:rev_ts:001", b"old").await.unwrap();
+            txn.put(b"data:rev_ts:002", b"keep").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let stale_txn = FusionTransaction {
+            storage: storage.clone(),
+            write_buffer: transaction_write_buffer(),
+            read_ts: 1,
+            read_ts_registered: false,
+        };
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.delete(b"data:rev_ts:001").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        assert_eq!(
+            stale_txn
+                .scan_range_reverse(b"data:rev_ts:", b"data:rev_ts;", None)
+                .await
+                .unwrap(),
+            vec![
+                (b"data:rev_ts:002".to_vec(), b"keep".to_vec()),
+                (b"data:rev_ts:001".to_vec(), b"old".to_vec()),
+            ]
+        );
+
+        let fresh_txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(
+            fresh_txn
+                .scan_range_reverse(b"data:rev_ts:", b"data:rev_ts;", None)
+                .await
+                .unwrap(),
+            vec![(b"data:rev_ts:002".to_vec(), b"keep".to_vec())]
+        );
+        assert_eq!(
+            fresh_txn
+                .last(b"data:rev_ts:", b"data:rev_ts;")
+                .await
+                .unwrap(),
+            Some((b"data:rev_ts:002".to_vec(), b"keep".to_vec()))
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_scan_range_reverse_records_raw_sstable_work_counters() {
+        let (storage, data_dir) = test_fusion_storage("reverse_raw_metrics").await;
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            for id in 1..=5 {
+                let key = format!("data:raw:{id:03}");
+                let value = format!("value{id}");
+                txn.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let metrics = &crate::monitor::GLOBAL_METRICS;
+        let scans_before = metrics.fusion_reverse_scan_count.load(Ordering::Relaxed);
+        let sources_before = metrics
+            .fusion_reverse_source_open_count
+            .load(Ordering::Relaxed);
+        let raw_before = metrics
+            .fusion_reverse_raw_entry_read_count
+            .load(Ordering::Relaxed);
+        let candidates_before = metrics
+            .fusion_reverse_visible_candidate_count
+            .load(Ordering::Relaxed);
+        let puts_before = metrics
+            .fusion_reverse_visible_put_count
+            .load(Ordering::Relaxed);
+        let sstable_blocks_before = metrics
+            .sstable_reverse_block_read_count
+            .load(Ordering::Relaxed);
+        let sstable_reverse_iterators_before = metrics
+            .sstable_reverse_iterator_open_count
+            .load(Ordering::Relaxed);
+        let sstable_decodes_before = metrics
+            .sstable_reverse_block_entry_decode_count
+            .load(Ordering::Relaxed);
+        let sstable_yields_before = metrics
+            .sstable_reverse_block_entry_yield_count
+            .load(Ordering::Relaxed);
+
+        let txn = storage.begin_transaction().await.unwrap();
+        let rows = txn
+            .scan_range_reverse(b"data:raw:", b"data:raw;", Some(2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (b"data:raw:005".to_vec(), b"value5".to_vec()),
+                (b"data:raw:004".to_vec(), b"value4".to_vec()),
+            ]
+        );
+
+        let scan_delta = metrics
+            .fusion_reverse_scan_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(scans_before);
+        let source_delta = metrics
+            .fusion_reverse_source_open_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(sources_before);
+        let raw_delta = metrics
+            .fusion_reverse_raw_entry_read_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(raw_before);
+        let candidate_delta = metrics
+            .fusion_reverse_visible_candidate_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(candidates_before);
+        let put_delta = metrics
+            .fusion_reverse_visible_put_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(puts_before);
+        let sstable_block_delta = metrics
+            .sstable_reverse_block_read_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(sstable_blocks_before);
+        let sstable_reverse_iterator_delta = metrics
+            .sstable_reverse_iterator_open_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(sstable_reverse_iterators_before);
+        let sstable_decode_delta = metrics
+            .sstable_reverse_block_entry_decode_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(sstable_decodes_before);
+        let sstable_yield_delta = metrics
+            .sstable_reverse_block_entry_yield_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(sstable_yields_before);
+
+        assert!(
+            scan_delta >= 1,
+            "reverse scan counter should increment, got {scan_delta}"
+        );
+        assert!(
+            source_delta >= 1,
+            "reverse source counter should increment, got {source_delta}"
+        );
+        assert!(
+            raw_delta >= 2,
+            "reverse raw-entry counter should observe SSTable pulls, got {raw_delta}"
+        );
+        assert!(
+            candidate_delta >= 2,
+            "visible candidate counter should observe yielded source candidates, got {candidate_delta}"
+        );
+        assert!(
+            put_delta >= 2,
+            "visible PUT counter should observe emitted rows, got {put_delta}"
+        );
+        assert!(
+            sstable_block_delta >= 1,
+            "SSTable reverse block counter should increment, got {sstable_block_delta}"
+        );
+        assert!(
+            sstable_reverse_iterator_delta >= 1,
+            "SSTable reverse iterator counter should increment, got {sstable_reverse_iterator_delta}"
+        );
+        assert!(
+            sstable_decode_delta >= 2,
+            "SSTable reverse decode counter should increment, got {sstable_decode_delta}"
+        );
+        assert!(
+            sstable_yield_delta >= 2,
+            "SSTable reverse yield counter should increment, got {sstable_yield_delta}"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fusion_scan_range_reverse_lazily_activates_sstable_sources_by_frontier() {
+        let (storage, data_dir) = test_fusion_storage("reverse_lazy_sstable_activation").await;
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            for id in 1..=3 {
+                let key = format!("data:lazy:{id:03}");
+                let value = format!("low{id}");
+                txn.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            for id in 900..=902 {
+                let key = format!("data:lazy:{id:03}");
+                let value = format!("high{id}");
+                txn.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        assert_eq!(
+            storage.sstables.read().unwrap().len(),
+            2,
+            "test setup should create two non-compacted SSTables"
+        );
+
+        reverse_activation_test_hooks::reset();
+        let txn = storage.begin_transaction().await.unwrap();
+        let rows = txn
+            .scan_range_reverse(b"data:lazy:", b"data:lazy;", Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(rows, vec![(b"data:lazy:902".to_vec(), b"high902".to_vec())]);
+        assert_eq!(
+            reverse_activation_test_hooks::get(),
+            1,
+            "LIMIT 1 should not activate the lower-frontier SSTable"
+        );
+
+        reverse_activation_test_hooks::reset();
+        let full_txn = storage.begin_transaction().await.unwrap();
+        let full_rows = full_txn
+            .scan_range_reverse(b"data:lazy:", b"data:lazy;", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            full_rows,
+            vec![
+                (b"data:lazy:902".to_vec(), b"high902".to_vec()),
+                (b"data:lazy:901".to_vec(), b"high901".to_vec()),
+                (b"data:lazy:900".to_vec(), b"high900".to_vec()),
+                (b"data:lazy:003".to_vec(), b"low3".to_vec()),
+                (b"data:lazy:002".to_vec(), b"low2".to_vec()),
+                (b"data:lazy:001".to_vec(), b"low1".to_vec()),
+            ]
+        );
+        assert_eq!(
+            reverse_activation_test_hooks::get(),
+            2,
+            "unbounded reverse scan should activate the lower-frontier SSTable after high keys drain"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fusion_scan_range_reverse_uses_in_range_block_frontier() {
+        let (storage, data_dir) = test_fusion_storage("reverse_block_frontier_activation").await;
+        storage.current_ts.store(2, Ordering::SeqCst);
+
+        let gap_sstable = build_test_sstable(
+            &storage,
+            10_001,
+            &[
+                vec![(b"data:block_frontier:050".as_slice(), b"gap-low".as_slice())],
+                vec![(
+                    b"data:block_frontier:900".as_slice(),
+                    b"gap-high".as_slice(),
+                )],
+            ],
+        )
+        .await;
+        let matching_sstable = build_test_sstable(
+            &storage,
+            10_002,
+            &[vec![
+                (
+                    b"data:block_frontier:500".as_slice(),
+                    b"match-500".as_slice(),
+                ),
+                (
+                    b"data:block_frontier:501".as_slice(),
+                    b"match-501".as_slice(),
+                ),
+            ]],
+        )
+        .await;
+        let deferred_sstable = build_test_sstable(
+            &storage,
+            10_003,
+            &[
+                vec![(
+                    b"data:block_frontier:150".as_slice(),
+                    b"deferred-low".as_slice(),
+                )],
+                vec![(
+                    b"data:block_frontier:900".as_slice(),
+                    b"deferred-high".as_slice(),
+                )],
+            ],
+        )
+        .await;
+
+        {
+            let mut sstables = storage.sstables.write().unwrap();
+            sstables.push(gap_sstable);
+            sstables.push(deferred_sstable);
+            sstables.push(matching_sstable);
+        }
+
+        let metrics = &crate::monitor::GLOBAL_METRICS;
+        let probe_before = metrics
+            .fusion_reverse_sstable_frontier_probe_count
+            .load(Ordering::Relaxed);
+        let in_range_before = metrics
+            .fusion_reverse_sstable_frontier_in_range_count
+            .load(Ordering::Relaxed);
+        let tighten_before = metrics
+            .fusion_reverse_sstable_frontier_tighten_count
+            .load(Ordering::Relaxed);
+        let empty_skip_before = metrics
+            .fusion_reverse_sstable_frontier_empty_skip_count
+            .load(Ordering::Relaxed);
+        let pending_before = metrics
+            .fusion_reverse_sstable_pending_count
+            .load(Ordering::Relaxed);
+        let activation_before = metrics
+            .fusion_reverse_sstable_activation_count
+            .load(Ordering::Relaxed);
+        let deferred_before = metrics
+            .fusion_reverse_sstable_deferred_unopened_count
+            .load(Ordering::Relaxed);
+
+        reverse_activation_test_hooks::reset();
+        let txn = storage.begin_transaction().await.unwrap();
+        let rows = txn
+            .scan_range_reverse(
+                b"data:block_frontier:100",
+                b"data:block_frontier:600",
+                Some(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![(b"data:block_frontier:501".to_vec(), b"match-501".to_vec())]
+        );
+        assert_eq!(
+            reverse_activation_test_hooks::get(),
+            1,
+            "block/index frontier should avoid activating lower-frontier SSTables under LIMIT"
+        );
+        assert_eq!(
+            metrics
+                .fusion_reverse_sstable_frontier_probe_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(probe_before),
+            3
+        );
+        assert_eq!(
+            metrics
+                .fusion_reverse_sstable_frontier_in_range_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(in_range_before),
+            2
+        );
+        assert_eq!(
+            metrics
+                .fusion_reverse_sstable_frontier_tighten_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(tighten_before),
+            1
+        );
+        assert_eq!(
+            metrics
+                .fusion_reverse_sstable_frontier_empty_skip_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(empty_skip_before),
+            1
+        );
+        assert_eq!(
+            metrics
+                .fusion_reverse_sstable_pending_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(pending_before),
+            2
+        );
+        assert_eq!(
+            metrics
+                .fusion_reverse_sstable_activation_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(activation_before),
+            1
+        );
+        assert_eq!(
+            metrics
+                .fusion_reverse_sstable_deferred_unopened_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(deferred_before),
+            1
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fusion_scan_range_reverse_skips_empty_memtable_sources() {
+        let (storage, data_dir) = test_fusion_storage("reverse_skip_empty_memtable_sources").await;
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:empty_mem:001", b"one").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        assert!(
+            storage.active_memtable.read().unwrap().map.is_empty(),
+            "snapshot should leave an empty active memtable"
+        );
+
+        reverse_activation_test_hooks::reset();
+        let txn = storage.begin_transaction().await.unwrap();
+        let rows = txn
+            .scan_range_reverse(b"data:empty_mem:", b"data:empty_mem;", Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![(b"data:empty_mem:001".to_vec(), b"one".to_vec())]
+        );
+        assert_eq!(
+            reverse_activation_test_hooks::get_source_open(),
+            1,
+            "reverse scan should not open a source for the empty active memtable"
+        );
+        assert_eq!(
+            reverse_activation_test_hooks::get(),
+            1,
+            "the only opened source should be the matching SSTable"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_scan_range_reverse_activates_equal_frontier_sstables_before_emit() {
+        let (storage, data_dir) = test_fusion_storage("reverse_equal_frontier_tombstone").await;
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:eq:001", b"old1").await.unwrap();
+            txn.put(b"data:eq:002", b"old2").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.delete(b"data:eq:002").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        assert_eq!(
+            storage.sstables.read().unwrap().len(),
+            2,
+            "test setup should create two SSTables with the same frontier user key"
+        );
+
+        let equal_frontier_before = crate::monitor::GLOBAL_METRICS
+            .fusion_reverse_sstable_activation_equal_frontier_count
+            .load(Ordering::Relaxed);
+
+        let txn = storage.begin_transaction().await.unwrap();
+        let rows = txn
+            .scan_range_reverse(b"data:eq:", b"data:eq;", None)
+            .await
+            .unwrap();
+
+        assert_eq!(rows, vec![(b"data:eq:001".to_vec(), b"old1".to_vec())]);
+        assert!(
+            crate::monitor::GLOBAL_METRICS
+                .fusion_reverse_sstable_activation_equal_frontier_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(equal_frontier_before)
+                >= 1,
+            "equal-frontier SSTable activation should be visible in metrics"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fusion_scan_range_reverse_skips_sstable_by_sql_index_prefix_filter() {
+        let (storage, data_dir) = test_fusion_storage("reverse_sql_index_prefix_filter").await;
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"index:metrics:host_id,ts:i0|i001:row0", b"low")
+                .await
+                .unwrap();
+            txn.put(b"index:metrics:host_id,ts:i9|i001:row9", b"high")
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"index:metrics:host_id,ts:i5|i001:row1", b"one")
+                .await
+                .unwrap();
+            txn.put(b"index:metrics:host_id,ts:i5|i002:row2", b"two")
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        assert_eq!(
+            storage.sstables.read().unwrap().len(),
+            2,
+            "test setup should create one matching SSTable and one overlapping no-match SSTable"
+        );
+
+        let checks_before = crate::monitor::GLOBAL_METRICS
+            .sstable_index_prefix_filter_check_count
+            .load(Ordering::Relaxed);
+        let skips_before = crate::monitor::GLOBAL_METRICS
+            .sstable_index_prefix_filter_skip_count
+            .load(Ordering::Relaxed);
+        let positives_before = crate::monitor::GLOBAL_METRICS
+            .sstable_index_prefix_filter_positive_count
+            .load(Ordering::Relaxed);
+
+        reverse_activation_test_hooks::reset();
+        let mut end = b"index:metrics:host_id,ts:i5|".to_vec();
+        end.push(0xff);
+        let txn = storage.begin_transaction().await.unwrap();
+        let rows = txn
+            .scan_range_reverse(b"index:metrics:host_id,ts:i5|", &end, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    b"index:metrics:host_id,ts:i5|i002:row2".to_vec(),
+                    b"two".to_vec()
+                ),
+                (
+                    b"index:metrics:host_id,ts:i5|i001:row1".to_vec(),
+                    b"one".to_vec()
+                ),
+            ]
+        );
+        assert_eq!(
+            reverse_activation_test_hooks::get(),
+            1,
+            "SQL index-prefix Bloom should skip the overlapping no-match SSTable before activation"
+        );
+
+        let check_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_index_prefix_filter_check_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(checks_before);
+        let skip_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_index_prefix_filter_skip_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(skips_before);
+        let positive_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_index_prefix_filter_positive_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(positives_before);
+        assert!(
+            check_delta >= 2,
+            "reverse range should probe both overlapping SSTables, got {check_delta}"
+        );
+        assert!(
+            skip_delta >= 1,
+            "reverse range should skip the no-match SSTable by SQL index-prefix Bloom"
+        );
+        assert!(
+            positive_delta >= 1,
+            "reverse range should count the matching SSTable as a positive SQL index-prefix probe"
+        );
+
+        cleanup_storage_dir(&data_dir);
     }
 
     #[tokio::test]
@@ -2513,6 +5858,424 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_prefix_uses_sstable_prefix_bloom_to_skip_overlapping_absent_prefix() {
+        let data_dir = unique_storage_dir("prefix_bloom_skip");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:a:001", b"low").await.unwrap();
+            txn.put(b"data:z:001", b"high").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:m:001", b"middle").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let negative_sst = {
+            let sstables = storage.sstables.read().unwrap();
+            sstables
+                .iter()
+                .find(|sst| {
+                    !sst.prefix_may_match(b"data:m:")
+                        && sst.prefix_may_match(b"data:a:")
+                        && sst.prefix_may_match(b"data:z:")
+                })
+                .cloned()
+                .expect("expected an SSTable whose key range overlaps data:m: without that prefix")
+        };
+        let negative_offsets = negative_sst.index_offsets.as_ref().clone();
+        let checks_before = crate::monitor::GLOBAL_METRICS
+            .sstable_prefix_filter_check_count
+            .load(Ordering::Relaxed);
+        let positives_before = crate::monitor::GLOBAL_METRICS
+            .sstable_prefix_filter_positive_count
+            .load(Ordering::Relaxed);
+        let skips_before = crate::monitor::GLOBAL_METRICS
+            .sstable_prefix_filter_skip_count
+            .load(Ordering::Relaxed);
+
+        let rows = {
+            let txn = storage.begin_transaction().await.unwrap();
+            txn.scan_prefix(b"data:m:", None).await.unwrap()
+        };
+
+        assert_eq!(rows, vec![(b"data:m:001".to_vec(), b"middle".to_vec())]);
+        let check_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_prefix_filter_check_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(checks_before);
+        let positive_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_prefix_filter_positive_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(positives_before);
+        let skip_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_prefix_filter_skip_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(skips_before);
+        assert!(
+            check_delta >= 2,
+            "prefix scan should probe both overlapping SSTables, got {check_delta}"
+        );
+        assert!(
+            positive_delta >= 1,
+            "prefix scan should count the matching SSTable as a positive probe"
+        );
+        assert!(
+            skip_delta >= 1,
+            "prefix scan should count the absent-prefix SSTable as a negative skip"
+        );
+        for offset in negative_offsets {
+            assert!(
+                storage
+                    .block_cache
+                    .get(&(negative_sst.id, offset))
+                    .is_none(),
+                "prefix bloom negative should skip the overlapping SSTable without reading its blocks"
+            );
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn scan_range_not_prefix_safe_does_not_use_prefix_bloom_negative_skip() {
+        let data_dir = unique_storage_dir("prefix_bloom_range_control");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:m:001", b"middle").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let sst = {
+            let sstables = storage.sstables.read().unwrap();
+            sstables
+                .iter()
+                .find(|sst| sst.prefix_may_match(b"data:m:"))
+                .cloned()
+                .expect("expected data:m SSTable")
+        };
+        let offsets = sst.index_offsets.as_ref().clone();
+
+        let rows = {
+            let txn = storage.begin_transaction().await.unwrap();
+            txn.scan_range(b"data:b:", b"data:n:", None).await.unwrap()
+        };
+
+        assert_eq!(rows, vec![(b"data:m:001".to_vec(), b"middle".to_vec())]);
+        assert!(
+            offsets
+                .into_iter()
+                .any(|offset| storage.block_cache.get(&(sst.id, offset)).is_some()),
+            "ordinary non-prefix-safe ranges must read candidate SSTable blocks instead of using prefix Bloom negative skip"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_scan_range_no_fill_cache_reads_without_populating_block_cache() {
+        let (storage, data_dir) = test_fusion_storage("scan_range_no_fill_cache").await;
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            for id in 0..128 {
+                let key = format!("data:nofill:{id:04}");
+                let value = vec![b'x'; 512];
+                txn.put(key.as_bytes(), &value).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let sstable_offsets = {
+            let sstables = storage.sstables.read().unwrap();
+            assert!(!sstables.is_empty(), "snapshot should create an SSTable");
+            sstables
+                .iter()
+                .map(|sst| (sst.id, sst.index_offsets.as_ref().clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let fill_skips_before = crate::monitor::GLOBAL_METRICS
+            .block_cache_fill_skip_count
+            .load(Ordering::Relaxed);
+        let no_fill_rows = {
+            let txn = storage.begin_transaction().await.unwrap();
+            txn.scan_range_with_options(
+                b"data:nofill:",
+                b"data:nofill;",
+                None,
+                StorageScanOptions::no_fill_cache(),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(no_fill_rows.len(), 128);
+
+        let fill_skip_delta = crate::monitor::GLOBAL_METRICS
+            .block_cache_fill_skip_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(fill_skips_before);
+        assert!(
+            fill_skip_delta > 0,
+            "no-fill range scan should skip block cache fills"
+        );
+        for (sst_id, offsets) in &sstable_offsets {
+            for offset in offsets {
+                assert!(
+                    storage.block_cache.get(&(*sst_id, *offset)).is_none(),
+                    "no-fill scan should not cache SSTable {sst_id} block {offset}"
+                );
+            }
+        }
+
+        let fill_rows = {
+            let txn = storage.begin_transaction().await.unwrap();
+            txn.scan_range(b"data:nofill:", b"data:nofill;", None)
+                .await
+                .unwrap()
+        };
+        assert_eq!(fill_rows.len(), 128);
+        assert!(
+            sstable_offsets.iter().any(|(sst_id, offsets)| offsets
+                .iter()
+                .any(|offset| storage.block_cache.get(&(*sst_id, *offset)).is_some())),
+            "default range scan should still populate the block cache"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn point_get_uses_sstable_user_key_bloom_to_skip_absent_key() {
+        let data_dir = unique_storage_dir("point_user_key_bloom_skip");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:point_bloom_a:001", b"low").await.unwrap();
+            txn.put(b"data:point_bloom_z:001", b"high").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let (absent_key, sstable_offsets) = {
+            let sstables = storage.sstables.read().unwrap();
+            assert!(
+                !sstables.is_empty(),
+                "test setup should create at least one SSTable"
+            );
+
+            let mut candidate = None;
+            for id in 0..10_000 {
+                let key = format!("data:point_bloom_m:{id:04}").into_bytes();
+                if sstables.iter().all(|sst| {
+                    matches!(
+                        sst.probe_user_key_filter(&key, TS_SIZE),
+                        SsTablePrefixFilterProbe::NoMatch
+                    )
+                }) {
+                    candidate = Some(key);
+                    break;
+                }
+            }
+            let offsets = sstables
+                .iter()
+                .map(|sst| (sst.id, sst.index_offsets.as_ref().clone()))
+                .collect::<Vec<_>>();
+            (
+                candidate.expect("should find an absent key with deterministic Bloom no-match"),
+                offsets,
+            )
+        };
+
+        let checks_before = crate::monitor::GLOBAL_METRICS
+            .sstable_user_key_filter_check_count
+            .load(Ordering::Relaxed);
+        let skips_before = crate::monitor::GLOBAL_METRICS
+            .sstable_user_key_filter_skip_count
+            .load(Ordering::Relaxed);
+        let overlap_skips_before = crate::monitor::GLOBAL_METRICS
+            .sstable_point_overlap_skip_count
+            .load(Ordering::Relaxed);
+
+        let value = {
+            let txn = storage.begin_transaction().await.unwrap();
+            txn.get(&absent_key).await.unwrap()
+        };
+
+        assert_eq!(value, None);
+        let check_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_user_key_filter_check_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(checks_before);
+        let skip_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_user_key_filter_skip_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(skips_before);
+        let overlap_skip_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_point_overlap_skip_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(overlap_skips_before);
+        assert_eq!(
+            overlap_skip_delta, 0,
+            "absent key is inside the SSTable min/max range, so overlap skip should not bypass Bloom"
+        );
+        assert!(
+            check_delta >= sstable_offsets.len() as u64,
+            "point get should probe every SSTable user-key Bloom, got {check_delta}"
+        );
+        assert!(
+            skip_delta >= sstable_offsets.len() as u64,
+            "point get should skip absent-key SSTables via user-key Bloom, got {skip_delta}"
+        );
+        for (sst_id, offsets) in sstable_offsets {
+            for offset in offsets {
+                assert!(
+                    storage.block_cache.get(&(sst_id, offset)).is_none(),
+                    "user-key Bloom negative should skip SSTable {sst_id} block {offset} without reading it"
+                );
+            }
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn point_get_skips_sstable_before_bloom_when_user_key_outside_file_range() {
+        let data_dir = unique_storage_dir("point_overlap_skip");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:point_overlap_a:001", b"low").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:point_overlap_z:001", b"high").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let (sstable_offsets, expected_overlap_skips) = {
+            let sstables = storage.sstables.read().unwrap();
+            assert!(
+                sstables.len() >= 2,
+                "test setup should create multiple disjoint SSTables"
+            );
+            let target_key = b"data:point_overlap_m:001";
+            let expected_skips = sstables
+                .iter()
+                .filter(|sst| {
+                    let (sst_min_user_key, _) = FusionStorage::decode_key(&sst.meta.first_key);
+                    let (sst_max_user_key, _) = FusionStorage::decode_key(&sst.meta.last_key);
+                    target_key.as_slice() < sst_min_user_key
+                        || target_key.as_slice() > sst_max_user_key
+                })
+                .count();
+            let offsets = sstables
+                .iter()
+                .map(|sst| (sst.id, sst.index_offsets.as_ref().clone()))
+                .collect::<Vec<_>>();
+            (offsets, expected_skips)
+        };
+        assert!(
+            expected_overlap_skips > 0,
+            "test setup should include at least one SSTable outside the point key range"
+        );
+
+        let probes_before = crate::monitor::GLOBAL_METRICS
+            .sstable_point_probe_count
+            .load(Ordering::Relaxed);
+        let checks_before = crate::monitor::GLOBAL_METRICS
+            .sstable_user_key_filter_check_count
+            .load(Ordering::Relaxed);
+        let overlap_skips_before = crate::monitor::GLOBAL_METRICS
+            .sstable_point_overlap_skip_count
+            .load(Ordering::Relaxed);
+
+        let value = {
+            let txn = storage.begin_transaction().await.unwrap();
+            txn.get(b"data:point_overlap_m:001").await.unwrap()
+        };
+
+        assert_eq!(value, None);
+        let probe_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_point_probe_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(probes_before);
+        let check_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_user_key_filter_check_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(checks_before);
+        let overlap_skip_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_point_overlap_skip_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(overlap_skips_before);
+
+        assert_eq!(
+            overlap_skip_delta, expected_overlap_skips as u64,
+            "point get should skip all disjoint SSTables by user-key min/max"
+        );
+        assert_eq!(
+            probe_delta,
+            (sstable_offsets.len() - expected_overlap_skips) as u64,
+            "only SSTables whose min/max overlaps the key should count as point probes"
+        );
+        assert_eq!(
+            check_delta,
+            (sstable_offsets.len() - expected_overlap_skips) as u64,
+            "only SSTables whose min/max overlaps the key should reach user-key Bloom"
+        );
+        for (sst_id, offsets) in sstable_offsets {
+            for offset in offsets {
+                assert!(
+                    storage.block_cache.get(&(sst_id, offset)).is_none(),
+                    "point overlap skip should avoid reading SSTable {sst_id} block {offset}"
+                );
+            }
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
     async fn fusion_scan_prefix_for_each_matches_scan_prefix_after_overwrite_delete_and_write_buffer(
     ) {
         let data_dir = unique_storage_dir("scan_for_each");
@@ -2566,6 +6329,409 @@ mod tests {
             assert_eq!(visited, rows.len());
             assert_eq!(collector.rows, rows);
         }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_scan_range_for_each_matches_forward_and_reverse_range() {
+        let data_dir = unique_storage_dir("scan_range_for_each");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:x:001", b"one").await.unwrap();
+            txn.put(b"data:x:002", b"two").await.unwrap();
+            txn.put(b"data:x:003", b"three").await.unwrap();
+            txn.put(b"data:y:001", b"other").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:x:002", b"two-new").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.delete(b"data:x:003").await.unwrap();
+            txn.put(b"data:x:004", b"four").await.unwrap();
+
+            struct Collector {
+                rows: Vec<(Vec<u8>, Vec<u8>)>,
+            }
+
+            impl crate::storage::ScanVisitor for Collector {
+                fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+                    self.rows.push((key.to_vec(), value.to_vec()));
+                    true
+                }
+            }
+
+            let forward_rows = txn.scan_range(b"data:x:", b"data:x;", None).await.unwrap();
+            let mut forward = Collector { rows: Vec::new() };
+            let forward_visited = txn
+                .scan_range_for_each(b"data:x:", b"data:x;", None, &mut forward)
+                .await
+                .unwrap();
+            assert_eq!(forward_visited, forward_rows.len());
+            assert_eq!(forward.rows, forward_rows);
+
+            let reverse_rows = txn
+                .scan_range_reverse(b"data:x:", b"data:x;", Some(2))
+                .await
+                .unwrap();
+            let mut reverse = Collector { rows: Vec::new() };
+            let reverse_visited = txn
+                .scan_range_reverse_for_each(b"data:x:", b"data:x;", Some(2), &mut reverse)
+                .await
+                .unwrap();
+            assert_eq!(reverse_visited, reverse_rows.len());
+            assert_eq!(reverse.rows, reverse_rows);
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_snapshot_flush_writes_sql_zone_map_metadata() {
+        let (storage, data_dir) = test_fusion_storage("zone_map_flush_metadata").await;
+        let schema = zone_map_test_schema();
+        let schema_bytes = bincode::serialize(&schema).unwrap();
+        let row_one = crate::common::encoding::RowEncoder::encode(&[
+            crate::common::Value::Integer(1),
+            crate::common::Value::Integer(7),
+        ]);
+        let row_two = crate::common::encoding::RowEncoder::encode(&[
+            crate::common::Value::Integer(2),
+            crate::common::Value::Integer(9),
+        ]);
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"schema:metrics", &schema_bytes).await.unwrap();
+            txn.put(b"data:metrics:001", &row_one).await.unwrap();
+            txn.put(b"data:metrics:002", &row_two).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        storage.create_snapshot_now().await.unwrap();
+
+        let sstable = storage
+            .sstables
+            .read()
+            .unwrap()
+            .last()
+            .expect("snapshot should register an SSTable")
+            .clone();
+        assert_eq!(sstable.meta.format_version, 6);
+        let block_properties = sstable.current_block_properties();
+        let maps = block_properties
+            .iter()
+            .flat_map(|property| property.sql_zone_maps.iter())
+            .collect::<Vec<_>>();
+        let bucket = maps
+            .iter()
+            .find(|map| map.column_name == "bucket")
+            .expect("bucket zone map should be produced");
+        assert_eq!(bucket.table_prefix, b"data:metrics:".to_vec());
+        assert_eq!(bucket.min_scalar, 7);
+        assert_eq!(bucket.max_scalar, 9);
+        assert_eq!(bucket.put_count, 2);
+        assert_eq!(bucket.tombstone_count, 0);
+        assert!(bucket.bounds_valid);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_forward_scan_skips_approved_sql_zone_map_blocks() {
+        let (storage, data_dir) = test_fusion_storage("zone_map_approved_skip").await;
+        let schema = zone_map_test_schema();
+        let schema_bytes = bincode::serialize(&schema).unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"schema:metrics", &schema_bytes).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        put_metric_rows(&storage, 512, 7).await;
+        storage.create_snapshot_now().await.unwrap();
+
+        let plan = bucket_eq_zone_map_plan(&schema, 999);
+        let scan_start = first_fully_data_zone_map_block_start(&storage);
+        assert_eq!(
+            FusionTransaction::sql_zone_map_table_prefix_for_range(
+                &plan,
+                &scan_start,
+                b"data:metrics;",
+            ),
+            Some(b"data:metrics:".to_vec())
+        );
+
+        let check_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_check_count
+            .load(Ordering::Relaxed);
+        let positive_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_positive_count
+            .load(Ordering::Relaxed);
+        let skip_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_skip_count
+            .load(Ordering::Relaxed);
+        let fail_open_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_fail_open_count
+            .load(Ordering::Relaxed);
+
+        let rows = {
+            let txn = storage.begin_transaction().await.unwrap();
+            txn.scan_range_with_options(
+                &scan_start,
+                b"data:metrics;",
+                None,
+                StorageScanOptions::no_fill_cache()
+                    .with_sql_block_zone_map_pruning_plan(Arc::new(plan)),
+            )
+            .await
+            .unwrap()
+        };
+
+        let check_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_check_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(check_before);
+        let positive_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_positive_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(positive_before);
+        let skip_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_skip_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(skip_before);
+        let fail_open_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_fail_open_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(fail_open_before);
+        assert!(
+            rows.is_empty(),
+            "no row can match bucket = 999; rows={}, check_delta={}, skip_delta={}, positive_delta={}, fail_open_delta={}",
+            rows.len(),
+            check_delta,
+            skip_delta,
+            positive_delta,
+            fail_open_delta
+        );
+        assert!(
+            skip_delta > 0,
+            "zone map should approve at least one block skip"
+        );
+        assert_eq!(
+            check_delta,
+            positive_delta + skip_delta + fail_open_delta,
+            "each checked zone-map block should have exactly one outcome"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_sql_zone_map_skip_fails_open_on_overlapping_newer_sstable() {
+        let (storage, data_dir) = test_fusion_storage("zone_map_mvcc_overlap_fail_open").await;
+        let schema = zone_map_test_schema();
+        let schema_bytes = bincode::serialize(&schema).unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"schema:metrics", &schema_bytes).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        put_metric_rows(&storage, 512, 7).await;
+        storage.create_snapshot_now().await.unwrap();
+
+        put_metric_rows(&storage, 512, 9).await;
+        storage.create_snapshot_now().await.unwrap();
+
+        let scan_start = first_fully_data_zone_map_block_start(&storage);
+        let mvcc_fail_open_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_overlap_fail_open_count
+            .load(Ordering::Relaxed);
+        let mvcc_boundary_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_boundary_split_fail_open_count
+            .load(Ordering::Relaxed);
+        let mvcc_write_buffer_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count
+            .load(Ordering::Relaxed);
+        let mvcc_memtable_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count
+            .load(Ordering::Relaxed);
+        let mvcc_sstable_before = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count
+            .load(Ordering::Relaxed);
+        let rows = {
+            let txn = storage.begin_transaction().await.unwrap();
+            txn.scan_range_with_options(
+                &scan_start,
+                b"data:metrics;",
+                None,
+                StorageScanOptions::no_fill_cache().with_sql_block_zone_map_pruning_plan(Arc::new(
+                    bucket_eq_zone_map_plan(&schema, 7),
+                )),
+            )
+            .await
+            .unwrap()
+        };
+
+        assert!(!rows.is_empty(), "scan range should include newer rows");
+        for (key, value) in &rows {
+            let id = std::str::from_utf8(
+                key.strip_prefix(b"data:metrics:")
+                    .expect("test key should use metrics prefix"),
+            )
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+            assert_eq!(
+                value,
+                &metric_row(id, 9),
+                "overlapping newer SSTable must be read, not skipped by a no-match zone map"
+            );
+        }
+        let mvcc_fail_open_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_overlap_fail_open_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(mvcc_fail_open_before);
+        let mvcc_boundary_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_boundary_split_fail_open_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(mvcc_boundary_before);
+        let mvcc_write_buffer_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_write_buffer_overlap_fail_open_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(mvcc_write_buffer_before);
+        let mvcc_memtable_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_memtable_overlap_fail_open_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(mvcc_memtable_before);
+        let mvcc_sstable_delta = crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_mvcc_sstable_overlap_fail_open_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(mvcc_sstable_before);
+        assert!(
+            mvcc_fail_open_delta > 0,
+            "overlapping SSTables should force zone-map fail-open"
+        );
+        assert!(
+            mvcc_sstable_delta > 0,
+            "overlapping SSTables should be attributed to the SSTable-overlap reason"
+        );
+        assert_eq!(
+            mvcc_fail_open_delta,
+            mvcc_boundary_delta
+                + mvcc_write_buffer_delta
+                + mvcc_memtable_delta
+                + mvcc_sstable_delta,
+            "MVCC reason counters should account for every MVCC fail-open"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_compaction_recomputes_sql_zone_maps_with_tombstones() {
+        let (storage, data_dir) = test_fusion_storage("zone_map_compaction_metadata").await;
+        let schema = zone_map_test_schema();
+        let schema_bytes = bincode::serialize(&schema).unwrap();
+        let row_old = crate::common::encoding::RowEncoder::encode(&[
+            crate::common::Value::Integer(1),
+            crate::common::Value::Integer(7),
+        ]);
+        let row_new = crate::common::encoding::RowEncoder::encode(&[
+            crate::common::Value::Integer(1),
+            crate::common::Value::Integer(9),
+        ]);
+        let row_filler = crate::common::encoding::RowEncoder::encode(&[
+            crate::common::Value::Integer(3),
+            crate::common::Value::Integer(5),
+        ]);
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"schema:metrics", &schema_bytes).await.unwrap();
+            txn.put(b"data:metrics:001", &row_old).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:metrics:001", &row_new).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.delete(b"data:metrics:002").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:metrics:003", &row_filler).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        assert_eq!(storage.sstables.read().unwrap().len(), COMPACTION_FANIN);
+        assert!(storage.compact_once().await.unwrap());
+
+        let output = storage
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .max_by_key(|sstable| sstable.id)
+            .expect("compaction should install an output SSTable")
+            .clone();
+        assert_eq!(output.meta.format_version, 6);
+        let block_properties = output.current_block_properties();
+        let maps = block_properties
+            .iter()
+            .flat_map(|property| property.sql_zone_maps.iter())
+            .collect::<Vec<_>>();
+        let bucket = maps
+            .iter()
+            .find(|map| map.column_name == "bucket")
+            .expect("bucket zone map should be produced after compaction");
+        assert_eq!(bucket.table_prefix, b"data:metrics:".to_vec());
+        assert_eq!(bucket.min_scalar, 5);
+        assert_eq!(bucket.max_scalar, 9);
+        assert_eq!(bucket.row_count, 3);
+        assert_eq!(bucket.put_count, 2);
+        assert_eq!(bucket.tombstone_count, 1);
+        assert_eq!(bucket.non_null_count, 2);
+        assert_eq!(bucket.null_count, 0);
+        assert!(bucket.bounds_valid);
+
+        let txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(txn.get(b"data:metrics:001").await.unwrap(), Some(row_new));
+        assert_eq!(txn.get(b"data:metrics:002").await.unwrap(), None);
+        assert_eq!(
+            txn.get(b"data:metrics:003").await.unwrap(),
+            Some(row_filler)
+        );
 
         cleanup_storage_dir(&data_dir);
     }
@@ -2763,6 +6929,450 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fusion_reopen_persists_sstable_timestamp_cache() {
+        let data_dir = unique_storage_dir("reopen_ts_cache");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let cache_path = sstable_timestamp_cache_path(&config.sstable_path());
+        let descriptor_cache_path = sstable_descriptor_cache_path(&config.sstable_path());
+
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        for (key, value) in [
+            (b"data:restore_cache:z".as_slice(), b"one".as_slice()),
+            (b"data:restore_cache:a".as_slice(), b"two".as_slice()),
+            (b"data:restore_cache:m".as_slice(), b"three".as_slice()),
+        ] {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(key, value).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        let persisted_ts = storage.current_ts.load(Ordering::SeqCst);
+        storage.create_snapshot_now().await.unwrap();
+        assert!(
+            cache_path.exists(),
+            "flush should persist timestamp cache before the next reopen"
+        );
+        assert!(
+            descriptor_cache_path.exists(),
+            "flush should persist descriptor cache before the next reopen"
+        );
+        let cache = SstableTimestampCache::load(&cache_path);
+        let cached_max_ts = cache.entries.values().map(|entry| entry.max_ts).max();
+        assert_eq!(cached_max_ts, Some(persisted_ts));
+        let descriptor_cache = SstableDescriptorCache::load(&descriptor_cache_path);
+        let sstable = storage.sstables.read().unwrap()[0].clone();
+        let fingerprint = sstable_timestamp_fingerprint(&sstable.path).unwrap();
+        let descriptor = descriptor_cache
+            .descriptor_for(sstable.id, &fingerprint)
+            .expect("descriptor cache should contain flushed SSTable");
+        assert_eq!(descriptor.first_key, sstable.meta.first_key);
+        assert_eq!(descriptor.last_key, sstable.meta.last_key);
+        assert_eq!(descriptor.format_version, sstable.meta.format_version);
+
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        assert_eq!(reopened.current_ts.load(Ordering::SeqCst), persisted_ts);
+        assert!(cache_path.exists(), "reopen should persist timestamp cache");
+        assert!(
+            descriptor_cache_path.exists(),
+            "reopen should persist descriptor cache"
+        );
+
+        let reopened_again = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened_again.current_ts.load(Ordering::SeqCst),
+            persisted_ts
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_reopen_uses_manifest_live_sstable_list() {
+        let data_dir = unique_storage_dir("reopen_manifest_live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let sstable_dir = config.sstable_path();
+
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:manifest:live", b"value").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+        assert!(sstable_manifest_current_path(&sstable_dir).exists());
+        assert!(sstable_manifest_path(&sstable_dir).exists());
+        let manifest_replay = manifest_log::replay_current_manifest(&sstable_dir).unwrap();
+
+        let live_ids = storage
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|sstable| sstable.id)
+            .collect::<Vec<_>>();
+        assert_eq!(live_ids.len(), 1);
+        assert_eq!(
+            manifest_replay
+                .edit_replay
+                .state
+                .files
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            live_ids,
+            "new SSTable manifests should be written through manifest v2 replayable records"
+        );
+        let orphan_id = 9_999;
+        let source_path = sstable_dir.join(sstable_file_name_for_id(live_ids[0]));
+        let orphan_path = sstable_dir.join(sstable_file_name_for_id(orphan_id));
+        std::fs::copy(&source_path, &orphan_path).unwrap();
+        assert!(orphan_path.exists());
+        let descriptor_cache_path = sstable_descriptor_cache_path(&sstable_dir);
+        assert!(descriptor_cache_path.exists());
+        drop(storage);
+        std::fs::remove_file(&descriptor_cache_path).unwrap();
+        let manifest_live_files = SstableManifest::load_live_files(&sstable_dir).unwrap();
+        assert_eq!(
+            manifest_live_files
+                .iter()
+                .map(|file| file.id)
+                .collect::<Vec<_>>(),
+            live_ids
+        );
+        assert!(
+            manifest_live_files
+                .iter()
+                .all(|file| file.descriptor.is_some()),
+            "v2 manifest should carry startup descriptors without the derived descriptor cache"
+        );
+
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        let reopened_ids = reopened
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|sstable| sstable.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reopened_ids, live_ids,
+            "valid manifest should ignore orphan SSTables that are not listed"
+        );
+
+        let txn = reopened.begin_transaction().await.unwrap();
+        assert_eq!(
+            txn.get(b"data:manifest:live").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_flush_appends_manifest_version_edits_to_existing_manifest() {
+        let data_dir = unique_storage_dir("append_manifest_flush");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let sstable_dir = config.sstable_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        for batch in 0..3 {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            for id in 0..16 {
+                let key = format!("data:manifest_append:{batch}:{id:02}");
+                txn.put(key.as_bytes(), b"value").await.unwrap();
+            }
+            txn.commit().await.unwrap();
+            storage.create_snapshot_now().await.unwrap();
+        }
+
+        let current = manifest_log::read_current_file(&sstable_dir).unwrap();
+        assert_eq!(current.file_number, 1);
+        assert!(!manifest_log::manifest_path(&sstable_dir, 2).exists());
+
+        let replay = manifest_log::replay_current_manifest(&sstable_dir).unwrap();
+        assert!(matches!(
+            replay.edit_replay.edits.first(),
+            Some(ManifestEdit::Snapshot { .. })
+        ));
+        let version_edit_count = replay
+            .edit_replay
+            .edits
+            .iter()
+            .filter(|edit| matches!(edit, ManifestEdit::VersionEdit { .. }))
+            .count();
+        assert_eq!(version_edit_count, 2);
+        let live_ids = storage
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|sstable| sstable.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replay
+                .edit_replay
+                .state
+                .files
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            live_ids
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_reopen_accepts_legacy_json_sstable_manifest() {
+        let data_dir = unique_storage_dir("legacy_json_manifest");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let sstable_dir = config.sstable_path();
+
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:manifest:legacy", b"value").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let live_sstables = storage.sstables.read().unwrap().clone();
+        let legacy_manifest = SstableManifest::from_sstables(&live_sstables).unwrap();
+        std::fs::write(
+            sstable_manifest_path(&sstable_dir),
+            serde_json::to_vec_pretty(&legacy_manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            sstable_manifest_current_path(&sstable_dir),
+            format!("{SSTABLE_MANIFEST_FILE}\n"),
+        )
+        .unwrap();
+
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        let txn = reopened.begin_transaction().await.unwrap();
+        assert_eq!(
+            txn.get(b"data:manifest:legacy").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        drop(txn);
+
+        {
+            let mut txn = reopened.begin_transaction().await.unwrap();
+            txn.put(b"data:manifest:legacy:next", b"value")
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+        reopened.create_snapshot_now().await.unwrap();
+        let current = manifest_log::read_current_file(&sstable_dir).unwrap();
+        assert_eq!(current.file_number, 2);
+        let replay = manifest_log::replay_current_manifest(&sstable_dir).unwrap();
+        assert!(matches!(
+            replay.edit_replay.edits.first(),
+            Some(ManifestEdit::Snapshot { .. })
+        ));
+        assert_eq!(
+            replay
+                .edit_replay
+                .state
+                .files
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            reopened
+                .sstables
+                .read()
+                .unwrap()
+                .iter()
+                .map(|sstable| sstable.id)
+                .collect::<Vec<_>>()
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_compaction_updates_manifest_live_sstable_list() {
+        let data_dir = unique_storage_dir("compaction_manifest_live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let sstable_dir = config.sstable_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        for batch in 0..4 {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            for id in 0..16 {
+                let key = format!("data:manifest_compact:{batch}:{id:02}");
+                txn.put(key.as_bytes(), b"value").await.unwrap();
+            }
+            txn.commit().await.unwrap();
+            storage.create_snapshot_now().await.unwrap();
+        }
+
+        let old_ids = storage
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|sstable| sstable.id)
+            .collect::<Vec<_>>();
+        assert_eq!(old_ids.len(), COMPACTION_FANIN);
+        let version_edits_before_compaction = manifest_log::replay_current_manifest(&sstable_dir)
+            .unwrap()
+            .edit_replay
+            .edits
+            .iter()
+            .filter(|edit| matches!(edit, ManifestEdit::VersionEdit { .. }))
+            .count();
+        assert!(storage.compact_once().await.unwrap());
+
+        let live_ids = storage
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|sstable| sstable.id)
+            .collect::<Vec<_>>();
+        let manifest_ids = SstableManifest::load_live_files(&sstable_dir)
+            .expect("manifest should remain valid after compaction")
+            .into_iter()
+            .map(|file| file.id)
+            .collect::<Vec<_>>();
+        assert_eq!(manifest_ids, live_ids);
+        let current_manifest = manifest_log::read_current_file(&sstable_dir).unwrap();
+        assert_eq!(
+            current_manifest.file_number, 1,
+            "normal flush and compaction should append VersionEdit records to the current MANIFEST"
+        );
+        let replay = manifest_log::replay_current_manifest(&sstable_dir).unwrap();
+        let version_edit_count = replay
+            .edit_replay
+            .edits
+            .iter()
+            .filter(|edit| matches!(edit, ManifestEdit::VersionEdit { .. }))
+            .count();
+        assert_eq!(version_edit_count, version_edits_before_compaction + 1);
+        let replay_ids = replay
+            .edit_replay
+            .state
+            .files
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(replay_ids, live_ids);
+        for old_id in old_ids {
+            assert!(
+                !manifest_ids.contains(&old_id),
+                "compaction manifest should not list obsolete SSTable {old_id}"
+            );
+        }
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_reopen_fails_when_manifest_references_missing_sstable() {
+        let data_dir = unique_storage_dir("manifest_missing_sstable");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:manifest:missing", b"value").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+        let sstable_path = storage.sstables.read().unwrap()[0].path.clone();
+        std::fs::remove_file(&sstable_path).unwrap();
+
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config).await;
+        assert!(
+            reopened.is_err(),
+            "manifest-referenced SSTable loss must not silently fall back to directory scan"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_reopen_returns_error_for_corrupt_wal() {
+        let data_dir = unique_storage_dir("corrupt_wal_startup");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        std::fs::write(&wal_path, [255u8]).unwrap();
+
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config).await;
+        assert!(
+            reopened.is_err(),
+            "corrupt WAL must return a startup error instead of panicking or recovering silently"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_shutdown_does_not_create_empty_sstable() {
+        let data_dir = unique_storage_dir("shutdown_empty_sstable");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        storage.shutdown().await;
+
+        let sstable_count = std::fs::read_dir(config.sstable_path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sst"))
+            .count();
+        assert_eq!(sstable_count, 0);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
     async fn fusion_get_uses_latest_mvcc_timestamp_after_compaction() {
         let data_dir = unique_storage_dir("get_after_compaction");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -2801,6 +7411,100 @@ mod tests {
         assert_eq!(
             txn.get(b"data:compact_get:001").await.unwrap(),
             Some(b"new".to_vec())
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_compaction_preserves_versions_visible_to_existing_snapshot() {
+        let data_dir = unique_storage_dir("snapshot_reads_after_compaction");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:compact_snapshot:001", b"old").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let long_txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(
+            long_txn.get(b"data:compact_snapshot:001").await.unwrap(),
+            Some(b"old".to_vec())
+        );
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:compact_snapshot:001", b"new").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        for id in 0..2 {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            let key = format!("data:compact_snapshot:filler:{id}");
+            txn.put(key.as_bytes(), b"filler").await.unwrap();
+            txn.commit().await.unwrap();
+            storage.create_snapshot_now().await.unwrap();
+        }
+
+        assert!(
+            storage.sstables.read().unwrap().len() >= COMPACTION_FANIN,
+            "test setup should create enough SSTables to trigger compaction"
+        );
+        assert!(storage.compact_once().await.unwrap());
+
+        let fresh_txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(
+            fresh_txn.get(b"data:compact_snapshot:001").await.unwrap(),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(
+            long_txn.get(b"data:compact_snapshot:001").await.unwrap(),
+            Some(b"old".to_vec()),
+            "compaction must not drop versions that remain visible to an existing transaction"
+        );
+
+        drop(fresh_txn);
+        drop(long_txn);
+
+        let dropped_before = crate::monitor::GLOBAL_METRICS
+            .compaction_dropped_version_count
+            .load(Ordering::Relaxed);
+        for id in 2..5 {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            let key = format!("data:compact_snapshot:filler:{id}");
+            txn.put(key.as_bytes(), b"filler").await.unwrap();
+            txn.commit().await.unwrap();
+            storage.create_snapshot_now().await.unwrap();
+        }
+        assert!(storage.compact_once().await.unwrap());
+        let dropped_delta = crate::monitor::GLOBAL_METRICS
+            .compaction_dropped_version_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(dropped_before);
+        assert!(
+            dropped_delta >= 1,
+            "after active readers release, compaction should safely drop obsolete versions"
+        );
+
+        let stale_txn = FusionTransaction {
+            storage: storage.clone(),
+            write_buffer: transaction_write_buffer(),
+            read_ts: 1,
+            read_ts_registered: false,
+        };
+        assert_eq!(
+            stale_txn.get(b"data:compact_snapshot:001").await.unwrap(),
+            None,
+            "old versions should be eligible for GC after no transaction can read them"
         );
 
         cleanup_storage_dir(&data_dir);
@@ -2864,7 +7568,7 @@ mod tests {
             );
         }
         storage.immutable_memtables.write().unwrap().push(base);
-        storage.flush_all_immutable_memtables().await;
+        storage.flush_all_immutable_memtables().await.unwrap();
 
         // Overwrites (ts=2) and one tombstone in the active memtable — exercises MVCC dedup that must
         // resolve identically regardless of which sub-range a key falls into.
@@ -2898,6 +7602,44 @@ mod tests {
             serial.len(),
             (n as usize) - 1,
             "one id was tombstoned at ts=2"
+        );
+
+        struct Collector {
+            rows: Vec<(Vec<u8>, Vec<u8>)>,
+            stop_after: Option<usize>,
+        }
+
+        impl ScanVisitor for Collector {
+            fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+                self.rows.push((key.to_vec(), value.to_vec()));
+                self.stop_after
+                    .map_or(true, |limit| self.rows.len() < limit)
+            }
+        }
+
+        let mut collector = Collector {
+            rows: Vec::new(),
+            stop_after: None,
+        };
+        let visited = txn
+            .scan_prefix_parallel_for_each(prefix, None, &mut collector)
+            .await
+            .unwrap();
+        assert_eq!(visited, Some(serial.len()));
+        assert_eq!(collector.rows, serial);
+
+        let mut early_stop = Collector {
+            rows: Vec::new(),
+            stop_after: Some(5),
+        };
+        let visited = txn
+            .scan_prefix_parallel_for_each(prefix, None, &mut early_stop)
+            .await
+            .unwrap();
+        assert_eq!(visited, Some(5));
+        assert_eq!(
+            early_stop.rows,
+            serial.iter().take(5).cloned().collect::<Vec<_>>()
         );
 
         cleanup_storage_dir(&data_dir);
@@ -3008,8 +7750,8 @@ mod tests {
     }
 
     #[test]
-    fn sstable_file_candidate_buffer_preallocates_first_file() {
-        let files = sstable_file_candidate_buffer();
+    fn sstable_live_file_buffer_preallocates_first_file() {
+        let files = sstable_live_file_buffer();
         assert!(files.capacity() >= 1);
     }
 

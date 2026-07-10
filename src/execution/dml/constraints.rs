@@ -1,6 +1,7 @@
 use crate::common::{Result, Value};
-use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
+use sqlparser::ast::Expr;
 
+use super::super::expr::SqlTruth;
 use super::super::Executor;
 
 const CHECK_KEYWORD: &[u8] = b"CHECK";
@@ -31,61 +32,11 @@ impl Executor {
         row: &[Value],
         schema: &crate::catalog::TableSchema,
     ) -> Result<Option<bool>> {
-        match expr {
-            Expr::Nested(inner) => self.evaluate_check_truth(inner, row, schema),
-            Expr::UnaryOp {
-                op: UnaryOperator::Not,
-                expr,
-            } => Ok(self
-                .evaluate_check_truth(expr, row, schema)?
-                .map(|value| !value)),
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::And,
-                right,
-            } => {
-                let left = self.evaluate_check_truth(left, row, schema)?;
-                let right = self.evaluate_check_truth(right, row, schema)?;
-                Ok(match (left, right) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                })
-            }
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::Or,
-                right,
-            } => {
-                let left = self.evaluate_check_truth(left, row, schema)?;
-                let right = self.evaluate_check_truth(right, row, schema)?;
-                Ok(match (left, right) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                })
-            }
-            Expr::BinaryOp { left, op, right }
-                if matches!(
-                    op,
-                    BinaryOperator::Eq
-                        | BinaryOperator::NotEq
-                        | BinaryOperator::Gt
-                        | BinaryOperator::Lt
-                        | BinaryOperator::GtEq
-                        | BinaryOperator::LtEq
-                ) =>
-            {
-                let left_val = self.evaluate_value(left, row, schema, &[])?;
-                let right_val = self.evaluate_value(right, row, schema, &[])?;
-                if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
-                    Ok(None)
-                } else {
-                    self.evaluate_expr(expr, row, schema, &[]).map(Some)
-                }
-            }
-            _ => self.evaluate_expr(expr, row, schema, &[]).map(Some),
-        }
+        Ok(match self.evaluate_expr_truth(expr, row, schema, &[])? {
+            SqlTruth::True => Some(true),
+            SqlTruth::False => Some(false),
+            SqlTruth::Unknown => None,
+        })
     }
 
     pub(super) fn evaluate_check_constraint(

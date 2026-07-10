@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     }
 
     // 1. Load Config
-    let config = Config::load(CONFIG_PATH);
+    let config = Config::try_load(CONFIG_PATH)?;
     println!("FusionDB v{} starting...", env!("CARGO_PKG_VERSION"));
     println!(
         "  HTTP:    {}:{}",
@@ -89,13 +89,11 @@ async fn main() -> Result<()> {
     ));
 
     // 5. Start Servers (returns shutdown handle)
-    let shutdown_tx = server::start_server(executor, storage, &config).await;
+    let shutdown_tx = server::start_server(executor, storage, &config).await?;
 
     // 6. Wait for Ctrl+C
     println!("Press Ctrl+C to shut down...");
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for Ctrl+C");
+    wait_for_shutdown_signal().await?;
 
     // 7. Graceful Shutdown
     println!("\nReceived shutdown signal.");
@@ -104,4 +102,21 @@ async fn main() -> Result<()> {
     fusion.shutdown().await;
 
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }

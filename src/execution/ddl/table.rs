@@ -139,7 +139,45 @@ fn table_row_id_suffix(row_id: &str) -> String {
     suffix
 }
 
+fn sql_identifier_name(ident: &sqlparser::ast::Ident) -> String {
+    ident.value.clone()
+}
+
 impl Executor {
+    async fn column_has_btree_index_dependency(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<bool> {
+        let entries = txn.scan_prefix(b"index_meta:", None).await?;
+        for (key, value) in entries {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            let Some(index_name) = key_str.strip_prefix("index_meta:") else {
+                continue;
+            };
+            let meta_str = String::from_utf8(value).unwrap_or_default();
+            let Some(index) = Self::parse_index_meta(index_name, &meta_str) else {
+                continue;
+            };
+            if index.table != table_name {
+                continue;
+            }
+            if index
+                .columns
+                .iter()
+                .chain(index.include_columns.iter())
+                .any(|column| column.eq_ignore_ascii_case(column_name))
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     pub(crate) async fn handle_create_table(
         &self,
         name: &sqlparser::ast::ObjectName,
@@ -167,7 +205,7 @@ impl Executor {
         let table_primary_key = Self::extract_table_primary_key(columns, constraints)?;
         let mut cols = Vec::with_capacity(columns.len());
         for c in columns {
-            let col_name = c.name.to_string();
+            let col_name = sql_identifier_name(&c.name);
             let column_primary = c
                 .options
                 .iter()
@@ -454,6 +492,8 @@ impl Executor {
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
             }
+            self.delete_index_count_summaries_for_table(&table_name, txn)
+                .await?;
             self.delete_index_meta_for_table(&table_name, txn).await?;
             self.delete_foreign_keys_for_table(&table_name, txn).await?;
 
@@ -474,12 +514,12 @@ impl Executor {
         for target in table_names {
             let table_name = target.name.to_string();
             let schema_key = table_schema_key_for_table(&table_name);
-            if txn.get(schema_key.as_bytes()).await?.is_none() {
-                return Err(FusionError::Execution(format!(
-                    "Table {} does not exist",
-                    table_name
-                )));
-            }
+            let schema_bytes = txn.get(schema_key.as_bytes()).await?.ok_or_else(|| {
+                FusionError::Execution(format!("Table {} does not exist", table_name))
+            })?;
+            let schema: TableSchema = bincode::deserialize(&schema_bytes).map_err(|e| {
+                FusionError::Execution(format!("Schema deserialization error: {}", e))
+            })?;
 
             let kv_pairs = self
                 .scan_routed_data_prefixes_for_table(&table_name, txn, None)
@@ -501,6 +541,20 @@ impl Executor {
             index_entries.append(&mut fts_entries);
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
+            }
+            self.delete_index_count_summaries_for_table(&table_name, txn)
+                .await?;
+            let empty_counts = std::collections::HashMap::new();
+            for column in &schema.columns {
+                if Self::index_count_summary_maintained_for_column(column) {
+                    self.replace_index_count_summary_for_column(
+                        &table_name,
+                        &column.name,
+                        &empty_counts,
+                        txn,
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -529,7 +583,7 @@ impl Executor {
         for op in operations {
             match op {
                 sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
-                    let col_name = column_def.name.to_string();
+                    let col_name = sql_identifier_name(&column_def.name);
                     if schema.columns.iter().any(|c| c.name == col_name) {
                         return Err(FusionError::Execution(format!(
                             "Column {} already exists in table {}",
@@ -563,7 +617,7 @@ impl Executor {
                     ..
                 } => {
                     for column_ident in column_names {
-                        let col_name = column_ident.to_string();
+                        let col_name = sql_identifier_name(column_ident);
                         let col_idx = schema.columns.iter().position(|c| c.name == col_name);
                         match col_idx {
                             Some(idx) => {
@@ -572,17 +626,12 @@ impl Executor {
                                         "Cannot drop PRIMARY KEY column".to_string(),
                                     ));
                                 }
-                                let affected_indexes = self
-                                    .load_composite_indexes_for_table(&table_name, txn)
-                                    .await?;
-                                if affected_indexes.iter().any(|index| {
-                                    index
-                                        .columns
-                                        .iter()
-                                        .any(|column| column.eq_ignore_ascii_case(&col_name))
-                                }) {
+                                if self
+                                    .column_has_btree_index_dependency(&table_name, &col_name, txn)
+                                    .await?
+                                {
                                     return Err(FusionError::Execution(format!(
-                                        "Cannot drop column {} because a composite index depends on it",
+                                        "Cannot drop column {} because a BTree index depends on it",
                                         col_name
                                     )));
                                 }
@@ -659,22 +708,17 @@ impl Executor {
                     new_column_name,
                     ..
                 } => {
-                    let old_name = old_column_name.to_string();
-                    let new_name = new_column_name.to_string();
+                    let old_name = sql_identifier_name(old_column_name);
+                    let new_name = sql_identifier_name(new_column_name);
                     let col = schema.columns.iter_mut().find(|c| c.name == old_name);
                     match col {
                         Some(c) => {
-                            let affected_indexes = self
-                                .load_composite_indexes_for_table(&table_name, txn)
-                                .await?;
-                            if affected_indexes.iter().any(|index| {
-                                index
-                                    .columns
-                                    .iter()
-                                    .any(|column| column.eq_ignore_ascii_case(&old_name))
-                            }) {
+                            if self
+                                .column_has_btree_index_dependency(&table_name, &old_name, txn)
+                                .await?
+                            {
                                 return Err(FusionError::Execution(format!(
-                                    "Cannot rename column {} because a composite index depends on it",
+                                    "Cannot rename column {} because a BTree index depends on it",
                                     old_name
                                 )));
                             }

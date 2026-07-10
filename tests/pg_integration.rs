@@ -235,6 +235,22 @@ async fn test_pg_grouped_aggregate_cache_consistent_and_invalidated_by_writes() 
 
     // Autocommit grouped aggregate over the 458-cached path; simple_query returns text columns.
     let q = "SELECT grp, COUNT(*) FROM gc GROUP BY grp ORDER BY grp";
+    let metrics = &fusiondb::monitor::GLOBAL_METRICS;
+    let query_count_before = metrics.query_count.load(Ordering::Relaxed);
+    let eligible_before = metrics
+        .query_result_cache_eligible_count
+        .load(Ordering::Relaxed);
+    let hit_before = metrics.query_result_cache_hit_count.load(Ordering::Relaxed);
+    let miss_before = metrics
+        .query_result_cache_miss_count
+        .load(Ordering::Relaxed);
+    let insert_before = metrics
+        .query_result_cache_insert_count
+        .load(Ordering::Relaxed);
+    let invalidation_before = metrics
+        .query_result_cache_invalidation_count
+        .load(Ordering::Relaxed);
+
     async fn run(client: &tokio_postgres::Client, q: &str) -> Vec<(String, f64)> {
         let msgs = client.simple_query(q).await.expect("group query");
         let mut out = Vec::new();
@@ -274,6 +290,54 @@ async fn test_pg_grouped_aggregate_cache_consistent_and_invalidated_by_writes() 
         Some(3.0),
         "post-write grouped query must reflect the insert (cache not stale): {:?}",
         r3
+    );
+    let query_count_delta = metrics
+        .query_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(query_count_before);
+    let eligible_delta = metrics
+        .query_result_cache_eligible_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(eligible_before);
+    let hit_delta = metrics
+        .query_result_cache_hit_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(hit_before);
+    let miss_delta = metrics
+        .query_result_cache_miss_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(miss_before);
+    let insert_delta = metrics
+        .query_result_cache_insert_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(insert_before);
+    let invalidation_delta = metrics
+        .query_result_cache_invalidation_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(invalidation_before);
+    assert!(
+        query_count_delta >= 4,
+        "three pgwire reads plus the write should be counted as queries, got {query_count_delta}"
+    );
+    assert!(
+        eligible_delta >= 3,
+        "pgwire grouped aggregate should enter query-result cache for all three reads, got {eligible_delta}"
+    );
+    assert!(
+        hit_delta >= 1,
+        "second pgwire grouped aggregate read should hit query-result cache, got {hit_delta}"
+    );
+    assert!(
+        miss_delta >= 2,
+        "initial and post-write pgwire grouped aggregate reads should miss cache, got {miss_delta}"
+    );
+    assert!(
+        insert_delta >= 2,
+        "initial and post-write pgwire grouped aggregate reads should insert cache entries, got {insert_delta}"
+    );
+    assert!(
+        invalidation_delta >= 1,
+        "pgwire write should invalidate query-result cache, got {invalidation_delta}"
     );
 
     let _ = std::fs::remove_file(&wal_path);

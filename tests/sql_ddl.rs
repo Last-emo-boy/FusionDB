@@ -129,6 +129,19 @@ async fn test_vacuum_rejects_table_specific_syntax() {
 }
 
 #[tokio::test]
+async fn test_unsupported_statement_returns_error() {
+    let (executor, wal) = setup().await;
+
+    let err = executor
+        .execute_sql("CREATE DATABASE unsupported_db")
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("Unsupported SQL statement"));
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_create_table_table_level_single_primary_key() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -374,6 +387,375 @@ async fn test_explain_commuted_btree_index_scan() {
 }
 
 #[tokio::test]
+async fn test_explain_order_by_secondary_btree_limit_index_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_order_idx (id INTEGER PRIMARY KEY, score INTEGER NOT NULL, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_explain_order_idx_score ON explain_order_idx (score)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, score FROM explain_order_idx ORDER BY score ASC LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using ordered secondary BTree"));
+        assert!(plan.contains("ORDER BY/LIMIT"));
+        assert!(plan.contains("score"));
+        assert!(plan.contains("ASC"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, score FROM explain_order_idx ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using ordered secondary BTree"));
+        assert!(plan.contains("ORDER BY/LIMIT"));
+        assert!(plan.contains("score"));
+        assert!(plan.contains("DESC"));
+    } else {
+        panic!("expected explain text");
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_order_by_composite_btree_limit_index_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_order_comp (
+            id INTEGER PRIMARY KEY,
+            host_id INTEGER NOT NULL,
+            ts INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_explain_order_comp_host_ts ON explain_order_comp (host_id, ts)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, ts FROM explain_order_comp
+         WHERE host_id = 1 AND ts >= 1000
+         ORDER BY ts ASC LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using ordered composite BTree"));
+        assert!(plan.contains("idx_explain_order_comp_host_ts"));
+        assert!(plan.contains("ORDER BY/LIMIT"));
+        assert!(plan.contains("rows <= 2"));
+        assert!(plan.contains("ts"));
+        assert!(plan.contains("ASC"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, ts FROM explain_order_comp
+         WHERE host_id = 1 AND ts >= 1000
+         ORDER BY ts DESC LIMIT 2",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using ordered composite BTree"));
+        assert!(plan.contains("idx_explain_order_comp_host_ts"));
+        assert!(plan.contains("ORDER BY/LIMIT"));
+        assert!(plan.contains("rows <= 2"));
+        assert!(plan.contains("DESC"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, ts FROM explain_order_comp
+         WHERE host_id = 1 AND ts >= 1000 AND payload = 'hot'
+         ORDER BY ts DESC LIMIT 2",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(!plan.contains("ordered composite BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_distinct_secondary_btree_index_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_distinct_idx (
+            id INTEGER PRIMARY KEY,
+            k INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_explain_distinct_idx_k ON explain_distinct_idx (k)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT DISTINCT k FROM explain_distinct_idx",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using distinct secondary BTree"));
+        assert!(plan.contains("DISTINCT loose key seek"));
+        assert!(plan.contains("k"));
+        assert!(!plan.contains("Access Path: Full Table Scan"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT COUNT(DISTINCT k) FROM explain_distinct_idx",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using distinct secondary BTree"));
+        assert!(plan.contains("COUNT DISTINCT loose key seek"));
+        assert!(plan.contains("k"));
+        assert!(!plan.contains("Access Path: Full Table Scan"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT DISTINCT payload FROM explain_distinct_idx",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Access Path: Full Table Scan"));
+        assert!(!plan.contains("distinct secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT DISTINCT k FROM explain_distinct_idx WHERE payload = 'x'",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Access Path: Full Table Scan"));
+        assert!(!plan.contains("distinct secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_group_by_secondary_btree_index_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_group_idx (
+            id INTEGER PRIMARY KEY,
+            k INTEGER NOT NULL,
+            nullable_k INTEGER,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_explain_group_idx_k ON explain_group_idx (k)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_explain_group_idx_nullable_k ON explain_group_idx (nullable_k)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT k, COUNT(*) FROM explain_group_idx GROUP BY k",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using group secondary BTree"));
+        assert!(plan.contains("GROUP BY COUNT summary index"));
+        assert!(plan.contains("k"));
+        assert!(!plan.contains("Access Path: Full Table Scan"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    exec_ok(
+        &executor,
+        "INSERT INTO explain_group_idx VALUES
+            (1, 1, 1, 'a'),
+            (2, 1, 1, 'b'),
+            (3, 2, 2, 'c')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE explain_group_idx COMPUTE STATISTICS",
+    )
+    .await;
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT k, COUNT(*) FROM explain_group_idx GROUP BY k",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using group secondary BTree"));
+        assert!(plan.contains("GROUP BY COUNT summary index"));
+        assert!(!plan.contains("Access Path: Full Table Scan"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT nullable_k, COUNT(*) FROM explain_group_idx GROUP BY nullable_k",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Access Path: Full Table Scan"));
+        assert!(!plan.contains("group secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT k, COUNT(*) FROM explain_group_idx WHERE payload = 'x' GROUP BY k",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Access Path: Full Table Scan"));
+        assert!(!plan.contains("group secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_order_by_secondary_btree_limit_nullable_fallback() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_order_nullable (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_explain_order_nullable_score ON explain_order_nullable (score)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id FROM explain_order_nullable ORDER BY score ASC LIMIT 2",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Full Table Scan"));
+        assert!(!plan.contains("ordered secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id FROM explain_order_nullable ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Full Table Scan"));
+        assert!(!plan.contains("ordered secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_order_by_secondary_btree_limit_alias_fallback() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_order_alias (id INTEGER PRIMARY KEY, score INTEGER NOT NULL)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_explain_order_alias_score ON explain_order_alias (score)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id AS score FROM explain_order_alias ORDER BY score ASC LIMIT 2",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Full Table Scan"));
+        assert!(!plan.contains("ordered secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id AS score FROM explain_order_alias ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Full Table Scan"));
+        assert!(!plan.contains("ordered secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_explain_commuted_primary_key_range_scan() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -384,6 +766,27 @@ async fn test_explain_commuted_primary_key_range_scan() {
     let (cols, rows) = query(
         &executor,
         "EXPLAIN SELECT * FROM explain_range_commuted WHERE 1 < id",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Primary Key Range Scan"));
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_explain_conjunctive_primary_key_range_scan() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_range_and (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT * FROM explain_range_and WHERE id >= 10 AND id < 20",
     )
     .await;
     assert_eq!(cols, vec!["EXPLAIN"]);
@@ -450,6 +853,75 @@ async fn test_explain_includes_analyze_statistics() {
 }
 
 #[tokio::test]
+async fn test_explain_analyze_includes_actual_rows_and_q_error() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE explain_analyze_stats (id INTEGER PRIMARY KEY, category TEXT, qty INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO explain_analyze_stats VALUES
+            (1, 'book', 5),
+            (2, 'book', 7),
+            (3, 'toy', NULL)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE explain_analyze_stats COMPUTE STATISTICS",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN ANALYZE SELECT id FROM explain_analyze_stats WHERE category = 'book' ORDER BY id",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN ANALYZE"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Planning Time: "));
+        assert!(plan.contains("Execution Time: "));
+        assert!(plan.contains("Actual Rows: 2"));
+        assert!(plan.contains("Estimate Rows: 2"));
+        assert!(plan.contains("Q-Error: 1.00"));
+        assert!(plan.contains("Plan:\nSELECT"));
+        assert!(plan.contains("Estimate: rows=2, cost="));
+    } else {
+        panic!("expected explain analyze text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN ANALYZE SELECT id FROM explain_analyze_stats WHERE category = 'book' ORDER BY id LIMIT 1",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Actual Rows: 1"));
+        assert!(plan.contains("Estimate Rows: 1"));
+        assert!(plan.contains("Q-Error: 1.00"));
+    } else {
+        panic!("expected explain analyze text");
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "EXPLAIN ANALYZE SELECT id FROM explain_analyze_stats WHERE category = 'missing'",
+    )
+    .await;
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Actual Rows: 0"));
+        assert!(plan.contains("Estimate Rows: 2"));
+        assert!(plan.contains("Q-Error: inf"));
+    } else {
+        panic!("expected explain analyze text");
+    }
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_explain_join_order_includes_analyze_estimates() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -510,6 +982,7 @@ async fn test_explain_join_order_includes_analyze_estimates() {
     if let Value::String(plan) = &rows[0][0] {
         assert!(plan.contains("Join Order:"));
         assert!(plan.contains("Join Estimate: rows="));
+        assert!(plan.contains("Join Estimate: rows=8"), "{plan}");
         let small = plan
             .find("explain_join_small(rows=1)")
             .expect("small table estimate missing");
@@ -522,6 +995,26 @@ async fn test_explain_join_order_includes_analyze_estimates() {
         assert!(small < mid && mid < big, "unexpected join order: {plan}");
     } else {
         panic!("expected explain text");
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN ANALYZE SELECT *
+           FROM explain_join_big, explain_join_mid, explain_join_small
+          WHERE explain_join_big.join_key = explain_join_mid.join_key
+            AND explain_join_mid.join_key = explain_join_small.join_key
+            AND explain_join_big.join_key = explain_join_small.join_key",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["EXPLAIN ANALYZE"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Actual Rows: 8"), "{plan}");
+        assert!(plan.contains("Estimate Rows: 8"), "{plan}");
+        assert!(plan.contains("Q-Error: 1.00"), "{plan}");
+    } else {
+        panic!("expected explain analyze text");
     }
     cleanup(&wal);
 }
@@ -658,6 +1151,7 @@ async fn test_explain_inner_join_chain_uses_analyze_estimates() {
     if let Value::String(plan) = &rows[0][0] {
         assert!(plan.contains("Join Order:"));
         assert!(plan.contains("Join Estimate: rows="));
+        assert!(plan.contains("Join Estimate: rows=8"), "{plan}");
         let small = plan
             .find("explain_inner_join_small(rows=1)")
             .expect("small table estimate missing");
@@ -727,6 +1221,49 @@ async fn test_alter_table_drop_column() {
     let (cols, rows) = query(&executor, "SELECT * FROM people").await;
     assert_eq!(cols, vec!["id", "name"]);
     assert_eq!(rows.len(), 2);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_alter_table_rejects_single_column_include_index_dependencies() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE include_deps (
+            id INTEGER PRIMARY KEY,
+            score INTEGER,
+            payload TEXT,
+            extra TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_include_deps_score ON include_deps (score) INCLUDE (payload)",
+    )
+    .await;
+
+    let drop_payload = executor
+        .execute_sql("ALTER TABLE include_deps DROP COLUMN payload")
+        .await;
+    assert!(drop_payload.is_err());
+    assert!(format!("{}", drop_payload.unwrap_err()).contains("BTree index"));
+
+    let drop_score = executor
+        .execute_sql("ALTER TABLE include_deps DROP COLUMN score")
+        .await;
+    assert!(drop_score.is_err());
+    assert!(format!("{}", drop_score.unwrap_err()).contains("BTree index"));
+
+    let rename_payload = executor
+        .execute_sql("ALTER TABLE include_deps RENAME COLUMN payload TO payload_new")
+        .await;
+    assert!(rename_payload.is_err());
+    assert!(format!("{}", rename_payload.unwrap_err()).contains("BTree index"));
+
+    exec_ok(&executor, "ALTER TABLE include_deps DROP COLUMN extra").await;
+    let (cols, _) = query(&executor, "SELECT * FROM include_deps").await;
+    assert_eq!(cols, vec!["id", "score", "payload"]);
     cleanup(&wal);
 }
 
@@ -819,6 +1356,48 @@ async fn test_alter_table_rename_column() {
     let (cols, _) = query(&executor, "SELECT * FROM t1").await;
     assert!(cols.contains(&"new_name".to_string()));
     assert!(!cols.contains(&"old_name".to_string()));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_alter_table_supports_quoted_delimiter_columns() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE alter_quoted_columns (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ALTER TABLE alter_quoted_columns ADD COLUMN \"payload:value\" TEXT",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO alter_quoted_columns VALUES (1, 'before')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ALTER TABLE alter_quoted_columns RENAME COLUMN \"payload:value\" TO \"payload,value\"",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT \"payload,value\" FROM alter_quoted_columns WHERE id = 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["payload,value"]);
+    assert_eq!(rows, vec![vec![Value::String("before".to_string())]]);
+
+    exec_ok(
+        &executor,
+        "ALTER TABLE alter_quoted_columns DROP COLUMN \"payload,value\"",
+    )
+    .await;
+    let (cols, _) = query(&executor, "SELECT * FROM alter_quoted_columns").await;
+    assert_eq!(cols, vec!["id"]);
     cleanup(&wal);
 }
 

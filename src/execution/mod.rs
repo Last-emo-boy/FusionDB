@@ -8,6 +8,7 @@ mod expr;
 mod foreign_key;
 mod query;
 mod scan;
+mod stats;
 mod types;
 
 pub(crate) use aggregation::AggregateAccumulator;
@@ -20,7 +21,9 @@ use crate::config::StorageConfig;
 use crate::distributed::sharding::{ShardRoute, ShardRouter};
 use crate::monitor;
 use crate::parser::parse_sql;
-use crate::storage::{vector_index::VectorIndex, FusionStorage, ScanVisitor, Storage, Transaction};
+use crate::storage::{
+    vector_index::VectorIndex, FusionStorage, ScanVisitor, Storage, StorageScanOptions, Transaction,
+};
 use moka::sync::Cache;
 use parking_lot::RwLock;
 use sqlparser::ast::{
@@ -391,6 +394,10 @@ struct CachedSelectResult {
     rows: Vec<Vec<Value>>,
 }
 
+tokio::task_local! {
+    static SQL_BLOCK_ZONE_MAP_PRUNING_ENABLED: bool;
+}
+
 struct StopAwareScanVisitor<'a> {
     inner: &'a mut dyn ScanVisitor,
     stopped: bool,
@@ -406,6 +413,44 @@ impl ScanVisitor for StopAwareScanVisitor<'_> {
     }
 }
 
+struct ExactTableDataScanVisitor<'a> {
+    executor: &'a Executor,
+    table_name: &'a str,
+    schema: Option<&'a TableSchema>,
+    prefixes: &'a [String],
+    inner: &'a mut dyn ScanVisitor,
+    accepted: &'a mut usize,
+    limit: Option<usize>,
+    stopped: bool,
+}
+
+impl ScanVisitor for ExactTableDataScanVisitor<'_> {
+    fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if !self.executor.routed_data_entry_belongs_to_table(
+            self.table_name,
+            self.schema,
+            self.prefixes,
+            key,
+            value,
+        ) {
+            return true;
+        }
+
+        if self.limit.is_some_and(|limit| *self.accepted >= limit) {
+            self.stopped = true;
+            return false;
+        }
+
+        *self.accepted += 1;
+        let keep_scanning = self.inner.visit(key, value);
+        if !keep_scanning || self.limit.is_some_and(|limit| *self.accepted >= limit) {
+            self.stopped = true;
+            return false;
+        }
+        true
+    }
+}
+
 pub struct Executor {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) shard_router: Option<ShardRouter>,
@@ -415,6 +460,7 @@ pub struct Executor {
     query_result_epoch: AtomicU64,
     prepared_statements: RwLock<PreparedStatementStore>,
     pub(crate) row_cache: Cache<String, Vec<Value>>,
+    pub(crate) sql_bulk_scan_no_fill: bool,
     pub(crate) vector_index: Arc<VectorIndex>,
     pub(crate) embedding_registry: Arc<EmbeddingRegistry>,
 }
@@ -498,9 +544,34 @@ impl Executor {
             query_result_epoch: AtomicU64::new(0),
             prepared_statements: RwLock::new(PreparedStatementStore::default()),
             row_cache: Cache::new(config.row_cache_capacity),
+            sql_bulk_scan_no_fill: config.sql_bulk_scan_no_fill,
             vector_index: shared_vector_index,
             embedding_registry: Arc::new(EmbeddingRegistry::new()),
         }
+    }
+
+    pub(crate) fn bulk_scan_options(&self) -> StorageScanOptions {
+        if self.sql_bulk_scan_no_fill {
+            StorageScanOptions::no_fill_cache()
+        } else {
+            StorageScanOptions::fill_cache()
+        }
+    }
+
+    pub(crate) fn sql_block_zone_map_pruning_enabled(&self) -> bool {
+        SQL_BLOCK_ZONE_MAP_PRUNING_ENABLED
+            .try_with(|enabled| *enabled)
+            .unwrap_or(true)
+    }
+
+    pub(crate) async fn execute_sql_with_sql_block_zone_map_pruning(
+        &self,
+        sql: &str,
+        enabled: bool,
+    ) -> Result<Vec<QueryResult>> {
+        SQL_BLOCK_ZONE_MAP_PRUNING_ENABLED
+            .scope(enabled, async move { self.execute_sql(sql).await })
+            .await
     }
 
     fn legacy_data_key_for_row_id(table_name: &str, row_id: &str) -> String {
@@ -518,6 +589,13 @@ impl Executor {
         prefix.push_str(table_name);
         prefix.push(':');
         prefix
+    }
+
+    fn schema_key_for_table(table_name: &str) -> String {
+        let mut key = String::with_capacity("schema:".len() + table_name.len());
+        key.push_str("schema:");
+        key.push_str(table_name);
+        key
     }
 
     fn sharded_data_prefix_for_table(shard_id: u64, table_name: &str) -> String {
@@ -666,6 +744,57 @@ impl Executor {
         }
 
         vec![Self::legacy_data_prefix_for_table(table_name)]
+    }
+
+    async fn load_schema_for_data_prefix_filter(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<TableSchema>> {
+        let schema_key = Self::schema_key_for_table(table_name);
+        let Some(schema_bytes) = txn.get(schema_key.as_bytes()).await? else {
+            return Ok(None);
+        };
+        let schema: TableSchema = bincode::deserialize(&schema_bytes)
+            .map_err(|e| FusionError::Execution(format!("Schema deserialization error: {}", e)))?;
+        Ok(Some(schema))
+    }
+
+    fn routed_data_entry_belongs_to_table(
+        &self,
+        table_name: &str,
+        schema: Option<&TableSchema>,
+        prefixes: &[String],
+        key: &[u8],
+        value: &[u8],
+    ) -> bool {
+        let Some(suffix) = prefixes
+            .iter()
+            .find_map(|prefix| key.strip_prefix(prefix.as_bytes()))
+            .and_then(|suffix| std::str::from_utf8(suffix).ok())
+        else {
+            return false;
+        };
+        if suffix.is_empty() {
+            return false;
+        }
+
+        if let Some(schema) = schema {
+            if let Some(pk_idx) = schema.get_primary_key_index() {
+                if let Ok(Some(pk_value)) =
+                    crate::common::encoding::RowDecoder::decode_column(value, pk_idx)
+                {
+                    if let Some(row_id) = Self::value_to_primary_row_id(&pk_value) {
+                        return self
+                            .routed_data_key_for_row_id(table_name, &row_id)
+                            .as_bytes()
+                            == key;
+                    }
+                }
+            }
+        }
+
+        !suffix.contains(':')
     }
 
     pub(crate) fn routed_index_key_for_value(
@@ -829,6 +958,22 @@ impl Executor {
         txn: &mut dyn Transaction,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_routed_prefixes_with_options(
+            prefixes,
+            txn,
+            limit,
+            StorageScanOptions::fill_cache(),
+        )
+        .await
+    }
+
+    pub(crate) async fn scan_routed_prefixes_with_options(
+        &self,
+        prefixes: Vec<String>,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+        options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut pairs = Vec::new();
         for prefix in prefixes {
             let remaining = limit.map(|limit| limit.saturating_sub(pairs.len()));
@@ -836,7 +981,7 @@ impl Executor {
                 break;
             }
             let mut shard_pairs = txn
-                .scan_prefix_parallel(prefix.as_bytes(), remaining)
+                .scan_prefix_parallel_with_options(prefix.as_bytes(), remaining, options.clone())
                 .await?;
             pairs.append(&mut shard_pairs);
             if limit.is_some_and(|limit| pairs.len() >= limit) {
@@ -846,14 +991,123 @@ impl Executor {
         Ok(pairs)
     }
 
+    pub(crate) async fn scan_routed_prefixes_for_each(
+        &self,
+        prefixes: Vec<String>,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        self.scan_routed_prefixes_for_each_with_options(
+            prefixes,
+            txn,
+            limit,
+            visitor,
+            StorageScanOptions::fill_cache(),
+        )
+        .await
+    }
+
+    pub(crate) async fn scan_routed_prefixes_for_each_with_options(
+        &self,
+        prefixes: Vec<String>,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<usize> {
+        let mut visited = 0usize;
+        for prefix in prefixes {
+            let remaining = limit.map(|limit| limit.saturating_sub(visited));
+            if remaining == Some(0) {
+                break;
+            }
+            let mut stop_aware = StopAwareScanVisitor {
+                inner: visitor,
+                stopped: false,
+            };
+            let prefix_bytes = prefix.as_bytes();
+            let prefix_visited = match txn
+                .scan_prefix_parallel_for_each_with_options(
+                    prefix_bytes,
+                    remaining,
+                    &mut stop_aware,
+                    options.clone(),
+                )
+                .await?
+            {
+                Some(count) => count,
+                None => {
+                    txn.scan_prefix_for_each_with_options(
+                        prefix_bytes,
+                        remaining,
+                        &mut stop_aware,
+                        options.clone(),
+                    )
+                    .await?
+                }
+            };
+            visited += prefix_visited;
+            if stop_aware.stopped {
+                break;
+            }
+            if limit.is_some_and(|limit| visited >= limit) {
+                break;
+            }
+        }
+        Ok(visited)
+    }
+
     pub(crate) async fn scan_routed_data_prefixes_for_table(
         &self,
         table_name: &str,
         txn: &mut dyn Transaction,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_routed_prefixes(self.routed_data_prefixes_for_table(table_name), txn, limit)
-            .await
+        self.scan_routed_data_prefixes_for_table_with_options(
+            table_name,
+            txn,
+            limit,
+            StorageScanOptions::fill_cache(),
+        )
+        .await
+    }
+
+    pub(crate) async fn scan_routed_data_prefixes_for_table_with_options(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+        options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let prefixes = self.routed_data_prefixes_for_table(table_name);
+        let schema = self
+            .load_schema_for_data_prefix_filter(table_name, txn)
+            .await?;
+        let mut pairs = Vec::new();
+
+        for prefix in &prefixes {
+            let shard_pairs = txn
+                .scan_prefix_parallel_with_options(prefix.as_bytes(), None, options.clone())
+                .await?;
+            for (key, value) in shard_pairs {
+                if !self.routed_data_entry_belongs_to_table(
+                    table_name,
+                    schema.as_ref(),
+                    &prefixes,
+                    &key,
+                    &value,
+                ) {
+                    continue;
+                }
+                pairs.push((key, value));
+                if limit.is_some_and(|limit| pairs.len() >= limit) {
+                    return Ok(pairs);
+                }
+            }
+        }
+
+        Ok(pairs)
     }
 
     pub(crate) async fn scan_routed_data_prefixes_for_each(
@@ -863,27 +1117,71 @@ impl Executor {
         limit: Option<usize>,
         visitor: &mut dyn ScanVisitor,
     ) -> Result<usize> {
-        let mut visited = 0usize;
-        for prefix in self.routed_data_prefixes_for_table(table_name) {
-            let remaining = limit.map(|limit| limit.saturating_sub(visited));
-            if remaining == Some(0) {
+        self.scan_routed_data_prefixes_for_each_with_options(
+            table_name,
+            txn,
+            limit,
+            visitor,
+            StorageScanOptions::fill_cache(),
+        )
+        .await
+    }
+
+    pub(crate) async fn scan_routed_data_prefixes_for_each_with_options(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<usize> {
+        let prefixes = self.routed_data_prefixes_for_table(table_name);
+        let schema = self
+            .load_schema_for_data_prefix_filter(table_name, txn)
+            .await?;
+        let mut accepted = 0usize;
+
+        for prefix in &prefixes {
+            if limit.is_some_and(|limit| accepted >= limit) {
                 break;
             }
-            let mut stop_aware = StopAwareScanVisitor {
+            let mut filter_visitor = ExactTableDataScanVisitor {
+                executor: self,
+                table_name,
+                schema: schema.as_ref(),
+                prefixes: &prefixes,
                 inner: visitor,
+                accepted: &mut accepted,
+                limit,
                 stopped: false,
             };
-            visited += txn
-                .scan_prefix_for_each(prefix.as_bytes(), remaining, &mut stop_aware)
-                .await?;
-            if stop_aware.stopped {
-                break;
+            let prefix_bytes = prefix.as_bytes();
+            match txn
+                .scan_prefix_parallel_for_each_with_options(
+                    prefix_bytes,
+                    None,
+                    &mut filter_visitor,
+                    options.clone(),
+                )
+                .await?
+            {
+                Some(_) => {}
+                None => {
+                    txn.scan_prefix_for_each_with_options(
+                        prefix_bytes,
+                        None,
+                        &mut filter_visitor,
+                        options.clone(),
+                    )
+                    .await?;
+                }
             }
-            if limit.is_some_and(|limit| visited >= limit) {
+            if filter_visitor.stopped {
                 break;
             }
         }
-        Ok(visited)
+
+        Ok(accepted)
     }
 
     pub(crate) async fn count_routed_data_prefixes_for_table(
@@ -3276,6 +3574,7 @@ impl Executor {
     pub(crate) fn invalidate_query_result_cache(&self) {
         self.query_result_epoch.fetch_add(1, AtomicOrdering::AcqRel);
         self.query_result_cache.invalidate_all();
+        crate::monitor::inc_query_result_cache_invalidation();
     }
 
     pub(crate) fn invalidate_storage_caches(&self) {
@@ -3342,16 +3641,23 @@ impl Executor {
     /// runs outside an explicit transaction, and has no bind params. Entries carry the current epoch,
     /// which any write bumps via `invalidate_query_result_cache`, so cached reads never go stale.
     pub(crate) async fn execute_cached_select(&self, stmt: &Statement) -> Result<QueryResult> {
-        let cache_key = Self::query_result_cache_key(&stmt.to_string());
+        let sql = stmt.to_string();
+        let cache_key = Self::query_result_cache_key(&sql);
         let epoch = self.current_query_result_epoch();
+        let start = std::time::Instant::now();
+        crate::monitor::inc_query_result_cache_eligible();
         if let Some(cached) = self.query_result_cache.get(&cache_key) {
             if cached.epoch == epoch {
+                crate::monitor::inc_query_result_cache_hit();
+                crate::monitor::record_query(&sql, start.elapsed());
                 return Ok(QueryResult::Select {
                     columns: cached.columns,
                     rows: cached.rows,
                 });
             }
+            crate::monitor::inc_query_result_cache_stale();
         }
+        crate::monitor::inc_query_result_cache_miss();
         let result = self.execute(stmt).await?;
         if let QueryResult::Select { columns, rows } = &result {
             self.query_result_cache.insert(
@@ -3362,6 +3668,7 @@ impl Executor {
                     rows: rows.clone(),
                 },
             );
+            crate::monitor::inc_query_result_cache_insert();
         }
         Ok(result)
     }
@@ -3693,7 +4000,6 @@ impl Executor {
             || upper.starts_with("SHOW INDEXES FROM ")
             || upper == "SHOW ALL"
             || upper == "SHOW USERS"
-            || upper.starts_with("EXPLAIN ")
         {
             return Ok(false);
         }
@@ -3867,6 +4173,7 @@ impl Executor {
                     &create_index.name,
                     &create_index.table_name,
                     &create_index.columns,
+                    &create_index.include,
                     create_index.unique,
                     &create_index.index_options,
                     txn,
@@ -3935,9 +4242,9 @@ impl Executor {
                 self.handle_create_view(&cv.name, &cv.query, cv.or_replace, txn)
                     .await
             }
-            _ => Ok(QueryResult::Success {
-                message: "Statement not supported yet".to_string(),
-            }),
+            _ => Err(FusionError::Execution(format!(
+                "Unsupported SQL statement: {stmt}"
+            ))),
         }
     }
 
@@ -4256,16 +4563,20 @@ impl Executor {
             let start = std::time::Instant::now();
             let cache_key = Self::query_result_cache_key(trimmed);
             let current_epoch = self.current_query_result_epoch();
+            crate::monitor::inc_query_result_cache_eligible();
             if let Some(cached) = self.query_result_cache.get(&cache_key) {
                 if cached.epoch == current_epoch {
+                    crate::monitor::inc_query_result_cache_hit();
                     crate::monitor::record_query(trimmed, start.elapsed());
                     return Ok(vec![QueryResult::Select {
                         columns: cached.columns,
                         rows: cached.rows,
                     }]);
                 }
+                crate::monitor::inc_query_result_cache_stale();
             }
 
+            crate::monitor::inc_query_result_cache_miss();
             let result = self.execute(&stmts[0]).await?;
             if let QueryResult::Select { columns, rows } = &result {
                 self.query_result_cache.insert(
@@ -4276,6 +4587,7 @@ impl Executor {
                         rows: rows.clone(),
                     },
                 );
+                crate::monitor::inc_query_result_cache_insert();
             }
             return Ok(vec![result]);
         }
@@ -4553,6 +4865,285 @@ impl Executor {
             "Expected quoted string after {}",
             keyword
         )))
+    }
+
+    pub(crate) fn index_count_summary_maintained_for_column(
+        column: &crate::catalog::Column,
+    ) -> bool {
+        column.is_indexed
+            && !column.is_primary
+            && !column.is_nullable
+            && column.index_type == crate::catalog::IndexType::BTree
+    }
+
+    pub(crate) fn index_count_summary_meta_key_for_column(
+        table_name: &str,
+        column_name: &str,
+    ) -> String {
+        let mut key = String::with_capacity(
+            "index_count_meta:".len() + table_name.len() + 1 + column_name.len(),
+        );
+        key.push_str("index_count_meta:");
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(column_name);
+        key
+    }
+
+    fn index_count_summary_meta_prefix_for_table(table_name: &str) -> String {
+        let mut prefix = String::with_capacity("index_count_meta:".len() + table_name.len() + 1);
+        prefix.push_str("index_count_meta:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    fn index_count_summary_prefix_for_table(table_name: &str) -> String {
+        let mut prefix = String::with_capacity("index_count:".len() + table_name.len() + 1);
+        prefix.push_str("index_count:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix
+    }
+
+    pub(crate) fn index_count_summary_prefix_for_column(
+        table_name: &str,
+        column_name: &str,
+    ) -> String {
+        let mut prefix = String::with_capacity(
+            "index_count:".len() + table_name.len() + 1 + column_name.len() + 1,
+        );
+        prefix.push_str("index_count:");
+        prefix.push_str(table_name);
+        prefix.push(':');
+        prefix.push_str(column_name);
+        prefix.push(':');
+        prefix
+    }
+
+    pub(crate) fn index_count_summary_key_for_value(
+        table_name: &str,
+        column_name: &str,
+        value_key: &str,
+    ) -> String {
+        let mut key = Self::index_count_summary_prefix_for_column(table_name, column_name);
+        key.reserve(value_key.len());
+        key.push_str(value_key);
+        key
+    }
+
+    pub(crate) fn encode_index_count_summary_count(count: i64) -> [u8; 8] {
+        count.to_le_bytes()
+    }
+
+    fn encode_index_count_summary_meta(total_entries: i64, group_count: usize) -> Vec<u8> {
+        format!("v1:{}:{}", total_entries, group_count).into_bytes()
+    }
+
+    pub(crate) fn decode_index_count_summary_meta(bytes: &[u8]) -> Option<(i64, usize)> {
+        let meta = std::str::from_utf8(bytes).ok()?;
+        let mut parts = meta.split(':');
+        if parts.next()? != "v1" {
+            return None;
+        }
+        let total_entries = parts.next()?.parse::<i64>().ok()?;
+        let group_count = parts.next()?.parse::<usize>().ok()?;
+        if parts.next().is_some() || total_entries < 0 {
+            return None;
+        }
+        Some((total_entries, group_count))
+    }
+
+    pub(crate) fn decode_index_count_summary_count(bytes: &[u8]) -> Option<i64> {
+        if bytes.len() != 8 {
+            return None;
+        }
+        let mut encoded = [0u8; 8];
+        encoded.copy_from_slice(bytes);
+        let count = i64::from_le_bytes(encoded);
+        (count >= 0).then_some(count)
+    }
+
+    pub(crate) async fn index_count_summary_available(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<bool> {
+        if self.shard_router.is_some() {
+            return Ok(false);
+        }
+        let meta_key = Self::index_count_summary_meta_key_for_column(table_name, column_name);
+        let Some(meta_bytes) = txn.get(meta_key.as_bytes()).await? else {
+            return Ok(false);
+        };
+        Ok(Self::decode_index_count_summary_meta(&meta_bytes).is_some())
+    }
+
+    pub(crate) async fn load_index_count_summary_meta(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<(i64, usize)>> {
+        if self.shard_router.is_some() {
+            return Ok(None);
+        }
+        let meta_key = Self::index_count_summary_meta_key_for_column(table_name, column_name);
+        let Some(meta_bytes) = txn.get(meta_key.as_bytes()).await? else {
+            return Ok(None);
+        };
+        Ok(Self::decode_index_count_summary_meta(&meta_bytes))
+    }
+
+    pub(crate) async fn replace_index_count_summary_for_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        counts: &HashMap<String, i64>,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        if self.shard_router.is_some() {
+            return Ok(());
+        }
+
+        self.delete_index_count_summary_for_column(table_name, column_name, txn)
+            .await?;
+        let mut total_entries = 0i64;
+        for (value_key, count) in counts {
+            if *count <= 0 {
+                return Err(FusionError::Execution(format!(
+                    "Invalid index count summary for {}.{}: {}",
+                    table_name, column_name, count
+                )));
+            }
+            total_entries = total_entries.checked_add(*count).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "Index count summary overflow for {}.{}",
+                    table_name, column_name
+                ))
+            })?;
+            let key = Self::index_count_summary_key_for_value(table_name, column_name, value_key);
+            let count_bytes = Self::encode_index_count_summary_count(*count);
+            txn.put(key.as_bytes(), &count_bytes).await?;
+        }
+
+        let meta_key = Self::index_count_summary_meta_key_for_column(table_name, column_name);
+        let meta_value = Self::encode_index_count_summary_meta(total_entries, counts.len());
+        txn.put(meta_key.as_bytes(), &meta_value).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_index_count_summary_for_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let prefix = Self::index_count_summary_prefix_for_column(table_name, column_name);
+        let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+        for (key, _) in entries {
+            txn.delete(&key).await?;
+        }
+        let meta_key = Self::index_count_summary_meta_key_for_column(table_name, column_name);
+        txn.delete(meta_key.as_bytes()).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_index_count_summaries_for_table(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        for prefix in [
+            Self::index_count_summary_prefix_for_table(table_name),
+            Self::index_count_summary_meta_prefix_for_table(table_name),
+        ] {
+            let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
+            for (key, _) in entries {
+                txn.delete(&key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn adjust_index_count_summary(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        value_key: &str,
+        delta: i64,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let Some((total_entries, group_count)) = self
+            .load_index_count_summary_meta(table_name, column_name, txn)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let key = Self::index_count_summary_key_for_value(table_name, column_name, value_key);
+        let current_count = match txn.get(key.as_bytes()).await? {
+            Some(bytes) => Self::decode_index_count_summary_count(&bytes).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "Malformed index count summary for {}.{}",
+                    table_name, column_name
+                ))
+            })?,
+            None => 0,
+        };
+        let new_count = current_count.checked_add(delta).ok_or_else(|| {
+            FusionError::Execution(format!(
+                "Index count summary overflow for {}.{}",
+                table_name, column_name
+            ))
+        })?;
+        if new_count < 0 {
+            return Err(FusionError::Execution(format!(
+                "Index count summary underflow for {}.{}",
+                table_name, column_name
+            )));
+        }
+        let new_total_entries = total_entries.checked_add(delta).ok_or_else(|| {
+            FusionError::Execution(format!(
+                "Index count summary overflow for {}.{}",
+                table_name, column_name
+            ))
+        })?;
+        if new_total_entries < 0 {
+            return Err(FusionError::Execution(format!(
+                "Index count summary metadata underflow for {}.{}",
+                table_name, column_name
+            )));
+        }
+        let new_group_count = match (current_count == 0, new_count == 0) {
+            (true, false) => group_count.checked_add(1).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "Index count summary group overflow for {}.{}",
+                    table_name, column_name
+                ))
+            })?,
+            (false, true) => group_count.checked_sub(1).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "Index count summary group underflow for {}.{}",
+                    table_name, column_name
+                ))
+            })?,
+            _ => group_count,
+        };
+        if new_count == 0 {
+            txn.delete(key.as_bytes()).await?;
+        } else {
+            let count_bytes = Self::encode_index_count_summary_count(new_count);
+            txn.put(key.as_bytes(), &count_bytes).await?;
+        }
+        let meta_key = Self::index_count_summary_meta_key_for_column(table_name, column_name);
+        let meta_value = Self::encode_index_count_summary_meta(new_total_entries, new_group_count);
+        txn.put(meta_key.as_bytes(), &meta_value).await?;
+        Ok(())
     }
 }
 
@@ -5304,8 +5895,14 @@ mod tests {
         assert!(!sql_requires_raft_write("SELECT * FROM users"));
         assert!(!sql_requires_raft_write("SHOW USERS"));
         assert!(!sql_requires_raft_write("EXPLAIN SELECT * FROM users"));
+        assert!(!sql_requires_raft_write(
+            "EXPLAIN ANALYZE SELECT * FROM users"
+        ));
 
         assert!(sql_requires_raft_write("INSERT INTO users VALUES (1)"));
+        assert!(sql_requires_raft_write(
+            "EXPLAIN ANALYZE INSERT INTO users VALUES (1)"
+        ));
         assert!(sql_requires_raft_write("CREATE TABLE users (id INTEGER)"));
         assert!(sql_requires_raft_write(
             "ANALYZE TABLE users COMPUTE STATISTICS"
@@ -5334,6 +5931,88 @@ mod tests {
             Some(CacheableAggregateFunction::Value)
         );
         assert_eq!(cacheable_aggregate_function_kind(&qualified), None);
+    }
+
+    #[tokio::test]
+    async fn scan_routed_data_prefixes_filters_table_name_prefix_collisions() {
+        let wal_path = format!("test_data_prefix_collision_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+        let schema = TableSchema::new(
+            "tenant".to_string(),
+            vec![
+                crate::catalog::Column {
+                    name: "id".to_string(),
+                    data_type: "TEXT".to_string(),
+                    is_primary: true,
+                    is_indexed: false,
+                    index_type: crate::catalog::IndexType::None,
+                    default_value: None,
+                    is_nullable: false,
+                    is_unique: true,
+                    check_expr: None,
+                },
+                crate::catalog::Column {
+                    name: "payload".to_string(),
+                    data_type: "TEXT".to_string(),
+                    is_primary: false,
+                    is_indexed: false,
+                    index_type: crate::catalog::IndexType::None,
+                    default_value: None,
+                    is_nullable: true,
+                    is_unique: false,
+                    check_expr: None,
+                },
+            ],
+        );
+        let tenant_key = executor.routed_data_key_for_row_id("tenant", "base:1");
+        let collision_key = executor.routed_data_key_for_row_id("tenant:archive", "archive:1");
+        {
+            let mut txn = storage.begin_transaction().await.expect("begin txn");
+            txn.put(
+                b"schema:tenant",
+                &bincode::serialize(&schema).expect("serialize schema"),
+            )
+            .await
+            .expect("put schema");
+            txn.put(
+                collision_key.as_bytes(),
+                &crate::common::encoding::RowEncoder::encode(&[
+                    Value::String("archive:1".to_string()),
+                    Value::String("archive".to_string()),
+                ]),
+            )
+            .await
+            .expect("put collision row");
+            txn.put(
+                tenant_key.as_bytes(),
+                &crate::common::encoding::RowEncoder::encode(&[
+                    Value::String("base:1".to_string()),
+                    Value::String("base".to_string()),
+                ]),
+            )
+            .await
+            .expect("put tenant row");
+            txn.commit().await.expect("commit");
+        }
+
+        let mut txn = storage.begin_transaction().await.expect("begin txn");
+        let rows = executor
+            .scan_routed_data_prefixes_for_table("tenant", &mut *txn, None)
+            .await
+            .expect("scan exact table");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, tenant_key.as_bytes());
+
+        let limited_rows = executor
+            .scan_routed_data_prefixes_for_table("tenant", &mut *txn, Some(1))
+            .await
+            .expect("limited scan exact table");
+        assert_eq!(limited_rows.len(), 1);
+        assert_eq!(limited_rows[0].0, tenant_key.as_bytes());
+        drop(txn);
+        let _ = std::fs::remove_file(wal_path);
     }
 
     #[tokio::test]

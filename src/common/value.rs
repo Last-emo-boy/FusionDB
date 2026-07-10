@@ -560,7 +560,7 @@ mod tests {
     fn test_display() {
         assert_eq!(format!("{}", Value::Null), "NULL");
         assert_eq!(format!("{}", Value::Integer(42)), "42");
-        assert_eq!(format!("{}", Value::Float(3.14)), "3.14");
+        assert_eq!(format!("{}", Value::Float(2.5)), "2.5");
         assert_eq!(format!("{}", Value::Boolean(true)), "true");
         assert_eq!(format!("{}", Value::String("hello".into())), "'hello'");
     }
@@ -570,8 +570,8 @@ mod tests {
         let v: Value = 42i64.into();
         assert_eq!(v, Value::Integer(42));
 
-        let v: Value = 3.14f64.into();
-        assert_eq!(v, Value::Float(3.14));
+        let v: Value = 2.5f64.into();
+        assert_eq!(v, Value::Float(2.5));
 
         let v: Value = "hello".into();
         assert_eq!(v, Value::String("hello".to_string()));

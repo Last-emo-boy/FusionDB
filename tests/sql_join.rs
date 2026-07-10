@@ -1,12 +1,21 @@
 use fusiondb::common::Value;
-use fusiondb::execution::Executor;
+use fusiondb::execution::{Executor, QueryResult};
 use fusiondb::storage::memory::MemoryStorage;
 use fusiondb::storage::Storage;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[path = "sql/common.rs"]
 mod common;
 use common::{cleanup, exec_ok, query, setup};
+
+fn corrupt_encoded_column_from(row: &mut [u8], column_index: usize) {
+    let off_pos = 2 + column_index * 4;
+    let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    for byte in &mut row[start..] {
+        *byte = 0xff;
+    }
+}
 
 #[tokio::test]
 async fn test_inner_join() {
@@ -652,6 +661,58 @@ async fn test_three_table_join_with_alias_projection() {
 }
 
 #[tokio::test]
+async fn test_three_table_join_limit_only_applies_to_final_join_step() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl3_users (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl3_orders (id INTEGER PRIMARY KEY, user_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl3_items (id INTEGER PRIMARY KEY, order_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO jl3_users VALUES (1, 'Alice'), (2, 'Bob')",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO jl3_orders VALUES (10, 99), (20, 2)").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO jl3_items VALUES (100, 10), (200, 20)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT u.name, o.id, i.id
+           FROM jl3_users u
+           INNER JOIN jl3_orders o ON u.id = o.user_id
+           INNER JOIN jl3_items i ON o.id = i.order_id
+          LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["u.name", "o.id", "i.id"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::String("Bob".to_string()),
+            Value::Integer(20),
+            Value::Integer(200),
+        ]]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_inner_join_with_left_filter_and_indexed_right_probe() {
     let (executor, wal) = setup().await;
     exec_ok(
@@ -692,6 +753,198 @@ async fn test_inner_join_with_left_filter_and_indexed_right_probe() {
     assert_eq!(rows[0][1], Value::String("Alice".to_string()));
     assert_eq!(rows[0][2], Value::String("Widget".to_string()));
     assert_eq!(rows[1][2], Value::String("Cable".to_string()));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_inner_join_limit_pushdown_with_local_left_predicate_stops_after_limit() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl_left_pred_l (id INTEGER PRIMARY KEY, keep INTEGER, right_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl_left_pred_r (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO jl_left_pred_l VALUES (1, 1, 1), (2, 1, 2)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO jl_left_pred_r VALUES (1, 'ok-first'), (2, 'bad-second')",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::String("bad-second".to_string()),
+        ]);
+        corrupt_encoded_column_from(&mut row, 1);
+        let key = format!(
+            "data:jl_left_pred_r:{}",
+            fusiondb::common::encoding::encode_i64_comparable(2)
+        );
+        txn.put(key.as_bytes(), &row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT l.id, r.payload
+           FROM jl_left_pred_l l
+           INNER JOIN jl_left_pred_r r ON l.right_id = r.id
+          WHERE l.keep = 1
+          LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["l.id", "r.payload"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::String("ok-first".to_string())
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_inner_join_limit_pushdown_with_local_right_predicate_stops_after_limit() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl_right_pred_l (id INTEGER PRIMARY KEY, right_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl_right_pred_r (id INTEGER PRIMARY KEY, keep INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO jl_right_pred_l VALUES (1, 1), (2, 2)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO jl_right_pred_r VALUES (1, 1, 'ok-first'), (2, 1, 'bad-second')",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Integer(1),
+            Value::String("bad-second".to_string()),
+        ]);
+        corrupt_encoded_column_from(&mut row, 2);
+        let key = format!(
+            "data:jl_right_pred_r:{}",
+            fusiondb::common::encoding::encode_i64_comparable(2)
+        );
+        txn.put(key.as_bytes(), &row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT l.id, r.payload
+           FROM jl_right_pred_l l
+           INNER JOIN jl_right_pred_r r ON l.right_id = r.id
+          WHERE r.keep = 1
+          LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["l.id", "r.payload"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::String("ok-first".to_string())
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_inner_join_limit_does_not_push_down_cross_table_where_predicate() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl_cross_pred_l (id INTEGER PRIMARY KEY, group_id INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl_cross_pred_r (id INTEGER PRIMARY KEY, group_id INTEGER)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO jl_cross_pred_l VALUES (1, 1)").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO jl_cross_pred_r VALUES (1, 1), (2, 1)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT l.id, r.id
+           FROM jl_cross_pred_l l
+           INNER JOIN jl_cross_pred_r r ON l.group_id = r.group_id
+          WHERE l.id < r.id
+          LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["l.id", "r.id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(1), Value::Integer(2)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_inner_join_limit_does_not_truncate_count_aggregate() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE jl_agg_l (id INTEGER PRIMARY KEY, right_id INTEGER)",
+    )
+    .await;
+    exec_ok(&executor, "CREATE TABLE jl_agg_r (id INTEGER PRIMARY KEY)").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO jl_agg_l VALUES (1, 1), (2, 2), (3, 3)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO jl_agg_r VALUES (1), (2), (3)").await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT COUNT(*)
+           FROM jl_agg_l l
+           INNER JOIN jl_agg_r r ON l.right_id = r.id
+          LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["COUNT(*)"]);
+    assert_eq!(rows, vec![vec![Value::Integer(3)]]);
     cleanup(&wal);
 }
 
@@ -1864,8 +2117,30 @@ async fn test_join_group_by_aggregate_result_cache_invalidates_after_insert() {
     .await;
 
     let sql = "SELECT c.city, COUNT(*), SUM(o.total) FROM cache_customer_join c INNER JOIN cache_orders_join o ON c.c_id = o.c_id GROUP BY c.city ORDER BY SUM(o.total) DESC";
-    let (_, first_rows) = query(&executor, sql).await;
-    let (_, cached_rows) = query(&executor, sql).await;
+    let metrics = &fusiondb::monitor::GLOBAL_METRICS;
+    let eligible_before = metrics
+        .query_result_cache_eligible_count
+        .load(Ordering::Relaxed);
+    let hit_before = metrics.query_result_cache_hit_count.load(Ordering::Relaxed);
+    let miss_before = metrics
+        .query_result_cache_miss_count
+        .load(Ordering::Relaxed);
+    let insert_before = metrics
+        .query_result_cache_insert_count
+        .load(Ordering::Relaxed);
+    let invalidation_before = metrics
+        .query_result_cache_invalidation_count
+        .load(Ordering::Relaxed);
+    async fn query_sql_rows(executor: &Executor, sql: &str) -> Vec<Vec<Value>> {
+        let mut results = executor.execute_sql(sql).await.unwrap();
+        match results.remove(0) {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("Expected Select, got {:?}", other),
+        }
+    }
+
+    let first_rows = query_sql_rows(&executor, sql).await;
+    let cached_rows = query_sql_rows(&executor, sql).await;
     assert_eq!(first_rows, cached_rows);
 
     exec_ok(
@@ -1873,7 +2148,7 @@ async fn test_join_group_by_aggregate_result_cache_invalidates_after_insert() {
         "INSERT INTO cache_orders_join VALUES (12, 1, 6.0)",
     )
     .await;
-    let (_, updated_rows) = query(&executor, sql).await;
+    let updated_rows = query_sql_rows(&executor, sql).await;
 
     assert_eq!(
         updated_rows,
@@ -1889,6 +2164,46 @@ async fn test_join_group_by_aggregate_result_cache_invalidates_after_insert() {
                 Value::Float(3.0),
             ],
         ]
+    );
+    let eligible_delta = metrics
+        .query_result_cache_eligible_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(eligible_before);
+    let hit_delta = metrics
+        .query_result_cache_hit_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(hit_before);
+    let miss_delta = metrics
+        .query_result_cache_miss_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(miss_before);
+    let insert_delta = metrics
+        .query_result_cache_insert_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(insert_before);
+    let invalidation_delta = metrics
+        .query_result_cache_invalidation_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(invalidation_before);
+    assert!(
+        eligible_delta >= 3,
+        "expected at least three cache-eligible grouped aggregate reads, got {eligible_delta}"
+    );
+    assert!(
+        hit_delta >= 1,
+        "second grouped aggregate read should hit the query-result cache, got {hit_delta}"
+    );
+    assert!(
+        miss_delta >= 2,
+        "initial and post-invalidation reads should miss the query-result cache, got {miss_delta}"
+    );
+    assert!(
+        insert_delta >= 2,
+        "initial and post-invalidation reads should insert query-result cache entries, got {insert_delta}"
+    );
+    assert!(
+        invalidation_delta >= 1,
+        "write should invalidate the query-result cache, got {invalidation_delta}"
     );
     cleanup(&wal);
 }
@@ -2251,6 +2566,47 @@ async fn test_cross_join() {
     exec_ok(&executor, "INSERT INTO cj2 VALUES (10, 'p'), (20, 'q')").await;
     let (_, rows) = query(&executor, "SELECT cj1.a, cj2.b FROM cj1 CROSS JOIN cj2").await;
     assert_eq!(rows.len(), 4); // 2 x 2 = 4
+    cleanup(&wal);
+}
+
+// BENCHPROD-445: CROSS JOIN LIMIT/OFFSET must push limit+offset into join execution so
+// large Cartesian joins do not materialize the full product before the final LIMIT.
+#[tokio::test]
+async fn test_cross_join_limit_offset_window() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE cj_limit_l (id INTEGER PRIMARY KEY, a TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE cj_limit_r (id INTEGER PRIMARY KEY, b TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO cj_limit_l VALUES (1, 'l1'), (2, 'l2'), (3, 'l3')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO cj_limit_r VALUES (10, 'r10'), (20, 'r20'), (30, 'r30')",
+    )
+    .await;
+
+    let (_, all_rows) = query(
+        &executor,
+        "SELECT l.a, r.b FROM cj_limit_l l CROSS JOIN cj_limit_r r",
+    )
+    .await;
+    let (_, window_rows) = query(
+        &executor,
+        "SELECT l.a, r.b FROM cj_limit_l l CROSS JOIN cj_limit_r r LIMIT 3 OFFSET 2",
+    )
+    .await;
+    let expected: Vec<Vec<Value>> = all_rows.into_iter().skip(2).take(3).collect();
+    assert_eq!(window_rows, expected);
     cleanup(&wal);
 }
 

@@ -7,16 +7,29 @@ use openraft::raft::{
 use openraft::{BasicNode, RaftNetwork};
 
 use super::typ::{NodeId, TypeConfig};
+use crate::server::security::ForwardingAuth;
 
 /// Network factory that creates HTTP-based connections to peer nodes.
 pub struct FusionNetworkFactory {
     pub client: reqwest::Client,
+    forwarding_auth: Option<ForwardingAuth>,
+    peer_scheme: String,
 }
 
 impl FusionNetworkFactory {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
+            forwarding_auth: None,
+            peer_scheme: "http".to_string(),
+        }
+    }
+
+    pub fn with_security(forwarding_secret: &str, peer_scheme: &str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            forwarding_auth: ForwardingAuth::new(forwarding_secret.as_bytes()),
+            peer_scheme: peer_scheme.to_string(),
         }
     }
 }
@@ -26,6 +39,8 @@ pub struct FusionNetwork {
     target: NodeId,
     target_addr: String,
     client: reqwest::Client,
+    forwarding_auth: Option<ForwardingAuth>,
+    peer_scheme: String,
 }
 
 impl RaftNetworkFactory<TypeConfig> for FusionNetworkFactory {
@@ -36,6 +51,8 @@ impl RaftNetworkFactory<TypeConfig> for FusionNetworkFactory {
             target,
             target_addr: node.addr.clone(),
             client: self.client.clone(),
+            forwarding_auth: self.forwarding_auth.clone(),
+            peer_scheme: self.peer_scheme.clone(),
         }
     }
 }
@@ -46,11 +63,14 @@ impl RaftNetwork<TypeConfig> for FusionNetwork {
         req: AppendEntriesRequest<TypeConfig>,
         _option: openraft::network::RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let url = format!("http://{}/raft/append", self.target_addr);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
+        let url = format!("{}://{}/raft/append", self.peer_scheme, self.target_addr);
+        let request = self.client.post(&url).json(&req);
+        let request = if let Some(auth) = self.forwarding_auth.as_ref() {
+            auth.apply(request, "postgres")
+        } else {
+            request
+        };
+        let resp = request
             .send()
             .await
             .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
@@ -70,11 +90,14 @@ impl RaftNetwork<TypeConfig> for FusionNetwork {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let url = format!("http://{}/raft/snapshot", self.target_addr);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
+        let url = format!("{}://{}/raft/snapshot", self.peer_scheme, self.target_addr);
+        let request = self.client.post(&url).json(&req);
+        let request = if let Some(auth) = self.forwarding_auth.as_ref() {
+            auth.apply(request, "postgres")
+        } else {
+            request
+        };
+        let resp = request
             .send()
             .await
             .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
@@ -91,11 +114,14 @@ impl RaftNetwork<TypeConfig> for FusionNetwork {
         req: VoteRequest<NodeId>,
         _option: openraft::network::RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let url = format!("http://{}/raft/vote", self.target_addr);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
+        let url = format!("{}://{}/raft/vote", self.peer_scheme, self.target_addr);
+        let request = self.client.post(&url).json(&req);
+        let request = if let Some(auth) = self.forwarding_auth.as_ref() {
+            auth.apply(request, "postgres")
+        } else {
+            request
+        };
+        let resp = request
             .send()
             .await
             .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;

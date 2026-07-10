@@ -5,6 +5,7 @@ use crate::storage::Transaction;
 use sqlparser::ast::{BinaryOperator, Expr, TableFactor, TableWithJoins};
 use std::collections::{HashMap, HashSet};
 
+use super::super::stats::StatsEstimator;
 use super::Executor;
 
 const JOIN_INDEX_PROBE_THRESHOLD: usize = 128;
@@ -80,6 +81,12 @@ struct CommaJoinRelationPlan {
     schema: TableSchema,
     stats: Option<super::super::analyze::TableStats>,
     estimated_rows: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JoinReorderEdge {
+    left_column: usize,
+    right_column: usize,
 }
 
 impl Executor {
@@ -177,6 +184,7 @@ impl Executor {
             &Some(base_projection),
             txn,
             params,
+            None,
             None,
             None,
             None,
@@ -1004,6 +1012,8 @@ impl Executor {
         let relation_count = relations.len();
         let mut local_counts = vec![0usize; relation_count];
         let mut edge_counts = vec![vec![0usize; relation_count]; relation_count];
+        let mut join_edges =
+            vec![vec![Vec::<JoinReorderEdge>::new(); relation_count]; relation_count];
         let mut schemas = Vec::with_capacity(relation_count);
         for relation in &relations {
             schemas.push(relation.schema.clone());
@@ -1030,6 +1040,15 @@ impl Executor {
             } else if members.len() == 2 {
                 edge_counts[members[0]][members[1]] += 1;
                 edge_counts[members[1]][members[0]] += 1;
+                if let Some(edge) =
+                    self.join_reorder_equality_edge(predicate, members[0], members[1], &schemas)
+                {
+                    join_edges[members[0]][members[1]].push(edge);
+                    join_edges[members[1]][members[0]].push(JoinReorderEdge {
+                        left_column: edge.right_column,
+                        right_column: edge.left_column,
+                    });
+                }
             }
         }
 
@@ -1064,11 +1083,13 @@ impl Executor {
         }
         remaining[first] = false;
         order.push(first);
+        let mut placed_rows = relations[first].estimated_rows;
 
         while remaining.iter().any(|value| *value) {
             let mut next = None;
             let mut next_score = 0usize;
             let mut next_rows = usize::MAX;
+            let mut next_projected_rows = usize::MAX;
             for candidate in 0..relation_count {
                 if !remaining[candidate] {
                     continue;
@@ -1082,21 +1103,40 @@ impl Executor {
                     .saturating_add(local_counts[candidate].saturating_mul(100))
                     .saturating_add(degree(candidate, &edge_counts));
                 let rows = relations[candidate].estimated_rows;
+                let projected_rows = if connected_edges > 0 {
+                    Self::estimate_reorder_candidate_rows(
+                        &relations,
+                        &order,
+                        candidate,
+                        placed_rows,
+                        rows,
+                        &join_edges,
+                    )
+                    .unwrap_or_else(|| placed_rows.max(rows).max(1))
+                } else {
+                    placed_rows.saturating_mul(rows).max(1)
+                };
                 if next.is_none()
                     || score > next_score
-                    || (score == next_score && rows < next_rows)
+                    || (score == next_score && projected_rows < next_projected_rows)
                     || (score == next_score
+                        && projected_rows == next_projected_rows
+                        && rows < next_rows)
+                    || (score == next_score
+                        && projected_rows == next_projected_rows
                         && rows == next_rows
                         && candidate > next.unwrap_or(candidate))
                 {
                     next = Some(candidate);
                     next_score = score;
                     next_rows = rows;
+                    next_projected_rows = projected_rows;
                 }
             }
             let next = next.unwrap();
             remaining[next] = false;
             order.push(next);
+            placed_rows = next_projected_rows;
         }
 
         let mut reordered = Vec::with_capacity(order.len() + passthrough.len());
@@ -1117,42 +1157,110 @@ impl Executor {
         Ok(Some(reordered))
     }
 
+    fn estimate_reorder_candidate_rows(
+        relations: &[CommaJoinRelationPlan],
+        placed: &[usize],
+        candidate: usize,
+        placed_rows: usize,
+        candidate_rows: usize,
+        join_edges: &[Vec<Vec<JoinReorderEdge>>],
+    ) -> Option<usize> {
+        let candidate_relation = relations.get(candidate)?;
+        let candidate_stats = candidate_relation.stats.as_ref()?;
+        let mut best_rows = None;
+
+        for placed_index in placed {
+            let placed_relation = relations.get(*placed_index)?;
+            let placed_stats = placed_relation.stats.as_ref()?;
+            for edge in join_edges.get(*placed_index)?.get(candidate)? {
+                let Some(estimate) = StatsEstimator::equality_join_estimate(
+                    &placed_relation.schema,
+                    placed_stats,
+                    edge.left_column,
+                    placed_rows,
+                    &candidate_relation.schema,
+                    candidate_stats,
+                    edge.right_column,
+                    candidate_rows,
+                ) else {
+                    continue;
+                };
+                best_rows =
+                    Some(best_rows.map_or(estimate.rows, |rows: usize| rows.min(estimate.rows)));
+            }
+        }
+
+        best_rows
+    }
+
+    fn join_reorder_equality_edge(
+        &self,
+        expr: &Expr,
+        left_relation: usize,
+        right_relation: usize,
+        schemas: &[TableSchema],
+    ) -> Option<JoinReorderEdge> {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = expr
+        else {
+            if let Expr::Nested(inner) = expr {
+                return self.join_reorder_equality_edge(
+                    inner,
+                    left_relation,
+                    right_relation,
+                    schemas,
+                );
+            }
+            return None;
+        };
+
+        let left_schema = schemas.get(left_relation)?;
+        let right_schema = schemas.get(right_relation)?;
+        if let (Some(left_column), Some(right_column)) = (
+            self.resolve_schema_column_index(left, left_schema),
+            self.resolve_schema_column_index(right, right_schema),
+        ) {
+            return Some(JoinReorderEdge {
+                left_column,
+                right_column,
+            });
+        }
+
+        if let (Some(left_column), Some(right_column)) = (
+            self.resolve_schema_column_index(right, left_schema),
+            self.resolve_schema_column_index(left, right_schema),
+        ) {
+            return Some(JoinReorderEdge {
+                left_column,
+                right_column,
+            });
+        }
+
+        None
+    }
+
     fn estimate_join_local_predicate_rows(
         &self,
         expr: &Expr,
         schema: &TableSchema,
         stats: &super::super::analyze::TableStats,
     ) -> Option<usize> {
+        let estimator = StatsEstimator::new(schema, stats);
         match expr {
             Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
                 let column_idx = self.join_column_constant_index(left, right, schema)?;
-                let column = schema.columns.get(column_idx)?;
-                if column.is_primary || column.is_unique {
-                    return Some(usize::from(stats.row_count > 0));
-                }
-
-                let column_stats =
-                    Self::join_column_stats_for_schema_index(stats, schema, column_idx)?;
-                if column_stats.distinct_count == 0 {
-                    return None;
-                }
-
-                Some(Self::join_selectivity_to_rows(
-                    stats.row_count,
-                    1.0 / column_stats.distinct_count as f64,
-                ))
+                estimator.equality_rows(column_idx)
             }
             Expr::IsNull(expr) => {
                 let column_idx = self.resolve_schema_column_index(expr, schema)?;
-                let column_stats =
-                    Self::join_column_stats_for_schema_index(stats, schema, column_idx)?;
-                Some(column_stats.null_count.min(stats.row_count))
+                estimator.null_rows(column_idx)
             }
             Expr::IsNotNull(expr) => {
                 let column_idx = self.resolve_schema_column_index(expr, schema)?;
-                let column_stats =
-                    Self::join_column_stats_for_schema_index(stats, schema, column_idx)?;
-                Some(stats.row_count.saturating_sub(column_stats.null_count))
+                estimator.not_null_rows(column_idx)
             }
             Expr::InList {
                 expr,
@@ -1160,21 +1268,7 @@ impl Executor {
                 negated,
             } if !*negated => {
                 let column_idx = self.resolve_schema_column_index(expr, schema)?;
-                let column = schema.columns.get(column_idx)?;
-                if column.is_primary || column.is_unique {
-                    return Some(list.len().min(stats.row_count));
-                }
-
-                let column_stats =
-                    Self::join_column_stats_for_schema_index(stats, schema, column_idx)?;
-                if column_stats.distinct_count == 0 {
-                    return None;
-                }
-
-                Some(Self::join_selectivity_to_rows(
-                    stats.row_count,
-                    (list.len() as f64 / column_stats.distinct_count as f64).clamp(0.0, 1.0),
-                ))
+                estimator.in_list_rows(column_idx, list.len())
             }
             Expr::Nested(inner) => self.estimate_join_local_predicate_rows(inner, schema, stats),
             _ => None,
@@ -1198,27 +1292,6 @@ impl Executor {
         } else {
             None
         }
-    }
-
-    fn join_column_stats_for_schema_index<'a>(
-        stats: &'a super::super::analyze::TableStats,
-        schema: &TableSchema,
-        index: usize,
-    ) -> Option<&'a super::super::analyze::ColumnStats> {
-        let column_name = schema.columns.get(index)?.name.as_str();
-        let unqualified = column_name.rsplit('.').next().unwrap_or(column_name);
-        stats.columns.iter().find(|column| {
-            column.name.eq_ignore_ascii_case(column_name)
-                || column.name.eq_ignore_ascii_case(unqualified)
-        })
-    }
-
-    fn join_selectivity_to_rows(row_count: usize, selectivity: f64) -> usize {
-        if row_count == 0 {
-            return 0;
-        }
-        let rows = (row_count as f64 * selectivity.clamp(0.0, 1.0)).ceil() as usize;
-        rows.clamp(1, row_count)
     }
 
     async fn original_join_output_projection(
@@ -1852,6 +1925,7 @@ impl Executor {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await?;
             (schema, rows)
@@ -2307,6 +2381,13 @@ impl Executor {
         let projection = &effective_projection;
 
         let first = &planned_from[0];
+        let total_join_steps = first.joins.len()
+            + planned_from
+                .iter()
+                .skip(1)
+                .map(|table| 1usize.saturating_add(table.joins.len()))
+                .sum::<usize>();
+        let mut completed_join_steps = 0usize;
         let join_column_refs = self.collect_join_column_references(planned_from);
         let mut pending_predicates = if let Some(expr) = &source_selection {
             Self::collect_conjunctive_predicates(expr)
@@ -2362,6 +2443,7 @@ impl Executor {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await?;
             (schema, rows)
@@ -2392,9 +2474,14 @@ impl Executor {
                     &join_column_refs,
                     txn,
                     params,
-                    limit,
+                    if completed_join_steps + 1 == total_join_steps {
+                        limit
+                    } else {
+                        None
+                    },
                 )
                 .await?;
+            completed_join_steps = completed_join_steps.saturating_add(1);
             (schema, rows) = self.apply_stage_join_projection(
                 schema,
                 rows,
@@ -2417,9 +2504,14 @@ impl Executor {
                     &join_column_refs,
                     txn,
                     params,
-                    limit,
+                    if completed_join_steps + 1 == total_join_steps {
+                        limit
+                    } else {
+                        None
+                    },
                 )
                 .await?;
+            completed_join_steps = completed_join_steps.saturating_add(1);
             (schema, rows) = self.apply_stage_join_projection(
                 schema,
                 rows,
@@ -2441,9 +2533,14 @@ impl Executor {
                         &join_column_refs,
                         txn,
                         params,
-                        limit,
+                        if completed_join_steps + 1 == total_join_steps {
+                            limit
+                        } else {
+                            None
+                        },
                     )
                     .await?;
+                completed_join_steps = completed_join_steps.saturating_add(1);
                 (schema, rows) = self.apply_stage_join_projection(
                     schema,
                     rows,

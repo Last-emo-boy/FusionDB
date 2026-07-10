@@ -150,6 +150,12 @@ impl Executor {
         predicates
     }
 
+    pub(crate) fn collect_disjunctive_predicates(expr: &Expr) -> Vec<Expr> {
+        let mut predicates = Vec::with_capacity(Self::disjunctive_predicate_count(expr));
+        Self::split_disjunctive_predicates(expr, &mut predicates);
+        predicates
+    }
+
     pub(super) fn combine_predicates(predicates: Vec<Expr>) -> Option<Expr> {
         let mut iter = predicates.into_iter();
         let first = iter.next()?;

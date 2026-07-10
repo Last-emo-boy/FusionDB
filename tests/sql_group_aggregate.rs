@@ -1,4 +1,4 @@
-use fusiondb::common::Value;
+use fusiondb::common::{encoding::RowEncoder, Value};
 use fusiondb::execution::Executor;
 use fusiondb::storage::memory::MemoryStorage;
 use fusiondb::storage::Storage;
@@ -7,6 +7,36 @@ use std::sync::Arc;
 #[path = "sql/common.rs"]
 mod common;
 use common::{cleanup, exec_ok, query, setup};
+
+fn encoded_row_id(value: i64) -> String {
+    fusiondb::common::encoding::encode_i64_comparable(value)
+}
+
+fn corrupt_only_encoded_column(row: &mut [u8], column_index: usize, column_count: usize) {
+    let off_pos = 2 + column_index * 4;
+    let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    let end = if column_index + 1 < column_count {
+        let next_off_pos = off_pos + 4;
+        u32::from_le_bytes(row[next_off_pos..next_off_pos + 4].try_into().unwrap()) as usize
+    } else {
+        row.len()
+    };
+    for byte in &mut row[start..end] {
+        *byte = 0xff;
+    }
+}
+
+fn index_count_summary_meta_key(table_name: &str, column_name: &str) -> String {
+    format!("index_count_meta:{table_name}:{column_name}")
+}
+
+fn index_count_summary_key(table_name: &str, column_name: &str, value_key: &str) -> String {
+    format!("index_count:{table_name}:{column_name}:{value_key}")
+}
+
+fn index_count_summary_prefix(table_name: &str, column_name: &str) -> String {
+    format!("index_count:{table_name}:{column_name}:")
+}
 
 #[tokio::test]
 async fn test_select_count_star() {
@@ -257,6 +287,56 @@ async fn test_filtered_bare_aggregates_stream_required_columns_only() {
 }
 
 #[tokio::test]
+async fn test_filtered_numeric_aggregates_batch_path_streams_only_needed_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE batch_numeric (id INTEGER PRIMARY KEY, bucket INTEGER, amount INTEGER, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for id in 1_i64..=1030 {
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(id % 2),
+                Value::Integer(id),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:batch_numeric:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT COUNT(*), SUM(amount) FROM batch_numeric WHERE bucket = 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["COUNT(*)", "SUM(amount)"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(515), Value::Integer(265225)]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_filtered_count_uses_index_candidates_and_required_columns_only() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
@@ -408,6 +488,623 @@ async fn test_group_by_count_fast_path_preserves_null_and_alias() {
         .iter()
         .any(|row| row[0] == Value::Null && row[1] == Value::Integer(1)));
     cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_group_by_count_index_key_scan_avoids_base_row_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_keys (
+            id INTEGER PRIMARY KEY,
+            bucket INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_keys VALUES
+            (1, 2, 'p1'),
+            (2, 1, 'p2'),
+            (3, 2, 'p3'),
+            (4, 3, 'p4'),
+            (5, 1, 'p5'),
+            (6, 1, 'p6')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_keys_bucket ON idx_group_count_keys (bucket)",
+    )
+    .await;
+    {
+        let txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(
+            txn.scan_prefix(
+                index_count_summary_prefix("idx_group_count_keys", "bucket").as_bytes(),
+                None
+            )
+            .await
+            .unwrap()
+            .len(),
+            3
+        );
+    }
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, bucket, payload) in [
+            (1_i64, 2_i64, "p1"),
+            (2, 1, "p2"),
+            (3, 2, "p3"),
+            (4, 3, "p4"),
+            (5, 1, "p5"),
+            (6, 1, "p6"),
+        ] {
+            let mut row = RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(bucket),
+                Value::String(payload.to_string()),
+            ]);
+            corrupt_only_encoded_column(&mut row, 1, 3);
+            txn.put(
+                format!("data:idx_group_count_keys:{}", encoded_row_id(id)).as_bytes(),
+                &row,
+            )
+            .await
+            .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT bucket, COUNT(*) FROM idx_group_count_keys GROUP BY bucket ORDER BY bucket",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["bucket", "COUNT(*)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(3)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(3), Value::Integer(1)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_count_analyzed_small_table_uses_summary_index() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_stats_small (
+            id INTEGER PRIMARY KEY,
+            bucket INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_stats_small VALUES
+            (1, 2, 'p1'),
+            (2, 1, 'p2'),
+            (3, 2, 'p3'),
+            (4, 3, 'p4'),
+            (5, 1, 'p5'),
+            (6, 1, 'p6')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_stats_small_bucket
+            ON idx_group_count_stats_small (bucket)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "ANALYZE TABLE idx_group_count_stats_small COMPUTE STATISTICS",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT bucket, COUNT(*) FROM idx_group_count_stats_small GROUP BY bucket ORDER BY bucket",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["bucket", "COUNT(*)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(3)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(3), Value::Integer(1)],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_group_by_count_malformed_index_key_falls_back_to_rows() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_malformed (
+            id INTEGER PRIMARY KEY,
+            bucket INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_malformed VALUES
+            (1, 2, 'p1'),
+            (2, 1, 'p2'),
+            (3, 2, 'p3'),
+            (4, 3, 'p4'),
+            (5, 1, 'p5')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_malformed_bucket
+            ON idx_group_count_malformed (bucket)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.delete(index_count_summary_meta_key("idx_group_count_malformed", "bucket").as_bytes())
+            .await
+            .unwrap();
+        txn.put(b"index:idx_group_count_malformed:bucket:!malformed", &[])
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT bucket, COUNT(*) FROM idx_group_count_malformed GROUP BY bucket ORDER BY bucket",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(3), Value::Integer(1)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_count_malformed_summary_falls_back_to_key_stream() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_bad_summary (
+            id INTEGER PRIMARY KEY,
+            bucket INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_bad_summary VALUES
+            (1, 2, 'p1'),
+            (2, 1, 'p2'),
+            (3, 2, 'p3'),
+            (4, 3, 'p4'),
+            (5, 1, 'p5')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_bad_summary_bucket
+            ON idx_group_count_bad_summary (bucket)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let value_key = encoded_row_id(1);
+        txn.put(
+            index_count_summary_key("idx_group_count_bad_summary", "bucket", &value_key).as_bytes(),
+            b"bad",
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT bucket, COUNT(*) FROM idx_group_count_bad_summary GROUP BY bucket ORDER BY bucket",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(3), Value::Integer(1)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_count_incomplete_summary_falls_back_to_key_stream() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_incomplete_summary (
+            id INTEGER PRIMARY KEY,
+            bucket INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_incomplete_summary VALUES
+            (1, 2, 'p1'),
+            (2, 1, 'p2'),
+            (3, 2, 'p3'),
+            (4, 3, 'p4'),
+            (5, 1, 'p5')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_incomplete_summary_bucket
+            ON idx_group_count_incomplete_summary (bucket)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let value_key = encoded_row_id(3);
+        txn.delete(
+            index_count_summary_key("idx_group_count_incomplete_summary", "bucket", &value_key)
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT bucket, COUNT(*) FROM idx_group_count_incomplete_summary GROUP BY bucket ORDER BY bucket",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(3), Value::Integer(1)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_count_index_key_scan_decodes_text_with_colon() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_text_keys (
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_text_keys VALUES
+            (1, 'a:b', 'p1'),
+            (2, 'z', 'p2'),
+            (3, 'a:b', 'p3')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_text_keys_label ON idx_group_count_text_keys (label)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, label, payload) in [(1_i64, "a:b", "p1"), (2, "z", "p2"), (3, "a:b", "p3")] {
+            let mut row = RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::String(label.to_string()),
+                Value::String(payload.to_string()),
+            ]);
+            corrupt_only_encoded_column(&mut row, 1, 3);
+            txn.put(
+                format!("data:idx_group_count_text_keys:{}", encoded_row_id(id)).as_bytes(),
+                &row,
+            )
+            .await
+            .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT label, COUNT(*) FROM idx_group_count_text_keys GROUP BY label ORDER BY label",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("a:b".to_string()), Value::Integer(2)],
+            vec![Value::String("z".to_string()), Value::Integer(1)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_count_nullable_index_fallback_preserves_null_group() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_nullable (
+            id INTEGER PRIMARY KEY,
+            bucket INTEGER,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_nullable VALUES
+            (1, NULL, 'p1'),
+            (2, 1, 'p2'),
+            (3, 1, 'p3')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_nullable_bucket ON idx_group_count_nullable (bucket)",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT bucket, COUNT(*) FROM idx_group_count_nullable GROUP BY bucket ORDER BY bucket",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Null, Value::Integer(1)],
+            vec![Value::Integer(1), Value::Integer(2)],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_group_by_count_index_key_scan_reflects_update_delete() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_dml (
+            id INTEGER PRIMARY KEY,
+            bucket INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_dml VALUES
+            (1, 1, 'p1'),
+            (2, 1, 'p2'),
+            (3, 2, 'p3'),
+            (4, 3, 'p4')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_dml_bucket ON idx_group_count_dml (bucket)",
+    )
+    .await;
+
+    exec_ok(
+        &executor,
+        "UPDATE idx_group_count_dml SET bucket = 2 WHERE id = 2",
+    )
+    .await;
+    exec_ok(&executor, "DELETE FROM idx_group_count_dml WHERE id = 4").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_dml VALUES (5, 2, 'p5'), (6, 4, 'p6')",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT bucket, COUNT(*) FROM idx_group_count_dml GROUP BY bucket ORDER BY bucket",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(3)],
+            vec![Value::Integer(4), Value::Integer(1)],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_group_by_count_summary_cleanup_and_truncate_reseed() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE idx_group_count_summary_cleanup (
+            id INTEGER PRIMARY KEY,
+            bucket INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_summary_cleanup VALUES
+            (1, 1, 'p1'),
+            (2, 2, 'p2')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_summary_cleanup_bucket
+            ON idx_group_count_summary_cleanup (bucket)",
+    )
+    .await;
+
+    {
+        let txn = storage.begin_transaction().await.unwrap();
+        assert!(txn
+            .get(
+                index_count_summary_meta_key("idx_group_count_summary_cleanup", "bucket")
+                    .as_bytes()
+            )
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            txn.scan_prefix(
+                index_count_summary_prefix("idx_group_count_summary_cleanup", "bucket").as_bytes(),
+                None
+            )
+            .await
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+
+    exec_ok(
+        &executor,
+        "DROP INDEX idx_group_count_summary_cleanup_bucket",
+    )
+    .await;
+    {
+        let txn = storage.begin_transaction().await.unwrap();
+        assert!(txn
+            .get(
+                index_count_summary_meta_key("idx_group_count_summary_cleanup", "bucket")
+                    .as_bytes()
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(txn
+            .scan_prefix(
+                index_count_summary_prefix("idx_group_count_summary_cleanup", "bucket").as_bytes(),
+                None
+            )
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_group_count_summary_cleanup_bucket
+            ON idx_group_count_summary_cleanup (bucket)",
+    )
+    .await;
+    exec_ok(&executor, "TRUNCATE TABLE idx_group_count_summary_cleanup").await;
+    {
+        let txn = storage.begin_transaction().await.unwrap();
+        assert!(txn
+            .get(
+                index_count_summary_meta_key("idx_group_count_summary_cleanup", "bucket")
+                    .as_bytes()
+            )
+            .await
+            .unwrap()
+            .is_some());
+        assert!(txn
+            .scan_prefix(
+                index_count_summary_prefix("idx_group_count_summary_cleanup", "bucket").as_bytes(),
+                None
+            )
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    exec_ok(
+        &executor,
+        "INSERT INTO idx_group_count_summary_cleanup VALUES (3, 9, 'p3')",
+    )
+    .await;
+    let (_, rows) = query(
+        &executor,
+        "SELECT bucket, COUNT(*) FROM idx_group_count_summary_cleanup GROUP BY bucket ORDER BY bucket",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(9), Value::Integer(1)]]);
+    assert_eq!(
+        storage
+            .begin_transaction()
+            .await
+            .unwrap()
+            .scan_prefix(
+                index_count_summary_prefix("idx_group_count_summary_cleanup", "bucket").as_bytes(),
+                None
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    cleanup(&wal_path);
 }
 
 #[tokio::test]
@@ -878,6 +1575,64 @@ async fn test_group_by_count_with_simple_where_streams_only_needed_columns() {
         vec![Value::String("database".to_string()), Value::Integer(3)]
     );
     assert_eq!(rows[1][1], Value::Integer(1));
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_group_by_count_batch_path_streams_only_needed_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE grouped_batch_events (id INTEGER PRIMARY KEY, day INTEGER, tag TEXT, payload TEXT)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for id in 1_i64..=1030 {
+            let day = id % 3;
+            let tag = match day {
+                1 => "alpha",
+                2 => "beta",
+                _ => "skip",
+            };
+            let mut row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(day),
+                Value::String(tag.to_string()),
+                Value::String(format!("payload-{}", id)),
+            ]);
+            let corrupt_col_idx = 3usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!(
+                "data:grouped_batch_events:{}",
+                fusiondb::common::encoding::encode_i64_comparable(id)
+            );
+            txn.put(key.as_bytes(), &row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT tag, COUNT(*) FROM grouped_batch_events WHERE day >= 1 GROUP BY tag ORDER BY tag",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("alpha".to_string()), Value::Integer(344)],
+            vec![Value::String("beta".to_string()), Value::Integer(343)],
+        ]
+    );
     cleanup(&wal_path);
 }
 

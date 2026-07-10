@@ -15,6 +15,7 @@ use super::sharding::{ShardMap, ShardRoute, ShardRouter};
 use super::typ::{NodeId, Request, TypeConfig};
 use super::FusionRaft;
 use crate::execution::{Executor, QueryResult};
+use crate::server::security::ForwardingAuth;
 
 /// Shared application state for Raft HTTP endpoints.
 #[derive(Clone)]
@@ -23,6 +24,8 @@ pub struct RaftAppState {
     pub executor: Arc<Executor>,
     pub client: reqwest::Client,
     pub shard_router: Option<ShardRouter>,
+    pub(crate) forwarding_auth: Option<ForwardingAuth>,
+    pub(crate) peer_scheme: String,
 }
 
 /// Build the Raft API router.
@@ -80,10 +83,12 @@ pub struct WriteResponse {
     pub message: String,
 }
 
-pub async fn submit_raft_write(
+pub(crate) async fn submit_raft_write(
     raft: &FusionRaft,
     client: &reqwest::Client,
     sql: String,
+    forwarding_auth: Option<&ForwardingAuth>,
+    peer_scheme: &str,
 ) -> Result<super::typ::Response, String> {
     let raft_req = Request { sql: sql.clone() };
     match raft.client_write(raft_req).await {
@@ -91,7 +96,14 @@ pub async fn submit_raft_write(
         Err(e) => {
             if let Some(forward) = e.forward_to_leader() {
                 if let Some(node) = &forward.leader_node {
-                    return forward_write_to_leader(client, &node.addr, WriteRequest { sql }).await;
+                    return forward_write_to_leader(
+                        client,
+                        &node.addr,
+                        WriteRequest { sql },
+                        forwarding_auth,
+                        peer_scheme,
+                    )
+                    .await;
                 }
             }
             Err(format!("Raft write error: {}", e))
@@ -103,11 +115,17 @@ async fn forward_write_to_leader(
     client: &reqwest::Client,
     leader_addr: &str,
     req: WriteRequest,
+    forwarding_auth: Option<&ForwardingAuth>,
+    peer_scheme: &str,
 ) -> Result<super::typ::Response, String> {
-    let url = format!("http://{}/raft/write", leader_addr);
-    let resp = client
-        .post(&url)
-        .json(&req)
+    let url = format!("{}://{}/raft/write", peer_scheme, leader_addr);
+    let request = client.post(&url).json(&req);
+    let request = if let Some(auth) = forwarding_auth {
+        auth.apply(request, "postgres")
+    } else {
+        request
+    };
+    let resp = request
         .send()
         .await
         .map_err(|e| format!("Raft leader forwarding error: {}", e))?;
@@ -129,7 +147,15 @@ async fn raft_write(
     State(state): State<RaftAppState>,
     Json(req): Json<WriteRequest>,
 ) -> Json<WriteResponse> {
-    match submit_raft_write(&state.raft, &state.client, req.sql).await {
+    match submit_raft_write(
+        &state.raft,
+        &state.client,
+        req.sql,
+        state.forwarding_auth.as_ref(),
+        &state.peer_scheme,
+    )
+    .await
+    {
         Ok(resp) => Json(WriteResponse {
             success: true,
             message: resp.message,

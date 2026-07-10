@@ -2,6 +2,7 @@ use fusiondb::common::Value;
 use fusiondb::config::StorageConfig;
 use fusiondb::execution::{Executor, QueryResult};
 use fusiondb::storage::{memory::MemoryStorage, FusionStorage, Storage};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 #[path = "sql/common.rs"]
@@ -10,6 +11,20 @@ use common::{cleanup, exec_ok, query, setup};
 
 fn encoded_row_id(value: i64) -> String {
     fusiondb::common::encoding::encode_i64_comparable(value)
+}
+
+fn corrupt_only_encoded_column(row: &mut [u8], column_index: usize, column_count: usize) {
+    let off_pos = 2 + column_index * 4;
+    let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    let end = if column_index + 1 < column_count {
+        let next_off_pos = off_pos + 4;
+        u32::from_le_bytes(row[next_off_pos..next_off_pos + 4].try_into().unwrap()) as usize
+    } else {
+        row.len()
+    };
+    for byte in &mut row[start..end] {
+        *byte = 0xff;
+    }
 }
 
 async fn setup_fusion_storage(
@@ -31,6 +46,104 @@ async fn setup_fusion_storage(
 
 fn cleanup_storage_dir(path: &std::path::Path) {
     let _ = std::fs::remove_dir_all(path);
+}
+
+#[tokio::test]
+async fn test_unbounded_fusion_full_scan_uses_no_fill_cache() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("sql_full_scan_no_fill").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE sql_full_scan_no_fill (id INTEGER PRIMARY KEY, payload TEXT)",
+    )
+    .await;
+    let payload = "x".repeat(512);
+    for id in 0..64 {
+        exec_ok(
+            &executor,
+            &format!("INSERT INTO sql_full_scan_no_fill VALUES ({id}, '{payload}')"),
+        )
+        .await;
+    }
+    fusion.create_snapshot_now().await.unwrap();
+
+    let metrics = &fusiondb::monitor::GLOBAL_METRICS;
+    let skips_before = metrics.block_cache_fill_skip_count.load(Relaxed);
+    let (cols, rows) = query(&executor, "SELECT payload FROM sql_full_scan_no_fill").await;
+    assert_eq!(cols, vec!["payload"]);
+    assert_eq!(rows.len(), 64);
+    let skip_delta = metrics
+        .block_cache_fill_skip_count
+        .load(Relaxed)
+        .saturating_sub(skips_before);
+    assert!(
+        skip_delta > 0,
+        "unbounded Fusion full scan should use no-fill cache reads"
+    );
+
+    cleanup_storage_dir(&data_dir);
+}
+
+#[tokio::test]
+async fn test_analyze_and_create_index_backfill_use_no_fill_cache() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("sql_maintenance_no_fill").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE sql_maintenance_no_fill (id INTEGER PRIMARY KEY, bucket INTEGER, payload TEXT)",
+    )
+    .await;
+    let payload = "y".repeat(512);
+    for id in 0..64 {
+        let bucket = id % 8;
+        exec_ok(
+            &executor,
+            &format!("INSERT INTO sql_maintenance_no_fill VALUES ({id}, {bucket}, '{payload}')"),
+        )
+        .await;
+    }
+    fusion.create_snapshot_now().await.unwrap();
+
+    let metrics = &fusiondb::monitor::GLOBAL_METRICS;
+    let analyze_skips_before = metrics.block_cache_fill_skip_count.load(Relaxed);
+    let msg = exec_ok(
+        &executor,
+        "ANALYZE TABLE sql_maintenance_no_fill COMPUTE STATISTICS",
+    )
+    .await;
+    assert!(msg.contains("Analyzed table sql_maintenance_no_fill"));
+    let analyze_skip_delta = metrics
+        .block_cache_fill_skip_count
+        .load(Relaxed)
+        .saturating_sub(analyze_skips_before);
+    assert!(
+        analyze_skip_delta > 0,
+        "ANALYZE should use no-fill cache reads for Fusion SSTable scans"
+    );
+
+    let create_index_skips_before = metrics.block_cache_fill_skip_count.load(Relaxed);
+    let msg = exec_ok(
+        &executor,
+        "CREATE INDEX idx_sql_maintenance_no_fill_bucket ON sql_maintenance_no_fill (bucket)",
+    )
+    .await;
+    assert!(msg.contains("indexed 64 rows"));
+    let create_index_skip_delta = metrics
+        .block_cache_fill_skip_count
+        .load(Relaxed)
+        .saturating_sub(create_index_skips_before);
+    assert!(
+        create_index_skip_delta > 0,
+        "CREATE INDEX backfill should use no-fill cache reads for Fusion SSTable scans"
+    );
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM sql_maintenance_no_fill WHERE bucket = 3",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows.len(), 8);
+
+    cleanup_storage_dir(&data_dir);
 }
 
 #[tokio::test]
@@ -656,6 +769,1729 @@ async fn test_create_integer_btree_index_after_load_uses_comparable_keys() {
 }
 
 #[tokio::test]
+async fn test_secondary_btree_between_skips_outside_range_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_range (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_range VALUES
+            (1, 10, 'bad-low'),
+            (2, 20, 'ok-20'),
+            (3, 30, 'ok-30'),
+            (4, 40, 'bad-high')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_range_score ON sec_range (score)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, score, payload) in [(1, 10, "bad-low"), (4, 40, "bad-high")] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(score),
+                Value::String(payload.to_string()),
+            ]);
+            let corrupt_col_idx = 2usize;
+            let off_pos = 2 + corrupt_col_idx * 4;
+            let start =
+                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+            for byte in &mut corrupt_row[start..] {
+                *byte = 0xff;
+            }
+            let key = format!("data:sec_range:{}", encoded_row_id(id));
+            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT payload FROM sec_range WHERE score BETWEEN 20 AND 30 ORDER BY id",
+    )
+    .await;
+    assert_eq!(cols, vec!["payload"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("ok-20".to_string())],
+            vec![Value::String("ok-30".to_string())],
+        ]
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM sec_range WHERE score >= 20 AND score < 40 ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_range_order_limit_skips_later_match_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_range_top (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_range_top VALUES
+            (1, 10, 'first'),
+            (2, 20, 'second'),
+            (3, 30, 'bad-third')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_range_top_score ON sec_range_top (score)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(3),
+            Value::Integer(30),
+            Value::String("bad-third".to_string()),
+        ]);
+        let corrupt_col_idx = 2usize;
+        let off_pos = 2 + corrupt_col_idx * 4;
+        let start =
+            u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        for byte in &mut corrupt_row[start..] {
+            *byte = 0xff;
+        }
+        let key = format!("data:sec_range_top:{}", encoded_row_id(3));
+        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT payload FROM sec_range_top WHERE score >= 10 ORDER BY score LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["payload"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("first".to_string())],
+            vec![Value::String("second".to_string())],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_range_order_desc_limit_skips_lower_match_decode() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_range_desc_top (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_range_desc_top VALUES
+            (1, 10, 'bad-low'),
+            (2, 20, 'second'),
+            (3, 30, 'third')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_range_desc_top_score ON sec_range_desc_top (score)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::String("bad-low".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 2, 3);
+        let key = format!("data:sec_range_desc_top:{}", encoded_row_id(1));
+        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT payload FROM sec_range_desc_top WHERE score <= 30 ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["payload"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("third".to_string())],
+            vec![Value::String("second".to_string())],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_order_by_limit_offset_uses_index_order() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_order_topk (id INTEGER PRIMARY KEY, score INTEGER NOT NULL, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_order_topk VALUES
+            (1, 50, 'fifty'),
+            (2, 10, 'ten'),
+            (3, 30, 'thirty'),
+            (4, 20, 'twenty')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_order_topk_score ON sec_order_topk (score)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, score FROM sec_order_topk ORDER BY score ASC LIMIT 2 OFFSET 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "score"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(4), Value::Integer(20)],
+            vec![Value::Integer(3), Value::Integer(30)],
+        ]
+    );
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, score FROM sec_order_topk ORDER BY score DESC LIMIT 2 OFFSET 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "score"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(3), Value::Integer(30)],
+            vec![Value::Integer(4), Value::Integer(20)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_ordered_topk_metrics_count_index_and_sort_paths() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE topk_metrics (id INTEGER PRIMARY KEY, score INTEGER NOT NULL, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO topk_metrics VALUES
+            (1, 50, 'first'),
+            (2, 10, 'second'),
+            (3, 30, 'third'),
+            (4, 20, 'fourth')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_topk_metrics_score ON topk_metrics (score)",
+    )
+    .await;
+
+    let metrics = &fusiondb::monitor::GLOBAL_METRICS;
+    let scans_before = metrics.index_ordered_topk_scan_count.load(Relaxed);
+    let visits_before = metrics.index_ordered_topk_entry_visit_count.load(Relaxed);
+    let reverse_before = metrics.index_ordered_topk_reverse_scan_count.load(Relaxed);
+    let index_only_before = metrics
+        .index_ordered_topk_index_only_row_count
+        .load(Relaxed);
+    let base_fetch_before = metrics
+        .index_ordered_topk_base_row_fetch_count
+        .load(Relaxed);
+    let sort_before = metrics.query_sort_fallback_count.load(Relaxed);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM topk_metrics ORDER BY score ASC LIMIT 2",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(2)], vec![Value::Integer(4)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM topk_metrics ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT payload FROM topk_metrics ORDER BY score ASC LIMIT 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("second".to_string())],
+            vec![Value::String("fourth".to_string())],
+        ]
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM topk_metrics ORDER BY score + 0 ASC LIMIT 2",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(2)], vec![Value::Integer(4)]]);
+
+    assert!(
+        metrics.index_ordered_topk_scan_count.load(Relaxed) >= scans_before + 3,
+        "ordered Top-K scan counter should increase for covered and base-fetch index paths"
+    );
+    assert!(
+        metrics.index_ordered_topk_entry_visit_count.load(Relaxed) >= visits_before + 6,
+        "ordered Top-K entry visits should include limited covered and base-fetch entries"
+    );
+    assert!(
+        metrics.index_ordered_topk_reverse_scan_count.load(Relaxed) >= reverse_before + 1,
+        "DESC index path should count a reverse ordered Top-K scan"
+    );
+    assert!(
+        metrics
+            .index_ordered_topk_index_only_row_count
+            .load(Relaxed)
+            >= index_only_before + 4,
+        "covered ordered Top-K rows should count as index-only materialization"
+    );
+    assert!(
+        metrics
+            .index_ordered_topk_base_row_fetch_count
+            .load(Relaxed)
+            >= base_fetch_before + 2,
+        "non-covered ordered Top-K rows should count base-row fetches"
+    );
+    assert!(
+        metrics.query_sort_fallback_count.load(Relaxed) >= sort_before + 1,
+        "expression ORDER BY fallback should count a query sort"
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_order_by_limit_include_covers_top_row() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_order_cover_topk (id INTEGER PRIMARY KEY, score INTEGER NOT NULL, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_order_cover_topk VALUES
+            (1, 10, 'first'),
+            (2, 20, 'second'),
+            (3, 30, 'third')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_order_cover_topk_score ON sec_order_cover_topk (score) INCLUDE (payload)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::String("first".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 2, 3);
+        txn.put(
+            format!("data:sec_order_cover_topk:{}", encoded_row_id(1)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+
+        let mut corrupt_desc_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(3),
+            Value::Integer(30),
+            Value::String("third".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_desc_row, 2, 3);
+        txn.put(
+            format!("data:sec_order_cover_topk:{}", encoded_row_id(3)).as_bytes(),
+            &corrupt_desc_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT payload FROM sec_order_cover_topk ORDER BY score ASC LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["payload"]);
+    assert_eq!(rows, vec![vec![Value::String("first".to_string())]]);
+
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT payload FROM sec_order_cover_topk ORDER BY score DESC LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["payload"]);
+    assert_eq!(rows, vec![vec![Value::String("third".to_string())]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_include_metadata_preserves_delimiter_identifiers() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE \"sec:cover,quoted\" (
+            id INTEGER PRIMARY KEY,
+            score INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO \"sec:cover,quoted\" VALUES
+            (1, 10, 'ten'),
+            (2, 20, 'twenty')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX \"idx:sec,cover\" ON \"sec:cover,quoted\" (score) INCLUDE (payload)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::String("ten".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 2, 3);
+        txn.put(
+            format!("data:\"sec:cover,quoted\":{}", encoded_row_id(1)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let metrics = &fusiondb::monitor::GLOBAL_METRICS;
+    let scans_before = metrics.index_ordered_topk_scan_count.load(Relaxed);
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT payload
+         FROM \"sec:cover,quoted\"
+         ORDER BY score ASC
+         LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["payload"]);
+    assert_eq!(rows, vec![vec![Value::String("ten".to_string())]]);
+    assert!(
+        metrics.index_ordered_topk_scan_count.load(Relaxed) > scans_before,
+        "quoted delimiter identifiers should still load the secondary covering index"
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_include_supports_quoted_delimiter_columns() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover_quoted_columns (
+            id INTEGER PRIMARY KEY,
+            \"score:rank\" INTEGER NOT NULL,
+            \"payload,value\" TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_quoted_columns VALUES
+            (1, 10, 'ten'),
+            (2, 20, 'twenty')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX \"idx:quoted,column\"
+         ON sec_cover_quoted_columns (\"score:rank\") INCLUDE (\"payload,value\")",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::String("ten".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 2, 3);
+        txn.put(
+            format!("data:sec_cover_quoted_columns:{}", encoded_row_id(1)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let metrics = &fusiondb::monitor::GLOBAL_METRICS;
+    let scans_before = metrics.index_ordered_topk_scan_count.load(Relaxed);
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT \"payload,value\"
+         FROM sec_cover_quoted_columns
+         ORDER BY \"score:rank\" ASC
+         LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["payload,value"]);
+    assert_eq!(rows, vec![vec![Value::String("ten".to_string())]]);
+    assert!(
+        metrics.index_ordered_topk_scan_count.load(Relaxed) > scans_before,
+        "quoted delimiter columns should still load the secondary covering index"
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_composite_include_metadata_preserves_delimiter_identifiers() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE \"comp:cover,quoted\" (
+            id INTEGER PRIMARY KEY,
+            host_id INTEGER NOT NULL,
+            ts_val INTEGER NOT NULL,
+            payload_text TEXT,
+            metric_value INTEGER
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO \"comp:cover,quoted\" VALUES
+            (1, 7, 10, 'first', 11),
+            (2, 7, 20, 'second', 22)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX \"idx:comp,cover\" ON \"comp:cover,quoted\" (host_id, ts_val)
+         INCLUDE (payload_text, metric_value)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(1),
+            Value::Integer(7),
+            Value::Integer(10),
+            Value::String("first".to_string()),
+            Value::Integer(11),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 3, 5);
+        corrupt_only_encoded_column(&mut corrupt_row, 4, 5);
+        txn.put(
+            format!("data:\"comp:cover,quoted\":{}", encoded_row_id(1)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let metrics = &fusiondb::monitor::GLOBAL_METRICS;
+    let scans_before = metrics.index_ordered_topk_scan_count.load(Relaxed);
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT payload_text, metric_value
+         FROM \"comp:cover,quoted\"
+         WHERE host_id = 7 AND ts_val >= 0
+         ORDER BY ts_val ASC
+         LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(cols, vec!["payload_text", "metric_value"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::String("first".to_string()), Value::Integer(11)]]
+    );
+    assert!(
+        metrics.index_ordered_topk_scan_count.load(Relaxed) > scans_before,
+        "quoted delimiter identifiers should still load the composite ordered index"
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_order_by_limit_residual_where_does_not_consume_limit() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_order_residual_topk (
+            id INTEGER PRIMARY KEY,
+            score INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_order_residual_topk VALUES
+            (1, 10, 'skip'),
+            (2, 20, 'target'),
+            (3, 30, 'target')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_order_residual_topk_score ON sec_order_residual_topk (score)",
+    )
+    .await;
+
+    let (_, explain_rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, score FROM sec_order_residual_topk
+         WHERE payload = 'target'
+         ORDER BY score ASC
+         LIMIT 1",
+    )
+    .await;
+    if let Value::String(plan) = &explain_rows[0][0] {
+        assert!(!plan.contains("ordered secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, score FROM sec_order_residual_topk
+         WHERE payload = 'target'
+         ORDER BY score ASC
+         LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "score"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2), Value::Integer(20)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_range_order_by_limit_residual_where_keeps_scanning_candidates() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_range_residual_topk (
+            id INTEGER PRIMARY KEY,
+            score INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_range_residual_topk VALUES
+            (1, 10, 'target'),
+            (2, 20, 'target'),
+            (3, 30, 'skip')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_range_residual_topk_score ON sec_range_residual_topk (score)",
+    )
+    .await;
+
+    let (_, explain_rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, score FROM sec_range_residual_topk
+         WHERE score <= 30 AND payload = 'target'
+         ORDER BY score DESC
+         LIMIT 1",
+    )
+    .await;
+    if let Value::String(plan) = &explain_rows[0][0] {
+        assert!(!plan.contains("ordered secondary BTree"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, score FROM sec_range_residual_topk
+         WHERE score <= 30 AND payload = 'target'
+         ORDER BY score DESC
+         LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "score"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2), Value::Integer(20)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_range_order_by_limit_respects_projection_alias() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_range_alias_topk (
+            id INTEGER PRIMARY KEY,
+            score INTEGER NOT NULL
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_range_alias_topk VALUES
+            (1, 100),
+            (2, 10),
+            (3, 50)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_range_alias_topk_score ON sec_range_alias_topk (score)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id AS score FROM sec_range_alias_topk
+         WHERE score >= 0
+         ORDER BY score ASC
+         LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["score"]);
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id AS score FROM sec_range_alias_topk
+         WHERE score >= 0
+         ORDER BY score DESC
+         LIMIT 2",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(3)], vec![Value::Integer(2)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_fusion_secondary_btree_desc_topk_skips_mvcc_tombstones() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("desc_topk_mvcc").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fusion_desc_topk (
+            id INTEGER PRIMARY KEY,
+            score INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fusion_desc_topk VALUES
+            (1, 10, 'ten'),
+            (2, 20, 'twenty'),
+            (3, 30, 'thirty'),
+            (4, 40, 'forty'),
+            (5, 50, 'fifty')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_fusion_desc_topk_score ON fusion_desc_topk (score)",
+    )
+    .await;
+    fusion.create_snapshot_now().await.unwrap();
+
+    exec_ok(&executor, "DELETE FROM fusion_desc_topk WHERE id = 5").await;
+    exec_ok(
+        &executor,
+        "UPDATE fusion_desc_topk SET score = 35, payload = 'thirty-five' WHERE id = 2",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fusion_desc_topk VALUES
+            (6, 45, 'forty-five'),
+            (7, 15, 'fifteen')",
+    )
+    .await;
+    fusion.create_snapshot_now().await.unwrap();
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, score, payload FROM fusion_desc_topk ORDER BY score DESC LIMIT 5",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using ordered secondary BTree"));
+        assert!(plan.contains("DESC"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, score, payload FROM fusion_desc_topk ORDER BY score DESC LIMIT 5",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "score", "payload"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(6),
+                Value::Integer(45),
+                Value::String("forty-five".to_string()),
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Integer(40),
+                Value::String("forty".to_string()),
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Integer(35),
+                Value::String("thirty-five".to_string()),
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Integer(30),
+                Value::String("thirty".to_string()),
+            ],
+            vec![
+                Value::Integer(7),
+                Value::Integer(15),
+                Value::String("fifteen".to_string()),
+            ],
+        ]
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, score FROM fusion_desc_topk
+         WHERE score <= 20
+         ORDER BY score DESC
+         LIMIT 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(7), Value::Integer(15)],
+            vec![Value::Integer(1), Value::Integer(10)],
+        ]
+    );
+    cleanup_storage_dir(&data_dir);
+}
+
+#[tokio::test]
+async fn test_fusion_secondary_btree_desc_topk_include_uses_visible_payload() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("desc_topk_include_mvcc").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE fusion_desc_topk_cover (
+            id INTEGER PRIMARY KEY,
+            score INTEGER NOT NULL,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO fusion_desc_topk_cover VALUES
+            (1, 10, 'ten'),
+            (2, 60, 'old-high'),
+            (3, 40, 'forty'),
+            (4, 55, 'delete-me')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_fusion_desc_topk_cover_score
+         ON fusion_desc_topk_cover (score) INCLUDE (payload)",
+    )
+    .await;
+    fusion.create_snapshot_now().await.unwrap();
+
+    exec_ok(
+        &executor,
+        "UPDATE fusion_desc_topk_cover
+         SET score = 50, payload = 'updated-high'
+         WHERE id = 2",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "UPDATE fusion_desc_topk_cover SET payload = 'forty-new' WHERE id = 3",
+    )
+    .await;
+    exec_ok(&executor, "DELETE FROM fusion_desc_topk_cover WHERE id = 4").await;
+    fusion.create_snapshot_now().await.unwrap();
+
+    {
+        let mut txn = fusion.begin_transaction().await.unwrap();
+        for (id, score, payload) in [(2, 50, "updated-high"), (3, 40, "forty-new")] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(score),
+                Value::String(payload.to_string()),
+            ]);
+            corrupt_only_encoded_column(&mut corrupt_row, 2, 3);
+            txn.put(
+                format!("data:fusion_desc_topk_cover:{}", encoded_row_id(id)).as_bytes(),
+                &corrupt_row,
+            )
+            .await
+            .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "EXPLAIN SELECT id, payload FROM fusion_desc_topk_cover ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["EXPLAIN"]);
+    assert_eq!(rows.len(), 1);
+    if let Value::String(plan) = &rows[0][0] {
+        assert!(plan.contains("Index Scan using ordered secondary BTree"));
+        assert!(plan.contains("DESC"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, payload FROM fusion_desc_topk_cover ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "payload"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(2), Value::String("updated-high".to_string()),],
+            vec![Value::Integer(3), Value::String("forty-new".to_string())],
+        ]
+    );
+    cleanup_storage_dir(&data_dir);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_order_by_limit_boolean_uses_index_order_and_cover() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_order_bool_topk (id INTEGER PRIMARY KEY, flag BOOLEAN NOT NULL, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_order_bool_topk VALUES
+            (1, true, 'one'),
+            (2, false, 'two'),
+            (3, true, 'three')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_order_bool_topk_flag ON sec_order_bool_topk (flag)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Boolean(false),
+            Value::String("two".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 1, 3);
+        txn.put(
+            format!("data:sec_order_bool_topk:{}", encoded_row_id(2)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT flag FROM sec_order_bool_topk ORDER BY flag ASC LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["flag"]);
+    assert_eq!(rows, vec![vec![Value::Boolean(false)]]);
+
+    let (_, explain_rows) = query(
+        &fresh_executor,
+        "EXPLAIN SELECT flag FROM sec_order_bool_topk ORDER BY flag ASC LIMIT 1",
+    )
+    .await;
+    if let Value::String(plan) = &explain_rows[0][0] {
+        assert!(plan.contains("Index Scan using ordered secondary BTree"));
+        assert!(plan.contains("flag"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_order_by_limit_temporal_aliases_use_index_cover() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_order_alias_topk (
+            id INTEGER PRIMARY KEY,
+            d DATE32 NOT NULL,
+            ts TIMESTAMPTZ NOT NULL,
+            span INTERVAL DAY NOT NULL
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_order_alias_topk VALUES
+            (1, '2024-02-01', '2024-02-01 00:00:00+00', '1 days'),
+            (2, '2024-01-01', '2024-03-01 00:00:00+00', '3 days'),
+            (3, '2024-03-01', '2024-01-01 00:00:00+00', '2 days')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_order_alias_topk_d ON sec_order_alias_topk (d)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_order_alias_topk_ts ON sec_order_alias_topk (ts)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_order_alias_topk_span ON sec_order_alias_topk (span)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+
+        let mut corrupt_date_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::date_from_str("2024-01-01").unwrap(),
+            Value::timestamp_from_str("2024-03-01 00:00:00+00").unwrap(),
+            Value::interval_from_str("3 days").unwrap(),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_date_row, 1, 4);
+        txn.put(
+            format!("data:sec_order_alias_topk:{}", encoded_row_id(2)).as_bytes(),
+            &corrupt_date_row,
+        )
+        .await
+        .unwrap();
+
+        let mut corrupt_timestamp_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(3),
+            Value::date_from_str("2024-03-01").unwrap(),
+            Value::timestamp_from_str("2024-01-01 00:00:00+00").unwrap(),
+            Value::interval_from_str("2 days").unwrap(),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_timestamp_row, 2, 4);
+        txn.put(
+            format!("data:sec_order_alias_topk:{}", encoded_row_id(3)).as_bytes(),
+            &corrupt_timestamp_row,
+        )
+        .await
+        .unwrap();
+
+        let mut corrupt_interval_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(1),
+            Value::date_from_str("2024-02-01").unwrap(),
+            Value::timestamp_from_str("2024-02-01 00:00:00+00").unwrap(),
+            Value::interval_from_str("1 days").unwrap(),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_interval_row, 3, 4);
+        txn.put(
+            format!("data:sec_order_alias_topk:{}", encoded_row_id(1)).as_bytes(),
+            &corrupt_interval_row,
+        )
+        .await
+        .unwrap();
+
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT d FROM sec_order_alias_topk ORDER BY d ASC LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["d"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::date_from_str("2024-01-01").unwrap()]]
+    );
+
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT ts FROM sec_order_alias_topk ORDER BY ts ASC LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["ts"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::timestamp_from_str("2024-01-01 00:00:00+00").unwrap()
+        ]]
+    );
+
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT span FROM sec_order_alias_topk ORDER BY span ASC LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["span"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::interval_from_str("1 days").unwrap()]]
+    );
+
+    let (_, explain_rows) = query(
+        &fresh_executor,
+        "EXPLAIN SELECT span FROM sec_order_alias_topk ORDER BY span ASC LIMIT 1",
+    )
+    .await;
+    if let Value::String(plan) = &explain_rows[0][0] {
+        assert!(plan.contains("Index Scan using ordered secondary BTree"));
+        assert!(plan.contains("span"));
+    } else {
+        panic!("expected explain text");
+    }
+
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_order_by_limit_falls_back_for_nullable_column() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_order_nullable_topk (id INTEGER PRIMARY KEY, score INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_order_nullable_topk VALUES (1, 10), (2, NULL), (3, 20)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_order_nullable_topk_score ON sec_order_nullable_topk (score)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id FROM sec_order_nullable_topk ORDER BY score ASC LIMIT 1",
+    )
+    .await;
+    assert_eq!(cols, vec!["id"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_index_only_covers_pk_and_index_column() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover VALUES (1, 10, 'ten'), (2, 20, 'twenty')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_cover_score ON sec_cover (score)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Integer(20),
+            Value::String("twenty".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 1, 3);
+        txn.put(
+            format!("data:sec_cover:{}", encoded_row_id(2)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT id, score FROM sec_cover WHERE score = 20",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "score"]);
+    assert_eq!(rows, vec![vec![Value::Integer(2), Value::Integer(20)]]);
+
+    let (_, payload_rows) = query(
+        &fresh_executor,
+        "SELECT payload FROM sec_cover WHERE id = 2",
+    )
+    .await;
+    assert_eq!(
+        payload_rows,
+        vec![vec![Value::String("twenty".to_string())]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_range_index_only_decodes_value_from_index_key() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover_range (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_range VALUES
+            (1, 10, 'ten'),
+            (2, 20, 'twenty'),
+            (3, 30, 'thirty')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_cover_range_score ON sec_cover_range (score)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Integer(20),
+            Value::String("twenty".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 1, 3);
+        txn.put(
+            format!("data:sec_cover_range:{}", encoded_row_id(2)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (_, rows) = query(
+        &fresh_executor,
+        "SELECT id, score FROM sec_cover_range
+         WHERE score BETWEEN 10 AND 20
+         ORDER BY score
+         LIMIT 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(10)],
+            vec![Value::Integer(2), Value::Integer(20)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_index_only_respects_update_and_delete() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover_dml (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_dml VALUES (1, 10, 'old'), (2, 20, 'keep')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_cover_dml_score ON sec_cover_dml (score)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "UPDATE sec_cover_dml SET score = 30 WHERE id = 2",
+    )
+    .await;
+    exec_ok(&executor, "DELETE FROM sec_cover_dml WHERE id = 1").await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, score FROM sec_cover_dml WHERE score IN (10, 20, 30) ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(2), Value::Integer(30)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_include_index_covers_payload_from_backfill() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover_include (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_include VALUES (1, 10, 'ten'), (2, 20, 'twenty')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_cover_include_score ON sec_cover_include (score) INCLUDE (payload)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Integer(20),
+            Value::String("twenty".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 2, 3);
+        txn.put(
+            format!("data:sec_cover_include:{}", encoded_row_id(2)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT id, payload FROM sec_cover_include WHERE score = 20",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "payload"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(2), Value::String("twenty".to_string())]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_include_legacy_s2_metadata_covers_payload() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover_include_legacy (
+            id INTEGER PRIMARY KEY,
+            score INTEGER,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_include_legacy VALUES (1, 10, 'ten'), (2, 20, 'twenty')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_cover_include_legacy_score
+         ON sec_cover_include_legacy (score) INCLUDE (payload)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(
+            b"index_meta:idx_sec_cover_include_legacy_score",
+            b"s2:sec_cover_include_legacy:score:payload",
+        )
+        .await
+        .unwrap();
+        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Integer(20),
+            Value::String("twenty".to_string()),
+        ]);
+        corrupt_only_encoded_column(&mut corrupt_row, 2, 3);
+        txn.put(
+            format!("data:sec_cover_include_legacy:{}", encoded_row_id(2)).as_bytes(),
+            &corrupt_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT id, payload FROM sec_cover_include_legacy WHERE score = 20",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "payload"]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(2), Value::String("twenty".to_string())]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_include_malformed_s3_metadata_falls_back_to_base_row() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover_include_bad_meta (
+            id INTEGER PRIMARY KEY,
+            score INTEGER,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_include_bad_meta VALUES (1, 10, 'ten'), (2, 20, 'old-index')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_cover_include_bad_meta_score
+         ON sec_cover_include_bad_meta (score) INCLUDE (payload)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(
+            b"index_meta:idx_sec_cover_include_bad_meta_score",
+            b"s3:5:stock1:5:score1:7:payloadjunk",
+        )
+        .await
+        .unwrap();
+        let base_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Integer(20),
+            Value::String("base-fallback".to_string()),
+        ]);
+        txn.put(
+            format!("data:sec_cover_include_bad_meta:{}", encoded_row_id(2)).as_bytes(),
+            &base_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT id, payload FROM sec_cover_include_bad_meta WHERE score = 20",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "payload"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::String("base-fallback".to_string())
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_include_malformed_payload_falls_back_to_base_rows() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover_include_bad_payload (
+            id INTEGER PRIMARY KEY,
+            score INTEGER,
+            payload TEXT
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_include_bad_payload VALUES (1, 10, 'ten'), (2, 20, 'old-index')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_cover_include_bad_payload_score
+         ON sec_cover_include_bad_payload (score) INCLUDE (payload)",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let score_key = fusiondb::common::encoding::encode_i64_comparable(20);
+        let row_id = encoded_row_id(2);
+        let index_key = format!(
+            "index:sec_cover_include_bad_payload:score:{}:{}",
+            score_key, row_id
+        );
+        txn.put(index_key.as_bytes(), &[]).await.unwrap();
+        let base_row = fusiondb::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::Integer(20),
+            Value::String("base-fallback".to_string()),
+        ]);
+        txn.put(
+            format!("data:sec_cover_include_bad_payload:{}", row_id).as_bytes(),
+            &base_row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (cols, rows) = query(
+        &fresh_executor,
+        "SELECT id, payload FROM sec_cover_include_bad_payload WHERE score = 20",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "payload"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::String("base-fallback".to_string())
+        ]]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_secondary_btree_include_index_payload_tracks_insert_update_and_range() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE sec_cover_include_dml (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_include_dml VALUES (1, 10, 'old')",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_sec_cover_include_dml_score ON sec_cover_include_dml (score) INCLUDE (payload)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "UPDATE sec_cover_include_dml SET payload = 'new' WHERE id = 1",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO sec_cover_include_dml VALUES (2, 20, 'inserted')",
+    )
+    .await;
+
+    {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (id, score, payload) in [(1, 10, "new"), (2, 20, "inserted")] {
+            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+                Value::Integer(id),
+                Value::Integer(score),
+                Value::String(payload.to_string()),
+            ]);
+            corrupt_only_encoded_column(&mut corrupt_row, 2, 3);
+            txn.put(
+                format!("data:sec_cover_include_dml:{}", encoded_row_id(id)).as_bytes(),
+                &corrupt_row,
+            )
+            .await
+            .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let fresh_executor = Arc::new(Executor::new(storage.clone()));
+    let (_, range_rows) = query(
+        &fresh_executor,
+        "SELECT id, payload FROM sec_cover_include_dml
+         WHERE score BETWEEN 10 AND 20
+         ORDER BY score",
+    )
+    .await;
+    assert_eq!(
+        range_rows,
+        vec![
+            vec![Value::Integer(1), Value::String("new".to_string())],
+            vec![Value::Integer(2), Value::String("inserted".to_string())],
+        ]
+    );
+
+    let (_, in_rows) = query(
+        &fresh_executor,
+        "SELECT id, payload FROM sec_cover_include_dml
+         WHERE score IN (10, 20)
+         ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        in_rows,
+        vec![
+            vec![Value::Integer(1), Value::String("new".to_string())],
+            vec![Value::Integer(2), Value::String("inserted".to_string())],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
 async fn test_empty_secondary_index_lookup_skips_full_table_scan() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
@@ -938,6 +2774,74 @@ async fn test_composite_index_range_order_limit_skips_outside_range_decode() {
         vec![
             vec![Value::Integer(1000), Value::Integer(2), Value::Integer(20)],
             vec![Value::Integer(1060), Value::Integer(3), Value::Integer(30)],
+        ]
+    );
+    cleanup(&wal_path);
+}
+
+#[tokio::test]
+async fn test_composite_index_order_limit_counts_after_residual_filter() {
+    let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+    let executor = Arc::new(Executor::new(storage.clone()));
+
+    exec_ok(
+        &executor,
+        "CREATE TABLE comp_order_residual_topk (
+            id INTEGER PRIMARY KEY,
+            host_id INTEGER,
+            ts INTEGER,
+            keep INTEGER
+        )",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO comp_order_residual_topk VALUES
+            (1, 1, 10, 0),
+            (2, 1, 20, 0),
+            (3, 1, 30, 1),
+            (4, 1, 40, 1),
+            (5, 2, 5, 1)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_comp_order_residual_host_ts
+         ON comp_order_residual_topk (host_id, ts)",
+    )
+    .await;
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT id, ts FROM comp_order_residual_topk
+         WHERE host_id = 1 AND keep = 1
+         ORDER BY ts ASC
+         LIMIT 2",
+    )
+    .await;
+    assert_eq!(cols, vec!["id", "ts"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(3), Value::Integer(30)],
+            vec![Value::Integer(4), Value::Integer(40)],
+        ]
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id, ts FROM comp_order_residual_topk
+         WHERE host_id = 1 AND keep = 1
+         ORDER BY ts DESC
+         LIMIT 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(4), Value::Integer(40)],
+            vec![Value::Integer(3), Value::Integer(30)],
         ]
     );
     cleanup(&wal_path);

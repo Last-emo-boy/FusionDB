@@ -3,6 +3,8 @@ use reqwest::{Client, Method};
 use serde_json::json;
 
 const DEFAULT_URL: &str = "http://127.0.0.1:8091";
+const DEFAULT_USER: &str = "postgres";
+const DEFAULT_PASSWORD: &str = "fusiondb";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -25,7 +27,8 @@ enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliConfig {
     base_url: String,
-    user: Option<String>,
+    user: String,
+    password: String,
     command: Command,
 }
 
@@ -58,7 +61,9 @@ fn parse_cli_args(args: &[String]) -> Result<Option<CliConfig>> {
     }
 
     let mut base_url = DEFAULT_URL.to_string();
-    let mut user = None;
+    let mut user = std::env::var("FUSIONDB_HTTP_USER").unwrap_or_else(|_| DEFAULT_USER.to_string());
+    let mut password =
+        std::env::var("FUSIONDB_HTTP_PASSWORD").unwrap_or_else(|_| DEFAULT_PASSWORD.to_string());
     let mut position = 0;
     while position < args.len() {
         let arg = &args[position];
@@ -77,10 +82,20 @@ fn parse_cli_args(args: &[String]) -> Result<Option<CliConfig>> {
             let Some(value) = args.get(position) else {
                 bail!("--user requires a value");
             };
-            user = Some(non_empty_value("--user", value)?);
+            user = non_empty_value("--user", value)?;
             position += 1;
         } else if let Some(value) = arg.strip_prefix("--user=") {
-            user = Some(non_empty_value("--user", value)?);
+            user = non_empty_value("--user", value)?;
+            position += 1;
+        } else if arg == "--password" {
+            position += 1;
+            let Some(value) = args.get(position) else {
+                bail!("--password requires a value");
+            };
+            password = non_empty_value("--password", value)?;
+            position += 1;
+        } else if let Some(value) = arg.strip_prefix("--password=") {
+            password = non_empty_value("--password", value)?;
             position += 1;
         } else {
             break;
@@ -96,6 +111,7 @@ fn parse_cli_args(args: &[String]) -> Result<Option<CliConfig>> {
     Ok(Some(CliConfig {
         base_url,
         user,
+        password,
         command,
     }))
 }
@@ -156,9 +172,7 @@ fn request_spec(config: &CliConfig) -> RequestSpec {
 
 async fn execute_request(client: &Client, config: &CliConfig, spec: RequestSpec) -> Result<String> {
     let mut request = client.request(spec.method, &spec.url);
-    if let Some(user) = &config.user {
-        request = request.header("x-fusiondb-user", user);
-    }
+    request = request.basic_auth(&config.user, Some(&config.password));
     if let Some(body) = spec.json_body {
         request = request.json(&body);
     }
@@ -295,7 +309,8 @@ fn push_query_param<T: std::fmt::Display>(
 }
 
 fn usage() -> &'static str {
-    "Usage: fusiondb-cli [--url URL] [--user USER] <command> [args]\n\
+    "Usage: fusiondb-cli [--url URL] [--user USER] [--password PASSWORD] <command> [args]\n\
+Environment: FUSIONDB_HTTP_USER, FUSIONDB_HTTP_PASSWORD\n\
 \n\
 Commands:\n\
   health                       GET /health\n\
@@ -324,7 +339,8 @@ mod tests {
         let config = parse_cli_args(&owned(&["health"])).unwrap().unwrap();
 
         assert_eq!(config.base_url, DEFAULT_URL);
-        assert_eq!(config.user, None);
+        assert_eq!(config.user, DEFAULT_USER);
+        assert_eq!(config.password, DEFAULT_PASSWORD);
         assert_eq!(config.command, Command::Health);
     }
 
@@ -334,6 +350,7 @@ mod tests {
             "--url",
             "http://localhost:9000/",
             "--user=admin",
+            "--password=secret",
             "query",
             "SELECT",
             "1",
@@ -342,7 +359,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.base_url, "http://localhost:9000");
-        assert_eq!(config.user.as_deref(), Some("admin"));
+        assert_eq!(config.user, "admin");
+        assert_eq!(config.password, "secret");
         assert_eq!(config.command, Command::Query("SELECT 1".to_string()));
     }
 

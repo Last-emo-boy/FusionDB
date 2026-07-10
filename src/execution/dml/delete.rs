@@ -265,6 +265,14 @@ impl Executor {
                                 row_id,
                             );
                             txn.delete(index_key.as_bytes()).await?;
+                            self.adjust_index_count_summary(
+                                &table_name_str,
+                                &col.name,
+                                &val_str,
+                                -1,
+                                txn,
+                            )
+                            .await?;
                         }
                     }
                 }

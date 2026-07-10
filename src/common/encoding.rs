@@ -20,7 +20,7 @@ mod tests {
             Value::Integer(12345),
             Value::String("hello world".to_string()),
             Value::Boolean(true),
-            Value::Float(3.14),
+            Value::Float(2.5),
             Value::Null,
         ];
 

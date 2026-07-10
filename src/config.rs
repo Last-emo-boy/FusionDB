@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+const BLOCK_CACHE_BLOCK_BYTES: u64 = 4 * 1024;
+
 /// FusionDB server configuration, loaded from `fusiondb.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,8 +46,10 @@ pub struct StorageConfig {
     pub row_cache_capacity: u64,
     /// Statement cache capacity
     pub statement_cache_capacity: u64,
-    /// Block cache capacity (number of 4KB blocks)
+    /// Block cache capacity (number of 4KB block units)
     pub block_cache_capacity: u64,
+    /// Use no-fill SSTable block-cache reads for SQL bulk scans
+    pub sql_bulk_scan_no_fill: bool,
     /// Slow query threshold in milliseconds
     pub slow_query_threshold_ms: u64,
 }
@@ -57,6 +61,8 @@ pub struct AuthConfig {
     pub password: String,
     /// Use SCRAM-SHA-256 instead of cleartext (default: false for backward compat)
     pub scram_sha256: bool,
+    /// Restore the legacy unauthenticated HTTP API. This is unsafe and disabled by default.
+    pub http_legacy_unsafe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +79,7 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DistributedConfig {
-    /// Enable OpenRaft-backed distributed mode
+    /// Enable OpenRaft-backed distributed mode (requires TLS and a forwarding secret)
     pub enabled: bool,
     /// Local Raft node id
     pub node_id: u64,
@@ -83,6 +89,8 @@ pub struct DistributedConfig {
     pub bootstrap: bool,
     /// Application-specific OpenRaft cluster name
     pub cluster_name: String,
+    /// Shared secret used to authenticate internal HTTP forwarding requests
+    pub forwarding_secret: String,
     /// Initial voting members used during bootstrap
     pub initial_members: Vec<DistributedPeerConfig>,
     /// Optional automatic sharding control-plane configuration
@@ -163,6 +171,7 @@ impl Default for StorageConfig {
             row_cache_capacity: 10_000,
             statement_cache_capacity: 1_000,
             block_cache_capacity: 25_000,
+            sql_bulk_scan_no_fill: true,
             slow_query_threshold_ms: 100,
         }
     }
@@ -173,6 +182,7 @@ impl Default for AuthConfig {
         Self {
             password: "fusiondb".to_string(),
             scram_sha256: false,
+            http_legacy_unsafe: false,
         }
     }
 }
@@ -202,6 +212,12 @@ impl StorageConfig {
     pub fn memtable_flush_threshold_bytes(&self) -> usize {
         self.memtable_flush_mb.saturating_mul(1024 * 1024)
     }
+
+    /// Block cache capacity in bytes, preserving the legacy 4KB block-unit config.
+    pub fn block_cache_capacity_bytes(&self) -> u64 {
+        self.block_cache_capacity
+            .saturating_mul(BLOCK_CACHE_BLOCK_BYTES)
+    }
 }
 
 impl ServerConfig {
@@ -223,24 +239,56 @@ impl DistributedConfig {
 }
 
 impl Config {
-    /// Load config from file path. Falls back to defaults if file doesn't exist.
-    pub fn load(path: &str) -> Self {
+    /// Load a configuration file without silently ignoring malformed content.
+    /// A missing file still selects the documented defaults.
+    pub fn try_load(path: &str) -> std::io::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(content) => match toml::from_str::<Config>(&content) {
-                Ok(config) => {
-                    println!("Loaded config from {}", path);
-                    config
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to parse {}: {}. Using defaults.", path, e);
-                    Config::default()
-                }
-            },
-            Err(_) => {
-                println!("No config file found at {}. Using defaults.", path);
-                Config::default()
+            Ok(content) => {
+                let config = toml::from_str::<Config>(&content).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Failed to parse {}: {}", path, e),
+                    )
+                })?;
+                println!("Loaded config from {}", path);
+                Ok(config)
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("No config file found at {}. Using defaults.", path);
+                Ok(Config::default())
+            }
+            Err(e) => Err(e),
         }
+    }
+
+    /// Validate configuration that defines protocol security boundaries.
+    pub fn validate_security(&self) -> std::io::Result<()> {
+        if self.auth.password.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[auth].password must not be empty",
+            ));
+        }
+        if self.distributed.enabled && !self.tls.enabled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[tls].enabled must be true when distributed mode is enabled",
+            ));
+        }
+        if self.distributed.enabled && self.distributed.forwarding_secret.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[distributed].forwarding_secret is required when distributed mode is enabled",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Load config from file path. Falls back to defaults if file doesn't exist.
+    #[deprecated(note = "Use Config::try_load so configuration errors can be reported to callers")]
+    pub fn load(path: &str) -> Self {
+        Self::try_load(path)
+            .unwrap_or_else(|e| panic!("Unable to load configuration from {}: {}", path, e))
     }
 
     /// Write default config to a file (for `fusiondb --init`).
@@ -270,7 +318,11 @@ mod tests {
         assert_eq!(config.distributed.sharding.strategy, ShardingStrategy::Hash);
         assert_eq!(config.distributed.sharding.shard_count, 16);
         assert_eq!(config.storage.data_dir, "data");
+        assert_eq!(config.storage.block_cache_capacity_bytes(), 102_400_000);
+        assert!(config.storage.sql_bulk_scan_no_fill);
         assert_eq!(config.auth.password, "fusiondb");
+        assert!(!config.auth.http_legacy_unsafe);
+        assert!(config.distributed.forwarding_secret.is_empty());
     }
 
     #[test]
@@ -285,8 +337,9 @@ bind = "0.0.0.0"
 max_connections = 250
 
 [storage]
-data_dir = "/var/fusiondb"
-memtable_flush_mb = 64
+        data_dir = "/var/fusiondb"
+        memtable_flush_mb = 64
+        sql_bulk_scan_no_fill = false
 
 [auth]
 password = "secret123"
@@ -329,6 +382,7 @@ addr = "127.0.0.1:8091"
         assert_eq!(config.distributed.sharding.range_boundaries, vec!["m", "t"]);
         assert_eq!(config.storage.data_dir, "/var/fusiondb");
         assert_eq!(config.storage.memtable_flush_mb, 64);
+        assert!(!config.storage.sql_bulk_scan_no_fill);
         assert_eq!(config.auth.password, "secret123");
         // Defaults for unset fields
         assert_eq!(config.storage.wal_file, "fusion.wal");
@@ -347,8 +401,44 @@ addr = "127.0.0.1:8091"
 
     #[test]
     fn test_load_missing_file() {
-        let config = Config::load("nonexistent_fusiondb.toml");
+        let config = Config::try_load("nonexistent_fusiondb.toml").unwrap();
         assert_eq!(config.server.http_port, 8091);
+    }
+
+    #[test]
+    fn strict_load_rejects_malformed_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "fusiondb_invalid_config_{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[tls\nenabled = true").unwrap();
+
+        let error = Config::try_load(path.to_str().unwrap()).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn distributed_mode_requires_tls_and_forwarding_secret() {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+
+        assert!(config
+            .validate_security()
+            .unwrap_err()
+            .to_string()
+            .contains("[tls].enabled"));
+
+        config.tls.enabled = true;
+        assert!(config
+            .validate_security()
+            .unwrap_err()
+            .to_string()
+            .contains("forwarding_secret"));
+
+        config.distributed.forwarding_secret = "cluster-test-secret".to_string();
+        assert!(config.validate_security().is_ok());
     }
 
     #[test]
@@ -362,6 +452,7 @@ addr = "127.0.0.1:8091"
         assert!(serialized.contains("[distributed.sharding]"));
         assert!(serialized.contains("strategy = \"hash\""));
         assert!(serialized.contains("data_dir = \"data\""));
+        assert!(serialized.contains("sql_bulk_scan_no_fill = true"));
     }
 
     #[test]
@@ -388,6 +479,7 @@ impl Default for DistributedConfig {
             advertise_addr: String::new(),
             bootstrap: true,
             cluster_name: "fusiondb".to_string(),
+            forwarding_secret: String::new(),
             initial_members: Vec::new(),
             sharding: ShardingConfig::default(),
         }

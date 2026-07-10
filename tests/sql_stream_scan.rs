@@ -1,8 +1,5 @@
 use fusiondb::common::Value;
 use fusiondb::execution::Executor;
-use fusiondb::storage::memory::MemoryStorage;
-use fusiondb::storage::Storage;
-use std::sync::Arc;
 
 #[path = "sql/common.rs"]
 mod common;
@@ -96,5 +93,69 @@ async fn test_streaming_filtered_limit_offset() {
     // OFFSET 2 over matches v>=5 (5,6,7,8,...) LIMIT 2 -> ids 7,8.
     let (_, rows) = query(&executor, "SELECT id FROM st WHERE v >= 5 LIMIT 2 OFFSET 2").await;
     assert_eq!(rows, vec![vec![Value::Integer(7)], vec![Value::Integer(8)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_streaming_order_by_limit_offset_topk() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE st_topk (id INTEGER PRIMARY KEY, score INTEGER, tag TEXT)",
+    )
+    .await;
+    for (id, score, tag) in [
+        (1, 20, "a"),
+        (2, 10, "b"),
+        (3, 50, "c"),
+        (4, 40, "d"),
+        (5, 30, "e"),
+        (6, 40, "f"),
+    ] {
+        exec_ok(
+            &executor,
+            &format!("INSERT INTO st_topk VALUES ({}, {}, '{}')", id, score, tag),
+        )
+        .await;
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM st_topk ORDER BY score DESC, id ASC LIMIT 3 OFFSET 1",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(4)],
+            vec![Value::Integer(6)],
+            vec![Value::Integer(5)],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_streaming_order_by_alias_shadow_falls_back_to_query_sort() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE st_alias_topk (id INTEGER PRIMARY KEY, score INTEGER)",
+    )
+    .await;
+    for (id, score) in [(1, 100), (2, 10), (3, 50)] {
+        exec_ok(
+            &executor,
+            &format!("INSERT INTO st_alias_topk VALUES ({}, {})", id, score),
+        )
+        .await;
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id AS score FROM st_alias_topk ORDER BY score ASC LIMIT 2",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
     cleanup(&wal);
 }

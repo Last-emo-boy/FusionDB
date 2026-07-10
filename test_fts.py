@@ -1,6 +1,12 @@
 import requests
 import json
 import time
+import os
+
+AUTH = (
+    os.environ.get("FUSIONDB_HTTP_USER", "postgres"),
+    os.environ.get("FUSIONDB_HTTP_PASSWORD", "fusiondb"),
+)
 
 BASE_URL = "http://localhost:8091/query"
 
@@ -17,7 +23,7 @@ URL = get_base_url()
 def execute_sql(sql):
     print(f"Executing: {sql}")
     try:
-        response = requests.post(URL, json={"sql": sql})
+        response = requests.post(URL, json={"sql": sql}, auth=AUTH)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -51,35 +57,35 @@ def test_fts():
     print("\nSearch: 'Rust'")
     res = execute_sql("SELECT id, title FROM articles WHERE MATCH(content) AGAINST('Rust')")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     # Should match id 1 and 4
-    ids = sorted([r[0]['Integer'] for r in rows])
+    ids = sorted([r[0] for r in rows])
     assert ids == [1, 4]
 
     # 6. Search: "databases" (case insensitive check, tokenizer lowercases)
     print("\nSearch: 'databases'")
     res = execute_sql("SELECT id, title FROM articles WHERE MATCH(content) AGAINST('Databases')")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     # Should match id 1
     assert len(rows) == 1
-    assert rows[0][0]['Integer'] == 1
+    assert rows[0][0] == 1
 
     # 7. Search: "Python"
     print("\nSearch: 'Python'")
     res = execute_sql("SELECT id, title FROM articles WHERE MATCH(content) AGAINST('Python')")
-    rows = res['result'][0]['rows']
-    ids = sorted([r[0]['Integer'] for r in rows])
+    rows = res['data'][0]['rows']
+    ids = sorted([r[0] for r in rows])
     assert ids == [2, 4]
 
     # 8. Search: "Rust Python" (AND logic)
     print("\nSearch: 'Rust Python'")
     res = execute_sql("SELECT id, title FROM articles WHERE MATCH(content) AGAINST('Rust Python')")
     print(json.dumps(res, indent=2))
-    rows = res['result'][0]['rows']
+    rows = res['data'][0]['rows']
     # Should match id 4 only
     assert len(rows) == 1
-    assert rows[0][0]['Integer'] == 4
+    assert rows[0][0] == 4
 
     # 9. Update
     print("\nUpdate id 2 to mention Rust")
@@ -87,8 +93,8 @@ def test_fts():
     
     print("\nSearch: 'Rust' after update")
     res = execute_sql("SELECT id, title FROM articles WHERE MATCH(content) AGAINST('Rust')")
-    rows = res['result'][0]['rows']
-    ids = sorted([r[0]['Integer'] for r in rows])
+    rows = res['data'][0]['rows']
+    ids = sorted([r[0] for r in rows])
     # Should match 1, 2, 4
     assert ids == [1, 2, 4]
 
@@ -98,8 +104,8 @@ def test_fts():
     
     print("\nSearch: 'Rust' after delete")
     res = execute_sql("SELECT id, title FROM articles WHERE MATCH(content) AGAINST('Rust')")
-    rows = res['result'][0]['rows']
-    ids = sorted([r[0]['Integer'] for r in rows])
+    rows = res['data'][0]['rows']
+    ids = sorted([r[0] for r in rows])
     # Should match 1, 2
     assert ids == [1, 2]
 

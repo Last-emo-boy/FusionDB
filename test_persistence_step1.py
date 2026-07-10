@@ -5,11 +5,16 @@ import subprocess
 import os
 import sys
 
+AUTH = (
+    os.environ.get("FUSIONDB_HTTP_USER", "postgres"),
+    os.environ.get("FUSIONDB_HTTP_PASSWORD", "fusiondb"),
+)
+
 BASE_URL = "http://localhost:8091/query"
 
 def execute_sql(sql):
     try:
-        response = requests.post(BASE_URL, json={"sql": sql})
+        response = requests.post(BASE_URL, json={"sql": sql}, auth=AUTH)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -29,7 +34,7 @@ def test_persistence():
     execute_sql("INSERT INTO persistent_table VALUES (1, 'Data 1')")
     res = execute_sql("SELECT * FROM persistent_table")
     print("Data before restart:", json.dumps(res))
-    assert len(res['result'][0]['rows']) == 1
+    assert len(res['data'][0]['rows']) == 1
 
     # Step 2: Stop Server
     print("Step 2: Stopping Server...")
@@ -48,8 +53,8 @@ if __name__ == "__main__":
              print("Error:", res['error'])
              sys.exit(1)
              
-        rows = res['result'][0]['rows']
-        if len(rows) == 1 and rows[0][1]['String'] == 'Data 1':
+        rows = res['data'][0]['rows']
+        if len(rows) == 1 and rows[0][1] == 'Data 1':
             print("Persistence Verified!")
         else:
             print("Persistence Failed!")

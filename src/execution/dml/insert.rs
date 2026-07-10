@@ -3,6 +3,7 @@ use crate::common::{FusionError, Result, Value};
 use crate::monitor;
 use crate::storage::Transaction;
 use sqlparser::ast::{Ident, OnInsert, SelectItem, SetExpr};
+use std::collections::HashMap;
 
 use super::super::composite_index::CompositeIndexMeta;
 use super::super::{Executor, ForeignKeyMeta, QueryResult};
@@ -12,6 +13,7 @@ struct InsertRowsContext {
     schema: TableSchema,
     composite_indexes: Vec<CompositeIndexMeta>,
     composite_unique_indexes: Vec<CompositeIndexMeta>,
+    single_column_index_includes: HashMap<usize, Vec<usize>>,
     foreign_keys: Vec<ForeignKeyMeta>,
     trigram_column_indices: Vec<usize>,
     col_mapping: Option<Vec<usize>>,
@@ -190,16 +192,30 @@ impl Executor {
         old_row: &[Value],
         new_row: &[Value],
         row_id: &str,
+        single_column_index_includes: &HashMap<usize, Vec<usize>>,
         txn: &mut dyn Transaction,
     ) -> Result<()> {
         for (idx, col) in schema.columns.iter().enumerate() {
-            if !col.is_indexed || old_row.get(idx) == new_row.get(idx) {
+            if !col.is_indexed {
+                continue;
+            }
+            let include_indices = single_column_index_includes
+                .get(&idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let key_changed = old_row.get(idx) != new_row.get(idx);
+            let include_changed =
+                Self::single_column_index_payload_touched(old_row, new_row, include_indices);
+            if !key_changed && !include_changed {
                 continue;
             }
 
             let old_val = old_row.get(idx).unwrap_or(&Value::Null);
             let new_val = new_row.get(idx).unwrap_or(&Value::Null);
             if col.index_type == IndexType::FTS {
+                if !key_changed {
+                    continue;
+                }
                 if let Value::String(text) = old_val {
                     for token in Self::tokenize_unique(text) {
                         let index_key = self
@@ -215,6 +231,9 @@ impl Executor {
                     }
                 }
             } else if col.index_type == IndexType::HNSW {
+                if !key_changed {
+                    continue;
+                }
                 let idx_name = Self::hnsw_index_name_for_column(table_name, &col.name);
                 if matches!(old_val, Value::Vector(_)) {
                     self.vector_index.delete(&idx_name, row_id)?;
@@ -224,23 +243,34 @@ impl Executor {
                         .insert(&idx_name, row_id.to_string(), vec.clone())?;
                 }
             } else {
-                if let Some(old_val_str) = self.value_to_index_string(old_val) {
-                    let index_key = self.routed_index_key_for_value(
-                        table_name,
-                        &col.name,
-                        &old_val_str,
-                        row_id,
-                    );
+                let old_val_str = self.value_to_index_string(old_val);
+                if let Some(old_val_str) = old_val_str.as_deref() {
+                    let index_key =
+                        self.routed_index_key_for_value(table_name, &col.name, old_val_str, row_id);
                     txn.delete(index_key.as_bytes()).await?;
                 }
-                if let Some(new_val_str) = self.value_to_index_string(new_val) {
-                    let index_key = self.routed_index_key_for_value(
-                        table_name,
-                        &col.name,
-                        &new_val_str,
-                        row_id,
-                    );
-                    txn.put(index_key.as_bytes(), &[]).await?;
+                let new_val_str = self.value_to_index_string(new_val);
+                if let Some(new_val_str) = new_val_str.as_deref() {
+                    let index_key =
+                        self.routed_index_key_for_value(table_name, &col.name, new_val_str, row_id);
+                    let payload = Self::secondary_index_payload_for_row(new_row, include_indices);
+                    txn.put(index_key.as_bytes(), &payload).await?;
+                }
+                if old_val_str != new_val_str {
+                    if let Some(old_val_str) = old_val_str.as_deref() {
+                        self.adjust_index_count_summary(
+                            table_name,
+                            &col.name,
+                            old_val_str,
+                            -1,
+                            txn,
+                        )
+                        .await?;
+                    }
+                    if let Some(new_val_str) = new_val_str.as_deref() {
+                        self.adjust_index_count_summary(table_name, &col.name, new_val_str, 1, txn)
+                            .await?;
+                    }
                 }
             }
         }
@@ -266,6 +296,9 @@ impl Executor {
         let composite_unique_indexes = self
             .load_composite_unique_indexes_for_table(table_name, txn)
             .await?;
+        let single_column_index_includes = self
+            .load_single_column_index_includes_for_table(table_name, &schema, txn)
+            .await?;
         let foreign_keys = self.load_child_foreign_keys(table_name, txn).await?;
         let trigram_column_indices = Self::indexed_trigram_text_columns(&schema);
         let col_mapping = Self::insert_column_mapping(table_name, columns, &schema)?;
@@ -275,6 +308,7 @@ impl Executor {
             schema,
             composite_indexes,
             composite_unique_indexes,
+            single_column_index_includes,
             foreign_keys,
             trigram_column_indices,
             col_mapping,
@@ -561,6 +595,7 @@ impl Executor {
                             &old_existing_row,
                             &existing_row,
                             &row_id,
+                            &context.single_column_index_includes,
                             txn,
                         )
                         .await?;
@@ -656,7 +691,22 @@ impl Executor {
                         &val_str,
                         &row_id,
                     );
-                    txn.put(index_key.as_bytes(), &[]).await?;
+                    let include_indices = context
+                        .single_column_index_includes
+                        .get(&idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let payload =
+                        Self::secondary_index_payload_for_row(&row_values, include_indices);
+                    txn.put(index_key.as_bytes(), &payload).await?;
+                    self.adjust_index_count_summary(
+                        &context.table_name,
+                        &col.name,
+                        &val_str,
+                        1,
+                        txn,
+                    )
+                    .await?;
                 }
             }
         }
@@ -708,6 +758,9 @@ impl Executor {
             .await?;
         let composite_unique_indexes = self
             .load_composite_unique_indexes_for_table(&table_name_str, txn)
+            .await?;
+        let single_column_index_includes = self
+            .load_single_column_index_includes_for_table(&table_name_str, &schema, txn)
             .await?;
         let foreign_keys = self.load_child_foreign_keys(&table_name_str, txn).await?;
         let trigram_column_indices = Self::indexed_trigram_text_columns(&schema);
@@ -977,6 +1030,7 @@ impl Executor {
                                         &old_existing_row,
                                         &existing_row,
                                         &row_id,
+                                        &single_column_index_includes,
                                         txn,
                                     )
                                     .await?;
@@ -1084,7 +1138,23 @@ impl Executor {
                                     &val_str,
                                     &row_id,
                                 );
-                                txn.put(index_key.as_bytes(), &[]).await?;
+                                let include_indices = single_column_index_includes
+                                    .get(&idx)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                let payload = Self::secondary_index_payload_for_row(
+                                    &row_values,
+                                    include_indices,
+                                );
+                                txn.put(index_key.as_bytes(), &payload).await?;
+                                self.adjust_index_count_summary(
+                                    &table_name_str,
+                                    &col.name,
+                                    &val_str,
+                                    1,
+                                    txn,
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -1214,7 +1284,23 @@ impl Executor {
                                     &val_str,
                                     &row_id,
                                 );
-                                txn.put(index_key.as_bytes(), &[]).await?;
+                                let include_indices = single_column_index_includes
+                                    .get(&idx)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                let payload = Self::secondary_index_payload_for_row(
+                                    &row_values,
+                                    include_indices,
+                                );
+                                txn.put(index_key.as_bytes(), &payload).await?;
+                                self.adjust_index_count_summary(
+                                    &table_name_str,
+                                    &col.name,
+                                    &val_str,
+                                    1,
+                                    txn,
+                                )
+                                .await?;
                             }
                         }
                     }

@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 pub mod http_server;
 pub mod pg_server;
 pub mod redis_server;
+pub(crate) mod security;
 pub mod tcp_server;
 pub mod tls;
 
@@ -21,47 +22,37 @@ pub async fn start_server(
     executor: Arc<Executor>,
     storage: Arc<dyn Storage>,
     config: &Config,
-) -> broadcast::Sender<()> {
+) -> crate::Result<broadcast::Sender<()>> {
+    config.validate_security()?;
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    // Build TLS acceptor if enabled
-    let tls_acceptor = if config.tls.enabled {
-        match tls::build_tls_acceptor(&config.tls) {
-            Ok(acceptor) => {
-                println!(
-                    "  TLS:     enabled (cert: {}, key: {})",
-                    config.tls.cert_path, config.tls.key_path
-                );
-                Some(acceptor)
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: TLS config error: {}. Falling back to plaintext.",
-                    e
-                );
-                None
-            }
-        }
+    let tls_config = if config.tls.enabled {
+        let tls_config = tls::build_tls_config(&config.tls)?;
+        println!(
+            "  TLS:     enabled (cert: {}, key: {})",
+            config.tls.cert_path, config.tls.key_path
+        );
+        Some(tls_config)
     } else {
         None
     };
+    let peer_scheme = if config.tls.enabled { "https" } else { "http" };
 
     let raft = if config.distributed.enabled {
-        match start_raft_node(executor.clone(), storage.clone(), config).await {
-            Ok(raft) => {
-                println!(
-                    "  Distributed: raft node {} enabled ({})",
-                    config.distributed.node_id,
-                    config.distributed.effective_advertise_addr(&config.server)
-                );
-                Some(raft)
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to start distributed Raft node: {}", e);
-                println!("  Distributed: disabled (Raft startup failed)");
-                None
-            }
-        }
+        let raft = start_raft_node(executor.clone(), storage.clone(), config)
+            .await
+            .map_err(|e| {
+                crate::common::FusionError::Execution(format!(
+                    "failed to start configured distributed Raft node: {}",
+                    e
+                ))
+            })?;
+        println!(
+            "  Distributed: raft node {} enabled ({})",
+            config.distributed.node_id,
+            config.distributed.effective_advertise_addr(&config.server)
+        );
+        Some(raft)
     } else {
         println!("  Distributed: isolated (set [distributed].enabled = true to enable OpenRaft)");
         None
@@ -88,16 +79,26 @@ pub async fn start_server(
     let mut http_rx = shutdown_tx.subscribe();
     let http_port = config.server.http_port;
     let http_bind = config.server.bind.clone();
-    let http_tls = tls_acceptor.clone();
+    let http_tls = tls_config.clone();
     let http_raft = raft.clone();
     let http_distributed_mode = distributed_mode.clone();
     let http_shard_router = shard_router.clone();
+    let http_security = http_server::HttpServerSecurity {
+        postgres_password: config.auth.password.clone(),
+        http_legacy_unsafe: config.auth.http_legacy_unsafe,
+        forwarding_secret: config.distributed.forwarding_secret.clone(),
+        peer_scheme: peer_scheme.to_string(),
+    };
 
     // Start HTTP Server
     #[allow(deprecated)]
     tokio::spawn(async move {
         tokio::select! {
-            _ = http_server::start_http_server(http_executor, http_storage, &http_bind, http_port, http_tls, http_raft, http_distributed_mode, http_shard_router) => {},
+            result = http_server::start_http_server_with_security(http_executor, http_storage, &http_bind, http_port, http_tls, http_raft, http_distributed_mode, http_shard_router, http_security) => {
+                if let Err(e) = result {
+                    eprintln!("FusionDB HTTP server stopped: {}", e);
+                }
+            },
             _ = http_rx.recv() => {
                 println!("[shutdown] HTTP server stopping...");
             },
@@ -111,12 +112,15 @@ pub async fn start_server(
     let pg_port = config.server.pg_port;
     let pg_bind = config.server.bind.clone();
     let pg_password = config.auth.password.clone();
-    let pg_tls = tls_acceptor;
+    let pg_tls = tls_config.map(tokio_rustls::TlsAcceptor::from);
     let pg_max_connections = config.server.max_connections;
+    let pg_forwarding_secret = config.distributed.forwarding_secret.clone();
+    let pg_peer_scheme = peer_scheme.to_string();
+    let pg_require_tls = config.tls.enabled;
 
     tokio::spawn(async move {
         tokio::select! {
-            _ = pg_server::start_pg_server_with_connection_limit(pg_executor, pg_storage, &pg_bind, pg_port, &pg_password, pg_tls, pg_max_connections) => {},
+            _ = pg_server::start_pg_server_with_connection_limit_and_security(pg_executor, pg_storage, &pg_bind, pg_port, &pg_password, pg_tls, pg_max_connections, &pg_forwarding_secret, &pg_peer_scheme, pg_require_tls) => {},
             _ = pg_rx.recv() => {
                 println!("[shutdown] Postgres server stopping...");
             },
@@ -139,7 +143,7 @@ pub async fn start_server(
         });
     }
 
-    shutdown_tx
+    Ok(shutdown_tx)
 }
 
 async fn start_raft_node(
@@ -152,15 +156,23 @@ async fn start_raft_node(
     let raft_config = raft_config.validate()?;
 
     let raft_store = FusionRaftStore::new(executor, storage);
-    let network = FusionNetworkFactory::new();
+    let peer_scheme = if config.tls.enabled { "https" } else { "http" };
+    let network =
+        FusionNetworkFactory::with_security(&config.distributed.forwarding_secret, peer_scheme);
     let raft =
         distributed::new_raft_node(config.distributed.node_id, raft_config, raft_store, network)
             .await?;
 
     if config.distributed.bootstrap {
         let members = initial_raft_members(config);
-        if let Err(e) = raft.initialize(members).await {
-            eprintln!("Warning: Raft bootstrap skipped or failed: {}", e);
+        match raft.initialize(members).await {
+            Ok(()) => {}
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::InitializeError::NotAllowed(_),
+            )) => {
+                println!("  Distributed: existing Raft state detected; bootstrap skipped");
+            }
+            Err(e) => return Err(Box::new(e)),
         }
     }
 

@@ -2,16 +2,17 @@ use crate::catalog::TableSchema;
 use crate::common::{Result, Value};
 use crate::storage::Transaction;
 use sqlparser::ast::{
-    BinaryOperator, Expr, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr,
-    TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+    ObjectNamePart, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins, UnaryOperator,
+    Value as SqlValue,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use super::super::{Executor, QueryResult};
+use super::SqlTruth;
 
 struct SubqueryLocalScope {
-    relation_names: HashSet<String>,
     schema: crate::catalog::TableSchema,
 }
 
@@ -52,9 +53,15 @@ struct ExistsJoinMembershipCache {
     values: HashSet<Value>,
 }
 
+struct InSubqueryMembershipCache {
+    values: HashSet<Value>,
+    contains_null: bool,
+}
+
 enum ExistsCache {
     Single(ExistsMembershipCache),
     Join(ExistsJoinMembershipCache),
+    InSubquery(InSubqueryMembershipCache),
 }
 
 fn subquery_schema_key_for_table(table_name: &str) -> String {
@@ -153,6 +160,19 @@ fn subquery_exists_join_membership_cache_key(
     write!(&mut key, "{filter_expr}").expect("writing to String cannot fail");
     key.push('|');
     subquery_push_ascii_lowercase(&mut key, probe_column);
+    key
+}
+
+fn subquery_in_membership_cache_key(
+    probe_expr: &Expr,
+    subquery: &Query,
+    column_type: &str,
+) -> String {
+    let mut key = String::with_capacity(column_type.len() + 2);
+    key.push_str("in|");
+    key.push_str(column_type);
+    key.push('|');
+    write!(&mut key, "{probe_expr}|{subquery}").expect("writing to String cannot fail");
     key
 }
 
@@ -399,6 +419,11 @@ impl Executor {
     fn contains_deferred_subquery(expr: &Expr) -> bool {
         match expr {
             Expr::Exists { .. } => true,
+            Expr::InSubquery {
+                expr: probe_expr,
+                subquery,
+                ..
+            } => Self::in_subquery_allows_deferred(probe_expr, subquery),
             Expr::BinaryOp { left, right, .. } => {
                 Self::contains_deferred_subquery(left) || Self::contains_deferred_subquery(right)
             }
@@ -411,7 +436,7 @@ impl Executor {
 
     fn deferred_subquery_cache_capacity(expr: &Expr) -> usize {
         match expr {
-            Expr::Exists { .. } => 1,
+            Expr::Exists { .. } | Expr::InSubquery { .. } => 1,
             Expr::BinaryOp { left, right, .. } => Self::deferred_subquery_cache_capacity(left)
                 .saturating_add(Self::deferred_subquery_cache_capacity(right)),
             Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
@@ -419,6 +444,40 @@ impl Executor {
             }
             _ => 0,
         }
+    }
+
+    fn in_subquery_probe_allows_deferred(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+            Expr::Nested(inner) | Expr::Cast { expr: inner, .. } => {
+                Self::in_subquery_probe_allows_deferred(inner)
+            }
+            _ => false,
+        }
+    }
+
+    fn in_subquery_allows_deferred(probe_expr: &Expr, subquery: &Query) -> bool {
+        Self::in_subquery_probe_allows_deferred(probe_expr)
+            && Self::in_subquery_query_shape_allows_deferred(subquery)
+    }
+
+    fn in_subquery_query_shape_allows_deferred(query: &Query) -> bool {
+        if query.with.is_some() {
+            return false;
+        }
+
+        match query.body.as_ref() {
+            SetExpr::Select(select) => Self::in_subquery_select_shape_allows_deferred(select),
+            SetExpr::Query(inner) => Self::in_subquery_query_shape_allows_deferred(inner),
+            _ => false,
+        }
+    }
+
+    fn in_subquery_select_shape_allows_deferred(select: &Select) -> bool {
+        matches!(
+            select.group_by,
+            sqlparser::ast::GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty()
+        ) && select.from.iter().all(|table| table.joins.is_empty())
     }
 
     fn combine_subquery_predicates(predicates: Vec<Expr>) -> Option<Expr> {
@@ -452,6 +511,7 @@ impl Executor {
                 &mut membership_caches,
             ))
             .await?
+            .is_true()
             {
                 filtered.push(row);
             }
@@ -467,11 +527,11 @@ impl Executor {
         txn: &mut dyn Transaction,
         params: &[Value],
         membership_caches: &mut HashMap<String, ExistsCache>,
-    ) -> Result<bool> {
+    ) -> Result<SqlTruth> {
         match expr {
             Expr::BinaryOp { left, op, right } => match op {
                 BinaryOperator::And => {
-                    if !Box::pin(self.evaluate_expr_with_subqueries(
+                    let left_truth = Box::pin(self.evaluate_expr_with_subqueries(
                         left,
                         row,
                         schema,
@@ -479,9 +539,9 @@ impl Executor {
                         params,
                         membership_caches,
                     ))
-                    .await?
-                    {
-                        return Ok(false);
+                    .await?;
+                    if matches!(left_truth, SqlTruth::False) {
+                        return Ok(SqlTruth::False);
                     }
                     Box::pin(self.evaluate_expr_with_subqueries(
                         right,
@@ -492,9 +552,10 @@ impl Executor {
                         membership_caches,
                     ))
                     .await
+                    .map(|right_truth| left_truth.and(right_truth))
                 }
                 BinaryOperator::Or => {
-                    if Box::pin(self.evaluate_expr_with_subqueries(
+                    let left_truth = Box::pin(self.evaluate_expr_with_subqueries(
                         left,
                         row,
                         schema,
@@ -502,9 +563,9 @@ impl Executor {
                         params,
                         membership_caches,
                     ))
-                    .await?
-                    {
-                        return Ok(true);
+                    .await?;
+                    if matches!(left_truth, SqlTruth::True) {
+                        return Ok(SqlTruth::True);
                     }
                     Box::pin(self.evaluate_expr_with_subqueries(
                         right,
@@ -515,8 +576,9 @@ impl Executor {
                         membership_caches,
                     ))
                     .await
+                    .map(|right_truth| left_truth.or(right_truth))
                 }
-                _ => self.evaluate_expr(expr, row, schema, params),
+                _ => self.evaluate_expr_truth(expr, row, schema, params),
             },
             Expr::Nested(inner) => {
                 Box::pin(self.evaluate_expr_with_subqueries(
@@ -532,7 +594,7 @@ impl Executor {
             Expr::UnaryOp {
                 op: UnaryOperator::Not,
                 expr: inner,
-            } => Ok(!Box::pin(self.evaluate_expr_with_subqueries(
+            } => Ok(Box::pin(self.evaluate_expr_with_subqueries(
                 inner,
                 row,
                 schema,
@@ -540,7 +602,25 @@ impl Executor {
                 params,
                 membership_caches,
             ))
-            .await?),
+            .await?
+            .not()),
+            Expr::InSubquery {
+                expr: probe_expr,
+                subquery,
+                negated,
+            } => {
+                Box::pin(self.evaluate_in_subquery_membership(
+                    probe_expr,
+                    subquery,
+                    *negated,
+                    row,
+                    schema,
+                    txn,
+                    params,
+                    membership_caches,
+                ))
+                .await
+            }
             Expr::Exists { subquery, negated } => {
                 let has_rows = if let Some(plan) = self.exists_membership_plan(subquery) {
                     self.evaluate_exists_membership(
@@ -568,10 +648,193 @@ impl Executor {
                     self.evaluate_exists_subquery(subquery, row, schema, txn, params)
                         .await?
                 };
-                Ok(if *negated { !has_rows } else { has_rows })
+                Ok(SqlTruth::from_bool(if *negated {
+                    !has_rows
+                } else {
+                    has_rows
+                }))
             }
-            _ => self.evaluate_expr(expr, row, schema, params),
+            _ => self.evaluate_expr_truth(expr, row, schema, params),
         }
+    }
+
+    async fn evaluate_in_subquery_membership(
+        &self,
+        probe_expr: &Expr,
+        subquery: &Query,
+        negated: bool,
+        outer_row: &[Value],
+        outer_schema: &crate::catalog::TableSchema,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+        membership_caches: &mut HashMap<String, ExistsCache>,
+    ) -> Result<SqlTruth> {
+        let Some(column_type) = self
+            .comparison_column_type(probe_expr, outer_schema)
+            .map(str::to_string)
+        else {
+            return self
+                .evaluate_in_subquery_via_materialization(
+                    probe_expr,
+                    subquery,
+                    negated,
+                    outer_row,
+                    outer_schema,
+                    txn,
+                    params,
+                )
+                .await;
+        };
+
+        if !matches!(
+            Box::pin(self.query_has_outer_references(subquery, txn, params)).await,
+            Ok(false)
+        ) {
+            return self
+                .evaluate_in_subquery_via_materialization(
+                    probe_expr,
+                    subquery,
+                    negated,
+                    outer_row,
+                    outer_schema,
+                    txn,
+                    params,
+                )
+                .await;
+        }
+
+        let key = subquery_in_membership_cache_key(probe_expr, subquery, &column_type);
+        if !membership_caches.contains_key(&key) {
+            let (values, contains_null) = self
+                .materialize_in_subquery_membership(subquery, &column_type, txn, params)
+                .await?;
+            membership_caches.insert(
+                key.clone(),
+                ExistsCache::InSubquery(InSubqueryMembershipCache {
+                    values,
+                    contains_null,
+                }),
+            );
+        }
+
+        let Some(ExistsCache::InSubquery(cache)) = membership_caches.get(&key) else {
+            return self
+                .evaluate_in_subquery_via_materialization(
+                    probe_expr,
+                    subquery,
+                    negated,
+                    outer_row,
+                    outer_schema,
+                    txn,
+                    params,
+                )
+                .await;
+        };
+
+        self.evaluate_cached_in_subquery_membership(
+            probe_expr,
+            negated,
+            cache,
+            &column_type,
+            outer_row,
+            outer_schema,
+            params,
+        )
+    }
+
+    async fn materialize_in_subquery_membership(
+        &self,
+        subquery: &Query,
+        column_type: &str,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<(HashSet<Value>, bool)> {
+        let result = Box::pin(self.handle_query(subquery, txn, params)).await?;
+        let QueryResult::Select { rows, .. } = result else {
+            return Ok((HashSet::new(), false));
+        };
+
+        let mut values = HashSet::with_capacity(rows.len());
+        let mut contains_null = false;
+        for row in rows {
+            let Some(value) = row.into_iter().next() else {
+                continue;
+            };
+            let value = Self::coerce_value_to_column_type(value, column_type)?;
+            if matches!(value, Value::Null) {
+                contains_null = true;
+            } else {
+                values.insert(value);
+            }
+        }
+
+        Ok((values, contains_null))
+    }
+
+    fn evaluate_cached_in_subquery_membership(
+        &self,
+        probe_expr: &Expr,
+        negated: bool,
+        cache: &InSubqueryMembershipCache,
+        column_type: &str,
+        outer_row: &[Value],
+        outer_schema: &crate::catalog::TableSchema,
+        params: &[Value],
+    ) -> Result<SqlTruth> {
+        if cache.values.is_empty() && !cache.contains_null {
+            return Ok(SqlTruth::from_bool(negated));
+        }
+
+        let probe_value = self.evaluate_value(probe_expr, outer_row, outer_schema, params)?;
+        let probe_value = Self::coerce_value_to_column_type(probe_value, column_type)?;
+        if matches!(probe_value, Value::Null) {
+            return Ok(SqlTruth::Unknown);
+        }
+
+        let found = cache.values.contains(&probe_value);
+        if negated {
+            Ok(if found {
+                SqlTruth::False
+            } else if cache.contains_null {
+                SqlTruth::Unknown
+            } else {
+                SqlTruth::True
+            })
+        } else {
+            Ok(if found {
+                SqlTruth::True
+            } else if cache.contains_null {
+                SqlTruth::Unknown
+            } else {
+                SqlTruth::False
+            })
+        }
+    }
+
+    async fn evaluate_in_subquery_via_materialization(
+        &self,
+        probe_expr: &Expr,
+        subquery: &Query,
+        negated: bool,
+        outer_row: &[Value],
+        outer_schema: &crate::catalog::TableSchema,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<SqlTruth> {
+        let expr = Expr::InSubquery {
+            expr: Box::new(probe_expr.clone()),
+            subquery: Box::new(subquery.clone()),
+            negated,
+        };
+        let materialized = Box::pin(self.materialize_subqueries_with_outer(
+            &expr,
+            Some(outer_row),
+            Some(outer_schema),
+            txn,
+            params,
+        ))
+        .await?;
+        self.evaluate_expr_truth(&materialized, outer_row, outer_schema, params)
     }
 
     async fn evaluate_exists_membership(
@@ -1083,6 +1346,204 @@ impl Executor {
         }
     }
 
+    async fn query_has_outer_references(
+        &self,
+        query: &Query,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<bool> {
+        if query.with.is_some() {
+            return Ok(true);
+        }
+
+        match query.body.as_ref() {
+            SetExpr::Select(select) => {
+                Box::pin(self.select_has_outer_references(select, txn, params)).await
+            }
+            SetExpr::Query(inner) => {
+                Box::pin(self.query_has_outer_references(inner, txn, params)).await
+            }
+            _ => Ok(true),
+        }
+    }
+
+    async fn select_has_outer_references(
+        &self,
+        select: &Select,
+        txn: &mut dyn Transaction,
+        params: &[Value],
+    ) -> Result<bool> {
+        if select.from.iter().any(|table| !table.joins.is_empty()) {
+            return Ok(true);
+        }
+
+        let local_scope = self.subquery_local_scope(&select.from, txn, params).await?;
+        if let Some(selection) = &select.selection {
+            if self.expr_has_outer_reference(selection, &local_scope) {
+                return Ok(true);
+            }
+        }
+        if let Some(having) = &select.having {
+            if self.expr_has_outer_reference(having, &local_scope) {
+                return Ok(true);
+            }
+        }
+        if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+            for expr in exprs {
+                if self.expr_has_outer_reference(expr, &local_scope) {
+                    return Ok(true);
+                }
+            }
+        } else {
+            return Ok(true);
+        }
+
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    if self.expr_has_outer_reference(expr, &local_scope) {
+                        return Ok(true);
+                    }
+                }
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn expr_has_outer_reference(&self, expr: &Expr, local_scope: &SubqueryLocalScope) -> bool {
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                !self.expr_is_local_to_subquery(expr, local_scope)
+            }
+            Expr::Value(_) | Expr::TypedString(_) => false,
+            Expr::BinaryOp { left, right, .. } => {
+                self.expr_has_outer_reference(left, local_scope)
+                    || self.expr_has_outer_reference(right, local_scope)
+            }
+            Expr::Nested(inner)
+            | Expr::UnaryOp { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Extract { expr: inner, .. }
+            | Expr::IsNull(inner)
+            | Expr::IsNotNull(inner)
+            | Expr::IsTrue(inner)
+            | Expr::IsFalse(inner) => self.expr_has_outer_reference(inner, local_scope),
+            Expr::Array(array) => array
+                .elem
+                .iter()
+                .any(|elem| self.expr_has_outer_reference(elem, local_scope)),
+            Expr::Function(func) => match &func.args {
+                FunctionArguments::List(args) => args.args.iter().any(|arg| match arg {
+                    FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => match arg {
+                        FunctionArgExpr::Expr(expr) => {
+                            self.expr_has_outer_reference(expr, local_scope)
+                        }
+                        _ => false,
+                    },
+                    FunctionArg::ExprNamed { name, arg, .. } => {
+                        self.expr_has_outer_reference(name, local_scope)
+                            || match arg {
+                                FunctionArgExpr::Expr(expr) => {
+                                    self.expr_has_outer_reference(expr, local_scope)
+                                }
+                                _ => false,
+                            }
+                    }
+                }),
+                _ => true,
+            },
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.expr_has_outer_reference(expr, local_scope)
+                    || self.expr_has_outer_reference(low, local_scope)
+                    || self.expr_has_outer_reference(high, local_scope)
+            }
+            Expr::InList { expr, list, .. } => {
+                self.expr_has_outer_reference(expr, local_scope)
+                    || list
+                        .iter()
+                        .any(|item| self.expr_has_outer_reference(item, local_scope))
+            }
+            Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+                self.expr_has_outer_reference(expr, local_scope)
+                    || self.expr_has_outer_reference(pattern, local_scope)
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|expr| self.expr_has_outer_reference(expr, local_scope))
+                    || conditions.iter().any(|case_when| {
+                        self.expr_has_outer_reference(&case_when.condition, local_scope)
+                            || self.expr_has_outer_reference(&case_when.result, local_scope)
+                    })
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|expr| self.expr_has_outer_reference(expr, local_scope))
+            }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                self.expr_has_outer_reference(expr, local_scope)
+                    || substring_from
+                        .as_ref()
+                        .is_some_and(|expr| self.expr_has_outer_reference(expr, local_scope))
+                    || substring_for
+                        .as_ref()
+                        .is_some_and(|expr| self.expr_has_outer_reference(expr, local_scope))
+            }
+            Expr::Trim {
+                expr,
+                trim_what,
+                trim_characters,
+                ..
+            } => {
+                self.expr_has_outer_reference(expr, local_scope)
+                    || trim_what
+                        .as_ref()
+                        .is_some_and(|expr| self.expr_has_outer_reference(expr, local_scope))
+                    || trim_characters.as_ref().is_some_and(|exprs| {
+                        exprs
+                            .iter()
+                            .any(|expr| self.expr_has_outer_reference(expr, local_scope))
+                    })
+            }
+            Expr::Position { expr, r#in } => {
+                self.expr_has_outer_reference(expr, local_scope)
+                    || self.expr_has_outer_reference(r#in, local_scope)
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                self.expr_has_outer_reference(root, local_scope)
+                    || access_chain.iter().any(|access| {
+                        if let sqlparser::ast::AccessExpr::Subscript(
+                            sqlparser::ast::Subscript::Index { index },
+                        ) = access
+                        {
+                            self.expr_has_outer_reference(index, local_scope)
+                        } else {
+                            false
+                        }
+                    })
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                self.expr_has_outer_reference(left, local_scope)
+                    || self.expr_has_outer_reference(right, local_scope)
+            }
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+            _ => true,
+        }
+    }
+
     async fn evaluate_exists_subquery(
         &self,
         subquery: &Query,
@@ -1184,32 +1645,18 @@ impl Executor {
             .iter()
             .map(|table| 1usize.saturating_add(table.joins.len()))
             .sum();
-        let mut relation_names = HashSet::with_capacity(relation_capacity);
         let mut columns = Vec::with_capacity(relation_capacity);
 
         for table in from {
-            self.append_local_scope_for_factor(
-                &table.relation,
-                &mut relation_names,
-                &mut columns,
-                txn,
-                params,
-            )
-            .await?;
-            for join in &table.joins {
-                self.append_local_scope_for_factor(
-                    &join.relation,
-                    &mut relation_names,
-                    &mut columns,
-                    txn,
-                    params,
-                )
+            self.append_local_scope_for_factor(&table.relation, &mut columns, txn, params)
                 .await?;
+            for join in &table.joins {
+                self.append_local_scope_for_factor(&join.relation, &mut columns, txn, params)
+                    .await?;
             }
         }
 
         Ok(SubqueryLocalScope {
-            relation_names,
             schema: crate::catalog::TableSchema::new("__subquery_scope".to_string(), columns),
         })
     }
@@ -1217,13 +1664,10 @@ impl Executor {
     async fn append_local_scope_for_factor(
         &self,
         factor: &TableFactor,
-        relation_names: &mut HashSet<String>,
         columns: &mut Vec<crate::catalog::Column>,
         txn: &mut dyn Transaction,
         params: &[Value],
     ) -> Result<()> {
-        relation_names.extend(self.relation_names(factor));
-
         let schema = match factor {
             TableFactor::Table { name, .. } => {
                 let table_name = name.to_string();
@@ -1403,22 +1847,11 @@ impl Executor {
                 .is_ok(),
             Expr::CompoundIdentifier(idents) => {
                 let col_name = Self::compound_identifier_name(idents);
-                let qualifier = Self::subquery_compound_identifier_prefix(idents);
-                if local_scope
-                    .relation_names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(&qualifier))
-                {
-                    return true;
-                }
                 local_scope
                     .schema
                     .columns
                     .iter()
                     .any(|column| column.name.eq_ignore_ascii_case(&col_name))
-                    || self
-                        .resolve_column_index(&col_name, &local_scope.schema)
-                        .is_ok()
             }
             _ => false,
         }

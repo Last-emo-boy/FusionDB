@@ -332,6 +332,43 @@ impl Executor {
         self.resolve_column_index(&col_name, schema).ok()
     }
 
+    fn order_expr_uses_projection_alias(expr: &Expr, projection: &[SelectItem]) -> bool {
+        let Expr::Identifier(ident) = expr else {
+            return false;
+        };
+
+        projection.iter().any(|item| {
+            if let SelectItem::ExprWithAlias { alias, .. } = item {
+                alias.value.eq_ignore_ascii_case(&ident.value)
+            } else {
+                false
+            }
+        })
+    }
+
+    pub(crate) fn order_by_allows_streaming_topk(
+        &self,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+        projection: &[SelectItem],
+    ) -> bool {
+        let Some(order_by) = order_by else {
+            return false;
+        };
+        let OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return false;
+        };
+        if exprs.is_empty() {
+            return false;
+        }
+
+        exprs.iter().all(|order_expr| {
+            if Self::order_limit_column_name(&order_expr.expr).is_none() {
+                return false;
+            }
+            !Self::order_expr_uses_projection_alias(&order_expr.expr, projection)
+        })
+    }
+
     fn evaluate_projection_order_value_source(
         &self,
         source: &ProjectionOrderValueSource<'_>,

@@ -60,6 +60,71 @@ fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqlTruth {
+    True,
+    False,
+    Unknown,
+}
+
+impl SqlTruth {
+    pub(crate) fn from_bool(value: bool) -> Self {
+        if value {
+            Self::True
+        } else {
+            Self::False
+        }
+    }
+
+    pub(crate) fn from_value(value: Value, expr: &Expr) -> Result<Self> {
+        Self::from_boolean_value(value, &format!("Unsupported expression type: {}", expr))
+    }
+
+    pub(crate) fn from_boolean_value(value: Value, error: &str) -> Result<Self> {
+        match value {
+            Value::Boolean(value) => Ok(Self::from_bool(value)),
+            Value::Null => Ok(Self::Unknown),
+            _ => Err(FusionError::Execution(error.to_string())),
+        }
+    }
+
+    pub(crate) fn is_true(self) -> bool {
+        matches!(self, Self::True)
+    }
+
+    pub(crate) fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    pub(crate) fn and(self, right: Self) -> Self {
+        match (self, right) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub(crate) fn or(self, right: Self) -> Self {
+        match (self, right) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        match self {
+            Self::True => Value::Boolean(true),
+            Self::False => Value::Boolean(false),
+            Self::Unknown => Value::Null,
+        }
+    }
+}
+
 impl Executor {
     pub(crate) fn placeholder_index(placeholder: &str) -> usize {
         placeholder
@@ -91,23 +156,37 @@ impl Executor {
         schema: &TableSchema,
         params: &[Value],
     ) -> Result<bool> {
+        Ok(self
+            .evaluate_expr_truth(expr, row, schema, params)?
+            .is_true())
+    }
+
+    pub(crate) fn evaluate_expr_truth(
+        &self,
+        expr: &Expr,
+        row: &[Value],
+        schema: &TableSchema,
+        params: &[Value],
+    ) -> Result<SqlTruth> {
         match expr {
             Expr::BinaryOp { left, op, right } => {
                 // Handle logical operators with short-circuit evaluation
                 match op {
                     BinaryOperator::And => {
-                        let l = self.evaluate_expr(left, row, schema, params)?;
-                        if !l {
-                            return Ok(false);
+                        let left_truth = self.evaluate_expr_truth(left, row, schema, params)?;
+                        if matches!(left_truth, SqlTruth::False) {
+                            return Ok(SqlTruth::False);
                         }
-                        return self.evaluate_expr(right, row, schema, params);
+                        let right_truth = self.evaluate_expr_truth(right, row, schema, params)?;
+                        return Ok(left_truth.and(right_truth));
                     }
                     BinaryOperator::Or => {
-                        let l = self.evaluate_expr(left, row, schema, params)?;
-                        if l {
-                            return Ok(true);
+                        let left_truth = self.evaluate_expr_truth(left, row, schema, params)?;
+                        if matches!(left_truth, SqlTruth::True) {
+                            return Ok(SqlTruth::True);
                         }
-                        return self.evaluate_expr(right, row, schema, params);
+                        let right_truth = self.evaluate_expr_truth(right, row, schema, params)?;
+                        return Ok(left_truth.or(right_truth));
                     }
                     _ => {}
                 }
@@ -118,25 +197,13 @@ impl Executor {
                     self.align_comparison_values(left, left_val, right, right_val, schema)?;
 
                 match op {
-                    BinaryOperator::Eq => {
-                        if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
-                            return Ok(false);
-                        }
-                        Ok(left_val.compare(&right_val) == std::cmp::Ordering::Equal)
-                    }
-                    BinaryOperator::NotEq => {
-                        if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
-                            return Ok(false);
-                        }
-                        Ok(left_val.compare(&right_val) != std::cmp::Ordering::Equal)
-                    }
-                    BinaryOperator::Gt => self.compare_values(&left_val, &right_val, |l, r| l > r),
-                    BinaryOperator::Lt => self.compare_values(&left_val, &right_val, |l, r| l < r),
-                    BinaryOperator::GtEq => {
-                        self.compare_values(&left_val, &right_val, |l, r| l >= r)
-                    }
-                    BinaryOperator::LtEq => {
-                        self.compare_values(&left_val, &right_val, |l, r| l <= r)
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Lt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::LtEq => {
+                        self.compare_binary_predicate_truth(&left_val, op, &right_val)
                     }
                     _ => Err(FusionError::Execution(format!(
                         "Unsupported operator: {}",
@@ -173,7 +240,7 @@ impl Executor {
                 };
 
                 if search_terms.is_empty() {
-                    return Ok(false);
+                    return Ok(SqlTruth::False);
                 }
 
                 if columns.len() != 1 {
@@ -191,12 +258,12 @@ impl Executor {
                     let text_tokens = Self::tokenize_unique(text);
                     for term in search_terms {
                         if !text_tokens.contains(&term) {
-                            return Ok(false);
+                            return Ok(SqlTruth::False);
                         }
                     }
-                    Ok(true)
+                    Ok(SqlTruth::True)
                 } else {
-                    Ok(false)
+                    Ok(SqlTruth::False)
                 }
             }
             Expr::InList {
@@ -210,7 +277,14 @@ impl Executor {
                 // item. The original `val` is what gets compared, so coercing only the
                 // list item to the column type is semantics-preserving.
                 let column_type = self.comparison_column_type(expr, schema);
+                if list.is_empty() {
+                    return Ok(SqlTruth::from_bool(*negated));
+                }
+                if matches!(val, Value::Null) {
+                    return Ok(SqlTruth::Unknown);
+                }
                 let mut found = false;
+                let mut contains_null = false;
                 for item in list {
                     let item_val = self.evaluate_value(item, row, schema, params)?;
                     let item_val = match column_type {
@@ -228,15 +302,31 @@ impl Executor {
                             item_val
                         }
                     };
+                    if matches!(item_val, Value::Null) {
+                        contains_null = true;
+                        continue;
+                    }
                     if val.compare(&item_val) == std::cmp::Ordering::Equal {
                         found = true;
                         break;
                     }
                 }
                 if *negated {
-                    Ok(!found)
+                    Ok(if found {
+                        SqlTruth::False
+                    } else if contains_null {
+                        SqlTruth::Unknown
+                    } else {
+                        SqlTruth::True
+                    })
                 } else {
-                    Ok(found)
+                    Ok(if found {
+                        SqlTruth::True
+                    } else if contains_null {
+                        SqlTruth::Unknown
+                    } else {
+                        SqlTruth::False
+                    })
                 }
             }
             Expr::AnyOp {
@@ -244,14 +334,14 @@ impl Executor {
                 compare_op,
                 right,
                 ..
-            } => self.evaluate_quantified_array_comparison(
+            } => self.evaluate_quantified_array_comparison_truth(
                 left, compare_op, right, false, row, schema, params,
             ),
             Expr::AllOp {
                 left,
                 compare_op,
                 right,
-            } => self.evaluate_quantified_array_comparison(
+            } => self.evaluate_quantified_array_comparison_truth(
                 left, compare_op, right, true, row, schema, params,
             ),
             Expr::Like {
@@ -262,15 +352,17 @@ impl Executor {
             } => {
                 let s = self.evaluate_value(expr, row, schema, params)?;
                 let p = self.evaluate_value(pattern, row, schema, params)?;
-                if let (Value::String(s_str), Value::String(p_str)) = (s, p) {
-                    let matched = Self::like_match(&s_str, &p_str);
-                    if *negated {
-                        Ok(!matched)
-                    } else {
-                        Ok(matched)
+                match (s, p) {
+                    (Value::Null, _) | (_, Value::Null) => Ok(SqlTruth::Unknown),
+                    (Value::String(s_str), Value::String(p_str)) => {
+                        let matched = Self::like_match(&s_str, &p_str);
+                        Ok(SqlTruth::from_bool(if *negated {
+                            !matched
+                        } else {
+                            matched
+                        }))
                     }
-                } else {
-                    Ok(false)
+                    _ => Ok(SqlTruth::False),
                 }
             }
             Expr::ILike {
@@ -281,20 +373,27 @@ impl Executor {
             } => {
                 let s = self.evaluate_value(expr, row, schema, params)?;
                 let p = self.evaluate_value(pattern, row, schema, params)?;
-                if let (Value::String(s_str), Value::String(p_str)) = (s, p) {
-                    let matched = Self::like_match(&s_str.to_lowercase(), &p_str.to_lowercase());
-                    Ok(if *negated { !matched } else { matched })
-                } else {
-                    Ok(false)
+                match (s, p) {
+                    (Value::Null, _) | (_, Value::Null) => Ok(SqlTruth::Unknown),
+                    (Value::String(s_str), Value::String(p_str)) => {
+                        let matched =
+                            Self::like_match(&s_str.to_lowercase(), &p_str.to_lowercase());
+                        Ok(SqlTruth::from_bool(if *negated {
+                            !matched
+                        } else {
+                            matched
+                        }))
+                    }
+                    _ => Ok(SqlTruth::False),
                 }
             }
             Expr::IsNull(expr) => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
-                Ok(val == Value::Null)
+                Ok(SqlTruth::from_bool(val == Value::Null))
             }
             Expr::IsNotNull(expr) => {
                 let val = self.evaluate_value(expr, row, schema, params)?;
-                Ok(val != Value::Null)
+                Ok(SqlTruth::from_bool(val != Value::Null))
             }
             Expr::Between {
                 expr,
@@ -309,31 +408,50 @@ impl Executor {
                     self.align_comparison_values(expr, val, low, low_val, schema)?;
                 let (val, high_val) =
                     self.align_comparison_values(expr, val, high, high_val, schema)?;
-                let ge = self.compare_values(&val, &low_val, |l, r| l >= r)?;
-                let le = self.compare_values(&val, &high_val, |l, r| l <= r)?;
-                let result = ge && le;
-                Ok(if *negated { !result } else { result })
+                let ge =
+                    self.compare_binary_predicate_truth(&val, &BinaryOperator::GtEq, &low_val)?;
+                let le =
+                    self.compare_binary_predicate_truth(&val, &BinaryOperator::LtEq, &high_val)?;
+                let result = ge.and(le);
+                Ok(if *negated { result.not() } else { result })
             }
-            Expr::Nested(inner) => self.evaluate_expr(inner, row, schema, params),
+            Expr::Nested(inner) => self.evaluate_expr_truth(inner, row, schema, params),
             Expr::UnaryOp { op, expr } => match op {
                 sqlparser::ast::UnaryOperator::Not => {
-                    let res = self.evaluate_expr(expr, row, schema, params)?;
-                    Ok(!res)
+                    let res = self.evaluate_expr_truth(expr, row, schema, params)?;
+                    Ok(res.not())
                 }
                 _ => Err(FusionError::Execution(
                     "Unsupported unary operator in boolean expression".to_string(),
                 )),
             },
             Expr::IsFalse(inner) => {
-                let val = self.evaluate_value(inner, row, schema, params)?;
-                Ok(val == Value::Boolean(false))
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(SqlTruth::from_bool(matches!(truth, SqlTruth::False)))
+            }
+            Expr::IsNotFalse(inner) => {
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(SqlTruth::from_bool(!matches!(truth, SqlTruth::False)))
             }
             Expr::IsTrue(inner) => {
-                let val = self.evaluate_value(inner, row, schema, params)?;
-                Ok(val == Value::Boolean(true))
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(SqlTruth::from_bool(matches!(truth, SqlTruth::True)))
+            }
+            Expr::IsNotTrue(inner) => {
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(SqlTruth::from_bool(!matches!(truth, SqlTruth::True)))
+            }
+            Expr::IsUnknown(inner) => {
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(SqlTruth::from_bool(matches!(truth, SqlTruth::Unknown)))
+            }
+            Expr::IsNotUnknown(inner) => {
+                let truth = self.evaluate_expr_truth(inner, row, schema, params)?;
+                Ok(SqlTruth::from_bool(!matches!(truth, SqlTruth::Unknown)))
             }
             Expr::Value(v) => match &v.value {
-                SqlValue::Boolean(b) => Ok(*b),
+                SqlValue::Boolean(b) => Ok(SqlTruth::from_bool(*b)),
+                SqlValue::Null => Ok(SqlTruth::Unknown),
                 _ => Err(FusionError::Execution(format!(
                     "Cannot use {:?} as boolean",
                     v.value
@@ -341,14 +459,8 @@ impl Executor {
             },
             _ => {
                 // Fallback: try evaluate_value and check if it's a boolean
-                match self.evaluate_value(expr, row, schema, params) {
-                    Ok(Value::Boolean(b)) => Ok(b),
-                    Ok(_) => Err(FusionError::Execution(format!(
-                        "Unsupported expression type: {}",
-                        expr
-                    ))),
-                    Err(e) => Err(e),
-                }
+                let value = self.evaluate_value(expr, row, schema, params)?;
+                SqlTruth::from_value(value, expr)
             }
         }
     }

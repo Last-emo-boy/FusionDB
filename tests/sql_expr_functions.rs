@@ -528,6 +528,34 @@ async fn test_like_full_patterns() {
 }
 
 #[tokio::test]
+async fn test_indexed_like_complex_prefix_keeps_residual_filter() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE indexed_like_prefix (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_indexed_like_prefix_name ON indexed_like_prefix (name)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO indexed_like_prefix VALUES (1, 'abc'), (2, 'abzz'), (3, 'abdc'), (4, 'xbc')",
+    )
+    .await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM indexed_like_prefix WHERE name LIKE 'ab%c'",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_coalesce_multi_arg() {
     let (executor, wal) = setup().await;
     exec_ok(

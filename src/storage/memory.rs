@@ -6,7 +6,7 @@
 /// write buffer with the committed snapshot so that read-your-own-writes
 /// semantics are honoured within a transaction.
 use super::wal::{WalEntry, WalManager};
-use super::{ScanVisitor, Storage, Transaction};
+use super::{ScanVisitor, Storage, StorageScanOptions, Transaction};
 use crate::common::Result;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -80,6 +80,10 @@ impl MemoryTransaction {
     where
         F: FnMut(&[u8], &[u8]) -> bool,
     {
+        if start >= end {
+            return;
+        }
+
         let data = self.storage.data.read();
 
         // Merge: iterate both sources in order
@@ -147,6 +151,77 @@ impl MemoryTransaction {
             }
         }
     }
+
+    fn for_each_merged_range_reverse<F>(&self, start: &[u8], end: &[u8], mut visit: F)
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        if start >= end {
+            return;
+        }
+
+        let data = self.storage.data.read();
+        let mut storage_iter = data.range(start.to_vec()..end.to_vec()).rev().peekable();
+        let mut wb_iter = self
+            .write_buffer
+            .range(start.to_vec()..end.to_vec())
+            .rev()
+            .peekable();
+
+        loop {
+            let should_continue = match (storage_iter.peek(), wb_iter.peek()) {
+                (Some(&(sk, sv)), Some(&(wk, wv))) => match sk.cmp(wk) {
+                    std::cmp::Ordering::Greater => {
+                        if !visit(sk, sv) {
+                            return;
+                        }
+                        storage_iter.next();
+                        true
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if let Some(val) = wv {
+                            if !visit(wk, val) {
+                                return;
+                            }
+                        }
+                        storage_iter.next();
+                        wb_iter.next();
+                        true
+                    }
+                    std::cmp::Ordering::Less => {
+                        if let Some(val) = wv {
+                            if !visit(wk, val) {
+                                return;
+                            }
+                        }
+                        wb_iter.next();
+                        true
+                    }
+                },
+                (Some(&(sk, sv)), None) => {
+                    if !visit(sk, sv) {
+                        return;
+                    }
+                    storage_iter.next();
+                    true
+                }
+                (None, Some(&(wk, wv))) => {
+                    if let Some(val) = wv {
+                        if !visit(wk, val) {
+                            return;
+                        }
+                    }
+                    wb_iter.next();
+                    true
+                }
+                (None, None) => false,
+            };
+
+            if !should_continue {
+                break;
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -183,6 +258,15 @@ impl Transaction for MemoryTransaction {
         Ok(Vec::new())
     }
 
+    async fn scan_prefix_with_options(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        _options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_prefix(prefix, limit).await
+    }
+
     async fn scan_prefix_for_each(
         &self,
         prefix: &[u8],
@@ -205,6 +289,16 @@ impl Transaction for MemoryTransaction {
         Ok(visited)
     }
 
+    async fn scan_prefix_for_each_with_options(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        _options: StorageScanOptions,
+    ) -> Result<usize> {
+        self.scan_prefix_for_each(prefix, limit, visitor).await
+    }
+
     async fn scan_range(
         &self,
         start: &[u8],
@@ -222,6 +316,112 @@ impl Transaction for MemoryTransaction {
             result.len() < safe_limit
         });
         Ok(result)
+    }
+
+    async fn scan_range_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        _options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_range(start, end, limit).await
+    }
+
+    async fn scan_range_for_each(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(0);
+        }
+
+        let mut visited = 0;
+        self.for_each_merged_range(start, end, |key, value| {
+            visited += 1;
+            visitor.visit(key, value) && visited < safe_limit
+        });
+        Ok(visited)
+    }
+
+    async fn scan_range_for_each_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        _options: StorageScanOptions,
+    ) -> Result<usize> {
+        self.scan_range_for_each(start, end, limit, visitor).await
+    }
+
+    async fn scan_range_reverse(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::with_capacity(safe_limit.min(4096));
+        self.for_each_merged_range_reverse(start, end, |key, value| {
+            result.push((key.to_vec(), value.to_vec()));
+            result.len() < safe_limit
+        });
+        Ok(result)
+    }
+
+    async fn scan_range_reverse_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        _options: StorageScanOptions,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_range_reverse(start, end, limit).await
+    }
+
+    async fn scan_range_reverse_for_each(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        let safe_limit = limit.unwrap_or(usize::MAX);
+        if safe_limit == 0 || start >= end {
+            return Ok(0);
+        }
+
+        let mut visited = 0;
+        self.for_each_merged_range_reverse(start, end, |key, value| {
+            visited += 1;
+            visitor.visit(key, value) && visited < safe_limit
+        });
+        Ok(visited)
+    }
+
+    async fn scan_range_reverse_for_each_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        _options: StorageScanOptions,
+    ) -> Result<usize> {
+        self.scan_range_reverse_for_each(start, end, limit, visitor)
+            .await
+    }
+
+    fn supports_bounded_scan_range_reverse(&self) -> bool {
+        true
     }
 
     async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
@@ -247,12 +447,11 @@ impl Transaction for MemoryTransaction {
     }
 
     async fn last(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let mut last = None;
-        self.for_each_merged_range(start, end, |key, value| {
-            last = Some((key.to_vec(), value.to_vec()));
-            true
-        });
-        Ok(last)
+        Ok(self
+            .scan_range_reverse(start, end, Some(1))
+            .await?
+            .into_iter()
+            .next())
     }
 
     async fn commit(self: Box<Self>) -> Result<()> {
@@ -458,6 +657,120 @@ mod tests {
             let count = txn.count_prefix(b"data:x:").await.unwrap();
             assert_eq!(count, 2); // x:2 and x:3
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_reverse_merges_write_buffer_tombstones_and_limit() {
+        let path = temp_wal();
+        let storage = MemoryStorage::new(&path).unwrap();
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:r:1", b"row1").await.unwrap();
+            txn.put(b"data:r:2", b"row2").await.unwrap();
+            txn.put(b"data:r:3", b"row3").await.unwrap();
+            txn.put(b"data:r:4", b"row4").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:r:5", b"row5").await.unwrap();
+            txn.put(b"data:r:2", b"row2-new").await.unwrap();
+            txn.delete(b"data:r:4").await.unwrap();
+            txn.delete(b"data:r:6").await.unwrap();
+
+            let rows = txn
+                .scan_range_reverse(b"data:r:", b"data:r;", None)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    (b"data:r:5".to_vec(), b"row5".to_vec()),
+                    (b"data:r:3".to_vec(), b"row3".to_vec()),
+                    (b"data:r:2".to_vec(), b"row2-new".to_vec()),
+                    (b"data:r:1".to_vec(), b"row1".to_vec()),
+                ]
+            );
+
+            let limited = txn
+                .scan_range_reverse(b"data:r:", b"data:r;", Some(2))
+                .await
+                .unwrap();
+            assert_eq!(
+                limited,
+                vec![
+                    (b"data:r:5".to_vec(), b"row5".to_vec()),
+                    (b"data:r:3".to_vec(), b"row3".to_vec()),
+                ]
+            );
+
+            struct StopAfter {
+                rows: Vec<(Vec<u8>, Vec<u8>)>,
+                max_rows: usize,
+            }
+
+            impl crate::storage::ScanVisitor for StopAfter {
+                fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+                    self.rows.push((key.to_vec(), value.to_vec()));
+                    self.rows.len() < self.max_rows
+                }
+            }
+
+            let mut forward = StopAfter {
+                rows: Vec::new(),
+                max_rows: 2,
+            };
+            let forward_visited = txn
+                .scan_range_for_each(b"data:r:", b"data:r;", None, &mut forward)
+                .await
+                .unwrap();
+            assert_eq!(forward_visited, 2);
+            assert_eq!(
+                forward.rows,
+                vec![
+                    (b"data:r:1".to_vec(), b"row1".to_vec()),
+                    (b"data:r:2".to_vec(), b"row2-new".to_vec()),
+                ]
+            );
+
+            let mut reverse = StopAfter {
+                rows: Vec::new(),
+                max_rows: usize::MAX,
+            };
+            let reverse_visited = txn
+                .scan_range_reverse_for_each(b"data:r:", b"data:r;", Some(2), &mut reverse)
+                .await
+                .unwrap();
+            assert_eq!(reverse_visited, 2);
+            assert_eq!(reverse.rows, limited);
+
+            let last = txn.last(b"data:r:", b"data:r;").await.unwrap();
+            assert_eq!(last, Some((b"data:r:5".to_vec(), b"row5".to_vec())));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_reverse_empty_and_zero_limit_are_empty() {
+        let path = temp_wal();
+        let storage = MemoryStorage::new(&path).unwrap();
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"k1", b"v1").await.unwrap();
+
+        assert_eq!(
+            txn.scan_range_reverse(b"k", b"l", Some(0)).await.unwrap(),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            txn.scan_range_reverse(b"z", b"a", None).await.unwrap(),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            txn.scan_range_reverse(b"k", b"k", None).await.unwrap(),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
