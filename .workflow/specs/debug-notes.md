@@ -128,3 +128,27 @@ Full scan val=42(50 万行,532 命中)warm 3.1s 画像:zone-map 检查 111,120 �
 7/8 之谜闭式破案:26,680=8×3,335——并行全扫切 K=8 片,sql_zone_map_skip_offsets_for_sstable 每片遍历 SSTable 全部块,把其他 7 片的块在范围边界检查(fusion.rs 原 3251)误记 IncompleteMetadata,每块每片白付区间 Vec 克隆+计数。修复:完全在 [start,end) 外的块在计数前静默 continue,仅真边界部分重叠块 fail-open。本地验证:检查 26,680→3,342、fail-open 23,352→14、剪枝决策逐一相同(skip 3,110/positive 218)、块读 16k→232。重要正面发现:zone map 本身在 val=X 上 93% 跳过率——功能优秀,被噪声淹没。解剖方法论:闭式数字吻合(87.5%=7/8)是切片类 bug 的指纹;四次假设撤销全程 maestro 留痕。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="471,index-misplan,selectivity,cbo" date="2026-07-10" title="471 立案:低选择率索引误选型,10 万点查 44s(2026-07-10)" source="main@876d8d8">
+
+### 471 立案:低选择率索引误选型,10 万点查 44s(2026-07-10)
+
+Avg order value(SELECT AVG(total) FROM orders WHERE status='delivered')warm 44s 画像:EXPLAIN 显示 Index Scan using status,但 status 选择率 ~50%(200k 行中 ~100k 命中)→ 10 万次逐行 txn.get 点查(user_key_filter_check 100,001、positive 34,013、block_cache_hit 34,528),每次 ~440µs。顺序全扫同表 ~1s。stats_guided_index_probe_limit(cap 65536,scan/mod.rs:523)未拦:疑无 ANALYZE 统计时默认走索引。修复方向:①用已维护的 index count summary(低基数列免费精确计数)或 count_prefix 流式预判命中数,>表占比阈值(或概率上限)退回全扫;②同类受害者:Revenue by category 10s(category 低基数)、Never-ordered 8.5s(NOT IN)、Subquery IN 24s 待逐一画像。方法照旧:单查 metrics 增量。
+
+</spec-entry>
+
+<spec-entry category="debug" keywords="471,fix-design,probe-cost" date="2026-07-10" title="471 修复设计定稿(2026-07-10)" source="main@876d8d8">
+
+### 471 修复设计定稿(2026-07-10)
+
+gate 缺口双因:①load_table_stats 为 None(无 ANALYZE)直接 Ok(None)=无界探测;②成本模型 index_cost=log2(rows)+est_rows 把点查按顺序行等价计价,实际点查 ~100-400µs vs 顺序 ~2-7µs/行(50-100×),有统计也会误选(100k est<200k rows 仍走索引 65536 探测≈28s)。修复:①统计无关兜底——try_index_scan Eq/IN 路径收集 row_ids 后计数免费,len>STATS_INDEX_PROBE_LIMIT_MAX(65536)即放弃索引退全扫(与既有 cap 语义一致);②成本模型点查加权 PROBE_COST_FACTOR(取 16 保守):index_cost=log2+est×16 vs table_rows。小命中索引路径不受影响;xlarge orders 实测目标 44s→~2s。
+
+</spec-entry>
+
+<spec-entry category="debug" keywords="471,column-scan,aggregate,correction" date="2026-07-10" title="471 再修正:肇事路径是二级索引聚合扫描,非 try_index_scan(2026-07-10)" source="main@876d8d8">
+
+### 471 再修正:肇事路径是二级索引聚合扫描,非 try_index_scan(2026-07-10)
+
+try_index_scan 有完备弃用机制(index_candidate_cap(None,None)=1024,should_use_index_plan 超限即弃)——100k 探测不可能来自它。AVG(total) WHERE status='x' 为纯聚合投影,走 column_scan.rs 的 secondary-index aggregate scan(~1293,7 月功能):扫 status 索引条目后逐行取数聚合,无候选上限。Revenue by category 10s 应为其 group_by 变体(group_by_count/aggregate_column_scan)。修复点改为:该家族入口加候选计数闸门(复用 STATS_INDEX_PROBE_LIMIT_MAX 或 index_candidate_cap 语义),超限退回全扫聚合(simple_column_aggregate_scan 批式全扫已高效);统计存在时用 stats 预判少付一次索引条目扫描。教训:同一逻辑查询在不同投影形态下走完全不同的执行家族,gate 必须逐家族审计。
+
+</spec-entry>
