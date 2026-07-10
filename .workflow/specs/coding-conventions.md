@@ -1042,3 +1042,11 @@ Routed table data scans now post-filter raw prefix hits in scan_routed_data_pref
 CREATE TABLE and ALTER TABLE column identity now use sqlparser Ident.value via a local sql_identifier_name helper instead of Ident::to_string(). This prevents quoted column names from being stored with literal quote characters while CREATE INDEX, SELECT, DML, and other resolution paths use ident.value. The slice intentionally applies only to column identity, not table names, because table names are embedded in schema/data/index/FTS/count keyspaces and require a separate keyspace migration. It enables quoted column names containing ':' or ',' to participate in single-column INCLUDE indexes and ALTER ADD/RENAME/DROP flows. Full PostgreSQL-style quote-aware exact lookup and unquoted lowercase folding remain future work; TableSchema::get_column_index still has legacy case-insensitive fallback.
 
 </spec-entry>
+
+<spec-entry category="coding" keywords="row-cache,mvcc,byte-identity,cache" date="2026-07-10" title="Row cache 字节一致性契约(BENCHPROD-463)" source="main@47449f4">
+
+### Row cache 字节一致性契约(BENCHPROD-463)
+
+执行层 row cache 自 4d2fcfc 起为 CachedRow{encoded: Arc<[u8]>, row},命中条件=调用方本次从存储解析出的字节与缓存字节 memcmp 相等(execution/mod.rs row_cache_lookup/row_cache_store)。禁止任何绕过 helper 的 row_cache.get/insert;禁止重新引入 per-key invalidate(正确性不依赖失效,唯一保留 Raft 快照 invalidate_all)。新点查路径顺序:covered → key_only_scan(零存储)→ txn.get → 字节验证 → 解码+store(仅全行)。row_read=每次存储取行(含验证命中)。测试契约:带外改写存储字节必须战胜缓存(*_tracks_storage_bytes/*_storage_truth 系列);投毒与旧快照回归测试在 execution::tests。
+
+</spec-entry>

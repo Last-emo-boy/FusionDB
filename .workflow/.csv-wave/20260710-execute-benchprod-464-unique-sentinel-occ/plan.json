@@ -1,0 +1,34 @@
+{
+  "id": "BENCHPROD-464",
+  "title": "UNIQUE sentinel keys in the OCC write set (concurrent duplicate soundness)",
+  "phase": "Correctness (commercial-parity track)",
+  "status": "done",
+  "discovery": "Single-column UNIQUE (non-PK) had multiple holes: (1) concurrent same-value INSERTs both commit — the duplicate check is a table scan that cannot see the other txn's uncommitted row, and index keys carry a row_id suffix so exact-key OCC never collides; (2) UPDATE skipped UNIQUE validation entirely (sequential duplicates); (3) UPSERT DO UPDATE never validated the post-assignment row; (4) INSERT..SELECT had no single-column UNIQUE check at all. Scope correction from own verification: composite PK and single-column PK are already race-safe (same-value writers collide on the data key itself); non-PK composite UNIQUE indexes are not validated at all today (pre-existing feature gap, separate ticket).",
+  "design": {
+    "mechanism": "row-id-free sentinel keys unique:<table>:<col>:<value> (sharded variant shard:N:unique:..., routed by hashing the VALUE so the same value always maps to the same shard prefix) staged via txn.put into the OCC write set on every INSERT/UPSERT/UPDATE writing a unique value; commit-time exact-key OCC validation (fusion.rs) deterministically aborts the second same-value committer (CRDB/TiDB unique-key shape, from the commercial-parity research)",
+    "division_of_labor": "sentinels close ONLY the concurrency window; the scan-based checks remain the committed-duplicate detector (legacy rows have no sentinels -> zero migration/backfill)",
+    "value_encoding": "value_to_index_string when available; stable FNV-1a-64 over bincode as fallback (FLOAT/BLOB/VECTOR/... — hash collision can only cause a conservative false conflict, never a missed one); -0.0 normalized to 0.0 before hashing (f64 eq vs bit-pattern divergence)",
+    "lifecycle": "INSERT x3 sites + UPSERT DO UPDATE x2 stage/migrate; UPDATE main loop + PK fast path validate + migrate; DELETE main loop tombstones (fast-path gate extended to exclude unique columns); TRUNCATE/DROP TABLE wipe the sentinel prefixes"
+  },
+  "verification": {
+    "fmt": "clean",
+    "clippy_correctness": "clean",
+    "lib": "563 (4 new fusion-backed race tests: INSERT-vs-INSERT, UPDATE-vs-INSERT, FLOAT INSERT-vs-INSERT via hash fallback, DELETE releases sentinel)",
+    "integration": "sql_view_show_constraints 20 (UPDATE duplicate rejected, UPSERT DO UPDATE duplicate rejected, INSERT..SELECT duplicate rejected, batch-internal duplicate rejected)",
+    "adversarial_review": "4-dimension find->verify workflow (21 agents, ~1.6M tok, 0 rejected findings): caught the FLOAT/unsupported-type sentinel gap (live-reproduced double-commit), the INSERT..SELECT missing check, the O(N x cols) scan-in-column-loop (measured 490x on 2000-row bulk UPDATE -> hoisted to one scan per row), and the untested migrate path — all fixed; confirmed ALTER orphans and ':' ambiguity as benign/conservative",
+    "bench": "medium parts=1 pgwire same-disk spot check after gate (benchmark tables have no non-PK UNIQUE columns, so sentinel cost is zero on all registered workloads)"
+  },
+  "disclosures": [
+    "cross-NODE uniqueness in true multi-node deployments remains best-effort (sentinels collide per-storage; unchanged from before)",
+    "MemoryStorage backend has no OCC, so the race stays open there (test-only backend)",
+    "UPDATE-side validation scans the table once per updated row that changes a unique value (same shape as the pre-existing INSERT-side check); bulk unique-rewriting UPDATEs are O(rows x table)",
+    "ALTER DROP/RENAME COLUMN orphan the column's sentinels (verified benign: values never read, committed keys cannot abort future txns; cleaned by TRUNCATE/DROP)",
+    "column names containing ':' can alias sentinel keys across columns (conservative false conflict only; same ambiguity as existing index keys)",
+    "NaN unique values never conflict (NaN != NaN under f64 eq, consistent with the scan check)"
+  ],
+  "out_of_scope": [
+    "non-PK composite UNIQUE enforcement (feature gap, needs its own ticket)",
+    "O(1) unique checks via sentinel reads (would replace the O(N) scans; requires backfill/migration story)",
+    "BENCHPROD-465 side-index transactionality"
+  ]
+}

@@ -650,3 +650,11 @@ Three read-only subagents reviewed the single-column INCLUDE s3 work. Consensus:
 Two read-only subagents completed after the s3 fail-open tests. Keyspace subagent recommends a vNext structured key codec with namespace tags and length-prefixed identifier components for data/index/FTS/count-summary keys, plus typed order-preserving value components for secondary indexes; migration should start with parsers/read compatibility, then dual-write/dual-delete, then backfill/metadata versioning. It warns that length-prefixing ordered value components would break range scans, and that SSTable prefix/Bloom extractors need versioned parsing. Identifier subagent recommends PostgreSQL-style canonicalization eventually: unquoted identifiers fold to lowercase while quoted identifiers store exact Ident.value; current TableSchema::get_column_index remains quote-unaware and case-insensitive. The implemented 2026-07-10 slice only fixes writer-side column identity by storing Ident.value in CREATE/ALTER TABLE and leaves table-name storage plus exact quote-aware lookup for future work.
 
 </spec-entry>
+
+<spec-entry category="arch" keywords="backlog,commercial-parity,unique,sentinel,side-index,raft,vectorized" date="2026-07-10" title="商业对标 backlog v1(2026-07-10 调研)" source="main@47449f4">
+
+### 商业对标 backlog v1(2026-07-10 调研)
+
+5 路带源调研(PG index-locking/GIN、CRDB/TiDB unique-key、Qdrant/Milvus/LanceDB、proposer-evaluated KV、CRDB vectorized)合成的分级清单。P0 正确性:①side-index(trigram/HNSW)提交耦合延迟应用——per-txn delta buffer,OCC 验证通过后在 commit lock 内应用,abort 即丢弃(InnoDB FTS 模式,零 undo);②UNIQUE sentinel key——复合唯一检查是未验证的 prefix 扫描(composite_index.rs:709-714),并发同值双提交;修复=向 write_buffer 额外写不含 row_id 的 sentinel key(值=row_id),现有 exact-key OCC 使败者确定性 abort(CRDB/TiDB 形态);NULL 跳过,DELETE 写墓碑,UPDATE 迁移;单列路径 insert.rs:481-503 同样审计;③Raft 复制 OCC 写集而非 SQL 文本(UUID/NOW 发散)+ pgwire DML 接入 Raft + vote/log 持久化。P1:读路径 candidate-then-verify(PG 核心不变式,残留索引垃圾无害化);向量索引=持久化列重建+delta map+tombstone 过滤(共识:不做 graph WAL,10x 放大且 hora 不支持;>1M 向量换 usearch);批量列式扫描 kernel(CRDB 同构证明 70x micro/4x TPC-H);fan-out 改为复制数据上的计算分区。P2:块级 PREWHERE、morsel 调度、自适应谓词重排、SSTable 侧车文本索引、HNSW 快照加速。冲突裁决:约束键必须进 OCC 写集,搜索索引 delta 必须不进——txn buffer 设计需显式编码此区分。全文:.workflow 调研 workflow wf_33111aa5-032 journal。
+
+</spec-entry>
