@@ -3,8 +3,7 @@
 **FusionDB** is a high-performance, multimodal, ACID-compliant database written in Rust. It combines relational SQL, vector search, full-text search, and AI-native embedding into a single engine, with zero external dependencies at runtime.
 
 ![CI Status](https://github.com/last-emo-boy/FusionDB/actions/workflows/ci.yml/badge.svg)
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Tests](https://img.shields.io/badge/tests-176%20passing-brightgreen)
+![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-2021%20edition-orange)
 
 ---
@@ -53,7 +52,7 @@
 | **Read Path** | MVCC Snapshot Isolation, Row Cache (Moka), Bloom Filters |
 | **Indexes** | BTree (secondary), FB+-Tree (MemTable), HNSW (vector), Inverted (FTS), Trigram |
 | **Transactions** | OCC (Optimistic Concurrency Control), Snapshot Isolation, `BEGIN`/`COMMIT`/`ROLLBACK` |
-| **Durability** | Segmented WAL (64MB rotation), CRC32 block checksums and LZ4 block compression on SSTables |
+| **Durability** | Synchronously persisted, CRC32-protected transaction frames in a segmented WAL; staged and atomically published SSTables with CRC32 blocks and LZ4 compression |
 | **Compaction** | 4-way merge with MVCC key deduplication |
 | **Columnar Analytics** | Arrow RecordBatch conversion, vectorized COUNT/SUM/AVG/MIN/MAX |
 | **Performance** | Optimized merge iterator, parallel range-merge full scans, jemalloc allocator, streaming COUNT(*), pre-allocated scan buffers, hash join for equi-joins, ANALYZE statistics, cost-based comma/inner join reordering |
@@ -64,18 +63,20 @@
 |---|---|
 | **Protocol** | PostgreSQL wire protocol (pgwire) + HTTP JSON API + optional Redis-compatible RESP endpoint |
 | **Configuration** | TOML config file (`fusiondb.toml`) with all server/storage/auth settings |
-| **Authentication** | Configurable password auth, SHA-256 password hashing, RBAC (CREATE USER, GRANT, REVOKE) |
-| **Graceful Shutdown** | Ctrl+C → flush MemTable → save indexes → truncate WAL |
+| **Authentication** | HTTP Basic / pgwire password auth, salted PBKDF2 user hashes, RBAC (CREATE USER, GRANT, REVOKE) |
+| **Graceful Shutdown** | Ctrl+C or `SIGTERM` → stop commits → flush every MemTable → persist the manifest and indexes → truncate WAL |
 | **Observability** | Slow query log, Prometheus `/metrics/prometheus`, `/slow_queries` JSON |
 | **Dashboard UI** | Supabase-style web dashboard — SQL Editor, Table Browser, Metrics Dashboard |
-| **Distributed** | OpenRaft consensus framework (TypeConfig, Log/StateMachine, HTTP Network) |
-| **Backend Plugin** | `BackendConfig` factory — swap between Fusion / Memory backends via config |
+| **Distributed** | OpenRaft consensus framework with mandatory TLS and body-bound HMAC authentication for inter-node requests |
+| **Backend API** | `BackendConfig` factory for embedded callers; the server binary uses FusionStorage |
 
 ---
 
 ## Quick Start
 
 ### Build from Source
+
+Rust 1.89 or newer is required.
 
 ```bash
 git clone https://github.com/last-emo-boy/FusionDB.git
@@ -106,13 +107,24 @@ Press Ctrl+C to shut down...
 
 ```bash
 docker build -t fusiondb .
-docker run -d -p 8091:8091 -p 8092:8092 -v fusion_data:/data --name fusiondb fusiondb:latest
+docker run -d \
+  -p 127.0.0.1:8091:8091 \
+  -p 127.0.0.1:8092:8092 \
+  -v fusion_data:/data \
+  --name fusiondb fusiondb:latest
 ```
+
+The image uses `/etc/fusiondb/fusiondb.toml`, binds the database services to
+`0.0.0.0`, and keeps database files under `/data`. Replace or mount that config
+before exposing the container; the checked-in container password is only a
+development default. Keep the default port mappings on loopback, or mount a
+TLS-enabled config with deployment credentials before publishing them on a
+network interface. The Dashboard is built and served separately.
 
 ### Run Tests
 
 ```bash
-cargo test                              # 176 tests (unit + SQL integration + pgwire)
+cargo test --all-targets                # Unit, SQL integration, protocol, and binary tests
 ```
 
 ### Benchmark
@@ -121,13 +133,19 @@ cargo test                              # 176 tests (unit + SQL integration + pg
 # Start the server first
 cargo run
 
-# In another terminal — run unified benchmark (8 parts)
-python benchmark.py                     # Medium scale (default)
-BENCH_SCALE=small python benchmark.py   # Quick smoke test
-BENCH_SCALE=large python benchmark.py   # Full stress test
+# In another terminal — run the default 10-part matrix
+python3 benchmark.py
+BENCH_SCALE=small python3 benchmark.py  # Quick smoke test
+BENCH_SCALE=large python3 benchmark.py  # Larger workload
+
+# Select any of the 31 registered parts or a focused matrix
+BENCH_PARTS=20 python3 benchmark.py
+BENCH_MATRIX=sql_block_zone_map_prune python3 benchmark.py
 ```
 
-The benchmark covers **8 scenarios** in a single run:
+The default matrix covers Parts 1-10. Parts 11-31 are focused scan, SSTable,
+cache, Top-K, restart, prefix-pruning, and zone-map workloads selected with
+`BENCH_PARTS` or `BENCH_MATRIX`.
 
 | Part | Scenario | What it tests |
 |---|---|---|
@@ -139,8 +157,13 @@ The benchmark covers **8 scenarios** in a single run:
 | 6 | **Stress & Edge Cases** | Wide IN, 3-table JOIN, high-cardinality GROUP BY, bulk UPDATE, UNION, CROSS JOIN |
 | 7 | **Inventory & Fulfillment** | Stock rollups, reorder candidates, shipment queues, reservation joins, restock writes |
 | 8 | **Risk & Audit** | Large-transfer review, failed-transfer audits, account exposure, suspicious spend/activity patterns |
+| 9 | **Column Scan** | Column-scan fast paths and aggregate execution |
+| 10 | **Stats-Aware Join** | ANALYZE statistics and join reordering |
 
-Results are printed to terminal and saved as `benchmark_report_<scale>.json`, including latency percentiles, standard deviation, coefficient of variation, success/error counts, row throughput, and concurrent workload throughput.
+Results are printed to terminal and saved as
+`benchmark_report_<scale>_<protocol>[_selection].json`, including latency
+percentiles, variability, checksums, errors, throughput, metrics deltas, and
+claim-gate status.
 
 ### Admin CLI
 
@@ -156,8 +179,8 @@ cargo run --bin fusiondb-cli -- checkpoint
 cargo run --bin fusiondb-cli -- vacuum
 cargo run --bin fusiondb-cli -- cdc --since 0 --limit 100
 
-# Custom endpoint/user
-cargo run --bin fusiondb-cli -- --url http://127.0.0.1:8091 --user admin metrics
+# Custom endpoint/credentials (password can use FUSIONDB_HTTP_PASSWORD)
+cargo run --bin fusiondb-cli -- --url http://127.0.0.1:8091 --user postgres --password fusiondb metrics
 ```
 
 ### Dashboard UI (FusionDB Studio)
@@ -168,7 +191,8 @@ npm install
 npm run dev             # Starts at http://localhost:5173
 ```
 
-The dashboard auto-proxies API requests to FusionDB's HTTP server (default `127.0.0.1:3000`). Make sure FusionDB is running first.
+The dashboard auto-proxies API requests to FusionDB's HTTP server at
+`127.0.0.1:8091`. Make sure FusionDB is running first.
 
 **Pages:**
 - **Dashboard** — Real-time metrics, table list, slow query log, checkpoint trigger
@@ -186,7 +210,7 @@ FusionDB speaks the PostgreSQL wire protocol. Use any Postgres client:
 
 ```bash
 # psql
-psql -h 127.0.0.1 -p 8092 -U admin -d fusiondb
+psql -h 127.0.0.1 -p 8092 -U postgres -d postgres
 # Password: fusiondb
 
 # Or programmatically (Python)
@@ -195,7 +219,7 @@ pip install psycopg2-binary
 
 ```python
 import psycopg2
-conn = psycopg2.connect(host="127.0.0.1", port=8092, user="admin", password="fusiondb", dbname="fusiondb")
+conn = psycopg2.connect(host="127.0.0.1", port=8092, user="postgres", password="fusiondb", dbname="postgres")
 cur = conn.cursor()
 cur.execute("SELECT * FROM my_table LIMIT 10")
 rows = cur.fetchall()
@@ -204,7 +228,7 @@ rows = cur.fetchall()
 ```rust
 // Rust (tokio-postgres)
 let (client, connection) = tokio_postgres::connect(
-    "host=127.0.0.1 port=8092 user=admin password=fusiondb", tokio_postgres::NoTls
+    "host=127.0.0.1 port=8092 user=postgres password=fusiondb", tokio_postgres::NoTls
 ).await?;
 let rows = client.query("SELECT * FROM my_table", &[]).await?;
 ```
@@ -212,7 +236,7 @@ let rows = client.query("SELECT * FROM my_table", &[]).await?;
 ```javascript
 // Node.js (pg)
 const { Client } = require('pg');
-const client = new Client({ host: '127.0.0.1', port: 8092, user: 'admin', password: 'fusiondb' });
+const client = new Client({ host: '127.0.0.1', port: 8092, user: 'postgres', password: 'fusiondb' });
 await client.connect();
 const res = await client.query('SELECT * FROM my_table');
 ```
@@ -222,6 +246,7 @@ const res = await client.query('SELECT * FROM my_table');
 ```bash
 # Execute SQL
 curl -X POST http://127.0.0.1:8091/query \
+  -u postgres:fusiondb \
   -H "Content-Type: application/json" \
   -d '{"sql": "SELECT * FROM my_table LIMIT 5"}'
 
@@ -229,10 +254,10 @@ curl -X POST http://127.0.0.1:8091/query \
 curl http://127.0.0.1:8091/health
 
 # View metrics
-curl http://127.0.0.1:8091/metrics
+curl -u postgres:fusiondb http://127.0.0.1:8091/metrics
 
 # List tables
-curl http://127.0.0.1:8091/tables
+curl -u postgres:fusiondb http://127.0.0.1:8091/tables
 ```
 
 ### Method 3: Prepared Statements (HTTP)
@@ -240,11 +265,13 @@ curl http://127.0.0.1:8091/tables
 ```bash
 # 1. Prepare
 curl -X POST http://127.0.0.1:8091/prepare \
+  -u postgres:fusiondb \
   -d '{"sql": "SELECT * FROM users WHERE id = $1"}'
 # Returns: {"statement_id": "uuid-xxx", "error": null}
 
 # 2. Execute with parameters
 curl -X POST http://127.0.0.1:8091/execute \
+  -u postgres:fusiondb \
   -d '{"statement_id": "uuid-xxx", "params": [42]}'
 ```
 
@@ -570,6 +597,9 @@ SELECT EMBEDDING('hello world machine learning') AS vec;
 ## HTTP API Reference
 
 All endpoints are served from `http://127.0.0.1:8091`.
+Except for `/health`, endpoints require HTTP Basic authentication. The default
+development credentials are `postgres:fusiondb`; change them before exposing
+the service.
 
 ### Endpoints
 
@@ -601,7 +631,9 @@ All endpoints are served from `http://127.0.0.1:8091`.
 
 // Response (SELECT)
 {
-  "result": [{
+  "status": "ok",
+  "data": [{
+    "type": "select",
     "columns": ["name", "score"],
     "rows": [["Alice", 95.5], ["Carol", 92.1]]
   }],
@@ -610,7 +642,8 @@ All endpoints are served from `http://127.0.0.1:8091`.
 
 // Response (INSERT/UPDATE/DELETE)
 {
-  "result": [{"message": "Inserted 3 rows"}],
+  "status": "ok",
+  "data": [{"type": "success", "message": "Inserted 3 rows"}],
   "error": null
 }
 ```
@@ -621,7 +654,7 @@ All endpoints are served from `http://127.0.0.1:8091`.
 {"query": [0.1, 0.2, 0.3], "limit": 5}
 
 // Response
-{"results": [{"id": "item_1", "distance": 0.05}, ...]}
+{"status": "ok", "data": {"results": [{"id": "item_1", "distance": 0.05}]}, "error": null}
 ```
 
 **POST /hybrid_search**
@@ -630,36 +663,28 @@ All endpoints are served from `http://127.0.0.1:8091`.
 {"text_query": "machine learning", "vector_query": [0.1, 0.2, 0.3], "limit": 5}
 
 // Response
-{"results": [{"id": "doc_42", "distance": 0.87}, ...]}
+{"status": "ok", "data": {"results": [{"id": "doc_42", "distance": 0.87}]}, "error": null}
 ```
 
 **GET /metrics**
 ```json
 {
-  "sql_parse_count": 1024,
-  "sql_plan_count": 512,
-  "row_read_count": 50000,
-  "row_cache_hit_count": 35000,
-  "row_write_count": 10000,
-  "fts_search_count": 100,
-  "fts_doc_hits": 5000,
-  "wal_write_count": 10000,
-  "wal_write_bytes": 2048000,
-  "query_count": 5000,
-  "slow_query_count": 12,
-  "query_total_us": 320000000,
-  "pg_active_connection_count": 24,
-  "pg_connection_rejected_count": 3,
-  "pg_connection_limit": 100
+  "status": "ok",
+  "data": {
+    "sql_parse_count": 1024,
+    "row_read_count": 50000,
+    "wal_write_count": 10000,
+    "query_count": 5000,
+    "pg_active_connection_count": 24,
+    "pg_connection_limit": 100
+  },
+  "error": null
 }
 ```
 
 **GET /slow_queries**
 ```json
-[
-  {"sql": "SELECT * FROM big_table WHERE ...", "duration_ms": 245.3, "timestamp": "1740300000.123"},
-  {"sql": "SELECT COUNT(*) FROM ...", "duration_ms": 102.1, "timestamp": "1740300001.456"}
-]
+{"status": "ok", "data": [{"sql": "SELECT * FROM big_table WHERE ...", "duration_ms": 245.3}], "error": null}
 ```
 
 **GET /metrics/prometheus**
@@ -695,7 +720,7 @@ fusiondb_slow_query_count 12
 }
 ```
 
-CDC is available on `FusionStorage` and records committed storage writes with a monotonic `sequence` for resumable polling. Registered users must be superusers to read this feed; anonymous and `postgres` remain legacy superusers for local compatibility.
+CDC is available on `FusionStorage` and records committed storage writes with a monotonic `sequence` for resumable polling. The endpoint requires an authenticated superuser.
 
 ---
 
@@ -764,7 +789,8 @@ registry.set_default("onnx-minilm");
 │                                                              │
 │  Write Path:                                                 │
 │    Client → WAL (append-only) → MemTable (lock-free SkipMap) │
-│    MemTable full (32MB) → Flush to SSTable → WAL truncate    │
+│    MemTable full (32MB) → staged SSTable → atomic publish    │
+│    WAL retained until a complete checkpoint or shutdown      │
 │                                                              │
 │  Read Path (MVCC):                                           │
 │    Row Cache (Moka, 10K entries)                             │
@@ -823,10 +849,18 @@ memtable_flush_mb = 32     # MemTable size before flush to SSTable (MB)
 row_cache_capacity = 10000 # Row cache entries (LRU)
 statement_cache_capacity = 1000  # Prepared statement cache size
 block_cache_capacity = 25000     # SSTable block cache (4KB blocks)
+sql_bulk_scan_no_fill = true     # Avoid block-cache pollution for SQL bulk scans
 slow_query_threshold_ms = 100    # Slow query log threshold (ms)
 
 [auth]
-password = "fusiondb"      # Password for PostgreSQL cleartext auth
+password = "fusiondb"      # Development password for postgres over pgwire and HTTP Basic
+scram_sha256 = false        # Reserved; cleartext password exchange requires TLS
+http_legacy_unsafe = false  # Never trust anonymous/Bearer-as-user/x-fusiondb-user by default
+
+[tls]
+enabled = false
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
 
 [distributed]
 enabled = false            # Enable OpenRaft-backed distributed mode
@@ -834,6 +868,7 @@ node_id = 1                # Local Raft node id
 advertise_addr = ""        # Peer-facing address; empty uses server bind/http_port
 bootstrap = true           # Initialize configured members on startup
 cluster_name = "fusiondb"  # OpenRaft cluster name
+forwarding_secret = ""      # Required whenever distributed mode is enabled
 initial_members = []       # Optional [{ node_id = 1, addr = "127.0.0.1:8091" }]
 
 [distributed.sharding]
@@ -853,9 +888,17 @@ range_boundaries = []      # Optional lexicographic range upper bounds
 
 ### Authentication
 
-Default credentials for PostgreSQL protocol:
-- **User**: any (not enforced)
-- **Password**: `fusiondb` (configurable in `fusiondb.toml`)
+Default development credentials for PostgreSQL and HTTP Basic authentication:
+- **User**: `postgres`
+- **Password**: `fusiondb` (configure `[auth].password` before deployment)
+
+RBAC users authenticate with the password stored by `CREATE USER`. Setting
+`http_legacy_unsafe = true` restores the old anonymous/header identity behavior
+only for migration and is not suitable for exposed services. When TLS is
+enabled, invalid certificates or keys fail startup instead of falling back to
+plaintext. Distributed mode additionally requires TLS and a non-empty
+`forwarding_secret`; internal signatures cover the method, path and query,
+timestamp, delegated user, and request body digest.
 
 ### Data Directory Layout
 
@@ -884,8 +927,10 @@ python benchmark.py                     # Run benchmark
 Environment variables:
 ```bash
 FUSIONDB_URL=http://127.0.0.1:8091/query  # Server endpoint
-BENCH_ROWS=10000                            # Data size
-BENCH_ITERS=10                              # Iterations per query
+FUSIONDB_HTTP_USER=postgres                 # HTTP Basic user
+FUSIONDB_HTTP_PASSWORD=fusiondb             # HTTP Basic password
+BENCH_SCALE=medium                          # small / medium / large / xlarge
+BENCH_MATRIX=full                           # Or a focused matrix preset
 ```
 
 ### Sample Results (10K rows, debug build, Windows)
@@ -949,14 +994,19 @@ FusionDB/
 │   │   ├── mod.rs                  # Server startup orchestration
 │   │   ├── http_server.rs          # Axum HTTP API (query, prepare, execute, vector_search)
 │   │   ├── pg_server.rs            # pgwire PostgreSQL protocol handler
+│   │   ├── security.rs             # Signed internal forwarding authentication
+│   │   ├── tls.rs                  # Shared rustls certificate/config loader
 │   │   └── tcp_server.rs           # Raw TCP server (legacy)
 │   └── storage/
 │       ├── mod.rs                  # Storage + Transaction traits
 │       ├── fusion.rs               # FusionStorage: MVCC + LSM + SkipMap + SSTable
 │       ├── memory.rs               # In-memory storage (for testing)
 │       ├── backend.rs              # Pluggable backend factory (BackendConfig)
-│       ├── wal.rs                  # Segmented WAL (64MB rotation, multi-segment replay)
+│       ├── wal.rs                  # Segmented WAL with atomic CRC32 transaction frames
 │       ├── sstable.rs              # SSTable with Bloom filters + CRC32 checksums + LZ4 block compression
+│       ├── manifest_edit.rs        # Version edits and manifest invariants
+│       ├── manifest_log.rs         # Durable CURRENT/manifest lifecycle
+│       ├── manifest_record.rs      # Checksummed fragmented manifest records
 │       ├── fbtree.rs               # FB+-Tree (fractal B-tree variant)
 │       ├── vector_index.rs         # HNSW vector index
 │       ├── inverted_index.rs       # BM25 inverted index for FTS
@@ -964,8 +1014,8 @@ FusionDB/
 │       ├── columnar.rs             # Columnar vector store (SIMD-friendly)
 │       └── columnar_analytics.rs   # Arrow-based vectorized aggregation
 ├── tests/
-│   ├── sql_integration.rs          # 98 SQL integration tests
-│   └── pg_integration.rs           # 4 pgwire protocol tests
+│   ├── sql_*.rs                    # SQL behavior and storage integration suites
+│   └── pg_integration.rs           # pgwire protocol integration suite
 ├── dashboard/                      # FusionDB Studio (Supabase-style web UI)
 │   ├── src/
 │   │   ├── components/Layout.tsx   # Sidebar + main layout
@@ -979,7 +1029,7 @@ FusionDB/
 ├── benchmark.py                    # Comprehensive performance benchmark
 ├── Cargo.toml                      # Dependencies
 ├── Dockerfile                      # Container build
-└── LICENSE                         # MIT
+└── LICENSE                         # GNU AGPL v3.0
 ```
 
 ---
@@ -1002,7 +1052,7 @@ These are known gaps that should be addressed before production use:
 - No savepoints (`SAVEPOINT` / `RELEASE`)
 
 ### Distributed
-- OpenRaft can be enabled via `[distributed]`, with `/raft/*` HTTP RPCs, leader-forwarded writes, and local follower reads
+- OpenRaft can be enabled via `[distributed]`, with `/raft/*` HTTP RPCs, leader-forwarded writes, and local follower reads; startup requires TLS and a non-empty forwarding secret
 - Raft log/state metadata is currently in-memory and intended as the control-plane wiring foundation
 - Snapshot transfer serializes visible key-value state for new node bootstrap
 - Sharding has a configurable hash/range control plane, route API, local row-data shard key layout (`shard:{id}:data:{table}:{row_id}`), and local secondary-index KV shard layouts (`shard:{id}:index:*`, `shard:{id}:fts:*`)
@@ -1015,8 +1065,8 @@ These are known gaps that should be addressed before production use:
 - No distributed transactions (2PC)
 
 ### Security
-- Password auth over pgwire is cleartext (SCRAM-SHA-256 blocked by pgwire 0.37)
-- TLS infrastructure ready but pgwire 0.37 requires external TLS proxy
+- HTTP Basic and pgwire cleartext password authentication must only be used over the built-in TLS listeners outside local development
+- SCRAM-SHA-256 is not implemented
 - No row-level security
 
 ### Operations
@@ -1032,9 +1082,9 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 
 | Phase | Status | Highlights |
 |---|---|---|
-| **1. Data Integrity** | ✅ Done | Graceful shutdown, TOML config, segmented WAL, SSTable CRC32, compaction dedup |
+| **1. Data Integrity** | ✅ Done | Atomic WAL frames, synchronized commits, checkpoint-safe WAL truncation, staged SSTables, CRC32 validation |
 | **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
-| **3. Security** | 🔲 Next | TLS/SSL, SCRAM-SHA-256, RBAC |
+| **3. Security** | 🔲 In progress | Built-in HTTP/pgwire TLS, Basic/password auth, PBKDF2 RBAC and signed internal forwarding; SCRAM and row-level security remain |
 | **4. Performance** | ✅ Done | Connection slots, parallel scan, LZ4 SSTable compression, cost-based optimizer |
 | **5. Distributed** | 🔲 In progress | OpenRaft main-loop wiring and snapshot transfer; sharding control plane, local row/index shard layouts, and point-write owner guard |
 | **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
@@ -1060,8 +1110,8 @@ RUST_LOG=debug cargo run --bin fusiondb
 # Run specific test
 cargo test test_insert_and_select -- --nocapture
 
-# Run benchmark with custom size
-BENCH_ROWS=50000 python benchmark.py
+# Run a focused benchmark scale/matrix
+BENCH_SCALE=large BENCH_MATRIX=index_topk python3 benchmark.py
 
 # Check code without building
 cargo check
@@ -1074,4 +1124,5 @@ cargo fmt
 
 ## License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the GNU Affero General Public License v3.0 only. See
+`LICENSE` for the complete terms.

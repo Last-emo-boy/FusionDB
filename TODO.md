@@ -1,10 +1,13 @@
 # FusionDB 开发计划 (Roadmap)
 
+> 历史规划归档：本文件保留早期方向，不再表示当前实现状态。
+> 当前能力、限制和运行方式以 `README.md`、`ROADMAP.md` 与测试代码为准。
+
 FusionDB 旨在打造一个**极致性能**、**多模态融合**、**AI 原生**的嵌入式数据库。以下是详尽的工程迭代路线图。
 
 ## Phase 1-5: 基础核心 (Completed)
 - [x] **Core**: 项目初始化, 类型系统, 错误处理.
-- [x] **Storage**: Sled 引擎集成, 原子事务基础.
+- [x] **Storage**: 自研 FusionStorage、MVCC/LSM、WAL 与 SSTable.
 - [x] **Query**: Parser, Create/Insert/Select, Where, Order By, Limit/Offset.
 - [x] **Multi-Model**: JSON 支持 (`->`), Vector 支持 (Distance, Sort).
 - [x] **Index**: B+Tree 索引, 自动维护, 等值查询优化.

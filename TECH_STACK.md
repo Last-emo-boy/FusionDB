@@ -1,7 +1,7 @@
 # FusionDB 技术栈 (Tech Stack)
 
 ## 核心语言
-- **Rust**: 2021 edition
+- **Rust**: 2021 edition，最低版本 1.89
   - 选择理由: 内存安全、高性能、零成本抽象，适合构建数据库内核。
 
 ## 关键依赖库
@@ -12,14 +12,14 @@
   - 用于元数据 (Schema) 和 JSON 数据类型的序列化与反序列化。
 
 ### 2. 存储引擎
-- **sled**: v0.34
-  - 高性能嵌入式 KV 数据库 (基于 Bw-Tree)。
-  - 提供原子批处理 (Batch) 和前缀扫描 (Scan Prefix) 功能，支持事务构建。
-  - **Storage Trait**: 抽象了底层存储，支持内存 (Memory) 和磁盘 (Sled) 两种模式。
-  - **Indexing**: 基于 KV 的二级索引实现 (`index:{table}:{col}:{val}:{row_id}`).
+- **FusionStorage**: 自研 MVCC/LSM 存储引擎
+  - SkipMap MemTable、分段 WAL、SSTable、Bloom Filter、CRC32 和 LZ4。
+  - `Storage`/`Transaction` trait 提供 Fusion 与测试用 Memory 后端抽象。
+  - 服务端入口固定使用 FusionStorage；`BackendConfig` 仅供嵌入式 API 调用。
+  - 二级索引存储于同一 KV/MVCC 提交路径。
 
 ### 3. 网络服务
-- **axum**: v0.7
+- **axum**: v0.8
   - 现代、符合人体工程学的 Web 框架 (基于 Tokio)。
 - **tokio**:
   - 异步运行时。

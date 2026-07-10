@@ -1,14 +1,16 @@
 # FusionDB Roadmap
 
-> Last updated: 2026-06-26
+> Last updated: 2026-07-10. This file tracks implemented code and verified gaps;
+> `TODO.md` is retained only as a historical planning document.
 
 ## Phase 1: Data Integrity & Reliability ✅
 
-- [x] **P1-1: Graceful shutdown** — Ctrl+C → flush MemTable → save indexes → truncate WAL
+- [x] **P1-1: Graceful shutdown** — Ctrl+C and `SIGTERM` → block commits → flush all MemTables → persist manifest/indexes → truncate WAL
 - [x] **P1-2: TOML config file** — `fusiondb.toml` with server/storage/auth sections, `--init` flag
-- [x] **P1-3: Segmented WAL** — 64MB segment rotation, multi-segment replay/truncate, backward compat
+- [x] **P1-3: Segmented WAL** — 64MB segment rotation, CRC32-protected atomic transaction frames, synchronous file/directory persistence, safe tail recovery, and legacy record replay
 - [x] **P1-4: SSTable checksums** — CRC32 per data block, verification on read, legacy block compat
 - [x] **P1-5: Compaction dedup** — Skip stale MVCC key versions during 4-way merge
+- [x] **P1-6: Atomic commit/checkpoint boundary** — Serialize OCC validation and publication, publish commit timestamps last, flush oldest-first through staged SSTables, and truncate WAL only after a complete checkpoint
 
 ## Phase 2: SQL Completeness ✅✅
 
@@ -51,10 +53,11 @@
 
 ## Phase 3: Security
 
-- [x] **P3-1: TLS infrastructure** — rustls + tokio-rustls deps, TlsConfig in TOML, tls.rs acceptor builder, server wiring (pgwire TLS requires proxy in v0.37)
-- [x] **P3-2: Configurable auth** — Password from fusiondb.toml config, passed through server startup chain
-- [ ] **P3-3: SCRAM-SHA-256** — Replace cleartext auth (blocked by pgwire 0.37 limitations)
-- [x] **P3-4: RBAC** — CREATE/DROP USER (SHA-256 hashed passwords), GRANT/REVOKE per-table permissions, SHOW USERS, SUPERUSER flag, check_permission enforcement API
+- [x] **P3-1: Built-in TLS listeners** — HTTP and pgwire use the configured rustls certificate directly; missing or invalid TLS material fails startup
+- [x] **P3-2: Fail-closed authentication** — HTTP Basic and pgwire password auth default to configured credentials/RBAC users; anonymous and trusted-header identity require an explicit unsafe compatibility flag
+- [ ] **P3-3: SCRAM-SHA-256** — Replace cleartext password exchange
+- [x] **P3-4: RBAC** — CREATE/DROP USER (salted PBKDF2 hashes with legacy SHA-256 verification), GRANT/REVOKE per-table permissions, SHOW USERS, SUPERUSER flag, check_permission enforcement API
+- [x] **P3-5: Internal request authentication** — Distributed mode requires TLS and signs method, path/query, delegated user, timestamp, and body digest with HMAC; management routes require superuser or a valid internal signature
 
 ## Phase 4: Performance & Scale ✅
 
@@ -65,7 +68,7 @@
 
 ## Phase 5: Distributed
 
-- [x] **P5-1: Wire OpenRaft into main loop** — Configurable Raft startup, `/raft/*` routes, leader-forwarded writes, local follower reads
+- [x] **P5-1: Wire OpenRaft into main loop** — Configurable fail-closed Raft startup, authenticated `/raft/*` routes, leader-forwarded writes, and local follower reads
 - [x] **P5-2: Snapshot transfer** — Serialized visible key-value state for new node bootstrap
 - [ ] **P5-3: Automatic sharding** — Hash/range control plane, local row/index KV shard layouts, HTTP/pgwire INSERT/UPDATE/DELETE/COPY point-write owner guard, pgwire transaction-visible schema routing, HTTP `/query`, HTTP prepared `/execute`, plus pgwire simple/extended-query and COPY single-owner point-write shard forwarding, primary-key point-read forwarding, simple single-table SELECT fan-out, and distributed `COUNT(*)`/`COUNT(DISTINCT column)`/`SUM(column)`/`SUM(DISTINCT column)`/`MIN(column)`/`MAX(column)`/`AVG(column)`/`AVG(DISTINCT column)` aggregation plus `GROUP BY col[, col2 ...], COUNT(*)`, `GROUP BY col[, col2 ...], SUM/MIN/MAX(col)`, and `GROUP BY col[, col2 ...], AVG(col)` fan-out (single- and multi-column) (re-grouped + count-summed / sum-merged / extremum-merged / partial-sum+count-merged-then-divided across owners), plus MULTI-aggregate grouped fan-out (two or more of `COUNT(*)`/`COUNT(col)`/`SUM`/`MIN`/`MAX` in one projection, each merged independently per group — e.g. `GROUP BY g, COUNT(*), SUM(x)`; `AVG`/`DISTINCT` aggregates excluded), plus post-merge `HAVING` + `ORDER BY`/`LIMIT`/`OFFSET` top-N for ALL these grouped variants (`COUNT(*)`, `SUM/MIN/MAX(col)`, `AVG(col)`) (owners run the clause-stripped query so each returns ALL its groups; the global `HAVING` filter, then stable-sort, then offset/limit are applied once after the cross-owner merge — never per-owner, so a group below a `HAVING` threshold locally but above it globally is correctly kept), (over `INTEGER`/`FLOAT` and `DECIMAL`/`NUMERIC` columns — `MIN`/`MAX` over `DECIMAL` compare numerically across owners, not lexically), across HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query; a grouped aggregate over a non-numeric column fails loudly (never silently local-only); mixed/multi-owner writes, distributed index ownership, and broader cross-node query planning remain
 
@@ -93,9 +96,9 @@
 
 ## Phase 8: CI/CD & DevOps
 
-- [x] **P8-1: GitHub Actions CI** — Parallel Rust (build+test+clippy+fmt) and Dashboard (npm build) jobs with caching
-- [x] **P8-2: Multi-stage Dockerfile** — Rust builder + Node.js dashboard builder + slim runtime image, correct port exposure (8091/8092)
-- [x] **P8-3: Unified Benchmark Suite** — 6-part benchmark (Base, E-commerce, Financial, Analytics, Concurrent, Stress), 4 scales (small/medium/large/xlarge), JSON report export, ~60 query benchmarks per run
+- [x] **P8-1: GitHub Actions CI** — Parallel Rust (all-target tests, correctness clippy, fmt) and Dashboard (dependency audit, typecheck, build, lint) jobs with caching and no ignored failures
+- [x] **P8-2: Multi-stage Dockerfile** — Rust builder plus slim server runtime, runtime config outside the `/data` volume, and correct port exposure (8091/8092)
+- [x] **P8-3: Unified Benchmark Suite** — 31 registered parts, 10 default parts, focused matrix selection, 4 scales, HTTP/pgwire protocols, metrics deltas, checksums, and JSON claim reports
 
 ## Phase 9: Performance Optimization
 
@@ -112,7 +115,6 @@
 
 | Suite | Count | Description |
 |---|---|---|
-| Unit tests | 74 | Storage, WAL, SSTable, config, encoding |
-| SQL integration | 98 | DDL, DML, queries, joins, aggregation, subqueries, UNION, CASE, CTE, functions, window fns, views, constraints, UPSERT, RBAC |
-| pgwire integration | 4 | PostgreSQL wire protocol end-to-end |
-| **Total** | **176** | All passing |
+| Unit/binary test declarations | 565 | Storage, WAL, SSTable, execution, config, encoding, protocol, and binary helpers |
+| Integration test declarations | 496 | SQL, pgwire, indexes, scans, joins, aggregates, DDL/DML, and transactions |
+| **Total declarations** | **1,061** | All passed with `cargo test --all-targets` on 2026-07-10 |
