@@ -1802,17 +1802,24 @@ impl Executor {
                                     break;
                                 }
                                 let scan_options = if remaining.is_none() {
-                                    self.bulk_scan_options()
+                                    // Zone-map pruning precomputes skip offsets
+                                    // for EVERY block in the range (each with an
+                                    // MVCC fail-open probe over all memtables) —
+                                    // worth it for bulk scans, but it defeats
+                                    // LIMIT early-stop: a LIMIT 100 range scan
+                                    // paid the whole 250k-row range up front
+                                    // (BENCHPROD-469). Attach the plan only for
+                                    // unlimited scans.
+                                    self.sql_block_zone_map_scan_options(
+                                        &table_name,
+                                        selection.as_ref(),
+                                        &schema,
+                                        params,
+                                        self.bulk_scan_options(),
+                                    )
                                 } else {
                                     StorageScanOptions::fill_cache()
                                 };
-                                let scan_options = self.sql_block_zone_map_scan_options(
-                                    &table_name,
-                                    selection.as_ref(),
-                                    &schema,
-                                    params,
-                                    scan_options,
-                                );
                                 let mut scanned = txn
                                     .scan_range_with_options(&start, &end, remaining, scan_options)
                                     .await?;
