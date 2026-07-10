@@ -152,3 +152,11 @@ gate 缺口双因:①load_table_stats 为 None(无 ANALYZE)直接 Ok(None)=无�
 try_index_scan 有完备弃用机制(index_candidate_cap(None,None)=1024,should_use_index_plan 超限即弃)——100k 探测不可能来自它。AVG(total) WHERE status='x' 为纯聚合投影,走 column_scan.rs 的 secondary-index aggregate scan(~1293,7 月功能):扫 status 索引条目后逐行取数聚合,无候选上限。Revenue by category 10s 应为其 group_by 变体(group_by_count/aggregate_column_scan)。修复点改为:该家族入口加候选计数闸门(复用 STATS_INDEX_PROBE_LIMIT_MAX 或 index_candidate_cap 语义),超限退回全扫聚合(simple_column_aggregate_scan 批式全扫已高效);统计存在时用 stats 预判少付一次索引条目扫描。教训:同一逻辑查询在不同投影形态下走完全不同的执行家族,gate 必须逐家族审计。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="473,subquery-in,sstable-reopen" date="2026-07-10" title="473 立案:Subquery IN 31s,查询内重复 SSTable 开销(2026-07-10)" source="main@6d572d2">
+
+### 473 立案:Subquery IN 31s,查询内重复 SSTable 开销(2026-07-10)
+
+SELECT * FROM users WHERE id IN (SELECT DISTINCT user_id FROM orders WHERE total>500) LIMIT 20:warm 31s(应 ~1.5s:orders 扫描+DISTINCT 物化+users IN 集合扫描)。两轮测量均被重启后 compaction 波次污染(每轮数百 MB 混入),但查询自身增量含决定性异常:sstable_open_meta_bytes 67MB/查 + open_filter 39MB + open_total_us 297ms——单查询内反复 OPEN/解码 SSTable meta;另见首轮 762k 次 point_overlap_skip(IN 成员判定疑逐行点查而非哈希集)。嫌疑:①deferred IN-membership(subquery.rs:661-838 per-value cache)对每候选行做存储点查;②物化路径重复重扫 orders;③no-fill 下 meta/filter 不缓存导致每次子扫描重开。Never-ordered(NOT IN)26.5s 同族。解剖方法:待系统安静(compaction 彻底完成)后单查增量+subquery.rs 路径读码;或本地 fdb-idx-repro 造 orders/users 双表干净重现。
+
+</spec-entry>
