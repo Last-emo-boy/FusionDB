@@ -104,3 +104,11 @@ Full scan val=42(50 万行,532 命中)warm 3.1s 画像:zone-map 检查 111,120 �
 细分计数器(schema_fail_open/mvcc_overlap 四子项)对 val=42 全扫单查增量全为零 ⟹ 97,237 次 fail-open 全部来自只进聚合计数的第三类:IncompleteMetadata/InvalidBounds/NullOrTombstone/CountMismatch(fusion.rs record_sql_zone_map_fail_open 的非 schema 分支)。头号嫌疑 IncompleteMetadata=块属性 sql_zone_maps_complete=false(采集不全:compaction 产出块跨表?builder schema 快照时机?)。下一步:evaluate_block_zone_maps 加临时 reason 直方图 eprintln→本地 50 万行重现(fdb-idx-repro 模式)→按 reason 修根因。若为采集缺陷,修 builder 侧一次性解决;若结构性,加 fail-open 占比熔断。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="470,seven-eighths,fail-open,handoff" date="2026-07-10" title="470 深挖状态:7/8 fail-open 之谜(2026-07-10)" source="main@b1062cf">
+
+### 470 深挖状态:7/8 fail-open 之谜(2026-07-10)
+
+最新事实链:①构建侧正常——snapshot 非空(1 表),12 个 kill 点零触发 ⟹ block_sql_zone_maps 返回 complete=true;②writer finish() 逻辑正确(有 zone map 走 V6,V6 From 保留 complete 字段);③但读侧 87.5%(恰 7/8)的检查落在 complete=false 块上(本地 120k 行重现:26,680 检查/23,352 fail-open/218 positive/3,110 skip,与 xlarge 同比例);④之前 snap 重现'零 fail-open'是直方图 5 万阈值假象,/metrics 增量揭穿。7/8 结构比例线索:疑与块族构成有关(data 块 vs index-key 块)或 flush 产 vs compaction 产 SSTable 差异。下一步打点:finish() 按 SSTable 打印 complete/incomplete 块计数 + skip_offsets 评估时打印 sstable id——区分哪类 SSTable 写了 false。临时打点现存 3 处(fail-open 读侧直方图/构建 kill 点/snapshot 大小),修复后一并移除。重现环境:/root/fdb-idx-repro 120k 行 + checkpoint。
+
+</spec-entry>
