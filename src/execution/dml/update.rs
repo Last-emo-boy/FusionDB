@@ -234,8 +234,27 @@ impl Executor {
                 )
                 .await?;
 
+                self.validate_unique_columns_for_update(
+                    &table_name_str,
+                    &schema,
+                    &old_row,
+                    &row,
+                    &k,
+                    txn,
+                )
+                .await?;
+
                 let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
                 txn.put(&k, &new_value_bytes).await?;
+                self.migrate_unique_sentinels_for_update(
+                    &table_name_str,
+                    &schema,
+                    &old_row,
+                    &row,
+                    row_id,
+                    txn,
+                )
+                .await?;
 
                 self.update_trigram_index_for_update(
                     &table_name_str,
@@ -511,8 +530,20 @@ impl Executor {
             }
         }
 
+        self.validate_unique_columns_for_update(
+            table_name,
+            schema,
+            &old_row,
+            &row,
+            key.as_bytes(),
+            txn,
+        )
+        .await?;
+
         let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
         txn.put(key.as_bytes(), &new_value_bytes).await?;
+        self.migrate_unique_sentinels_for_update(table_name, schema, &old_row, &row, row_id, txn)
+            .await?;
         monitor::inc_row_write();
 
         Ok(Some(QueryResult::Success {

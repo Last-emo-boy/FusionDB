@@ -575,8 +575,26 @@ impl Executor {
                             txn,
                         )
                         .await?;
+                        self.validate_unique_columns_for_update(
+                            &context.table_name,
+                            &context.schema,
+                            &old_existing_row,
+                            &existing_row,
+                            key.as_bytes(),
+                            txn,
+                        )
+                        .await?;
                         let value = crate::common::encoding::RowEncoder::encode(&existing_row);
                         txn.put(key.as_bytes(), &value).await?;
+                        self.migrate_unique_sentinels_for_update(
+                            &context.table_name,
+                            &context.schema,
+                            &old_existing_row,
+                            &existing_row,
+                            &row_id,
+                            txn,
+                        )
+                        .await?;
                         self.update_trigram_index_for_update(
                             &context.table_name,
                             &context.schema,
@@ -647,6 +665,14 @@ impl Executor {
         let value = crate::common::encoding::RowEncoder::encode(&row_values);
         txn.put(key.as_bytes(), &value).await?;
         monitor::inc_row_write();
+        self.put_unique_sentinels_for_row(
+            &context.table_name,
+            &context.schema,
+            &row_values,
+            &row_id,
+            txn,
+        )
+        .await?;
 
         self.update_trigram_index_for_insert(
             &context.table_name,
@@ -1005,9 +1031,27 @@ impl Executor {
                                         txn,
                                     )
                                     .await?;
+                                    self.validate_unique_columns_for_update(
+                                        &table_name_str,
+                                        &schema,
+                                        &old_existing_row,
+                                        &existing_row,
+                                        key.as_bytes(),
+                                        txn,
+                                    )
+                                    .await?;
                                     let value =
                                         crate::common::encoding::RowEncoder::encode(&existing_row);
                                     txn.put(key.as_bytes(), &value).await?;
+                                    self.migrate_unique_sentinels_for_update(
+                                        &table_name_str,
+                                        &schema,
+                                        &old_existing_row,
+                                        &existing_row,
+                                        &row_id,
+                                        txn,
+                                    )
+                                    .await?;
                                     self.update_trigram_index_for_update(
                                         &table_name_str,
                                         &schema,
@@ -1082,6 +1126,14 @@ impl Executor {
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
                     monitor::inc_row_write();
+                    self.put_unique_sentinels_for_row(
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &row_id,
+                        txn,
+                    )
+                    .await?;
 
                     self.update_trigram_index_for_insert(
                         &table_name_str,
@@ -1226,9 +1278,29 @@ impl Executor {
                         txn,
                     )
                     .await?;
+                    // INSERT..SELECT previously skipped the single-column
+                    // UNIQUE scan check entirely; an empty old row makes the
+                    // shared validator treat every unique column as changed.
+                    self.validate_unique_columns_for_update(
+                        &table_name_str,
+                        &schema,
+                        &[],
+                        &row_values,
+                        key.as_bytes(),
+                        txn,
+                    )
+                    .await?;
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
                     monitor::inc_row_write();
+                    self.put_unique_sentinels_for_row(
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &row_id,
+                        txn,
+                    )
+                    .await?;
                     self.update_trigram_index_for_insert(
                         &table_name_str,
                         &schema,

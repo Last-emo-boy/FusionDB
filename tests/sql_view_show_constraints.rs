@@ -600,3 +600,138 @@ async fn test_foreign_key_blocks_dependent_alter_and_drop_table() {
     assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
     cleanup(&wal);
 }
+
+/// BENCHPROD-464: UPDATE previously skipped UNIQUE validation entirely — a
+/// sequential UPDATE could silently create duplicate unique values.
+#[tokio::test]
+async fn test_update_enforces_unique_constraint() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE upd_uniq (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO upd_uniq VALUES (1, 'a@x'), (2, 'b@x')",
+    )
+    .await;
+
+    let result = executor
+        .execute_sql("UPDATE upd_uniq SET email = 'a@x' WHERE id = 2")
+        .await;
+    assert!(result.is_err(), "duplicate via UPDATE must be rejected");
+    assert!(format!("{}", result.unwrap_err()).contains("UNIQUE"));
+
+    // Same-value self-update stays legal.
+    exec_ok(&executor, "UPDATE upd_uniq SET email = 'b@x' WHERE id = 2").await;
+    // Changing to a fresh value stays legal, and frees the old one.
+    exec_ok(&executor, "UPDATE upd_uniq SET email = 'c@x' WHERE id = 2").await;
+    exec_ok(&executor, "UPDATE upd_uniq SET email = 'b@x' WHERE id = 1").await;
+
+    let (_, rows) = query(&executor, "SELECT email FROM upd_uniq ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("b@x".to_string())],
+            vec![Value::String("c@x".to_string())]
+        ]
+    );
+    cleanup(&wal);
+}
+
+/// BENCHPROD-464: UPSERT DO UPDATE previously skipped single-column UNIQUE
+/// validation on the post-assignment row.
+#[tokio::test]
+async fn test_upsert_do_update_enforces_unique_constraint() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE ups_uniq (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO ups_uniq VALUES (1, 'a@x'), (2, 'b@x')",
+    )
+    .await;
+
+    let result = executor
+        .execute_sql(
+            "INSERT INTO ups_uniq VALUES (2, 'ignored') \
+             ON CONFLICT (id) DO UPDATE SET email = 'a@x'",
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "DO UPDATE creating a duplicate unique value must be rejected"
+    );
+    assert!(format!("{}", result.unwrap_err()).contains("UNIQUE"));
+
+    // Legal DO UPDATE to a fresh value still works.
+    exec_ok(
+        &executor,
+        "INSERT INTO ups_uniq VALUES (2, 'ignored') \
+         ON CONFLICT (id) DO UPDATE SET email = 'c@x'",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT email FROM ups_uniq ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("a@x".to_string())],
+            vec![Value::String("c@x".to_string())]
+        ]
+    );
+    cleanup(&wal);
+}
+
+/// BENCHPROD-464: INSERT..SELECT previously performed no single-column
+/// UNIQUE validation at all.
+#[tokio::test]
+async fn test_insert_select_enforces_unique_constraint() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE isel_uniq (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO isel_uniq VALUES (1, 'a@x')").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE isel_src (id INTEGER PRIMARY KEY, email TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO isel_src VALUES (2, 'a@x')").await;
+
+    let result = executor
+        .execute_sql("INSERT INTO isel_uniq SELECT * FROM isel_src")
+        .await;
+    assert!(
+        result.is_err(),
+        "INSERT..SELECT of a duplicate unique value must be rejected"
+    );
+    assert!(format!("{}", result.unwrap_err()).contains("UNIQUE"));
+    cleanup(&wal);
+}
+
+/// Multi-row INSERT with an internal duplicate must be rejected (the per-row
+/// scan sees the earlier sibling through read-your-own-writes).
+#[tokio::test]
+async fn test_multi_row_insert_internal_unique_duplicate() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE batch_uniq (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    let result = executor
+        .execute_sql("INSERT INTO batch_uniq VALUES (1, 'x@x'), (2, 'x@x')")
+        .await;
+    assert!(
+        result.is_err(),
+        "batch-internal duplicate unique value must be rejected"
+    );
+    assert!(format!("{}", result.unwrap_err()).contains("UNIQUE"));
+    cleanup(&wal);
+}

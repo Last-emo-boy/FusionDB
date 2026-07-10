@@ -131,7 +131,7 @@ impl Executor {
             let no_secondary_indexes = schema
                 .columns
                 .iter()
-                .all(|col| !col.is_indexed || col.is_primary)
+                .all(|col| (!col.is_indexed && !col.is_unique) || col.is_primary)
                 && composite_indexes.is_empty()
                 && parent_foreign_keys.is_empty();
             if no_secondary_indexes {
@@ -215,6 +215,8 @@ impl Executor {
                 .await?;
 
                 txn.delete(&k).await?;
+                self.delete_unique_sentinels_for_row(&table_name_str, &schema, &row, txn)
+                    .await?;
 
                 let row_id = Self::row_id_from_data_key(&k)?;
                 self.update_trigram_index_for_delete(

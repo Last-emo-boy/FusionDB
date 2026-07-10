@@ -485,6 +485,14 @@ impl Executor {
                 .scan_routed_prefixes(self.routed_fts_prefixes_for_table(&table_name), txn, None)
                 .await?;
             index_entries.append(&mut fts_entries);
+            let mut unique_sentinels = self
+                .scan_routed_prefixes(
+                    self.routed_unique_sentinel_prefixes_for_table(&table_name),
+                    txn,
+                    None,
+                )
+                .await?;
+            index_entries.append(&mut unique_sentinels);
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
             }
@@ -532,6 +540,14 @@ impl Executor {
                 .scan_routed_prefixes(self.routed_fts_prefixes_for_table(&table_name), txn, None)
                 .await?;
             index_entries.append(&mut fts_entries);
+            let mut unique_sentinels = self
+                .scan_routed_prefixes(
+                    self.routed_unique_sentinel_prefixes_for_table(&table_name),
+                    txn,
+                    None,
+                )
+                .await?;
+            index_entries.append(&mut unique_sentinels);
             for (k, _) in index_entries {
                 txn.delete(&k).await?;
             }

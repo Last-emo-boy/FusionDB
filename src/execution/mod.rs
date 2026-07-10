@@ -855,6 +855,68 @@ impl Executor {
         key
     }
 
+    /// Unique-constraint sentinel key for a (table, column, value) triple.
+    ///
+    /// The key carries NO row-id suffix, so two concurrent transactions
+    /// writing the same unique value stage the exact same key and the
+    /// commit-time OCC validation deterministically aborts the loser —
+    /// closing the read-then-write phantom that the scan-based duplicate
+    /// check cannot see (BENCHPROD-464). Routing hashes the VALUE (not the
+    /// row id), so the same value always maps to the same shard prefix
+    /// regardless of where the owning rows live. Cross-node uniqueness in
+    /// true multi-node deployments remains best-effort, as before.
+    pub(crate) fn routed_unique_sentinel_key_for_value(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        value: &str,
+    ) -> String {
+        let mut key = if let Some(router) = &self.shard_router {
+            let route = router.route_key(table_name, value);
+            let mut prefix = String::with_capacity(
+                "shard:0000:unique:".len() + table_name.len() + 1 + column_name.len() + 1,
+            );
+            prefix.push_str("shard:");
+            prefix.push_str(&route.shard_id.to_string());
+            prefix.push_str(":unique:");
+            prefix.push_str(table_name);
+            prefix.push(':');
+            prefix.push_str(column_name);
+            prefix.push(':');
+            prefix
+        } else {
+            let mut prefix = String::with_capacity(
+                "unique:".len() + table_name.len() + 1 + column_name.len() + 1,
+            );
+            prefix.push_str("unique:");
+            prefix.push_str(table_name);
+            prefix.push(':');
+            prefix.push_str(column_name);
+            prefix.push(':');
+            prefix
+        };
+        key.push_str(value);
+        key
+    }
+
+    /// All physical prefixes that may hold unique sentinels for a table
+    /// (used by TRUNCATE / DROP TABLE cleanup).
+    pub(crate) fn routed_unique_sentinel_prefixes_for_table(
+        &self,
+        table_name: &str,
+    ) -> Vec<String> {
+        if let Some(router) = &self.shard_router {
+            let shard_count = router.shard_count();
+            let mut prefixes = Vec::with_capacity(shard_count as usize);
+            for shard_id in 0..shard_count {
+                prefixes.push(format!("shard:{}:unique:{}:", shard_id, table_name));
+            }
+            return prefixes;
+        }
+
+        vec![format!("unique:{}:", table_name)]
+    }
+
     pub(crate) fn routed_index_prefixes_for_table(&self, table_name: &str) -> Vec<String> {
         if let Some(router) = &self.shard_router {
             let shard_count = router.shard_count();
@@ -6368,6 +6430,211 @@ mod tests {
             other => panic!("expected select result, got {other:?}"),
         }
         old_snapshot_txn.rollback().await.expect("rollback");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Two concurrent transactions inserting the same UNIQUE value must not
+    /// both commit (BENCHPROD-464): the scan-based duplicate check cannot see
+    /// the other uncommitted row, but both stage the same row-id-free unique
+    /// sentinel key, so exact-key OCC validation aborts the loser.
+    #[tokio::test]
+    async fn concurrent_unique_inserts_collide_on_sentinel() {
+        let data_dir =
+            std::path::PathBuf::from(format!("test_unique_sentinel_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = crate::config::StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let fusion = crate::storage::fusion::FusionStorage::with_config(
+            &wal_path.to_string_lossy(),
+            &config,
+        )
+        .await
+        .expect("fusion storage");
+        let storage: Arc<dyn Storage> = Arc::new(fusion);
+        let executor = Executor::new(storage.clone());
+
+        executor
+            .execute_sql("CREATE TABLE uniq_race (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            .await
+            .expect("create table");
+
+        let insert_a = parse_sql("INSERT INTO uniq_race VALUES (1, 'dup@x')").expect("parse a");
+        let insert_b = parse_sql("INSERT INTO uniq_race VALUES (2, 'dup@x')").expect("parse b");
+
+        let mut txn_a = storage.begin_transaction().await.expect("begin a");
+        let mut txn_b = storage.begin_transaction().await.expect("begin b");
+
+        executor
+            .execute_in_transaction(&insert_a[0], &mut *txn_a)
+            .await
+            .expect("stage a");
+        // txn_b's scan-based duplicate check cannot see txn_a's uncommitted row.
+        executor
+            .execute_in_transaction(&insert_b[0], &mut *txn_b)
+            .await
+            .expect("stage b");
+
+        txn_a.commit().await.expect("commit a");
+        let err = txn_b
+            .commit()
+            .await
+            .expect_err("second same-value insert must abort at OCC validation");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("conflict"),
+            "expected a write-conflict abort, got: {msg}"
+        );
+
+        // Exactly one row must be visible.
+        let results = executor
+            .execute_sql("SELECT COUNT(*) FROM uniq_race")
+            .await
+            .expect("count");
+        match results.as_slice() {
+            [QueryResult::Select { rows, .. }] => {
+                assert_eq!(rows, &vec![vec![Value::Integer(1)]]);
+            }
+            other => panic!("expected select result, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The sentinel must not linger as a false conflict: DELETE tombstones it
+    /// and a later INSERT of the same value succeeds.
+    #[tokio::test]
+    async fn unique_sentinel_released_after_delete() {
+        let wal_path = format!("test_unique_release_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage);
+
+        executor
+            .execute_sql("CREATE TABLE uniq_cycle (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            .await
+            .expect("create table");
+        executor
+            .execute_sql("INSERT INTO uniq_cycle VALUES (1, 'a@x')")
+            .await
+            .expect("insert");
+        executor
+            .execute_sql("DELETE FROM uniq_cycle WHERE id = 1")
+            .await
+            .expect("delete");
+        executor
+            .execute_sql("INSERT INTO uniq_cycle VALUES (2, 'a@x')")
+            .await
+            .expect("re-insert of a deleted unique value must succeed");
+
+        let err = executor
+            .execute_sql("INSERT INTO uniq_cycle VALUES (3, 'a@x')")
+            .await
+            .expect_err("live duplicate must still be rejected");
+        assert!(err.to_string().contains("UNIQUE"));
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// Pins the UPDATE half of the sentinel mechanism: a concurrent UPDATE
+    /// migrating a row onto value v and an INSERT of v stage the same
+    /// sentinel, so the second committer aborts.
+    #[tokio::test]
+    async fn concurrent_update_and_insert_collide_on_sentinel() {
+        let data_dir =
+            std::path::PathBuf::from(format!("test_unique_upd_race_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = crate::config::StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let fusion = crate::storage::fusion::FusionStorage::with_config(
+            &wal_path.to_string_lossy(),
+            &config,
+        )
+        .await
+        .expect("fusion storage");
+        let storage: Arc<dyn Storage> = Arc::new(fusion);
+        let executor = Executor::new(storage.clone());
+
+        executor
+            .execute_sql("CREATE TABLE uniq_upd (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            .await
+            .expect("create table");
+        executor
+            .execute_sql("INSERT INTO uniq_upd VALUES (1, 'old@x')")
+            .await
+            .expect("seed row");
+
+        let update = parse_sql("UPDATE uniq_upd SET email = 'new@x' WHERE id = 1").unwrap();
+        let insert = parse_sql("INSERT INTO uniq_upd VALUES (2, 'new@x')").unwrap();
+
+        let mut txn_a = storage.begin_transaction().await.expect("begin a");
+        let mut txn_b = storage.begin_transaction().await.expect("begin b");
+        executor
+            .execute_in_transaction(&update[0], &mut *txn_a)
+            .await
+            .expect("stage update");
+        executor
+            .execute_in_transaction(&insert[0], &mut *txn_b)
+            .await
+            .expect("stage insert");
+
+        txn_a.commit().await.expect("commit update");
+        let err = txn_b
+            .commit()
+            .await
+            .expect_err("insert of the migrated value must abort");
+        assert!(err.to_string().to_lowercase().contains("conflict"));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Pins the hash-fallback sentinel encoding: FLOAT UNIQUE columns have no
+    /// index string, so without the fallback both concurrent inserts of the
+    /// same float committed (live-reproduced during review).
+    #[tokio::test]
+    async fn concurrent_float_unique_inserts_collide_on_sentinel() {
+        let data_dir =
+            std::path::PathBuf::from(format!("test_unique_float_race_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = crate::config::StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let fusion = crate::storage::fusion::FusionStorage::with_config(
+            &wal_path.to_string_lossy(),
+            &config,
+        )
+        .await
+        .expect("fusion storage");
+        let storage: Arc<dyn Storage> = Arc::new(fusion);
+        let executor = Executor::new(storage.clone());
+
+        executor
+            .execute_sql("CREATE TABLE uniq_float (id INTEGER PRIMARY KEY, score DOUBLE UNIQUE)")
+            .await
+            .expect("create table");
+
+        let insert_a = parse_sql("INSERT INTO uniq_float VALUES (1, 1.5)").unwrap();
+        let insert_b = parse_sql("INSERT INTO uniq_float VALUES (2, 1.5)").unwrap();
+
+        let mut txn_a = storage.begin_transaction().await.expect("begin a");
+        let mut txn_b = storage.begin_transaction().await.expect("begin b");
+        executor
+            .execute_in_transaction(&insert_a[0], &mut *txn_a)
+            .await
+            .expect("stage a");
+        executor
+            .execute_in_transaction(&insert_b[0], &mut *txn_b)
+            .await
+            .expect("stage b");
+
+        txn_a.commit().await.expect("commit a");
+        let err = txn_b
+            .commit()
+            .await
+            .expect_err("second same-float insert must abort at OCC validation");
+        assert!(err.to_string().to_lowercase().contains("conflict"));
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

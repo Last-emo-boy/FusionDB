@@ -28,7 +28,207 @@ fn is_trigram_text_data_type(data_type: &str) -> bool {
         || starts_with_ascii_case_insensitive(data_type, "CHARACTER")
 }
 
+/// Stable FNV-1a 64 over the value's bincode encoding. Used as the sentinel
+/// key component for value types `value_to_index_string` cannot render
+/// (FLOAT/BLOB/VECTOR/...). Equal values always hash equal, so the OCC
+/// collision is guaranteed; a hash collision between different values only
+/// produces a conservative false conflict, never a missed one.
+fn unique_sentinel_hash_string(value: &Value) -> Option<String> {
+    // -0.0 == 0.0 under SQL/f64 equality but their bit patterns differ;
+    // normalize so equal floats always hash to the same sentinel.
+    let normalized;
+    let value = match value {
+        Value::Float(f) if *f == 0.0 => {
+            normalized = Value::Float(0.0);
+            &normalized
+        }
+        other => other,
+    };
+    let bytes = bincode::serialize(value).ok()?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(format!("h64:{hash:016x}"))
+}
+
 impl Executor {
+    /// Sentinel key component for a unique value: the normal index string
+    /// when available, else a stable hash so every value type is covered.
+    fn unique_sentinel_value_string(&self, value: &Value) -> Option<String> {
+        self.value_to_index_string(value)
+            .or_else(|| unique_sentinel_hash_string(value))
+    }
+
+    /// Stage unique-constraint sentinel keys for every non-PK UNIQUE column
+    /// of a freshly written row. Sentinels carry no row-id suffix, so they
+    /// enter the OCC write set and concurrent same-value writers collide at
+    /// commit — closing the scan-then-write phantom (BENCHPROD-464). The
+    /// scan-based duplicate check remains responsible for already-committed
+    /// duplicates (legacy rows have no sentinels).
+    pub(crate) async fn put_unique_sentinels_for_row(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        row_values: &[Value],
+        row_id: &str,
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if !col.is_unique || col.is_primary {
+                continue;
+            }
+            let Some(value) = row_values.get(idx) else {
+                continue;
+            };
+            if *value == Value::Null {
+                continue;
+            }
+            let Some(value_str) = self.unique_sentinel_value_string(value) else {
+                continue;
+            };
+            let key = self.routed_unique_sentinel_key_for_value(table_name, &col.name, &value_str);
+            txn.put(key.as_bytes(), row_id.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    /// Remove the unique sentinels owned by a row that is being deleted.
+    pub(crate) async fn delete_unique_sentinels_for_row(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        row_values: &[Value],
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if !col.is_unique || col.is_primary {
+                continue;
+            }
+            let Some(value) = row_values.get(idx) else {
+                continue;
+            };
+            if *value == Value::Null {
+                continue;
+            }
+            let Some(value_str) = self.unique_sentinel_value_string(value) else {
+                continue;
+            };
+            let key = self.routed_unique_sentinel_key_for_value(table_name, &col.name, &value_str);
+            txn.delete(key.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    /// Migrate unique sentinels when an UPDATE (or UPSERT DO UPDATE) changes
+    /// a unique column's value: drop the old value's sentinel, stage the new
+    /// value's sentinel so concurrent writers of the new value collide.
+    pub(crate) async fn migrate_unique_sentinels_for_update(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        old_row: &[Value],
+        new_row: &[Value],
+        row_id: &str,
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if !col.is_unique || col.is_primary {
+                continue;
+            }
+            let old_value = old_row.get(idx);
+            let new_value = new_row.get(idx);
+            if old_value == new_value {
+                continue;
+            }
+            if let Some(old_value) = old_value {
+                if *old_value != Value::Null {
+                    if let Some(value_str) = self.unique_sentinel_value_string(old_value) {
+                        let key = self.routed_unique_sentinel_key_for_value(
+                            table_name, &col.name, &value_str,
+                        );
+                        txn.delete(key.as_bytes()).await?;
+                    }
+                }
+            }
+            if let Some(new_value) = new_value {
+                if *new_value != Value::Null {
+                    if let Some(value_str) = self.unique_sentinel_value_string(new_value) {
+                        let key = self.routed_unique_sentinel_key_for_value(
+                            table_name, &col.name, &value_str,
+                        );
+                        txn.put(key.as_bytes(), row_id.as_bytes()).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// UPDATE-side duplicate check for unique columns whose value changed.
+    /// Mirrors the INSERT-side scan check (which UPDATE previously skipped
+    /// entirely), excluding the row being updated.
+    pub(crate) async fn validate_unique_columns_for_update(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        old_row: &[Value],
+        new_row: &[Value],
+        current_row_key: &[u8],
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        // One table scan serves every changed unique column of this row.
+        let mut changed_unique_columns = Vec::new();
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if !col.is_unique || col.is_primary {
+                continue;
+            }
+            let Some(new_value) = new_row.get(idx) else {
+                continue;
+            };
+            if *new_value == Value::Null || old_row.get(idx) == Some(new_value) {
+                continue;
+            }
+            changed_unique_columns.push((idx, &col.name, new_value));
+        }
+        if changed_unique_columns.is_empty() {
+            return Ok(());
+        }
+
+        let existing = self
+            .scan_routed_data_prefixes_for_table(table_name, txn, None)
+            .await?;
+        for (k, v) in &existing {
+            if k.as_slice() == current_row_key {
+                continue;
+            }
+            for &(idx, col_name, new_value) in &changed_unique_columns {
+                let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
+                    if let Some(row) = self.row_cache_lookup(key_str, v) {
+                        row.get(idx).cloned().unwrap_or(Value::Null)
+                    } else {
+                        crate::common::encoding::RowDecoder::decode_column(v, idx)
+                            .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
+                            .unwrap_or(Value::Null)
+                    }
+                } else {
+                    crate::common::encoding::RowDecoder::decode_column(v, idx)
+                        .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
+                        .unwrap_or(Value::Null)
+                };
+                if existing_value == *new_value {
+                    return Err(FusionError::Execution(format!(
+                        "UNIQUE constraint violated for column '{}': duplicate value '{}'",
+                        col_name,
+                        crate::common::encoding::encode_key(new_value)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn fts_index_key_for_row(
         table_name: &str,
