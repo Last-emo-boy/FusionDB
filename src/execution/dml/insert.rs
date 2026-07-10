@@ -236,11 +236,15 @@ impl Executor {
                 }
                 let idx_name = Self::hnsw_index_name_for_column(table_name, &col.name);
                 if matches!(old_val, Value::Vector(_)) {
-                    self.vector_index.delete(&idx_name, row_id)?;
+                    self.defer_or_apply_vector_delete(&idx_name, row_id, txn)?;
                 }
                 if let Value::Vector(vec) = new_val {
-                    self.vector_index
-                        .insert(&idx_name, row_id.to_string(), vec.clone())?;
+                    self.defer_or_apply_vector_insert(
+                        &idx_name,
+                        row_id.to_string(),
+                        vec.clone(),
+                        txn,
+                    )?;
                 }
             } else {
                 let old_val_str = self.value_to_index_string(old_val);
@@ -703,8 +707,12 @@ impl Executor {
                     if let Value::Vector(vec) = val {
                         let idx_name =
                             Self::hnsw_index_name_for_column(&context.table_name, &col.name);
-                        self.vector_index
-                            .insert(&idx_name, row_id.clone(), vec.clone())?;
+                        self.defer_or_apply_vector_insert(
+                            &idx_name,
+                            row_id.clone(),
+                            vec.clone(),
+                            txn,
+                        )?;
                     }
                 } else if let Some(val_str) = self.value_to_index_string(val) {
                     let index_key = self.routed_index_key_for_value(
@@ -1166,10 +1174,11 @@ impl Executor {
                                         &table_name_str,
                                         &col.name,
                                     );
-                                    self.vector_index.insert(
+                                    self.defer_or_apply_vector_insert(
                                         &idx_name,
                                         row_id.clone(),
                                         vec.clone(),
+                                        txn,
                                     )?;
                                 }
                             } else if let Some(val_str) = self.value_to_index_string(val) {
@@ -1332,10 +1341,11 @@ impl Executor {
                                         &table_name_str,
                                         &col.name,
                                     );
-                                    self.vector_index.insert(
+                                    self.defer_or_apply_vector_insert(
                                         &idx_name,
                                         row_id.clone(),
                                         vec.clone(),
+                                        txn,
                                     )?;
                                 }
                             } else if let Some(val_str) = self.value_to_index_string(val) {

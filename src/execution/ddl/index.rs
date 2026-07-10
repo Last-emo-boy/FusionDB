@@ -289,8 +289,12 @@ impl Executor {
             } else if index_type == IndexType::HNSW {
                 if let Value::Vector(vec) = &val {
                     let idx_name = hnsw_index_name_for_column(&table_name_str, col_name);
-                    self.vector_index
-                        .insert(&idx_name, row_id.to_string(), vec.clone())?;
+                    self.defer_or_apply_vector_insert(
+                        &idx_name,
+                        row_id.to_string(),
+                        vec.clone(),
+                        txn,
+                    )?;
                 }
             } else {
                 if let Some(val_str) = self.value_to_index_string(&val) {

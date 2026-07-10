@@ -2043,6 +2043,7 @@ impl FusionStorage {
                 write_buffer: transaction_write_buffer(),
                 read_ts,
                 read_ts_registered: false,
+                side_index_deltas: std::sync::Mutex::new(Vec::new()),
             };
             let existing = snapshot_txn.scan_range(start, end, None).await?;
             let total_entries = existing.len().saturating_add(entries.len());
@@ -2670,14 +2671,117 @@ impl FusionStorage {
     }
 }
 
+/// A deferred side-index mutation (trigram / HNSW). These structures are not
+/// part of the OCC write set; buffering them on the transaction and applying
+/// only after commit-time validation succeeds keeps aborted transactions from
+/// leaving phantom entries in shared in-memory indexes (BENCHPROD-465,
+/// InnoDB-FTS-style deferral). Rollback simply drops the buffer.
+#[derive(Debug)]
+pub enum SideIndexDelta {
+    TrigramAdd {
+        table: String,
+        column: String,
+        numeric_id: u64,
+        row_id: String,
+        text: String,
+    },
+    TrigramRemove {
+        table: String,
+        column: String,
+        numeric_id: u64,
+        text: String,
+    },
+    VectorInsert {
+        index: String,
+        id: String,
+        vector: Vec<f32>,
+    },
+    VectorDelete {
+        index: String,
+        id: String,
+    },
+}
+
 pub struct FusionTransaction {
     pub storage: FusionStorage,
     pub write_buffer: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pub read_ts: u64,
     read_ts_registered: bool,
+    side_index_deltas: std::sync::Mutex<Vec<SideIndexDelta>>,
 }
 
 impl FusionTransaction {
+    /// Buffer a side-index mutation to be applied only if this transaction
+    /// commits (after OCC validation and WAL durability). See SideIndexDelta.
+    pub fn defer_side_index_delta(&self, delta: SideIndexDelta) {
+        self.side_index_deltas.lock().unwrap().push(delta);
+    }
+
+    /// Apply the buffered side-index deltas. Called from commit after the
+    /// write set is durable and published to the memtable, immediately
+    /// before the visibility watermark moves: a concurrent search may see an
+    /// index entry for a not-yet-visible row (harmless — index hits are
+    /// re-verified against base rows), and within this process a visible row
+    /// is never missing its index entries. (Across a crash, trigram postings
+    /// remain checkpoint-granular as before: postings committed after the
+    /// last checkpoint are not replayed; the vector index self-heals via the
+    /// startup rebuild from rows.)
+    fn apply_side_index_deltas(&self) {
+        let deltas = std::mem::take(&mut *self.side_index_deltas.lock().unwrap());
+        if deltas.is_empty() {
+            return;
+        }
+
+        let mut trigram_lock = None;
+        for delta in &deltas {
+            match delta {
+                SideIndexDelta::TrigramAdd {
+                    table,
+                    column,
+                    numeric_id,
+                    row_id,
+                    text,
+                } => {
+                    let lock = trigram_lock
+                        .get_or_insert_with(|| self.storage.trigram_index.write().unwrap());
+                    lock.add_with_id_str(table, column, *numeric_id, row_id, text);
+                }
+                SideIndexDelta::TrigramRemove {
+                    table,
+                    column,
+                    numeric_id,
+                    text,
+                } => {
+                    let lock = trigram_lock
+                        .get_or_insert_with(|| self.storage.trigram_index.write().unwrap());
+                    lock.remove_with_id(table, column, *numeric_id, text);
+                }
+                SideIndexDelta::VectorInsert { .. } | SideIndexDelta::VectorDelete { .. } => {}
+            }
+        }
+        drop(trigram_lock);
+
+        for delta in deltas {
+            match delta {
+                SideIndexDelta::VectorInsert { index, id, vector } => {
+                    if let Err(e) = self.storage.vector_index.insert(&index, id, vector) {
+                        eprintln!(
+                            "[fusion] post-commit vector index insert failed for '{index}': {e}"
+                        );
+                    }
+                }
+                SideIndexDelta::VectorDelete { index, id } => {
+                    if let Err(e) = self.storage.vector_index.delete(&index, &id) {
+                        eprintln!(
+                            "[fusion] post-commit vector index delete failed for '{index}': {e}"
+                        );
+                    }
+                }
+                SideIndexDelta::TrigramAdd { .. } | SideIndexDelta::TrigramRemove { .. } => {}
+            }
+        }
+    }
+
     /// Snapshot the visible memtables (active + immutable, newest-first) as a cheap Arc clone.
     fn snapshot_memtables(&self) -> Vec<MemTable> {
         let mut mem_tables =
@@ -4331,6 +4435,9 @@ impl Transaction for FusionTransaction {
 
     async fn commit(mut self: Box<Self>) -> Result<()> {
         if self.write_buffer.is_empty() {
+            // No KV writes means nothing to validate or log, but buffered
+            // side-index deltas must still apply rather than vanish.
+            self.apply_side_index_deltas();
             return Ok(());
         }
 
@@ -4408,6 +4515,12 @@ impl Transaction for FusionTransaction {
             self.storage.rotate_memtable().await;
         }
 
+        // Side-index deltas apply only now — after OCC validation and WAL
+        // durability, so an aborted transaction never touches the shared
+        // trigram/vector indexes — and before the visibility watermark, so a
+        // visible row is never missing its index entries.
+        self.apply_side_index_deltas();
+
         // current_ts is the public visibility watermark. It must move only after WAL durability
         // and complete source publication, otherwise a new reader can observe a partial commit.
         self.storage.current_ts.store(commit_ts, Ordering::SeqCst);
@@ -4434,6 +4547,7 @@ impl Storage for FusionStorage {
             write_buffer: transaction_write_buffer(),
             read_ts,
             read_ts_registered: true,
+            side_index_deltas: std::sync::Mutex::new(Vec::new()),
         }))
     }
 
@@ -5034,6 +5148,7 @@ mod tests {
             write_buffer: transaction_write_buffer(),
             read_ts: 3,
             read_ts_registered: false,
+            side_index_deltas: std::sync::Mutex::new(Vec::new()),
         };
         txn.put(b"data:rev:009", b"wb9").await.unwrap();
         txn.delete(b"data:rev:007").await.unwrap();
@@ -5089,6 +5204,7 @@ mod tests {
             write_buffer: transaction_write_buffer(),
             read_ts: 1,
             read_ts_registered: false,
+            side_index_deltas: std::sync::Mutex::new(Vec::new()),
         };
 
         {
@@ -7500,6 +7616,7 @@ mod tests {
             write_buffer: transaction_write_buffer(),
             read_ts: 1,
             read_ts_registered: false,
+            side_index_deltas: std::sync::Mutex::new(Vec::new()),
         };
         assert_eq!(
             stale_txn.get(b"data:compact_snapshot:001").await.unwrap(),

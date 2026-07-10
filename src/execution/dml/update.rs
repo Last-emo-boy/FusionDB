@@ -315,13 +315,14 @@ impl Executor {
                                 let idx_name =
                                     Self::hnsw_index_name_for_column(&table_name_str, &col.name);
                                 if matches!(old_val, Value::Vector(_)) {
-                                    self.vector_index.delete(&idx_name, row_id)?;
+                                    self.defer_or_apply_vector_delete(&idx_name, row_id, txn)?;
                                 }
                                 if let Value::Vector(vec) = new_val {
-                                    self.vector_index.insert(
+                                    self.defer_or_apply_vector_insert(
                                         &idx_name,
                                         row_id.to_string(),
                                         vec.clone(),
+                                        txn,
                                     )?;
                                 }
                             } else {

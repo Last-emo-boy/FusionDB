@@ -150,6 +150,25 @@ impl VectorIndex {
         self.indexes.write().clear();
     }
 
+    /// Pre-commit validation for a deferred insert: fails if the vector's
+    /// dimension conflicts with the index's established dimension, WITHOUT
+    /// mutating anything. Lets callers reject the statement before commit
+    /// instead of discovering the mismatch during post-commit apply
+    /// (BENCHPROD-465).
+    pub fn validate_insert_dimensions(&self, name: &str, dimension: usize) -> Result<()> {
+        let indexes = self.indexes.read();
+        if let Some(wrapper_lock) = indexes.get(name) {
+            let wrapper = wrapper_lock.read();
+            if wrapper.dimension != 0 && wrapper.dimension != dimension {
+                return Err(FusionError::Execution(format!(
+                    "Vector dimension mismatch: expected {}, got {}",
+                    wrapper.dimension, dimension
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn insert(&self, name: &str, id: String, vector: Vec<f32>) -> Result<()> {
         let wrapper_lock = self.get_or_create_wrapper(name);
         let mut wrapper = wrapper_lock.write();

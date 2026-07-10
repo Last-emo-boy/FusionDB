@@ -3666,3 +3666,192 @@ async fn test_show_indexes() {
 
     cleanup(&wal);
 }
+
+/// BENCHPROD-465: side-index (trigram) mutations are commit-deferred — an
+/// uncommitted transaction leaves no trace, a rolled-back one never touches
+/// the shared index, and commit applies the buffered deltas.
+#[tokio::test]
+async fn test_trigram_index_mutations_are_commit_deferred() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("trigram_deferred").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE defer_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_defer_docs_body ON defer_docs (body)",
+    )
+    .await;
+
+    let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+    let insert = executor
+        .prepare("INSERT INTO defer_docs VALUES (1, 'rollback needle text')")
+        .unwrap();
+
+    // Staged but uncommitted: the shared trigram index must be untouched.
+    let mut txn = storage.begin_transaction().await.unwrap();
+    executor
+        .execute_in_transaction(&insert[0], &mut *txn)
+        .await
+        .unwrap();
+    {
+        let guard = fusion.trigram_index.read().unwrap();
+        assert!(
+            guard.search("defer_docs", "body", "%needle%").is_none(),
+            "uncommitted insert must not touch the trigram index"
+        );
+    }
+
+    // Rollback: still untouched.
+    txn.rollback().await.unwrap();
+    {
+        let guard = fusion.trigram_index.read().unwrap();
+        assert!(
+            guard.search("defer_docs", "body", "%needle%").is_none(),
+            "rolled-back insert must never reach the trigram index"
+        );
+    }
+
+    // Commit path applies the deltas.
+    exec_ok(
+        &executor,
+        "INSERT INTO defer_docs VALUES (2, 'committed needle text')",
+    )
+    .await;
+    let row_keys = {
+        let guard = fusion.trigram_index.read().unwrap();
+        let ids = guard
+            .search("defer_docs", "body", "%needle%")
+            .expect("committed insert must populate trigram postings");
+        guard.map_ids_to_row_keys("defer_docs", &ids)
+    };
+    assert_eq!(row_keys, vec![encoded_row_id(2)]);
+    cleanup_storage_dir(&data_dir);
+}
+
+/// BENCHPROD-465: HNSW mutations are commit-deferred on the Fusion backend.
+/// Uses EMBEDDING() because SQL array literals store as Value::Array and do
+/// not reach the vector index (pre-existing gap, tracked separately).
+#[tokio::test]
+async fn test_vector_index_mutations_are_commit_deferred() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("vector_deferred").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE defer_vecs (id INTEGER PRIMARY KEY, emb VECTOR(128))",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_defer_vecs_emb ON defer_vecs (emb) USING HNSW",
+    )
+    .await;
+
+    let (_, erows) = query(&executor, "SELECT EMBEDDING('deferred vector probe')").await;
+    let Value::Vector(query_vec) = &erows[0][0] else {
+        panic!("EMBEDDING must return a vector");
+    };
+    let query_vec = query_vec.clone();
+
+    let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+    let insert = executor
+        .prepare("INSERT INTO defer_vecs VALUES (1, EMBEDDING('deferred vector probe'))")
+        .unwrap();
+
+    let mut txn = storage.begin_transaction().await.unwrap();
+    executor
+        .execute_in_transaction(&insert[0], &mut *txn)
+        .await
+        .unwrap();
+    let hits = fusion
+        .vector_index
+        .search("hnsw_defer_vecs_emb", &query_vec, 5)
+        .unwrap();
+    assert!(
+        hits.is_empty(),
+        "uncommitted vector insert must not reach the HNSW index"
+    );
+
+    txn.rollback().await.unwrap();
+    let hits = fusion
+        .vector_index
+        .search("hnsw_defer_vecs_emb", &query_vec, 5)
+        .unwrap();
+    assert!(hits.is_empty(), "rolled-back vector insert must vanish");
+
+    exec_ok(
+        &executor,
+        "INSERT INTO defer_vecs VALUES (2, EMBEDDING('deferred vector probe'))",
+    )
+    .await;
+    let hits = fusion
+        .vector_index
+        .search("hnsw_defer_vecs_emb", &query_vec, 5)
+        .unwrap();
+    assert_eq!(hits.len(), 1, "committed vector insert must be searchable");
+    cleanup_storage_dir(&data_dir);
+}
+
+/// BENCHPROD-465: an OCC-aborted transaction's side-index deltas are dropped
+/// — only the winner's text reaches the trigram index.
+#[tokio::test]
+async fn test_occ_abort_drops_side_index_deltas() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("occ_abort_side_index").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE occ_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_occ_docs_body ON occ_docs (body)",
+    )
+    .await;
+
+    let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+    let insert_a = executor
+        .prepare("INSERT INTO occ_docs VALUES (1, 'winner needle text')")
+        .unwrap();
+    let insert_b = executor
+        .prepare("INSERT INTO occ_docs VALUES (1, 'loser needle text')")
+        .unwrap();
+
+    let mut txn_a = storage.begin_transaction().await.unwrap();
+    let mut txn_b = storage.begin_transaction().await.unwrap();
+    executor
+        .execute_in_transaction(&insert_a[0], &mut *txn_a)
+        .await
+        .unwrap();
+    executor
+        .execute_in_transaction(&insert_b[0], &mut *txn_b)
+        .await
+        .unwrap();
+
+    txn_a.commit().await.unwrap();
+    assert!(
+        txn_b.commit().await.is_err(),
+        "same-PK concurrent insert must abort"
+    );
+
+    let row_keys = {
+        let guard = fusion.trigram_index.read().unwrap();
+        let ids = guard
+            .search("occ_docs", "body", "%needle%")
+            .expect("winner's postings must exist");
+        guard.map_ids_to_row_keys("occ_docs", &ids)
+    };
+    assert_eq!(
+        row_keys,
+        vec![encoded_row_id(1)],
+        "only one posting (the winner's) may exist"
+    );
+    let loser_ids = {
+        let guard = fusion.trigram_index.read().unwrap();
+        guard.search("occ_docs", "body", "%loser%")
+    };
+    assert!(
+        loser_ids.is_none() || loser_ids.unwrap().is_empty(),
+        "aborted transaction's trigram delta must be dropped"
+    );
+    cleanup_storage_dir(&data_dir);
+}

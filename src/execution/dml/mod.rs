@@ -331,19 +331,16 @@ impl Executor {
             return;
         };
 
-        let storage = &ftxn.storage;
-        let mut idx_lock = storage.trigram_index.write().unwrap();
         let numeric_id = Self::trigram_numeric_row_id(row_id);
-
         for &idx in trigram_column_indices {
             if let Some(Value::String(text)) = row_values.get(idx) {
-                idx_lock.add_with_id_str(
-                    table_name,
-                    &schema.columns[idx].name,
+                ftxn.defer_side_index_delta(crate::storage::fusion::SideIndexDelta::TrigramAdd {
+                    table: table_name.to_string(),
+                    column: schema.columns[idx].name.clone(),
                     numeric_id,
-                    row_id,
-                    text,
-                );
+                    row_id: row_id.to_string(),
+                    text: text.clone(),
+                });
             }
         }
     }
@@ -367,15 +364,13 @@ impl Executor {
             return;
         };
 
-        let storage = &ftxn.storage;
-        let mut idx_lock = storage.trigram_index.write().unwrap();
-        idx_lock.add_with_id_str(
-            table_name,
-            column_name,
-            Self::trigram_numeric_row_id(row_id),
-            row_id,
-            text,
-        );
+        ftxn.defer_side_index_delta(crate::storage::fusion::SideIndexDelta::TrigramAdd {
+            table: table_name.to_string(),
+            column: column_name.to_string(),
+            numeric_id: Self::trigram_numeric_row_id(row_id),
+            row_id: row_id.to_string(),
+            text: text.clone(),
+        });
     }
 
     pub(crate) fn update_trigram_index_for_update(
@@ -399,10 +394,7 @@ impl Executor {
             return;
         };
 
-        let storage = &ftxn.storage;
-        let mut idx_lock = storage.trigram_index.write().unwrap();
         let numeric_id = Self::trigram_numeric_row_id(row_id);
-
         for &idx in trigram_column_indices {
             let old_val = old_row.get(idx);
             let new_val = new_row.get(idx);
@@ -411,16 +403,23 @@ impl Executor {
             }
 
             if let Some(Value::String(text)) = old_val {
-                idx_lock.remove_with_id(table_name, &schema.columns[idx].name, numeric_id, text);
+                ftxn.defer_side_index_delta(
+                    crate::storage::fusion::SideIndexDelta::TrigramRemove {
+                        table: table_name.to_string(),
+                        column: schema.columns[idx].name.clone(),
+                        numeric_id,
+                        text: text.clone(),
+                    },
+                );
             }
             if let Some(Value::String(text)) = new_val {
-                idx_lock.add_with_id_str(
-                    table_name,
-                    &schema.columns[idx].name,
+                ftxn.defer_side_index_delta(crate::storage::fusion::SideIndexDelta::TrigramAdd {
+                    table: table_name.to_string(),
+                    column: schema.columns[idx].name.clone(),
                     numeric_id,
-                    row_id,
-                    text,
-                );
+                    row_id: row_id.to_string(),
+                    text: text.clone(),
+                });
             }
         }
     }
@@ -445,15 +444,68 @@ impl Executor {
             return;
         };
 
-        let storage = &ftxn.storage;
-        let mut idx_lock = storage.trigram_index.write().unwrap();
         let numeric_id = Self::trigram_numeric_row_id(row_id);
-
         for &idx in trigram_column_indices {
             if let Some(Value::String(text)) = row_values.get(idx) {
-                idx_lock.remove_with_id(table_name, &schema.columns[idx].name, numeric_id, text);
+                ftxn.defer_side_index_delta(
+                    crate::storage::fusion::SideIndexDelta::TrigramRemove {
+                        table: table_name.to_string(),
+                        column: schema.columns[idx].name.clone(),
+                        numeric_id,
+                        text: text.clone(),
+                    },
+                );
             }
         }
+    }
+
+    /// Defer an HNSW insert to commit time on the Fusion backend (aborted
+    /// transactions must not touch the shared vector index); apply directly
+    /// on other backends (test-only MemoryStorage keeps its old semantics).
+    pub(crate) fn defer_or_apply_vector_insert(
+        &self,
+        index_name: &str,
+        id: String,
+        vector: Vec<f32>,
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        if let Some(ftxn) = txn
+            .as_any()
+            .downcast_ref::<crate::storage::fusion::FusionTransaction>()
+        {
+            // Fail the statement now (pre-commit) on a dimension conflict;
+            // the deferred apply must not be the first place this surfaces.
+            self.vector_index
+                .validate_insert_dimensions(index_name, vector.len())?;
+            ftxn.defer_side_index_delta(crate::storage::fusion::SideIndexDelta::VectorInsert {
+                index: index_name.to_string(),
+                id,
+                vector,
+            });
+            return Ok(());
+        }
+        self.vector_index.insert(index_name, id, vector)
+    }
+
+    /// Commit-deferred counterpart of `VectorIndex::delete`.
+    pub(crate) fn defer_or_apply_vector_delete(
+        &self,
+        index_name: &str,
+        id: &str,
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        if let Some(ftxn) = txn
+            .as_any()
+            .downcast_ref::<crate::storage::fusion::FusionTransaction>()
+        {
+            ftxn.defer_side_index_delta(crate::storage::fusion::SideIndexDelta::VectorDelete {
+                index: index_name.to_string(),
+                id: id.to_string(),
+            });
+            return Ok(());
+        }
+        self.vector_index.delete(index_name, id)?;
+        Ok(())
     }
 
     pub(crate) fn trigram_numeric_row_id(row_id: &str) -> u64 {

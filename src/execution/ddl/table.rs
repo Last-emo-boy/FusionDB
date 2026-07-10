@@ -1043,11 +1043,12 @@ impl Executor {
                         {
                             let index_name =
                                 Self::hnsw_index_name_for_column(table_name, &column.name);
-                            self.vector_index.delete(&index_name, old_row_id)?;
-                            self.vector_index.insert(
+                            self.defer_or_apply_vector_delete(&index_name, old_row_id, txn)?;
+                            self.defer_or_apply_vector_insert(
                                 &index_name,
                                 new_row_id.to_string(),
                                 vector,
+                                txn,
                             )?;
                         }
                     }
