@@ -88,3 +88,19 @@ xlarge 数据集上 SELECT * FROM bench WHERE id>250000 LIMIT 100:warm 29.3s 且
 根因:merge_visible_range 为每个 SSTable 调 sql_zone_map_skip_offsets_for_sstable,对区间内每块预评估 zone map 且每块做遍历全 memtable 的 MVCC fail-open 校验——O(区间块数×memtable 探测),LIMIT 早停被击穿(LIMIT 100 先付 25 万行区间全款)。修复:PK 区间分支仅无 limit 时挂剪枝计划(scan/mod.rs)。实测 50 万行:2715ms→2.2ms warm(~1200×),正确性验证通过。途中撤销两个错误假设:索引跨重启丢失(查错表,bench/bench_idx 双表)、limit 未下推(守卫链完好)。方法论沉淀:visits 计数+耗时打点一击定位 setup-vs-loop;'预计算 vs 早停'是一类模式——全扫 zone-map 挂载点(444 visitor 自停)同类待测。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="470,zone-map,fail-open,no-fill,fullscan" date="2026-07-10" title="全扫地板解剖:zone-map fail-open 风暴与 no-fill 重读(2026-07-10)" source="main@fb1393a">
+
+### 全扫地板解剖:zone-map fail-open 风暴与 no-fill 重读(2026-07-10)
+
+Full scan val=42(50 万行,532 命中)warm 3.1s 画像:zone-map 检查 111,120 次/fail-open 97,237(87.5%)/真跳过仅 2.6%——收益近零成本全付且每次 warm 重付;no-fill 策略(sql_bulk_scan_no_fill 默认 true)每查重读+解压 11-32k 块(14-39MB)。checkpoint 后 fail-open 不变(97,253)⟹ 与 memtable 重叠无关,结构性原因待查:读 SqlBlockZoneMapFailOpenReason(storage/mod.rs:80)与 sql_zone_map_skip_offsets_for_sstable 的 fail-open 分支分类 87%。候选修复方向:①fail-open 占比阈值熔断(某表/某谓词 fail-open>50% 时本查询放弃 zone-map);②按 reason 修根因;③no-fill 与重复扫描的权衡需要 scan-result cache 或放宽 fill 策略(部分填充)。7.4µs/行 vs 0.37µs/行地板的 20 倍差主要由这两项+27 个 SSTable 的迭代器开销构成。BENCHPROD-470 主题定为全扫地板恢复。
+
+</spec-entry>
+
+<spec-entry category="debug" keywords="470,fail-open,incomplete-metadata" date="2026-07-10" title="470 收窄:fail-open 全部为第三类原因(2026-07-10)" source="main@fb1393a">
+
+### 470 收窄:fail-open 全部为第三类原因(2026-07-10)
+
+细分计数器(schema_fail_open/mvcc_overlap 四子项)对 val=42 全扫单查增量全为零 ⟹ 97,237 次 fail-open 全部来自只进聚合计数的第三类:IncompleteMetadata/InvalidBounds/NullOrTombstone/CountMismatch(fusion.rs record_sql_zone_map_fail_open 的非 schema 分支)。头号嫌疑 IncompleteMetadata=块属性 sql_zone_maps_complete=false(采集不全:compaction 产出块跨表?builder schema 快照时机?)。下一步:evaluate_block_zone_maps 加临时 reason 直方图 eprintln→本地 50 万行重现(fdb-idx-repro 模式)→按 reason 修根因。若为采集缺陷,修 builder 侧一次性解决;若结构性,加 fail-open 占比熔断。
+
+</spec-entry>
