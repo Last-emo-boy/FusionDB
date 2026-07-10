@@ -2137,6 +2137,18 @@ impl SsTable {
         Ok(None)
     }
 
+    /// Best-effort total entry count for filter sizing during compaction:
+    /// sum of per-block counts when block properties are loaded, else a
+    /// block-count heuristic.
+    pub fn estimated_entry_count(&self) -> usize {
+        let props = self.current_block_properties();
+        let from_props: usize = props.iter().map(|p| p.entry_count as usize).sum();
+        if from_props > 0 {
+            return from_props;
+        }
+        self.index_offsets.len().saturating_mul(512)
+    }
+
     pub fn current_block_properties(&self) -> Arc<Vec<SsTableBlockProperties>> {
         self.block_properties
             .get()
@@ -3586,6 +3598,49 @@ impl SsTableReverseIterator {
 
 #[cfg(test)]
 mod tests {
+    /// BENCHPROD-468: filters must be sized to the real entry count. A
+    /// saturated bloom (fixed 100k capacity under a 32MB memtable's ~300k+
+    /// entries) degrades to ~100% false positives, turning every absent-key
+    /// point probe into real block reads — O(sstable count) per get.
+    #[test]
+    fn filter_sized_to_entry_count_keeps_false_positives_low() {
+        let mut sized = super::SsTableBuilder::new(std::path::PathBuf::from("unused.sst"));
+        sized.set_expected_filter_items(300_000);
+        let mut saturated = super::SsTableBuilder::new(std::path::PathBuf::from("unused2.sst"));
+        // saturated keeps the 100k default
+
+        for i in 0..300_000u64 {
+            let key = format!("data:ev:{i:016x}AAAAAAAAA");
+            sized.add_key(key.as_bytes());
+            saturated.add_key(key.as_bytes());
+        }
+
+        let absent_probes = 2_000u64;
+        let mut sized_fp = 0u32;
+        let mut saturated_fp = 0u32;
+        for i in 0..absent_probes {
+            let key = format!("data:ev:{:016x}AAAAAAAAA", 10_000_000 + i);
+            if sized.filter.contains(key.as_bytes()) {
+                sized_fp += 1;
+            }
+            if saturated.filter.contains(key.as_bytes()) {
+                saturated_fp += 1;
+            }
+        }
+
+        assert!(
+            sized_fp < 100,
+            "correctly sized filter must stay near its 1% design FP rate, got {sized_fp}/2000"
+        );
+        // At 3x overload the measured FP rate is already ~37% (vs the 1%
+        // design point); production memtables overloaded 5x+ and measured
+        // ~100%. Anything above 20% here demonstrates the failure mode.
+        assert!(
+            saturated_fp > 400,
+            "regression guard expects the saturated default to be badly degraded, got {saturated_fp}/2000"
+        );
+    }
+
     use crate::catalog::{Column, IndexType, TableSchema};
     use crate::common::{encoding::RowEncoder, Value};
     use crate::storage::{SQL_BLOCK_ZONE_MAP_TYPE_BOOLEAN, SQL_BLOCK_ZONE_MAP_TYPE_TIMESTAMP};
@@ -6122,6 +6177,7 @@ pub struct SsTableBuilder {
     block_properties: Vec<SsTableBlockProperties>,
     reverse_seek_blocks: Vec<SsTableReverseSeekBlockIndex>,
     filter: BloomFilter,
+    expected_filter_items: usize,
     prefix_filter: Option<BloomFilter>,
     user_key_filter: Option<BloomFilter>,
     sql_index_prefix_filter: Option<BloomFilter>,
@@ -6134,8 +6190,10 @@ pub struct SsTableBuilder {
 
 impl SsTableBuilder {
     pub fn new(path: PathBuf) -> Self {
-        // Estimate size? For now default.
-        // BloomFilter size: 10k items, 0.01 fp rate
+        // Default capacity; production callers size the filters to the real
+        // entry count via set_expected_filter_items (a saturated bloom
+        // degrades to ~100% false positives and every point probe pays a
+        // real block read — BENCHPROD-468).
         let filter = BloomFilter::with_false_pos(0.01).expected_items(100_000);
 
         Self {
@@ -6145,6 +6203,7 @@ impl SsTableBuilder {
             block_properties: Vec::new(),
             reverse_seek_blocks: Vec::new(),
             filter,
+            expected_filter_items: 100_000,
             prefix_filter: None,
             user_key_filter: None,
             sql_index_prefix_filter: None,
@@ -6156,16 +6215,28 @@ impl SsTableBuilder {
         }
     }
 
+    /// Size every bloom filter for the real number of entries this SSTable
+    /// will hold. Must be called before any add_key and before
+    /// enable_user_key_prefix_filter; the whole-key filter is rebuilt here.
+    pub fn set_expected_filter_items(&mut self, expected_items: usize) {
+        let expected_items = expected_items.max(10_000);
+        self.expected_filter_items = expected_items;
+        self.filter = BloomFilter::with_false_pos(0.01).expected_items(expected_items);
+    }
+
     pub fn enable_user_key_prefix_filter(&mut self, suffix_len: usize) {
+        let expected_items = self.expected_filter_items;
         if self.prefix_filter.is_none() {
-            self.prefix_filter = Some(BloomFilter::with_false_pos(0.01).expected_items(100_000));
+            self.prefix_filter =
+                Some(BloomFilter::with_false_pos(0.01).expected_items(expected_items));
         }
         if self.user_key_filter.is_none() {
-            self.user_key_filter = Some(BloomFilter::with_false_pos(0.01).expected_items(100_000));
+            self.user_key_filter =
+                Some(BloomFilter::with_false_pos(0.01).expected_items(expected_items));
         }
         if self.sql_index_prefix_filter.is_none() {
             self.sql_index_prefix_filter =
-                Some(BloomFilter::with_false_pos(0.01).expected_items(100_000));
+                Some(BloomFilter::with_false_pos(0.01).expected_items(expected_items));
         }
         self.prefix_filter_suffix_len = Some(suffix_len);
     }

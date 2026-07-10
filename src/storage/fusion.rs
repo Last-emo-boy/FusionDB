@@ -2273,8 +2273,13 @@ impl FusionStorage {
         Arc::new(schemas)
     }
 
-    async fn sstable_builder_with_zone_maps(&self, path: PathBuf) -> SsTableBuilder {
+    async fn sstable_builder_with_zone_maps(
+        &self,
+        path: PathBuf,
+        expected_items: usize,
+    ) -> SsTableBuilder {
         let mut builder = SsTableBuilder::new(path);
+        builder.set_expected_filter_items(expected_items);
         builder.enable_user_key_prefix_filter(TS_SIZE);
         builder.enable_sql_zone_map_collection(self.sql_zone_map_schema_snapshot().await);
         builder
@@ -2343,6 +2348,10 @@ impl FusionStorage {
             return Ok(false);
         };
         let compaction_input_bytes = candidates.iter().map(|sst| sst.file_len).sum::<u64>();
+        let compaction_input_entries = candidates
+            .iter()
+            .map(|sst| sst.estimated_entry_count())
+            .sum::<usize>();
 
         let mut iterators = Vec::with_capacity(COMPACTION_FANIN);
         for sst in &candidates {
@@ -2364,7 +2373,7 @@ impl FusionStorage {
         SsTable::remove_reverse_seek_file_for_path(&staging_path).await;
         SsTable::remove_index_cache_file_for_path(&staging_path).await;
         let mut builder = self
-            .sstable_builder_with_zone_maps(staging_path.clone())
+            .sstable_builder_with_zone_maps(staging_path.clone(), compaction_input_entries)
             .await;
 
         // Merge Logic
@@ -2657,7 +2666,7 @@ impl FusionStorage {
         SsTable::remove_index_cache_file_for_path(&staging_path).await;
         SsTable::remove_reverse_seek_file_for_path(&staging_path).await;
         let mut builder = self
-            .sstable_builder_with_zone_maps(staging_path.clone())
+            .sstable_builder_with_zone_maps(staging_path.clone(), mem.map.len())
             .await;
 
         let mut block_count = 0;
