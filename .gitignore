@@ -11,7 +11,9 @@ __pycache__/
 tmp_*
 probe_socket.txt
 server_port.txt
+server.pid
 test_*.wal
+*.wal.seg.*
 test_explain_wal
 inverted_index.bin
 trigram_index.bin
@@ -20,3 +22,11 @@ trigram_index.bin
 # Benchmark output
 benchmark_report_*.json
 *.wal
+/.bench_runs/
+
+# Maestro knowledge-system derived caches (specs/ is tracked)
+/.workflow/embedding-index.bin
+/.workflow/search-cache.json
+/.workflow/search-daemon.json
+/.workflow/spec-analytics.jsonl
+/.workflow/wiki-index.json

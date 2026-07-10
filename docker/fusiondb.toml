@@ -1,0 +1,43 @@
+[server]
+http_port = 8091
+pg_port = 8092
+redis_enabled = false
+redis_port = 6379
+bind = "0.0.0.0"
+max_connections = 100
+
+[storage]
+data_dir = "/data"
+wal_file = "fusion.wal"
+sstable_dir = "sstables"
+memtable_flush_mb = 32
+row_cache_capacity = 10000
+statement_cache_capacity = 1000
+block_cache_capacity = 25000
+sql_bulk_scan_no_fill = true
+slow_query_threshold_ms = 100
+
+[auth]
+password = "fusiondb"
+scram_sha256 = false
+http_legacy_unsafe = false
+
+[tls]
+enabled = false
+cert_path = "/etc/fusiondb/certs/server.crt"
+key_path = "/etc/fusiondb/certs/server.key"
+
+[distributed]
+enabled = false
+node_id = 1
+advertise_addr = ""
+bootstrap = true
+cluster_name = "fusiondb"
+forwarding_secret = ""
+initial_members = []
+
+[distributed.sharding]
+enabled = false
+strategy = "hash"
+shard_count = 16
+range_boundaries = []

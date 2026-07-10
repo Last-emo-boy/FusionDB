@@ -1,5 +1,5 @@
 # === Build Stage: Rust ===
-FROM rust:1.83 AS builder
+FROM rust:1.89-bookworm AS builder
 
 WORKDIR /usr/src/fusiondb
 COPY Cargo.toml Cargo.lock ./
@@ -7,16 +7,7 @@ COPY src/ src/
 COPY tests/ tests/
 
 # Build release binary
-RUN cargo build --release
-
-# === Build Stage: Dashboard ===
-FROM node:20-slim AS dashboard-builder
-
-WORKDIR /app
-COPY dashboard/package.json dashboard/package-lock.json ./
-RUN npm ci
-COPY dashboard/ .
-RUN npm run build
+RUN cargo build --release --locked
 
 # === Runtime Stage ===
 FROM debian:bookworm-slim
@@ -28,12 +19,10 @@ WORKDIR /usr/local/bin
 # Copy server binary
 COPY --from=builder /usr/src/fusiondb/target/release/fusiondb .
 
-# Copy dashboard static files
-COPY --from=dashboard-builder /app/dist /usr/local/share/fusiondb/dashboard
-
-# Create data directories
-RUN mkdir -p /data/sstables /data/wal
-WORKDIR /data
+# Install a container-specific config outside the data volume.
+RUN mkdir -p /data/sstables /etc/fusiondb
+COPY docker/fusiondb.toml /etc/fusiondb/fusiondb.toml
+WORKDIR /etc/fusiondb
 
 # Expose ports: HTTP API + PostgreSQL Protocol
 EXPOSE 8091 8092

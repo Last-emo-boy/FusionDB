@@ -1,0 +1,15 @@
+.git
+.github
+target
+data
+.bench_runs
+benchmark_report_*.json
+server.pid
+server_port.txt
+*.wal
+*.wal.seg.*
+dashboard/node_modules
+dashboard/dist
+dashboard/.vite
+node_modules
+npm-debug.log*

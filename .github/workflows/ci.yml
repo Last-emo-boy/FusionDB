@@ -37,20 +37,16 @@ jobs:
       run: cargo fmt -- --check
 
     - name: Clippy Lint
-      run: cargo clippy --all-targets -- -D warnings
-      continue-on-error: true
+      run: cargo clippy --all-targets -- -D clippy::correctness
 
     - name: Build
       run: cargo build --verbose
 
-    - name: Run unit tests
-      run: cargo test --lib --verbose
+    - name: Run all tests
+      run: cargo test --all-targets --verbose
 
-    - name: Run SQL integration tests
-      run: cargo test --test sql_integration --verbose
-
-    - name: Run pgwire integration tests
-      run: cargo test --test pg_integration --verbose
+    - name: Validate benchmark script
+      run: python3 -m py_compile benchmark.py
 
   dashboard:
     name: Dashboard Build
@@ -71,9 +67,14 @@ jobs:
     - name: Install dependencies
       run: npm ci
 
+    - name: Audit dependencies
+      run: npm audit --audit-level=high
+
     - name: Type check
       run: npx tsc --noEmit
-      continue-on-error: true
+
+    - name: Lint
+      run: npm run lint
 
     - name: Build dashboard
       run: npm run build
