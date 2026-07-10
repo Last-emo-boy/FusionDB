@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Server, Database, Globe, Shield } from 'lucide-react';
 import {
   fetchAuthContext,
@@ -33,30 +33,40 @@ const CAPABILITY_LABELS = [
 export default function SettingsPage() {
   const [apiUrl, setApiUrl] = useState('');
   const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [savedMessage, setSavedMessage] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<CapabilityInfo | null>(null);
   const [authContext, setAuthContext] = useState<AuthContextInfo | null>(null);
 
-  const loadRemoteState = async () => {
+  const loadRemoteState = useCallback(async () => {
     const [caps, auth] = await Promise.all([fetchCapabilities(), fetchAuthContext()]);
     setCapabilities(caps);
     setAuthContext(auth);
-  };
+  }, []);
 
   useEffect(() => {
     const sync = () => {
       const settings = getClientSettings();
       setApiUrl(settings.apiBaseUrl);
       setUsername(settings.username);
+      setPassword(settings.password);
     };
 
     sync();
-    loadRemoteState();
-    return subscribeClientSettings(sync);
-  }, []);
+    const initialLoad = window.setTimeout(() => void loadRemoteState(), 0);
+    const unsubscribe = subscribeClientSettings(sync);
+    return () => {
+      window.clearTimeout(initialLoad);
+      unsubscribe();
+    };
+  }, [loadRemoteState]);
 
   const saveSettings = async () => {
-    saveClientSettings({ apiBaseUrl: apiUrl.trim(), username: username.trim() });
+    saveClientSettings({
+      apiBaseUrl: apiUrl.trim(),
+      username: username.trim(),
+      password,
+    });
     setSavedMessage('Settings saved locally for this browser.');
     await loadRemoteState();
     window.setTimeout(() => setSavedMessage(null), 2500);
@@ -87,22 +97,35 @@ export default function SettingsPage() {
             </p>
           </div>
           <div>
-            <label className="block text-xs text-text-secondary mb-1">HTTP User Context</label>
+            <label className="block text-xs text-text-secondary mb-1">HTTP User</label>
             <input
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="e.g. analyst"
+              placeholder="postgres"
               className="w-full px-3 py-2 text-sm bg-bg-primary border border-border rounded-md text-text-primary focus:outline-none focus:border-accent"
             />
             <p className="text-[11px] text-text-muted mt-1">
-              Sent as <code>x-fusiondb-user</code> so the dashboard can exercise RBAC-aware HTTP routes.
+              Used with HTTP Basic authentication and RBAC authorization.
+            </p>
+          </div>
+          <div>
+            <label className="block text-xs text-text-secondary mb-1">HTTP Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="current-password"
+              className="w-full px-3 py-2 text-sm bg-bg-primary border border-border rounded-md text-text-primary focus:outline-none focus:border-accent"
+            />
+            <p className="text-[11px] text-text-muted mt-1">
+              Kept in session storage and cleared when the browser session ends.
             </p>
           </div>
           <div>
             <label className="block text-xs text-text-secondary mb-1">PostgreSQL Wire Protocol</label>
             <div className="px-3 py-2 text-sm bg-bg-primary border border-border rounded-md text-text-muted">
-              localhost:5433
+              localhost:8092
             </div>
             <p className="text-[11px] text-text-muted mt-1">
               Connect with any PostgreSQL client: psql, DBeaver, pgAdmin, etc.

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   Database,
@@ -11,6 +11,7 @@ import {
   Shield,
   Layers3,
 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import {
   createCheckpoint,
   createCompaction,
@@ -37,7 +38,7 @@ function StatCard({
   sub,
   accent,
 }: {
-  icon: any;
+  icon: LucideIcon;
   label: string;
   value: string | number;
   sub?: string;
@@ -76,7 +77,7 @@ export default function DashboardPage() {
   const [operationError, setOperationError] = useState<string | null>(null);
   const [runningOperation, setRunningOperation] = useState<'checkpoint' | 'compact' | null>(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setRefreshing(true);
     const [m, t, sq, caps, auth, prepared] = await Promise.all([
       fetchMetrics(),
@@ -94,13 +95,17 @@ export default function DashboardPage() {
     setPreparedStatements(prepared);
     setConnected(m !== null && caps !== null);
     setRefreshing(false);
-  };
+  }, []);
 
   useEffect(() => {
-    load();
-    const interval = setInterval(load, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    const refresh = () => void load();
+    const initialLoad = window.setTimeout(refresh, 0);
+    const interval = window.setInterval(refresh, 5000);
+    return () => {
+      window.clearTimeout(initialLoad);
+      window.clearInterval(interval);
+    };
+  }, [load]);
 
   const avgQueryUs = metrics && metrics.query_count > 0
     ? Math.round(metrics.query_total_us / metrics.query_count)

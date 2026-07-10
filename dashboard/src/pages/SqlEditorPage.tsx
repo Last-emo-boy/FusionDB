@@ -35,7 +35,7 @@ export default function SqlEditorPage() {
   const [loading, setLoading] = useState(false);
   const [execTime, setExecTime] = useState<number | null>(null);
   const [preparedStatements, setPreparedStatements] = useState<PreparedStatementInfo[]>([]);
-  const [_history, setHistory] = useState<HistoryEntry[]>([]);
+  const [, setHistory] = useState<HistoryEntry[]>([]);
   const [activeTab, setActiveTab] = useState(0);
 
   const loadPreparedStatements = useCallback(async () => {
@@ -76,11 +76,12 @@ export default function SqlEditorPage() {
         setHistory((h) => [{ sql: queryText, time: elapsed, rowCount: totalRows }, ...h].slice(0, 50));
         await loadPreparedStatements();
       }
-    } catch (e: any) {
+    } catch (error: unknown) {
       const elapsed = Math.round(performance.now() - start);
+      const message = error instanceof Error ? error.message : 'Unknown connection error';
       setExecTime(elapsed);
-      setError(`Connection error: ${e.message}`);
-      setHistory((h) => [{ sql: queryText, time: elapsed, error: e.message }, ...h].slice(0, 50));
+      setError(`Connection error: ${message}`);
+      setHistory((h) => [{ sql: queryText, time: elapsed, error: message }, ...h].slice(0, 50));
     } finally {
       setLoading(false);
     }
@@ -407,16 +408,18 @@ export default function SqlEditorPage() {
   );
 }
 
-function formatValue(val: any): string {
+function formatValue(val: unknown): string {
   if (val === null || val === undefined) return 'NULL';
   if (typeof val === 'object') {
     if ('Integer' in val) return String(val.Integer);
     if ('Float' in val) return String(val.Float);
-    if ('String' in val) return val.String;
+    if ('String' in val) return String(val.String);
     if ('Boolean' in val) return String(val.Boolean);
     if ('Null' in val) return 'NULL';
-    if ('Vector' in val) return `[${val.Vector.slice(0, 3).join(', ')}${val.Vector.length > 3 ? ', ...' : ''}]`;
-    return JSON.stringify(val);
+    if ('Vector' in val && Array.isArray(val.Vector)) {
+      return `[${val.Vector.slice(0, 3).join(', ')}${val.Vector.length > 3 ? ', ...' : ''}]`;
+    }
+    return JSON.stringify(val) ?? String(val);
   }
   return String(val);
 }

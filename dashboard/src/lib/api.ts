@@ -1,11 +1,12 @@
 const API_BASE = '/api';
 const CLIENT_SETTINGS_KEY = 'fusiondb.client-settings';
+const CLIENT_PASSWORD_KEY = 'fusiondb.client-password';
 const CLIENT_SETTINGS_EVENT = 'fusiondb:client-settings-changed';
 
 export interface SelectQueryResult {
   type: 'select';
   columns: string[];
-  rows: any[][];
+  rows: unknown[][];
 }
 
 export interface SuccessQueryResult {
@@ -93,11 +94,13 @@ export interface PreparedStatementInfo {
 export interface ClientSettings {
   apiBaseUrl: string;
   username: string;
+  password: string;
 }
 
 const DEFAULT_CLIENT_SETTINGS: ClientSettings = {
   apiBaseUrl: '',
-  username: '',
+  username: 'postgres',
+  password: 'fusiondb',
 };
 
 function canUseStorage(): boolean {
@@ -113,7 +116,8 @@ export function getClientSettings(): ClientSettings {
     const parsed = JSON.parse(raw) as Partial<ClientSettings>;
     return {
       apiBaseUrl: typeof parsed.apiBaseUrl === 'string' ? parsed.apiBaseUrl : '',
-      username: typeof parsed.username === 'string' ? parsed.username : '',
+      username: typeof parsed.username === 'string' ? parsed.username : 'postgres',
+      password: window.sessionStorage.getItem(CLIENT_PASSWORD_KEY) ?? 'fusiondb',
     };
   } catch {
     return DEFAULT_CLIENT_SETTINGS;
@@ -127,7 +131,11 @@ export function saveClientSettings(next: Partial<ClientSettings>): ClientSetting
   };
 
   if (canUseStorage()) {
-    window.localStorage.setItem(CLIENT_SETTINGS_KEY, JSON.stringify(merged));
+    window.localStorage.setItem(CLIENT_SETTINGS_KEY, JSON.stringify({
+      apiBaseUrl: merged.apiBaseUrl,
+      username: merged.username,
+    }));
+    window.sessionStorage.setItem(CLIENT_PASSWORD_KEY, merged.password);
     window.dispatchEvent(new CustomEvent(CLIENT_SETTINGS_EVENT, { detail: merged }));
   }
 
@@ -157,6 +165,13 @@ function buildApiUrl(path: string): string {
     return `${API_BASE}${path}`;
   }
   return `${baseOverride.replace(/\/$/, '')}${path}`;
+}
+
+function basicAuthorization(username: string, password: string): string {
+  const bytes = new TextEncoder().encode(`${username}:${password}`);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `Basic ${window.btoa(binary)}`;
 }
 
 async function parseEnvelope<T>(response: Response): Promise<ApiEnvelope<T>> {
@@ -197,8 +212,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<ApiEnvelope
   if (!headers.has('Content-Type') && init?.body) {
     headers.set('Content-Type', 'application/json');
   }
-  if (settings.username.trim()) {
-    headers.set('x-fusiondb-user', settings.username.trim());
+  if (settings.username.trim() && settings.password) {
+    headers.set('Authorization', basicAuthorization(settings.username.trim(), settings.password));
   }
 
   try {
@@ -207,11 +222,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<ApiEnvelope
       headers,
     });
     return await parseEnvelope<T>(response);
-  } catch (error: any) {
+  } catch (error: unknown) {
     return {
       status: 'error',
       data: null,
-      error: error?.message ?? 'Network request failed',
+      error: error instanceof Error ? error.message : 'Network request failed',
     };
   }
 }
@@ -270,7 +285,7 @@ export async function listPreparedStatements(): Promise<PreparedStatementInfo[]>
 
 export async function executePreparedStatement(
   statementId: string,
-  params: any[] = [],
+  params: unknown[] = [],
 ): Promise<QueryResponse> {
   return request<QueryResult[]>('/execute', {
     method: 'POST',

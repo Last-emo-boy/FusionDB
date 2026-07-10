@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Table2,
   Key,
@@ -15,19 +15,26 @@ import {
 import { fetchAuthContext, fetchTables, executeQuery } from '../lib/api';
 import type { AuthContextInfo, TableInfo } from '../lib/api';
 
-function formatValue(val: any): string {
+function formatValue(val: unknown): string {
   if (val === null || val === undefined) return 'NULL';
   if (typeof val === 'object') {
     if ('Integer' in val) return String(val.Integer);
     if ('Float' in val) return String(val.Float);
-    if ('String' in val) return val.String;
+    if ('String' in val) return String(val.String);
     if ('Boolean' in val) return String(val.Boolean);
     if ('Null' in val) return 'NULL';
-    if ('Vector' in val)
+    if ('Vector' in val && Array.isArray(val.Vector)) {
       return `[${val.Vector.slice(0, 3).join(', ')}${val.Vector.length > 3 ? ', ...' : ''}]`;
-    return JSON.stringify(val);
+    }
+    return JSON.stringify(val) ?? String(val);
   }
   return String(val);
+}
+
+function hasNumericTag(value: unknown): boolean {
+  return typeof value === 'object'
+    && value !== null
+    && ('Integer' in value || 'Float' in value);
 }
 
 function DataTypeIcon({ type }: { type: string }) {
@@ -44,7 +51,7 @@ function DataTypeIcon({ type }: { type: string }) {
 export default function TableEditorPage() {
   const [tables, setTables] = useState<TableInfo[]>([]);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
-  const [rows, setRows] = useState<any[][] | null>(null);
+  const [rows, setRows] = useState<unknown[][] | null>(null);
   const [columns, setColumns] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [rowCount, setRowCount] = useState<number | null>(null);
@@ -55,27 +62,34 @@ export default function TableEditorPage() {
   const [insertError, setInsertError] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<number | null>(null);
   const [authContext, setAuthContext] = useState<AuthContextInfo | null>(null);
+  const filterRef = useRef(filter);
 
-  const loadTables = async () => {
+  useEffect(() => {
+    filterRef.current = filter;
+  }, [filter]);
+
+  const loadTables = useCallback(async () => {
     const [t, auth] = await Promise.all([fetchTables(), fetchAuthContext()]);
     setTables(t);
     setAuthContext(auth);
-    if (t.length > 0 && !selectedTable) {
-      setSelectedTable(t[0].name);
+    if (t.length > 0) {
+      setSelectedTable((current) => current ?? t[0].name);
     }
-  };
-
-  useEffect(() => {
-    loadTables();
   }, []);
 
-  const loadTableData = async (tableName: string) => {
+  useEffect(() => {
+    const initialLoad = window.setTimeout(() => void loadTables(), 0);
+    return () => window.clearTimeout(initialLoad);
+  }, [loadTables]);
+
+  const loadTableData = useCallback(async (tableName: string) => {
     setLoading(true);
     setInsertMode(false);
     setInsertError(null);
     setDeleteConfirm(null);
-    const limitSql = filter.trim()
-      ? `SELECT * FROM ${tableName} WHERE ${filter} LIMIT 200`
+    const activeFilter = filterRef.current.trim();
+    const limitSql = activeFilter
+      ? `SELECT * FROM ${tableName} WHERE ${activeFilter} LIMIT 200`
       : `SELECT * FROM ${tableName} LIMIT 200`;
     const res = await executeQuery(limitSql);
     if (res.status === 'ok' && res.data && res.data[0]?.type === 'select') {
@@ -90,16 +104,24 @@ export default function TableEditorPage() {
     const countRes = await executeQuery(`SELECT COUNT(*) FROM ${tableName}`);
     if (countRes.status === 'ok' && countRes.data && countRes.data[0]?.type === 'select' && countRes.data[0].rows[0]) {
       const v = countRes.data[0].rows[0][0];
-      setRowCount(typeof v === 'object' && 'Integer' in v ? v.Integer : null);
+      setRowCount(
+        typeof v === 'object'
+          && v !== null
+          && 'Integer' in v
+          && typeof v.Integer === 'number'
+          ? v.Integer
+          : null,
+      );
     }
     setLoading(false);
-  };
+  }, []);
 
   useEffect(() => {
-    if (selectedTable) {
-      loadTableData(selectedTable);
-    }
-  }, [selectedTable]);
+    if (!selectedTable) return;
+
+    const dataLoad = window.setTimeout(() => void loadTableData(selectedTable), 0);
+    return () => window.clearTimeout(dataLoad);
+  }, [loadTableData, selectedTable]);
 
   const selectedSchema = tables.find((t) => t.name === selectedTable);
   const filteredTables = tables.filter((t) =>
@@ -141,7 +163,7 @@ export default function TableEditorPage() {
     if (pkIdx === -1) return;
     const pkVal = row[pkIdx];
     const formatted = formatValue(pkVal);
-    const isNum = typeof pkVal === 'object' && ('Integer' in pkVal || 'Float' in pkVal);
+    const isNum = hasNumericTag(pkVal);
     const whereVal = isNum ? formatted : `'${formatted}'`;
 
     const sql = `DELETE FROM ${selectedTable} WHERE ${pkCol.name} = ${whereVal}`;
