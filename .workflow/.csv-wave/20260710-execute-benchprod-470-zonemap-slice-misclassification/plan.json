@@ -1,0 +1,14 @@
+{
+  "id": "BENCHPROD-470",
+  "title": "Zone-map slice misclassification: (K-1)/K of evaluations were bogus fail-opens",
+  "phase": "Perf (xlarge full-scan floor)",
+  "status": "done",
+  "discovery": "Full scan val=X at xlarge: 111k zone-map checks with 87.5% fail-open per query (warm, repeatable). Dissection was a chain of retracted hypotheses (each honestly recorded in maestro): NOT memtable-overlap (checkpoint didn't move it), NOT build-side (12 instrumented kill sites silent; on-disk census: 100% complete for BOTH sql_zone_maps and table_prefix_ranges; disk meta verified framed V6 by raw bytes), NOT wire/decode (V6 From preserves fields), NOT the interval-missing arm (probe silent). The killer: sql_zone_map_skip_offsets_for_sstable iterates ALL blocks per (sub-)scan; parallel full scans split the keyspace into K=8 slices, and each slice classified every OTHER slice's blocks (exactly 7/8 = the observed 87.5%!) as IncompleteMetadata fail-open at the range-boundary test — paying an interval Vec clone + counters per block per slice. 26,680 = 8 x 3,335 data blocks, closed-form.",
+  "fix": "blocks entirely outside [start,end) now continue silently BEFORE the check counter (irrelevant, not a metadata failure); only genuinely boundary-partial blocks fail open (~2 per slice)",
+  "verification": {
+    "local_120k": "checks 26,680 -> 3,342; fail-open 23,352 -> 14; skip/positive decisions IDENTICAL (3,110/218 — pruning correctness preserved); block reads ~16k -> 232; rows exact (120)",
+    "suites": "sql_full_scan_parallel + full gate",
+    "note": "zone maps themselves work well once evaluated (93% skip rate on val=X)"
+  },
+  "followups": ["xlarge parts 1 re-run to quantify Full scan/BETWEEN/IN recovery", "no-fill re-read cost remains as the next floor component"]
+}

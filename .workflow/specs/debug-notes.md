@@ -112,3 +112,19 @@ Full scan val=42(50 万行,532 命中)warm 3.1s 画像:zone-map 检查 111,120 �
 最新事实链:①构建侧正常——snapshot 非空(1 表),12 个 kill 点零触发 ⟹ block_sql_zone_maps 返回 complete=true;②writer finish() 逻辑正确(有 zone map 走 V6,V6 From 保留 complete 字段);③但读侧 87.5%(恰 7/8)的检查落在 complete=false 块上(本地 120k 行重现:26,680 检查/23,352 fail-open/218 positive/3,110 skip,与 xlarge 同比例);④之前 snap 重现'零 fail-open'是直方图 5 万阈值假象,/metrics 增量揭穿。7/8 结构比例线索:疑与块族构成有关(data 块 vs index-key 块)或 flush 产 vs compaction 产 SSTable 差异。下一步打点:finish() 按 SSTable 打印 complete/incomplete 块计数 + skip_offsets 评估时打印 sstable id——区分哪类 SSTable 写了 false。临时打点现存 3 处(fail-open 读侧直方图/构建 kill 点/snapshot 大小),修复后一并移除。重现环境:/root/fdb-idx-repro 120k 行 + checkpoint。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="470,table-prefix-ranges,root-cause" date="2026-07-10" title="470 真凶定位:table_prefix_ranges 不完整,非 zone_maps(2026-07-10)" source="main@7586041">
+
+### 470 真凶定位:table_prefix_ranges 不完整,非 zone_maps(2026-07-10)
+
+决定性反转:读侧 IncompleteMetadata 来自 sql_zone_map_skip_offsets_for_sstable 的第三分支——block_property_table_prefix_interval(property, prefix) 返回 None(即块的 table_prefix_ranges_complete=false 或 ranges 缺失)时逐块记 IncompleteMetadata。盘上 sql_zone_maps_complete=100%(finish 普查 8559/8559)但查错了字段;真正不完整的是 table_prefix_ranges(V6 的另一字段,块级表前缀区间,zone map 评估的前置)。数字自洽:23,352 fail(区间缺失块)/3,110 skip(区间存在且不含目标表)/218 positive。下一步:读 block_table_prefix_ranges(builder 侧)的 incomplete 条件,7/8 比例应从其结构解释;修复目标=让区间采集完整或评估侧对区间缺失退化为 first/last key 粗判而非 fail-open。
+
+</spec-entry>
+
+<spec-entry category="debug" keywords="470,slice,fail-open,fixed" date="2026-07-10" title="470 破案与修复:并行切片误分类,(K-1)/K 假 fail-open(2026-07-10)" source="main@7586041">
+
+### 470 破案与修复:并行切片误分类,(K-1)/K 假 fail-open(2026-07-10)
+
+7/8 之谜闭式破案:26,680=8×3,335——并行全扫切 K=8 片,sql_zone_map_skip_offsets_for_sstable 每片遍历 SSTable 全部块,把其他 7 片的块在范围边界检查(fusion.rs 原 3251)误记 IncompleteMetadata,每块每片白付区间 Vec 克隆+计数。修复:完全在 [start,end) 外的块在计数前静默 continue,仅真边界部分重叠块 fail-open。本地验证:检查 26,680→3,342、fail-open 23,352→14、剪枝决策逐一相同(skip 3,110/positive 218)、块读 16k→232。重要正面发现:zone map 本身在 val=X 上 93% 跳过率——功能优秀,被噪声淹没。解剖方法论:闭式数字吻合(87.5%=7/8)是切片类 bug 的指纹;四次假设撤销全程 maestro 留痕。
+
+</spec-entry>
