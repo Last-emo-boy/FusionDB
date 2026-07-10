@@ -1,0 +1,42 @@
+{
+  "id": "BENCHPROD-463",
+  "title": "Row cache byte-identity validation (P0: cache bypassed MVCC)",
+  "phase": "Correctness (commercial-parity track)",
+  "status": "done",
+  "discovery": "The execution-layer row cache (Cache<String, Vec<Value>>) had NO version/validation: (a) permanent-stale race — writer stages put + invalidates key, concurrent reader re-caches the OLD value before commit, no post-commit invalidation exists on any normal path (invalidate_all only on Raft snapshot install), so the stale row is served to ALL later readers indefinitely; (b) snapshot violation — an explicit pgwire transaction pinned to an older read_ts could be served a NEWER cached version. Found via whole-repo read (codex end-to-end trace + 7-reader workflow), verified against code.",
+  "design": {
+    "chosen": "byte-identity validation: CachedRow { encoded: Arc<[u8]>, row } — a hit requires the caller's freshly-resolved storage bytes to memcmp-equal the cached encoded bytes (row_cache_lookup/row_cache_store in execution/mod.rs). Identical bytes imply identical decoded row, so wrong results are structurally impossible and NO invalidation protocol is needed; every per-key invalidate was deleted (Raft-snapshot invalidate_all kept as belt).",
+    "rejected": [
+      "per-table epoch bump post-commit: unsound publish-to-bump gap (a freshly-begun reader can accept a pre-commit entry); double-bump variants still leave the gap",
+      "versioned get (commit_ts in Transaction trait): still needs epoch/invalidation to detect newer-version-exists; trait change across 2 backends for no soundness gain over byte identity"
+    ],
+    "tradeoff": "former pure-cache-hit point paths (PK point, HNSW fetch, ordered Top-K base row, join PK probe, fetch_full_row_by_id) now do txn.get first and the cache only skips DECODE; key_only_scan branches were reordered BEFORE storage access to stay zero-storage-touch"
+  },
+  "changes": {
+    "core": "execution/mod.rs: CachedRow struct + row_cache_lookup (hit counter inside) + row_cache_store; row_cache type Cache<String, CachedRow>",
+    "sites": "~25 call sites migrated across scan/mod.rs (9 lookup + 8 store), dml/{insert,update,delete}.rs, ddl/{table,index}.rs, scan/{index_plan,join}.rs, analyze.rs, foreign_key.rs; ~14 per-key invalidates deleted (dml, ddl/table TRUNCATE/DROP/ALTER, query/mod.rs CTE materialize)",
+    "counters": "row_read now counts every storage row fetch (including byte-validated cache hits) uniformly at all reordered sites, including the parallel PK fetch stream"
+  },
+  "tests": {
+    "new_lib": [
+      "execution::tests::row_cache_hit_requires_byte_identity (poisoned cache entry with mismatched bytes must be ignored)",
+      "execution::tests::row_cache_does_not_leak_newer_version_into_snapshot (FusionStorage: txn pinned to old read_ts must see its snapshot after a newer version is cached)"
+    ],
+    "migrated_contract_tests": "10 integration tests asserted the OLD unsound contract (corrupt stored bytes out of band, expect the cache to mask it): sql_index_cache (7), sql_dml (2), sql_ddl (1), sql_in_list (1), sql_join (3), sql_returning_upsert_vector_rbac (1), sql_view_show_constraints (1) — rewritten to the new contract (out-of-band VALID byte rewrite must win over the stale cache; UNIQUE check judges storage truth both directions) and renamed *_tracks_storage_bytes / *_storage_truth"
+  },
+  "verification": {
+    "fmt": "clean",
+    "clippy_correctness": "clean",
+    "lib": 559,
+    "all_targets": "31 test binaries green after test migration (one pre-existing load-dependent lib flaky observed twice across many runs, name not yet captured, tracked in maestro learnings)",
+    "adversarial_review": "4-dimension find->verify workflow (26 agents, ~1.76M tok): MVCC soundness CONFIRMED (no violating interleaving constructible for RYOW/identical-bytes/moka races/Raft snapshot/sharding/TRUNCATE-recreate); removed invalidations confirmed fully covered; caught the 6 then-unmigrated contract tests + row_read metering inconsistency (both fixed); rejected 5 claims incl. PK-null-patch invariant and join-probe multiplier (probe_cache memoizes)",
+    "bench_ab": "medium parts=1 pgwire, same-disk ext4 A/B (first attempt invalidated: baseline accidentally ran on tmpfs, fsync-free writes made single-row DML look 5-7x regressed). Same-disk result: scans/filters/aggregates within noise (±9%); PK point lookup 0.10->0.16 ms (+0.06 ms absolute, base itself ranges 0.10-0.19 across environments); single-row DML fsync-dominated with mixed signs (UPDATE -17%, INSERT +32%), no consistent regression; SUM/ORDER-BY +18% within observed same-code cross-run variance (~±3 ms)"
+  },
+  "disclosures": [
+    "point-path cache hits no longer skip the storage probe, only the decode — PK worst case ~+60us at pgwire; a dedicated high-iteration PK microbench would be needed to resolve the true us-level delta",
+    "HNSW row-fetch path has zero benchmark coverage — regression there is unmeasurable today",
+    "CachedRow roughly doubles per-entry memory; moka capacity is entry-count based (row_cache_capacity)",
+    "row_reads_per_query metric is not comparable across the fix boundary (hits now count as row reads)"
+  ],
+  "out_of_scope": ["trigram/HNSW non-transactional side writes + composite UNIQUE phantom (BENCHPROD-464)", "128-bit hash instead of full bytes to halve entry memory"]
+}
