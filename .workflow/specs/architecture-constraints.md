@@ -682,3 +682,11 @@ Two read-only subagents completed after the s3 fail-open tests. Keyspace subagen
 469 修复后全量审计 6 个 sql_block_zone_map_scan_options 挂载点:scan/mod.rs:1813 PK区间=已修(仅无limit挂载);2284 Top-K visitor=合理(Top-K 天然全遍历,预计算摊销);2370=合理(有谓词时 scan_limit 必为 None 走 bulk,无谓词时无计划可挂);3136/3158=测试。唯一存量:2339 FilteredLimitScanVisitor(444)——visitor 自停但计划照挂,与 469 的区别:谓词 zone map 有真实剪枝收益,稀疏匹配(匹配少、块可大量跳)预计算是赚的,密集匹配(visitor 快速集满 limit)是亏的。决策需成本闸门:用 StatsEstimator 的选择率估计(已有 selectivity 基建)——估计匹配行数 >> limit 时挂计划,否则不挂;或先做 sparse/dense 两态 A/B 实测再定阈值。候选票 BENCHPROD-470,先测后动。
 
 </spec-entry>
+
+<spec-entry category="arch" keywords="xlarge,recovery,469,470" date="2026-07-10" title="xlarge 全扫家族恢复实测(469+470 后,2026-07-10)" source="main@3202ff1">
+
+### xlarge 全扫家族恢复实测(469+470 后,2026-07-10)
+
+part1 三阶段对照(原始快照→470 后):Range LIMIT 12,076→5.0ms(2438×);IN list 5,563→981ms(5.7×);BETWEEN 4,639→1,066ms(4.4×);Full scan narrow 4,413→1,043ms(4.2×);Full scan 6,003→2,232ms(2.7×);Base 均值 1,795→407ms(4.4×);全家族零回归。对 07-08 基线:BETWEEN/IN 已反超 2×+(且数据多 17.5%);Full scan 余 1.4× 差距=no-fill 重读(每查重解压全部未跳块)+串行物化,为下层地板成分。剩余 xlarge 热点:Revenue 10s/Avg order value 26s/Subquery 24s(聚合/JOIN 形态)、并发 read-heavy 超时(需查询超时护栏)。报告归档 .csv-wave/20260710-xlarge-part1-after-470.json
+
+</spec-entry>
