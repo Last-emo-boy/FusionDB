@@ -1349,13 +1349,23 @@ impl Executor {
                 visitor.visit_row(&data)?;
             }
         } else if let Some(value_key) = self.value_to_index_string(&value) {
+            // Cap the candidate set: each candidate costs a random point get
+            // (~100-400us), so beyond a few thousand matches the batch
+            // full-scan aggregate is strictly faster. A 50%-selectivity
+            // predicate on a 200k-row table paid 100k point gets (44s)
+            // before this gate (BENCHPROD-471). Declining falls through to
+            // simple_column_aggregate_scan's batched full scan.
+            const COLUMN_AGGREGATE_INDEX_PROBE_CAP: usize = 4096;
             let entries = self
                 .scan_routed_prefixes(
                     self.routed_index_prefixes_for_value(table_name, &column_name, &value_key),
                     txn,
-                    None,
+                    Some(COLUMN_AGGREGATE_INDEX_PROBE_CAP + 1),
                 )
                 .await?;
+            if entries.len() > COLUMN_AGGREGATE_INDEX_PROBE_CAP {
+                return Ok(None);
+            }
             for (key, _) in entries {
                 let Some(row_id) = Self::row_id_from_key(&key) else {
                     continue;
