@@ -455,8 +455,7 @@ impl Executor {
                     let mut rows = Vec::with_capacity(kv_pairs.len());
                     for (k, v) in kv_pairs {
                         let row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
-                            if let Some(row) = self.row_cache.get(key_str) {
-                                monitor::inc_row_cache_hit();
+                            if let Some(row) = self.row_cache_lookup(key_str, &v) {
                                 row
                             } else {
                                 let row = crate::common::encoding::RowDecoder::decode(&v).map_err(
@@ -467,7 +466,7 @@ impl Executor {
                                         ))
                                     },
                                 )?;
-                                self.row_cache.insert(key_str.to_string(), row.clone());
+                                self.row_cache_store(key_str.to_string(), &v, &row);
                                 row
                             }
                         } else {
@@ -1308,8 +1307,7 @@ impl Executor {
         value: &[u8],
     ) -> Result<Option<Vec<Value>>> {
         if let Ok(key_str) = std::str::from_utf8(key) {
-            if let Some(row) = self.row_cache.get(key_str) {
-                monitor::inc_row_cache_hit();
+            if let Some(row) = self.row_cache_lookup(key_str, value) {
                 return if self.evaluate_expr(selection, &row, schema, params)? {
                     Ok(Some(row))
                 } else {
@@ -1336,7 +1334,7 @@ impl Executor {
                     if projection_indices.is_none() {
                         Self::decode_row_for_projection(value, None)
                             .map(|row| {
-                                self.row_cache.insert(key_str.to_string(), row.clone());
+                                self.row_cache_store(key_str.to_string(), value, &row);
                                 row
                             })
                             .map_err(|e| {
@@ -1628,21 +1626,23 @@ impl Executor {
                                                             &table_name,
                                                             &id,
                                                         );
-                                                        if let Some(row) = self.row_cache.get(&key)
-                                                        {
-                                                            rows.push(row);
-                                                        } else if let Some(data) =
+                                                        if let Some(data) =
                                                             txn.get(key.as_bytes()).await?
                                                         {
-                                                            if let Ok(row) =
+                                                            if let Some(row) =
+                                                                self.row_cache_lookup(&key, &data)
+                                                            {
+                                                                rows.push(row);
+                                                            } else if let Ok(row) =
                                                                 Self::decode_row_for_projection(
                                                                     &data,
                                                                     projection_indices.as_deref(),
                                                                 )
                                                             {
                                                                 if projection_indices.is_none() {
-                                                                    self.row_cache
-                                                                        .insert(key, row.clone());
+                                                                    self.row_cache_store(
+                                                                        key, &data, &row,
+                                                                    );
                                                                 }
                                                                 rows.push(row);
                                                             }
@@ -1708,13 +1708,11 @@ impl Executor {
                                     return Ok((schema, vec![], false));
                                 }
 
-                                if let Some(row) = self.row_cache.get(&key) {
-                                    monitor::inc_row_cache_hit();
-                                    return Ok((schema, vec![row], false));
-                                }
-
                                 if let Some(v) = txn.get(key.as_bytes()).await? {
                                     monitor::inc_row_read();
+                                    if let Some(row) = self.row_cache_lookup(&key, &v) {
+                                        return Ok((schema, vec![row], false));
+                                    }
                                     let lookup_projection_indices =
                                         projection_indices.as_ref().map(|indices| {
                                             if let Some(pk_idx) = pk_index {
@@ -1757,7 +1755,7 @@ impl Executor {
                                     }
 
                                     if projection_indices.is_none() {
-                                        self.row_cache.insert(key, row.clone());
+                                        self.row_cache_store(key, &v, &row);
                                     }
 
                                     return Ok((schema, vec![row], false));
@@ -1834,8 +1832,7 @@ impl Executor {
                                 } else {
                                     let cache_key = std::str::from_utf8(&k).ok();
                                     if let Some(key_str) = cache_key {
-                                        if let Some(row) = self.row_cache.get(key_str) {
-                                            monitor::inc_row_cache_hit();
+                                        if let Some(row) = self.row_cache_lookup(key_str, &v) {
                                             rows.push(row);
                                             if let Some(l) = limit {
                                                 if rows.len() >= l {
@@ -1858,7 +1855,7 @@ impl Executor {
                                     })?;
                                     if projection_indices.is_none() {
                                         if let Some(key_str) = cache_key {
-                                            self.row_cache.insert(key_str.to_string(), row.clone());
+                                            self.row_cache_store(key_str.to_string(), &v, &row);
                                         }
                                     }
                                     row
@@ -1919,31 +1916,29 @@ impl Executor {
                                     monitor::inc_index_ordered_topk_index_only_row();
                                 }
                                 row.clone()
-                            } else if let Some(row) = self.row_cache.get(&data_key) {
-                                if ordered_topk_counted {
-                                    monitor::inc_index_ordered_topk_base_row_fetch();
-                                }
-                                monitor::inc_row_cache_hit();
-                                row
                             } else if let Some(data_bytes) = txn.get(data_key.as_bytes()).await? {
                                 if ordered_topk_counted {
                                     monitor::inc_index_ordered_topk_base_row_fetch();
                                 }
                                 monitor::inc_row_read();
-                                let row: Vec<Value> = Self::decode_row_for_projection(
-                                    &data_bytes,
-                                    projection_indices.as_deref(),
-                                )
-                                .map_err(|e| {
-                                    FusionError::Execution(format!(
-                                        "Data deserialization error: {}",
-                                        e
-                                    ))
-                                })?;
-                                if projection_indices.is_none() {
-                                    self.row_cache.insert(data_key, row.clone());
+                                if let Some(row) = self.row_cache_lookup(&data_key, &data_bytes) {
+                                    row
+                                } else {
+                                    let row: Vec<Value> = Self::decode_row_for_projection(
+                                        &data_bytes,
+                                        projection_indices.as_deref(),
+                                    )
+                                    .map_err(|e| {
+                                        FusionError::Execution(format!(
+                                            "Data deserialization error: {}",
+                                            e
+                                        ))
+                                    })?;
+                                    if projection_indices.is_none() {
+                                        self.row_cache_store(data_key, &data_bytes, &row);
+                                    }
+                                    row
                                 }
-                                row
                             } else {
                                 continue;
                             };
@@ -2059,12 +2054,6 @@ impl Executor {
                                                 monitor::inc_index_ordered_topk_index_only_row();
                                             }
                                             row.clone()
-                                        } else if let Some(row) = self.row_cache.get(&data_key) {
-                                            if ordered_topk_counted {
-                                                monitor::inc_index_ordered_topk_base_row_fetch();
-                                            }
-                                            monitor::inc_row_cache_hit();
-                                            row
                                         } else if key_only_scan {
                                             if ordered_topk_counted {
                                                 monitor::inc_index_ordered_topk_index_only_row();
@@ -2079,20 +2068,31 @@ impl Executor {
                                                 monitor::inc_index_ordered_topk_base_row_fetch();
                                             }
                                             monitor::inc_row_read();
-                                            let row: Vec<Value> = Self::decode_row_for_projection(
-                                                &data_bytes,
-                                                projection_indices.as_deref(),
-                                            )
-                                            .map_err(|e| {
-                                                FusionError::Execution(format!(
-                                                    "Data deserialization error: {}",
-                                                    e
-                                                ))
-                                            })?;
-                                            if projection_indices.is_none() {
-                                                self.row_cache.insert(data_key, row.clone());
+                                            if let Some(row) =
+                                                self.row_cache_lookup(&data_key, &data_bytes)
+                                            {
+                                                row
+                                            } else {
+                                                let row: Vec<Value> =
+                                                    Self::decode_row_for_projection(
+                                                        &data_bytes,
+                                                        projection_indices.as_deref(),
+                                                    )
+                                                    .map_err(|e| {
+                                                        FusionError::Execution(format!(
+                                                            "Data deserialization error: {}",
+                                                            e
+                                                        ))
+                                                    })?;
+                                                if projection_indices.is_none() {
+                                                    self.row_cache_store(
+                                                        data_key,
+                                                        &data_bytes,
+                                                        &row,
+                                                    );
+                                                }
+                                                row
                                             }
-                                            row
                                         } else {
                                             continue;
                                         };
@@ -2164,13 +2164,6 @@ impl Executor {
                                                     )));
                                                 }
 
-                                                if let Some(row) = executor.row_cache.get(&data_key)
-                                                {
-                                                    return Ok::<_, FusionError>(Some((
-                                                        row_id, row, true, false, false,
-                                                    )));
-                                                }
-
                                                 if key_only_scan {
                                                     let r = Self::primary_key_row_from_parts(
                                                         schema_width,
@@ -2178,7 +2171,7 @@ impl Executor {
                                                         pk_type_upper.as_deref(),
                                                         &row_id,
                                                     );
-                                                    return Ok(Some((
+                                                    return Ok::<_, FusionError>(Some((
                                                         row_id, r, false, false, false,
                                                     )));
                                                 }
@@ -2186,6 +2179,14 @@ impl Executor {
                                                 if let Some(data_bytes) =
                                                     txn_ref.get(data_key.as_bytes()).await?
                                                 {
+                                                    monitor::inc_row_read();
+                                                    if let Some(row) = executor
+                                                        .row_cache_lookup(&data_key, &data_bytes)
+                                                    {
+                                                        return Ok(Some((
+                                                            row_id, row, true, false, false,
+                                                        )));
+                                                    }
                                                     let cacheable = projection_indices.is_none();
                                                     let row = Self::decode_row_for_projection(
                                                         &data_bytes,
@@ -2197,7 +2198,14 @@ impl Executor {
                                                             e
                                                         ))
                                                     })?;
-                                                    Ok(Some((row_id, row, false, cacheable, true)))
+                                                    if cacheable {
+                                                        executor.row_cache_store(
+                                                            data_key.clone(),
+                                                            &data_bytes,
+                                                            &row,
+                                                        );
+                                                    }
+                                                    Ok(Some((row_id, row, false, false, true)))
                                                 } else {
                                                     Ok(None)
                                                 }
@@ -2209,26 +2217,13 @@ impl Executor {
                                     while let Some(res) = stream.next().await {
                                         let res = res?;
                                         if let Some((
-                                            row_id,
+                                            _row_id,
                                             row,
-                                            from_cache,
-                                            cacheable,
-                                            read_storage,
+                                            _from_cache,
+                                            _cacheable,
+                                            _read_storage,
                                         )) = res
                                         {
-                                            if read_storage {
-                                                monitor::inc_row_read();
-                                                if cacheable {
-                                                    let data_key = self.routed_data_key_for_row_id(
-                                                        &table_name,
-                                                        &row_id,
-                                                    );
-                                                    self.row_cache.insert(data_key, row.clone());
-                                                }
-                                            } else if from_cache {
-                                                monitor::inc_row_cache_hit();
-                                            }
-
                                             if !exact
                                                 && !self
                                                     .evaluate_expr(sel, &row, &schema, params)?
@@ -2463,14 +2458,16 @@ impl Executor {
                             .map(|(k, v)| {
                                 let row = match std::str::from_utf8(&k) {
                                     Ok(key_str) => {
-                                        if let Some(row) = self.row_cache.get(key_str) {
-                                            monitor::inc_row_cache_hit();
+                                        if let Some(row) = self.row_cache_lookup(key_str, &v) {
                                             Ok(row)
                                         } else if projection_indices.is_none() {
                                             Self::decode_row_for_projection(&v, None)
                                                 .map(|row| {
-                                                    self.row_cache
-                                                        .insert(key_str.to_string(), row.clone());
+                                                    self.row_cache_store(
+                                                        key_str.to_string(),
+                                                        &v,
+                                                        &row,
+                                                    );
                                                     row
                                                 })
                                                 .map_err(|e| {
@@ -2530,12 +2527,11 @@ impl Executor {
                         } else {
                             match std::str::from_utf8(&k) {
                                 Ok(key_str) => {
-                                    if let Some(row) = self.row_cache.get(key_str) {
-                                        monitor::inc_row_cache_hit();
+                                    if let Some(row) = self.row_cache_lookup(key_str, &v) {
                                         Some(row)
                                     } else if projection_indices.is_none() {
                                         Self::decode_row_for_projection(&v, None).ok().map(|row| {
-                                            self.row_cache.insert(key_str.to_string(), row.clone());
+                                            self.row_cache_store(key_str.to_string(), &v, &row);
                                             row
                                         })
                                     } else {
@@ -2751,16 +2747,14 @@ impl ScanVisitor for OrderTopKScanVisitor<'_> {
         } else {
             let decoded = match std::str::from_utf8(key) {
                 Ok(key_str) => {
-                    if let Some(row) = self.executor.row_cache.get(key_str) {
-                        monitor::inc_row_cache_hit();
+                    if let Some(row) = self.executor.row_cache_lookup(key_str, value) {
                         Some(row)
                     } else if self.projection_indices.is_none() {
                         Executor::decode_row_for_projection(value, None)
                             .ok()
                             .map(|row| {
                                 self.executor
-                                    .row_cache
-                                    .insert(key_str.to_string(), row.clone());
+                                    .row_cache_store(key_str.to_string(), value, &row);
                                 row
                             })
                     } else {
@@ -2829,16 +2823,14 @@ impl FilteredScanVisitor<'_> {
         } else {
             match std::str::from_utf8(key) {
                 Ok(key_str) => {
-                    if let Some(row) = self.executor.row_cache.get(key_str) {
-                        monitor::inc_row_cache_hit();
+                    if let Some(row) = self.executor.row_cache_lookup(key_str, value) {
                         Some(row)
                     } else if self.projection_indices.is_none() {
                         Executor::decode_row_for_projection(value, None)
                             .ok()
                             .map(|row| {
                                 self.executor
-                                    .row_cache
-                                    .insert(key_str.to_string(), row.clone());
+                                    .row_cache_store(key_str.to_string(), value, &row);
                                 row
                             })
                     } else {

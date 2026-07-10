@@ -1,6 +1,5 @@
 use crate::catalog::{IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
-use crate::monitor;
 use crate::storage::Transaction;
 use sqlparser::ast::TableFactor;
 
@@ -140,7 +139,6 @@ impl Executor {
                     let key = self.routed_data_key_for_row_id(&table_name_str, row_id);
                     if txn.get(key.as_bytes()).await?.is_some() {
                         txn.delete(key.as_bytes()).await?;
-                        self.row_cache.invalidate(&key);
                         return Ok(QueryResult::Success {
                             message: "Deleted 1 rows".to_string(),
                         });
@@ -158,9 +156,6 @@ impl Executor {
                     let deleted_count = kv_pairs.len();
                     for (k, _) in kv_pairs {
                         txn.delete(&k).await?;
-                        if let Ok(key_str) = std::str::from_utf8(&k) {
-                            self.row_cache.invalidate(key_str);
-                        }
                     }
 
                     return Ok(QueryResult::Success {
@@ -190,8 +185,7 @@ impl Executor {
         };
         for (k, v) in kv_pairs {
             let row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
-                if let Some(row) = self.row_cache.get(key_str) {
-                    monitor::inc_row_cache_hit();
+                if let Some(row) = self.row_cache_lookup(key_str, &v) {
                     row
                 } else {
                     crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
@@ -221,11 +215,6 @@ impl Executor {
                 .await?;
 
                 txn.delete(&k).await?;
-
-                // Invalidate Cache
-                if let Ok(key_str) = std::str::from_utf8(&k) {
-                    self.row_cache.invalidate(key_str);
-                }
 
                 let row_id = Self::row_id_from_data_key(&k)?;
                 self.update_trigram_index_for_delete(

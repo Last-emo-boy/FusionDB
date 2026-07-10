@@ -311,7 +311,7 @@ async fn test_predicate_first_in_list_limit_matches_expected_order() {
 }
 
 #[tokio::test]
-async fn test_predicate_first_in_list_reuses_row_cache() {
+async fn test_predicate_first_in_list_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -344,20 +344,24 @@ async fn test_predicate_first_in_list_reuses_row_cache() {
         ]
     );
 
+    // Rewrite the stored bytes out of band: the predicate-first IN scan must
+    // decode the new bytes instead of serving the stale cached rows.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        for (id, bucket, payload) in [(1_i64, 1_i64, "one"), (2_i64, 2_i64, "two")] {
-            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        for (id, bucket, payload) in [
+            (1_i64, 1_i64, "one-rewritten"),
+            (2_i64, 2_i64, "two-rewritten"),
+        ] {
+            let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
                 Value::Integer(id),
                 Value::Integer(bucket),
                 Value::String(payload.to_string()),
             ]);
-            corrupt_encoded_column(&mut corrupt_row, 1, 3);
             let key = format!(
                 "data:in_pf_cache:{}",
                 fusiondb::common::encoding::encode_i64_comparable(id)
             );
-            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+            txn.put(key.as_bytes(), &updated_row).await.unwrap();
         }
         txn.commit().await.unwrap();
     }
@@ -370,7 +374,10 @@ async fn test_predicate_first_in_list_reuses_row_cache() {
     assert_eq!(cols, vec!["id", "payload"]);
     assert_eq!(
         rows,
-        vec![vec![Value::Integer(2), Value::String("two".to_string())]]
+        vec![vec![
+            Value::Integer(2),
+            Value::String("two-rewritten".to_string())
+        ]]
     );
 
     cleanup(&wal_path);

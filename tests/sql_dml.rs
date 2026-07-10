@@ -1196,7 +1196,7 @@ async fn test_composite_index_dml_falls_back_to_legacy_metadata_scan() {
 }
 
 #[tokio::test]
-async fn test_delete_primary_key_reuses_row_cache_for_secondary_index() {
+async fn test_delete_primary_key_cleans_index_from_storage_truth() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -1219,33 +1219,28 @@ async fn test_delete_primary_key_reuses_row_cache_for_secondary_index() {
         vec![vec![Value::Integer(2), Value::String("Bob".to_string())]]
     );
 
-    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
-        Value::Integer(2),
-        Value::String("Bob".to_string()),
-    ]);
-    let corrupt_col_idx = 1usize;
-    let off_pos = 2 + corrupt_col_idx * 4;
-    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-    for byte in &mut corrupt_row[start..] {
-        *byte = 0xff;
-    }
-
-    {
-        let mut txn = storage.begin_transaction().await.unwrap();
-        txn.put(b"data:del_cache:8000000000000002", &corrupt_row)
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
-    }
+    // Rename the row through SQL: the cached 'Bob' row is now stale. The
+    // DELETE must clean up index entries from the CURRENT storage row
+    // ('Carol'), never from a stale cached row.
+    exec_ok(
+        &executor,
+        "UPDATE del_cache SET name = 'Carol' WHERE id = 2",
+    )
+    .await;
 
     let msg = exec_ok(&executor, "DELETE FROM del_cache WHERE id = 2").await;
     assert!(msg.contains("Deleted 1"));
 
     {
         let txn = storage.begin_transaction().await.unwrap();
-        let index_key = b"index:del_cache:name:Bob:8000000000000002";
-        assert!(txn.get(index_key).await.unwrap().is_none());
+        let bob_index_key = b"index:del_cache:name:Bob:8000000000000002";
+        assert!(txn.get(bob_index_key).await.unwrap().is_none());
+        let carol_index_key = b"index:del_cache:name:Carol:8000000000000002";
+        assert!(txn.get(carol_index_key).await.unwrap().is_none());
     }
+
+    let (_, rows) = query(&executor, "SELECT * FROM del_cache WHERE id = 2").await;
+    assert!(rows.is_empty());
     cleanup(&wal_path);
 }
 
@@ -1347,7 +1342,7 @@ async fn test_update_invalidates_row_cache_for_index_lookup() {
 }
 
 #[tokio::test]
-async fn test_update_primary_key_reuses_row_cache_for_secondary_index() {
+async fn test_update_primary_key_maintains_index_from_storage_truth() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -1374,25 +1369,14 @@ async fn test_update_primary_key_reuses_row_cache_for_secondary_index() {
         ]]
     );
 
-    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
-        Value::Integer(2),
-        Value::String("Bob".to_string()),
-        Value::Integer(42),
-    ]);
-    let corrupt_col_idx = 1usize;
-    let off_pos = 2 + corrupt_col_idx * 4;
-    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-    for byte in &mut corrupt_row[start..] {
-        *byte = 0xff;
-    }
-
-    {
-        let mut txn = storage.begin_transaction().await.unwrap();
-        txn.put(b"data:upd_cache:8000000000000002", &corrupt_row)
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
-    }
+    // Rename the row through SQL so the cached 'Bob' row goes stale, then
+    // update again: index maintenance must be driven by the CURRENT storage
+    // row ('Carol'), never by a stale cached row.
+    exec_ok(
+        &executor,
+        "UPDATE upd_cache SET name = 'Carol' WHERE id = 2",
+    )
+    .await;
 
     let msg = exec_ok(
         &executor,
@@ -1403,6 +1387,14 @@ async fn test_update_primary_key_reuses_row_cache_for_secondary_index() {
 
     let (_, rows) = query(&executor, "SELECT * FROM upd_cache WHERE name = 'Bob'").await;
     assert_eq!(rows.len(), 0);
+    let (_, rows) = query(&executor, "SELECT * FROM upd_cache WHERE name = 'Carol'").await;
+    assert_eq!(rows.len(), 0);
+
+    {
+        let txn = storage.begin_transaction().await.unwrap();
+        let carol_index_key = b"index:upd_cache:name:Carol:8000000000000002";
+        assert!(txn.get(carol_index_key).await.unwrap().is_none());
+    }
 
     let (cols, rows) = query(&executor, "SELECT * FROM upd_cache WHERE name = 'Robert'").await;
     assert_eq!(cols, vec!["id", "name", "age"]);

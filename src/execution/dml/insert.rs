@@ -119,7 +119,7 @@ impl Executor {
         let mut max_seen = 0_i64;
         for (key, value) in existing {
             let candidate = if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Some(row) = self.row_cache.get(key_str) {
+                if let Some(row) = self.row_cache_lookup(key_str, &value) {
                     row.get(column_idx).cloned()
                 } else {
                     crate::common::encoding::RowDecoder::decode_column(&value, column_idx)
@@ -484,8 +484,7 @@ impl Executor {
                     .await?;
                 for (k, v) in &existing {
                     let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
-                        if let Some(row) = self.row_cache.get(key_str) {
-                            monitor::inc_row_cache_hit();
+                        if let Some(row) = self.row_cache_lookup(key_str, v) {
                             row.get(idx).cloned().unwrap_or(Value::Null)
                         } else {
                             crate::common::encoding::RowDecoder::decode_column(v, idx)
@@ -530,9 +529,8 @@ impl Executor {
                     }
                     sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
                         let mut existing_row: Vec<Value> = if let Some(row) =
-                            self.row_cache.get(&key)
+                            self.row_cache_lookup(&key, &existing_bytes)
                         {
-                            monitor::inc_row_cache_hit();
                             row
                         } else {
                             crate::common::encoding::RowDecoder::decode(&existing_bytes).map_err(
@@ -579,7 +577,6 @@ impl Executor {
                         .await?;
                         let value = crate::common::encoding::RowEncoder::encode(&existing_row);
                         txn.put(key.as_bytes(), &value).await?;
-                        self.row_cache.invalidate(&key);
                         self.update_trigram_index_for_update(
                             &context.table_name,
                             &context.schema,
@@ -649,7 +646,6 @@ impl Executor {
 
         let value = crate::common::encoding::RowEncoder::encode(&row_values);
         txn.put(key.as_bytes(), &value).await?;
-        self.row_cache.invalidate(&key);
         monitor::inc_row_write();
 
         self.update_trigram_index_for_insert(
@@ -907,8 +903,7 @@ impl Executor {
                                 .await?;
                             for (k, v) in &existing {
                                 let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
-                                    if let Some(row) = self.row_cache.get(key_str) {
-                                        monitor::inc_row_cache_hit();
+                                    if let Some(row) = self.row_cache_lookup(key_str, v) {
                                         row.get(idx).cloned().unwrap_or(Value::Null)
                                     } else {
                                         crate::common::encoding::RowDecoder::decode_column(v, idx)
@@ -958,9 +953,8 @@ impl Executor {
                                 sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
                                     // Load existing row, apply assignments using EXCLUDED references
                                     let mut existing_row: Vec<Value> = if let Some(row) =
-                                        self.row_cache.get(&key)
+                                        self.row_cache_lookup(&key, &existing_bytes)
                                     {
-                                        monitor::inc_row_cache_hit();
                                         row
                                     } else {
                                         crate::common::encoding::RowDecoder::decode(&existing_bytes)
@@ -1014,7 +1008,6 @@ impl Executor {
                                     let value =
                                         crate::common::encoding::RowEncoder::encode(&existing_row);
                                     txn.put(key.as_bytes(), &value).await?;
-                                    self.row_cache.invalidate(&key);
                                     self.update_trigram_index_for_update(
                                         &table_name_str,
                                         &schema,
@@ -1088,11 +1081,7 @@ impl Executor {
 
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
                     txn.put(key.as_bytes(), &value).await?;
-                    self.row_cache.invalidate(&key);
                     monitor::inc_row_write();
-
-                    // Update Cache
-                    // self.row_cache.insert(key.clone(), row_values.clone());
 
                     self.update_trigram_index_for_insert(
                         &table_name_str,

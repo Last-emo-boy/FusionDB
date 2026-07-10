@@ -323,7 +323,7 @@ async fn test_comma_join_reorder_preserves_ldbc_q4_shape_with_deferred_exists() 
 }
 
 #[tokio::test]
-async fn test_join_base_scan_reuses_row_cache() {
+async fn test_join_base_scan_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -358,26 +358,21 @@ async fn test_join_base_scan_reuses_row_cache() {
         ]
     );
 
+    // Rewrite the stored bytes out of band: the join base scan must decode
+    // the new bytes instead of serving the stale cached rows.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        for (id, name) in [(1_i64, "Alice"), (2_i64, "Bob")] {
-            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        for (id, name) in [(1_i64, "Alice-rewritten"), (2_i64, "Bob-rewritten")] {
+            let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
                 Value::Integer(id),
                 Value::String(name.to_string()),
             ]);
-            let corrupt_col_idx = 1usize;
-            let off_pos = 2 + corrupt_col_idx * 4;
-            let start =
-                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-            for byte in &mut corrupt_row[start..] {
-                *byte = 0xff;
-            }
 
             let key = format!(
                 "data:join_cache_users:{}",
                 fusiondb::common::encoding::encode_i64_comparable(id)
             );
-            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+            txn.put(key.as_bytes(), &updated_row).await.unwrap();
         }
         txn.commit().await.unwrap();
     }
@@ -398,13 +393,13 @@ async fn test_join_base_scan_reuses_row_cache() {
         ]
     );
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][1], Value::String("Alice".to_string()));
-    assert_eq!(rows[1][1], Value::String("Bob".to_string()));
+    assert_eq!(rows[0][1], Value::String("Alice-rewritten".to_string()));
+    assert_eq!(rows[1][1], Value::String("Bob-rewritten".to_string()));
     cleanup(&wal_path);
 }
 
 #[tokio::test]
-async fn test_join_base_scan_populates_row_cache() {
+async fn test_join_base_scan_populated_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -437,26 +432,21 @@ async fn test_join_base_scan_populates_row_cache() {
     .await;
     assert_eq!(rows.len(), 2);
 
+    // Rewrite the stored bytes out of band: the follow-up scan must decode
+    // the new bytes instead of serving the rows cached by the join.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        for (id, name) in [(1_i64, "Alice"), (2_i64, "Bob")] {
-            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        for (id, name) in [(1_i64, "Alice-rewritten"), (2_i64, "Bob-rewritten")] {
+            let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
                 Value::Integer(id),
                 Value::String(name.to_string()),
             ]);
-            let corrupt_col_idx = 1usize;
-            let off_pos = 2 + corrupt_col_idx * 4;
-            let start =
-                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-            for byte in &mut corrupt_row[start..] {
-                *byte = 0xff;
-            }
 
             let key = format!(
                 "data:join_warm_users:{}",
                 fusiondb::common::encoding::encode_i64_comparable(id)
             );
-            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+            txn.put(key.as_bytes(), &updated_row).await.unwrap();
         }
         txn.commit().await.unwrap();
     }
@@ -466,8 +456,14 @@ async fn test_join_base_scan_populates_row_cache() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::String("Alice".to_string())],
-            vec![Value::Integer(2), Value::String("Bob".to_string())]
+            vec![
+                Value::Integer(1),
+                Value::String("Alice-rewritten".to_string())
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("Bob-rewritten".to_string())
+            ]
         ]
     );
     cleanup(&wal_path);
@@ -517,7 +513,7 @@ async fn test_primary_key_join_probe_aligns_projected_right_column_after_key() {
 }
 
 #[tokio::test]
-async fn test_primary_key_join_probe_projection_reuses_right_row_cache() {
+async fn test_primary_key_join_probe_projection_right_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -549,26 +545,21 @@ async fn test_primary_key_join_probe_projection_reuses_right_row_cache() {
         ]]
     );
 
+    // Rewrite the stored bytes out of band: the primary-key join probe must
+    // decode the new bytes instead of serving the stale cached right row.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
             Value::Integer(10),
-            Value::String("Cached".to_string()),
+            Value::String("Cached-rewritten".to_string()),
             Value::String("unused".to_string()),
         ]);
-        let corrupt_col_idx = 1usize;
-        let off_pos = 2 + corrupt_col_idx * 4;
-        let start =
-            u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-        for byte in &mut corrupt_row[start..] {
-            *byte = 0xff;
-        }
 
         let key = format!(
             "data:probe_right_cache:{}",
             fusiondb::common::encoding::encode_i64_comparable(10)
         );
-        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.put(key.as_bytes(), &updated_row).await.unwrap();
         txn.commit().await.unwrap();
     }
 
@@ -582,7 +573,10 @@ async fn test_primary_key_join_probe_projection_reuses_right_row_cache() {
     assert_eq!(cols, vec!["l.id", "r.name"]);
     assert_eq!(
         rows,
-        vec![vec![Value::Integer(1), Value::String("Cached".to_string())]]
+        vec![vec![
+            Value::Integer(1),
+            Value::String("Cached-rewritten".to_string())
+        ]]
     );
     cleanup(&wal_path);
 }

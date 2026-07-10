@@ -778,17 +778,15 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<Option<Vec<Value>>> {
         let data_key = self.routed_data_key_for_row_id(table_name, row_id);
-        if let Some(row) = self.row_cache.get(&data_key) {
-            monitor::inc_row_cache_hit();
-            return Ok(Some(row));
-        }
-
         if let Some(data_bytes) = txn.get(data_key.as_bytes()).await? {
             monitor::inc_row_read();
+            if let Some(row) = self.row_cache_lookup(&data_key, &data_bytes) {
+                return Ok(Some(row));
+            }
             let row = crate::common::encoding::RowDecoder::decode(&data_bytes).map_err(|e| {
                 FusionError::Execution(format!("Data deserialization error: {}", e))
             })?;
-            self.row_cache.insert(data_key, row.clone());
+            self.row_cache_store(data_key, &data_bytes, &row);
             Ok(Some(row))
         } else {
             Ok(None)

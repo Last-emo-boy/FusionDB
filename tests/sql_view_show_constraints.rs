@@ -229,7 +229,7 @@ async fn test_unique_constraint() {
 }
 
 #[tokio::test]
-async fn test_insert_unique_check_reuses_row_cache() {
+async fn test_insert_unique_check_from_storage_truth() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -255,39 +255,46 @@ async fn test_insert_unique_check_reuses_row_cache() {
         ]]
     );
 
-    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+    // Rewrite the stored bytes out of band: the INSERT unique check must
+    // decode the new bytes instead of serving the stale cached row.
+    let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
         Value::Integer(1),
-        Value::String("alice@test.com".to_string()),
+        Value::String("alice-rewritten@test.com".to_string()),
         Value::String("Alice".to_string()),
     ]);
-    let corrupt_col_idx = 1usize;
-    let off_pos = 2 + corrupt_col_idx * 4;
-    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-    for byte in &mut corrupt_row[start..] {
-        *byte = 0xff;
-    }
 
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        txn.put(b"data:uq_cache:8000000000000001", &corrupt_row)
+        txn.put(b"data:uq_cache:8000000000000001", &updated_row)
             .await
             .unwrap();
         txn.commit().await.unwrap();
     }
 
+    // The stale cached email is no longer present in storage, so inserting it
+    // must succeed.
     let msg = exec_ok(
         &executor,
-        "INSERT INTO uq_cache VALUES (2, 'bob@test.com', 'Bob')",
+        "INSERT INTO uq_cache VALUES (2, 'alice@test.com', 'Bob')",
     )
     .await;
     assert!(msg.contains("Inserted 1"));
+
+    // The rewritten storage email IS a duplicate, so inserting it must fail.
+    let stmts = executor
+        .prepare("INSERT INTO uq_cache VALUES (3, 'alice-rewritten@test.com', 'Carol')")
+        .unwrap();
+    let result = executor.execute(&stmts[0]).await;
+    assert!(result.is_err());
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(err_msg.contains("UNIQUE"));
 
     let (_, rows) = query(&executor, "SELECT * FROM uq_cache WHERE id = 2").await;
     assert_eq!(
         rows,
         vec![vec![
             Value::Integer(2),
-            Value::String("bob@test.com".to_string()),
+            Value::String("alice@test.com".to_string()),
             Value::String("Bob".to_string())
         ]]
     );

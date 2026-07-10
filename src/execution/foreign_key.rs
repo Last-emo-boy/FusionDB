@@ -564,7 +564,7 @@ impl Executor {
             .await?;
         for (key, bytes) in rows {
             let row = if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Some(row) = self.row_cache.get(key_str) {
+                if let Some(row) = self.row_cache_lookup(key_str, &bytes) {
                     row
                 } else {
                     crate::common::encoding::RowDecoder::decode(&bytes)

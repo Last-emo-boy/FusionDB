@@ -1199,7 +1199,6 @@ impl Executor {
             let key = materialized_cte_data_key_for_row_id(cte_name, &pk_str);
             let val = crate::common::encoding::RowEncoder::encode(row);
             txn.put(key.as_bytes(), &val).await?;
-            self.row_cache.invalidate(&key);
         }
 
         Ok(())

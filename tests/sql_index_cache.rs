@@ -147,7 +147,7 @@ async fn test_analyze_and_create_index_backfill_use_no_fill_cache() {
 }
 
 #[tokio::test]
-async fn test_full_table_scan_reuses_row_cache() {
+async fn test_full_table_scan_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -165,16 +165,12 @@ async fn test_full_table_scan_reuses_row_cache() {
         vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
     );
 
-    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+    // Rewrite the stored bytes out of band: the row cache must notice the
+    // byte change and decode the new bytes instead of serving the stale row.
+    let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
         Value::Integer(1),
-        Value::String("Alice".to_string()),
+        Value::String("Alice-rewritten".to_string()),
     ]);
-    let corrupt_col_idx = 1usize;
-    let off_pos = 2 + corrupt_col_idx * 4;
-    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-    for byte in &mut corrupt_row[start..] {
-        *byte = 0xff;
-    }
 
     {
         let mut txn = storage.begin_transaction().await.unwrap();
@@ -182,20 +178,23 @@ async fn test_full_table_scan_reuses_row_cache() {
             "data:full_scan_cache:{}",
             fusiondb::common::encoding::encode_i64_comparable(1)
         );
-        txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+        txn.put(key.as_bytes(), &updated_row).await.unwrap();
         txn.commit().await.unwrap();
     }
 
     let (_, rows) = query(&executor, "SELECT * FROM full_scan_cache").await;
     assert_eq!(
         rows,
-        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+        vec![vec![
+            Value::Integer(1),
+            Value::String("Alice-rewritten".to_string())
+        ]]
     );
     cleanup(&wal_path);
 }
 
 #[tokio::test]
-async fn test_full_table_projection_reuses_full_row_cache() {
+async fn test_full_table_projection_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -228,27 +227,25 @@ async fn test_full_table_projection_reuses_full_row_cache() {
         ]
     );
 
+    // Rewrite the stored bytes out of band: the projected read must decode
+    // the new bytes instead of serving the stale cached full rows.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        for (id, name, payload) in [(1_i64, "Alice", "a"), (2_i64, "Bob", "b")] {
-            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        for (id, name, payload) in [
+            (1_i64, "Alice-rewritten", "a"),
+            (2_i64, "Bob-rewritten", "b"),
+        ] {
+            let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
                 Value::Integer(id),
                 Value::String(name.to_string()),
                 Value::String(payload.to_string()),
             ]);
-            let corrupt_col_idx = 1usize;
-            let off_pos = 2 + corrupt_col_idx * 4;
-            let start =
-                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-            for byte in &mut corrupt_row[start..] {
-                *byte = 0xff;
-            }
 
             let key = format!(
                 "data:full_project_cache:{}",
                 fusiondb::common::encoding::encode_i64_comparable(id)
             );
-            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+            txn.put(key.as_bytes(), &updated_row).await.unwrap();
         }
         txn.commit().await.unwrap();
     }
@@ -258,8 +255,8 @@ async fn test_full_table_projection_reuses_full_row_cache() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::String("Alice".to_string())],
-            vec![Value::String("Bob".to_string())]
+            vec![Value::String("Alice-rewritten".to_string())],
+            vec![Value::String("Bob-rewritten".to_string())]
         ]
     );
     cleanup(&wal_path);
@@ -341,7 +338,7 @@ async fn test_commuted_primary_key_range_skips_nonmatching_row_decode() {
 }
 
 #[tokio::test]
-async fn test_primary_key_range_reuses_row_cache() {
+async fn test_primary_key_range_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -366,26 +363,21 @@ async fn test_primary_key_range_reuses_row_cache() {
         ]
     );
 
+    // Rewrite the stored bytes out of band: the range scan must decode the
+    // new bytes instead of serving the stale cached rows.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        for (id, name) in [(1_i64, "Alice"), (2_i64, "Bob")] {
-            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        for (id, name) in [(1_i64, "Alice-rewritten"), (2_i64, "Bob-rewritten")] {
+            let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
                 Value::Integer(id),
                 Value::String(name.to_string()),
             ]);
-            let corrupt_col_idx = 1usize;
-            let off_pos = 2 + corrupt_col_idx * 4;
-            let start =
-                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-            for byte in &mut corrupt_row[start..] {
-                *byte = 0xff;
-            }
 
             let key = format!(
                 "data:range_cache:{}",
                 fusiondb::common::encoding::encode_i64_comparable(id)
             );
-            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+            txn.put(key.as_bytes(), &updated_row).await.unwrap();
         }
         txn.commit().await.unwrap();
     }
@@ -394,15 +386,21 @@ async fn test_primary_key_range_reuses_row_cache() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::String("Alice".to_string())],
-            vec![Value::Integer(2), Value::String("Bob".to_string())]
+            vec![
+                Value::Integer(1),
+                Value::String("Alice-rewritten".to_string())
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("Bob-rewritten".to_string())
+            ]
         ]
     );
     cleanup(&wal_path);
 }
 
 #[tokio::test]
-async fn test_primary_key_range_projection_reuses_full_row_cache() {
+async fn test_primary_key_range_projection_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -435,27 +433,25 @@ async fn test_primary_key_range_projection_reuses_full_row_cache() {
         ]
     );
 
+    // Rewrite the stored bytes out of band: the projected range read must
+    // decode the new bytes instead of serving the stale cached full rows.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        for (id, name, payload) in [(1_i64, "Alice", "a"), (2_i64, "Bob", "b")] {
-            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        for (id, name, payload) in [
+            (1_i64, "Alice-rewritten", "a"),
+            (2_i64, "Bob-rewritten", "b"),
+        ] {
+            let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
                 Value::Integer(id),
                 Value::String(name.to_string()),
                 Value::String(payload.to_string()),
             ]);
-            let corrupt_col_idx = 1usize;
-            let off_pos = 2 + corrupt_col_idx * 4;
-            let start =
-                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-            for byte in &mut corrupt_row[start..] {
-                *byte = 0xff;
-            }
 
             let key = format!(
                 "data:range_project_cache:{}",
                 fusiondb::common::encoding::encode_i64_comparable(id)
             );
-            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+            txn.put(key.as_bytes(), &updated_row).await.unwrap();
         }
         txn.commit().await.unwrap();
     }
@@ -469,8 +465,8 @@ async fn test_primary_key_range_projection_reuses_full_row_cache() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::String("Alice".to_string())],
-            vec![Value::String("Bob".to_string())]
+            vec![Value::String("Alice-rewritten".to_string())],
+            vec![Value::String("Bob-rewritten".to_string())]
         ]
     );
     cleanup(&wal_path);
@@ -3179,7 +3175,7 @@ async fn test_delete_removes_trigram_index_on_fusion_storage() {
 }
 
 #[tokio::test]
-async fn test_create_index_reuses_row_cache_for_backfill() {
+async fn test_create_index_backfill_indexes_storage_truth() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -3212,27 +3208,25 @@ async fn test_create_index_reuses_row_cache_for_backfill() {
         ]
     );
 
+    // Rewrite the stored bytes out of band: the index backfill must index
+    // the current storage truth instead of the stale cached rows.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        for (id, name, age) in [(1_i64, "Alice", 30_i64), (2_i64, "Bob", 42_i64)] {
-            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        for (id, name, age) in [
+            (1_i64, "Alice-rewritten", 30_i64),
+            (2_i64, "Bob-rewritten", 42_i64),
+        ] {
+            let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
                 Value::Integer(id),
                 Value::String(name.to_string()),
                 Value::Integer(age),
             ]);
-            let corrupt_col_idx = 1usize;
-            let off_pos = 2 + corrupt_col_idx * 4;
-            let start =
-                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-            for byte in &mut corrupt_row[start..] {
-                *byte = 0xff;
-            }
 
             let key = format!(
                 "data:index_backfill_cache:{}",
                 fusiondb::common::encoding::encode_i64_comparable(id)
             );
-            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+            txn.put(key.as_bytes(), &updated_row).await.unwrap();
         }
         txn.commit().await.unwrap();
     }
@@ -3244,9 +3238,16 @@ async fn test_create_index_reuses_row_cache_for_backfill() {
     .await;
     assert!(msg.contains("indexed 2 rows"));
 
-    let (cols, rows) = query(
+    let (_, stale_rows) = query(
         &executor,
         "SELECT * FROM index_backfill_cache WHERE name = 'Bob'",
+    )
+    .await;
+    assert!(stale_rows.is_empty());
+
+    let (cols, rows) = query(
+        &executor,
+        "SELECT * FROM index_backfill_cache WHERE name = 'Bob-rewritten'",
     )
     .await;
     assert_eq!(cols, vec!["id", "name", "age"]);
@@ -3254,7 +3255,7 @@ async fn test_create_index_reuses_row_cache_for_backfill() {
         rows,
         vec![vec![
             Value::Integer(2),
-            Value::String("Bob".to_string()),
+            Value::String("Bob-rewritten".to_string()),
             Value::Integer(42)
         ]]
     );
@@ -3400,7 +3401,7 @@ async fn test_primary_key_in_projection_stream_skips_payload_decode() {
 }
 
 #[tokio::test]
-async fn test_primary_key_point_lookup_reuses_row_cache() {
+async fn test_primary_key_point_lookup_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -3418,20 +3419,16 @@ async fn test_primary_key_point_lookup_reuses_row_cache() {
         vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
     );
 
-    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+    // Rewrite the stored bytes out of band: the point lookup must decode
+    // the new bytes instead of serving the stale cached row.
+    let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
         Value::Integer(1),
-        Value::String("Alice".to_string()),
+        Value::String("Alice-rewritten".to_string()),
     ]);
-    let corrupt_col_idx = 1usize;
-    let off_pos = 2 + corrupt_col_idx * 4;
-    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-    for byte in &mut corrupt_row[start..] {
-        *byte = 0xff;
-    }
 
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        txn.put(b"data:pk_lookup_cache:8000000000000001", &corrupt_row)
+        txn.put(b"data:pk_lookup_cache:8000000000000001", &updated_row)
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -3440,13 +3437,16 @@ async fn test_primary_key_point_lookup_reuses_row_cache() {
     let (_, rows) = query(&executor, "SELECT * FROM pk_lookup_cache WHERE id = 1").await;
     assert_eq!(
         rows,
-        vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+        vec![vec![
+            Value::Integer(1),
+            Value::String("Alice-rewritten".to_string())
+        ]]
     );
     cleanup(&wal_path);
 }
 
 #[tokio::test]
-async fn test_primary_key_projection_reuses_full_row_cache() {
+async fn test_primary_key_projection_row_cache_tracks_storage_bytes() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -3472,21 +3472,17 @@ async fn test_primary_key_projection_reuses_full_row_cache() {
         ]]
     );
 
-    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+    // Rewrite the stored bytes out of band: the projected point lookup must
+    // decode the new bytes instead of serving the stale cached full row.
+    let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
         Value::Integer(1),
-        Value::String("Alice".to_string()),
+        Value::String("Alice-rewritten".to_string()),
         Value::String("payload".to_string()),
     ]);
-    let corrupt_col_idx = 1usize;
-    let off_pos = 2 + corrupt_col_idx * 4;
-    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-    for byte in &mut corrupt_row[start..] {
-        *byte = 0xff;
-    }
 
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        txn.put(b"data:pk_project_cache:8000000000000001", &corrupt_row)
+        txn.put(b"data:pk_project_cache:8000000000000001", &updated_row)
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -3494,7 +3490,10 @@ async fn test_primary_key_projection_reuses_full_row_cache() {
 
     let (cols, rows) = query(&executor, "SELECT name FROM pk_project_cache WHERE id = 1").await;
     assert_eq!(cols, vec!["name"]);
-    assert_eq!(rows, vec![vec![Value::String("Alice".to_string())]]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::String("Alice-rewritten".to_string())]]
+    );
     cleanup(&wal_path);
 }
 

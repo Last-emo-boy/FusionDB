@@ -209,7 +209,7 @@ async fn test_upsert_do_update_maintains_composite_index() {
 }
 
 #[tokio::test]
-async fn test_upsert_do_update_reuses_row_cache_for_existing_row() {
+async fn test_upsert_do_update_reads_existing_row_from_storage_truth() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -240,21 +240,17 @@ async fn test_upsert_do_update_reuses_row_cache_for_existing_row() {
         ]]
     );
 
-    let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+    // Rewrite the stored bytes out of band: the ON CONFLICT DO UPDATE must
+    // decode the new bytes instead of serving the stale cached row.
+    let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
         Value::Integer(1),
-        Value::String("Alice".to_string()),
+        Value::String("Alice-rewritten".to_string()),
         Value::Integer(10),
     ]);
-    let corrupt_col_idx = 1usize;
-    let off_pos = 2 + corrupt_col_idx * 4;
-    let start = u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-    for byte in &mut corrupt_row[start..] {
-        *byte = 0xff;
-    }
 
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        txn.put(b"data:upsert_reuse:8000000000000001", &corrupt_row)
+        txn.put(b"data:upsert_reuse:8000000000000001", &updated_row)
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -266,13 +262,15 @@ async fn test_upsert_do_update_reuses_row_cache_for_existing_row() {
     )
     .await;
 
-    let (cols, rows) = query(&executor, "SELECT * FROM upsert_reuse WHERE name = 'Alice'").await;
+    // The DO UPDATE only assigns val: name must reflect the rewritten storage
+    // bytes, not the stale cached 'Alice'.
+    let (cols, rows) = query(&executor, "SELECT * FROM upsert_reuse WHERE id = 1").await;
     assert_eq!(cols, vec!["id", "name", "val"]);
     assert_eq!(
         rows,
         vec![vec![
             Value::Integer(1),
-            Value::String("Alice".to_string()),
+            Value::String("Alice-rewritten".to_string()),
             Value::Integer(99)
         ]]
     );

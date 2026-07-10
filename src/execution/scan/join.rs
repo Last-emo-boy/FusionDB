@@ -713,15 +713,13 @@ impl Executor {
                 return Ok(Vec::new());
             };
             let data_key = self.routed_data_key_for_row_id(table_name, &row_id);
-            if let Some(row) = self.row_cache.get(&data_key) {
-                monitor::inc_row_cache_hit();
-                return Ok(vec![row]);
-            }
-
             let Some(data_bytes) = txn.get(data_key.as_bytes()).await? else {
                 return Ok(Vec::new());
             };
             monitor::inc_row_read();
+            if let Some(row) = self.row_cache_lookup(&data_key, &data_bytes) {
+                return Ok(vec![row]);
+            }
             let row =
                 Self::decode_row_for_projection(&data_bytes, projection_indices).map_err(|e| {
                     FusionError::Execution(format!("Data deserialization error: {}", e))
@@ -760,16 +758,14 @@ impl Executor {
                 }
             } else {
                 let data_key = self.routed_data_key_for_row_id(table_name, row_id);
-                if let Some(row) = self.row_cache.get(&data_key) {
-                    monitor::inc_row_cache_hit();
-                    rows.push(row);
-                    continue;
-                }
-
                 let Some(data_bytes) = txn.get(data_key.as_bytes()).await? else {
                     continue;
                 };
                 monitor::inc_row_read();
+                if let Some(row) = self.row_cache_lookup(&data_key, &data_bytes) {
+                    rows.push(row);
+                    continue;
+                }
                 let row = Self::decode_row_for_projection(&data_bytes, projection_indices)
                     .map_err(|e| {
                         FusionError::Execution(format!("Data deserialization error: {}", e))

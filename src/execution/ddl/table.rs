@@ -1,6 +1,5 @@
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
-use crate::monitor;
 use crate::storage::Transaction;
 use sqlparser::ast::{ColumnOption, Expr, TableConstraint};
 use std::collections::HashSet;
@@ -477,9 +476,6 @@ impl Executor {
                 .await?;
             for (k, _) in kv_pairs {
                 txn.delete(&k).await?;
-                if let Ok(key_str) = std::str::from_utf8(&k) {
-                    self.row_cache.invalidate(key_str);
-                }
             }
 
             let mut index_entries = self
@@ -526,9 +522,6 @@ impl Executor {
                 .await?;
             for (k, _) in &kv_pairs {
                 txn.delete(k).await?;
-                if let Ok(key_str) = std::str::from_utf8(k) {
-                    self.row_cache.invalidate(key_str);
-                }
             }
             count += kv_pairs.len();
 
@@ -668,8 +661,7 @@ impl Executor {
                                 for (k, v) in rows {
                                     let key_str = std::str::from_utf8(&k).ok();
                                     let row = if let Some(key_str) = key_str {
-                                        if let Some(row) = self.row_cache.get(key_str) {
-                                            monitor::inc_row_cache_hit();
+                                        if let Some(row) = self.row_cache_lookup(key_str, &v) {
                                             Some(row)
                                         } else {
                                             crate::common::encoding::RowDecoder::decode(&v).ok()
@@ -684,9 +676,6 @@ impl Executor {
                                             let new_v =
                                                 crate::common::encoding::RowEncoder::encode(&row);
                                             txn.put(&k, &new_v).await?;
-                                            if let Some(key_str) = key_str {
-                                                self.row_cache.invalidate(key_str);
-                                            }
                                         }
                                     }
                                 }
@@ -857,8 +846,7 @@ impl Executor {
                 .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?
                 .to_string();
 
-            let pk_value = if let Some(row) = self.row_cache.get(key_str) {
-                monitor::inc_row_cache_hit();
+            let pk_value = if let Some(row) = self.row_cache_lookup(key_str, &value) {
                 row.get(column_idx).cloned().unwrap_or(Value::Null)
             } else {
                 crate::common::encoding::RowDecoder::decode_column(&value, column_idx)
@@ -923,8 +911,6 @@ impl Executor {
                 }
                 txn.delete(&old_key).await?;
                 txn.put(new_key.as_bytes(), &value).await?;
-                self.row_cache.invalidate(&old_key_str);
-                self.row_cache.invalidate(&new_key);
                 self.rewrite_row_id_references_for_primary_key(
                     table_name,
                     schema,

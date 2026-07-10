@@ -1268,7 +1268,7 @@ async fn test_alter_table_rejects_single_column_include_index_dependencies() {
 }
 
 #[tokio::test]
-async fn test_alter_table_drop_column_reuses_row_cache() {
+async fn test_alter_table_drop_column_rewrites_storage_truth() {
     let wal_path = format!("test_{}.wal", uuid::Uuid::new_v4());
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
     let executor = Arc::new(Executor::new(storage.clone()));
@@ -1301,27 +1301,25 @@ async fn test_alter_table_drop_column_reuses_row_cache() {
         ]
     );
 
+    // Rewrite the stored bytes out of band: the DROP COLUMN row rewrite must
+    // work from the CURRENT storage bytes, never from stale cached rows.
     {
         let mut txn = storage.begin_transaction().await.unwrap();
-        for (id, name, age) in [(1_i64, "Alice", 30_i64), (2_i64, "Bob", 25_i64)] {
-            let mut corrupt_row = fusiondb::common::encoding::RowEncoder::encode(&[
+        for (id, name, age) in [
+            (1_i64, "Alice-rewritten", 30_i64),
+            (2_i64, "Bob-rewritten", 25_i64),
+        ] {
+            let updated_row = fusiondb::common::encoding::RowEncoder::encode(&[
                 Value::Integer(id),
                 Value::String(name.to_string()),
                 Value::Integer(age),
             ]);
-            let corrupt_col_idx = 1usize;
-            let off_pos = 2 + corrupt_col_idx * 4;
-            let start =
-                u32::from_le_bytes(corrupt_row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-            for byte in &mut corrupt_row[start..] {
-                *byte = 0xff;
-            }
 
             let key = format!(
                 "data:drop_cache:{}",
                 fusiondb::common::encoding::encode_i64_comparable(id)
             );
-            txn.put(key.as_bytes(), &corrupt_row).await.unwrap();
+            txn.put(key.as_bytes(), &updated_row).await.unwrap();
         }
         txn.commit().await.unwrap();
     }
@@ -1333,8 +1331,14 @@ async fn test_alter_table_drop_column_reuses_row_cache() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::String("Alice".to_string())],
-            vec![Value::Integer(2), Value::String("Bob".to_string())]
+            vec![
+                Value::Integer(1),
+                Value::String("Alice-rewritten".to_string())
+            ],
+            vec![
+                Value::Integer(2),
+                Value::String("Bob-rewritten".to_string())
+            ]
         ]
     );
     cleanup(&wal_path);

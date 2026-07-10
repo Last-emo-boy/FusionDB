@@ -140,8 +140,7 @@ impl Executor {
         };
         for (k, v) in kv_pairs {
             let mut row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
-                if let Some(row) = self.row_cache.get(key_str) {
-                    monitor::inc_row_cache_hit();
+                if let Some(row) = self.row_cache_lookup(key_str, &v) {
                     row
                 } else {
                     crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
@@ -237,9 +236,6 @@ impl Executor {
 
                 let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
                 txn.put(&k, &new_value_bytes).await?;
-                if let Ok(key_str) = std::str::from_utf8(&k) {
-                    self.row_cache.invalidate(key_str);
-                }
 
                 self.update_trigram_index_for_update(
                     &table_name_str,
@@ -488,8 +484,7 @@ impl Executor {
             }));
         };
 
-        let mut row: Vec<Value> = if let Some(cached) = self.row_cache.get(&key) {
-            monitor::inc_row_cache_hit();
+        let mut row: Vec<Value> = if let Some(cached) = self.row_cache_lookup(&key, &value) {
             cached
         } else {
             crate::common::encoding::RowDecoder::decode(&value)
@@ -518,7 +513,6 @@ impl Executor {
 
         let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
         txn.put(key.as_bytes(), &new_value_bytes).await?;
-        self.row_cache.invalidate(&key);
         monitor::inc_row_write();
 
         Ok(Some(QueryResult::Success {

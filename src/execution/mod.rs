@@ -459,10 +459,23 @@ pub struct Executor {
     simple_pk_update_fast_path_cache: Cache<String, bool>,
     query_result_epoch: AtomicU64,
     prepared_statements: RwLock<PreparedStatementStore>,
-    pub(crate) row_cache: Cache<String, Vec<Value>>,
+    pub(crate) row_cache: Cache<String, CachedRow>,
     pub(crate) sql_bulk_scan_no_fill: bool,
     pub(crate) vector_index: Arc<VectorIndex>,
     pub(crate) embedding_registry: Arc<EmbeddingRegistry>,
+}
+
+/// A decoded row paired with the exact encoded bytes it was decoded from.
+///
+/// The row cache is validated by byte identity: a cached row may only be
+/// used when the caller holds encoded bytes identical to `encoded`. This
+/// makes the cache immune to MVCC staleness by construction — a snapshot
+/// read that resolves different bytes (an older or newer row version) can
+/// never match, so no invalidation protocol is required for correctness.
+#[derive(Clone)]
+pub(crate) struct CachedRow {
+    encoded: Arc<[u8]>,
+    row: Vec<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -556,6 +569,31 @@ impl Executor {
         } else {
             StorageScanOptions::fill_cache()
         }
+    }
+
+    /// Byte-identity-validated row cache lookup: returns the cached decoded
+    /// row only when `encoded` is exactly the bytes the entry was decoded
+    /// from. A mismatch (any other MVCC version of the row) is a miss.
+    pub(crate) fn row_cache_lookup(&self, key: &str, encoded: &[u8]) -> Option<Vec<Value>> {
+        let cached = self.row_cache.get(key)?;
+        if cached.encoded.as_ref() == encoded {
+            monitor::inc_row_cache_hit();
+            Some(cached.row)
+        } else {
+            None
+        }
+    }
+
+    /// Store a decoded row together with the encoded bytes it came from.
+    /// Only full (unprojected) rows may be stored.
+    pub(crate) fn row_cache_store(&self, key: String, encoded: &[u8], row: &[Value]) {
+        self.row_cache.insert(
+            key,
+            CachedRow {
+                encoded: Arc::from(encoded),
+                row: row.to_vec(),
+            },
+        );
     }
 
     pub(crate) fn sql_block_zone_map_pruning_enabled(&self) -> bool {
@@ -6233,5 +6271,104 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// A cache entry whose encoded bytes differ from the bytes resolved by
+    /// the current read must be ignored (BENCHPROD-463: the pre-fix cache
+    /// validated nothing, so a stale entry poisoned every later reader).
+    #[tokio::test]
+    async fn row_cache_hit_requires_byte_identity() {
+        let wal_path = format!("test_row_cache_bytes_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage);
+        executor
+            .execute_sql("CREATE TABLE rc_bytes (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .expect("create table");
+        executor
+            .execute_sql("INSERT INTO rc_bytes VALUES (1, 'truth')")
+            .await
+            .expect("insert");
+
+        let row_id = Executor::value_to_primary_row_id(&Value::Integer(1)).expect("row id");
+        let key = executor.routed_data_key_for_row_id("rc_bytes", &row_id);
+        executor.row_cache.insert(
+            key,
+            CachedRow {
+                encoded: Arc::from(&b"stale-version-bytes"[..]),
+                row: vec![Value::Integer(1), Value::String("poison".to_string())],
+            },
+        );
+
+        let results = executor
+            .execute_sql("SELECT v FROM rc_bytes WHERE id = 1")
+            .await
+            .expect("select");
+        match results.as_slice() {
+            [QueryResult::Select { rows, .. }] => {
+                assert_eq!(rows, &vec![vec![Value::String("truth".to_string())]]);
+            }
+            other => panic!("expected select result, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// A transaction pinned to an older MVCC snapshot must not observe a
+    /// newer row version through the row cache (BENCHPROD-463: the pre-fix
+    /// cache returned whatever version was cached last, breaking snapshot
+    /// isolation for explicit transactions).
+    #[tokio::test]
+    async fn row_cache_does_not_leak_newer_version_into_snapshot() {
+        let data_dir =
+            std::path::PathBuf::from(format!("test_row_cache_snap_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = crate::config::StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let fusion = crate::storage::fusion::FusionStorage::with_config(
+            &wal_path.to_string_lossy(),
+            &config,
+        )
+        .await
+        .expect("fusion storage");
+        let storage: Arc<dyn Storage> = Arc::new(fusion);
+        let executor = Executor::new(storage.clone());
+
+        executor
+            .execute_sql("CREATE TABLE rc_snap (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .expect("create table");
+        executor
+            .execute_sql("INSERT INTO rc_snap VALUES (1, 'old')")
+            .await
+            .expect("insert");
+
+        let mut old_snapshot_txn = storage.begin_transaction().await.expect("begin txn");
+
+        executor
+            .execute_sql("UPDATE rc_snap SET v = 'new' WHERE id = 1")
+            .await
+            .expect("update");
+        executor
+            .execute_sql("SELECT * FROM rc_snap WHERE id = 1")
+            .await
+            .expect("warm cache with new version");
+
+        let statements = parse_sql("SELECT v FROM rc_snap WHERE id = 1").expect("parse");
+        let result = executor
+            .execute_in_transaction(&statements[0], &mut *old_snapshot_txn)
+            .await
+            .expect("snapshot select");
+        match result {
+            QueryResult::Select { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::String("old".to_string())]]);
+            }
+            other => panic!("expected select result, got {other:?}"),
+        }
+        old_snapshot_txn.rollback().await.expect("rollback");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

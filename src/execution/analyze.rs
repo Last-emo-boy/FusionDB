@@ -456,7 +456,7 @@ impl Executor {
             row_count += 1;
             let key_str = std::str::from_utf8(&key).ok();
             let row = if let Some(key_str) = key_str {
-                if let Some(row) = self.row_cache.get(key_str) {
+                if let Some(row) = self.row_cache_lookup(key_str, &bytes) {
                     row
                 } else {
                     crate::common::encoding::RowDecoder::decode(&bytes).map_err(|e| {

@@ -1,6 +1,5 @@
 use crate::catalog::{IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
-use crate::monitor;
 use crate::storage::Transaction;
 use sqlparser::ast::Expr;
 use std::collections::HashMap;
@@ -250,8 +249,7 @@ impl Executor {
             let col_idx = target_col_indices[0];
             let col_name = &target_col_names[0];
             let (val, payload) = if include_col_indices.is_empty() {
-                let val = if let Some(row) = self.row_cache.get(key_str) {
-                    monitor::inc_row_cache_hit();
+                let val = if let Some(row) = self.row_cache_lookup(key_str, &v) {
                     row.get(col_idx).cloned()
                 } else {
                     crate::common::encoding::RowDecoder::decode_column(&v, col_idx).map_err(
@@ -260,8 +258,7 @@ impl Executor {
                 };
                 (val, Vec::new())
             } else {
-                let row = if let Some(row) = self.row_cache.get(key_str) {
-                    monitor::inc_row_cache_hit();
+                let row = if let Some(row) = self.row_cache_lookup(key_str, &v) {
                     row
                 } else {
                     crate::common::encoding::RowDecoder::decode(&v).map_err(|e| {
