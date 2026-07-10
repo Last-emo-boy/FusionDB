@@ -1,0 +1,33 @@
+{
+  "id": "BENCHPROD-465",
+  "title": "Commit-deferred side-index mutations (trigram/HNSW)",
+  "phase": "Correctness (commercial-parity track)",
+  "status": "done",
+  "discovery": "trigram and HNSW in-memory indexes were mutated DIRECTLY during DML, before OCC validation — an aborted or rolled-back transaction left phantom entries with no compensation path.",
+  "design": {
+    "mechanism": "InnoDB-FTS-style deferral (from commercial-parity research): FusionTransaction.side_index_deltas: Mutex<Vec<SideIndexDelta>> (TrigramAdd/TrigramRemove/VectorInsert/VectorDelete in storage/fusion.rs); Executor helpers buffer on the Fusion backend; FusionTransaction::commit applies via apply_side_index_deltas() inside the commit lock, after OCC + WAL durability + memtable publication, BEFORE the current_ts visibility watermark; rollback drops the buffer; empty-write-buffer commits still apply deltas",
+    "division": "constraint keys (464 sentinels) go INTO the OCC write set; search-index deltas stay OUT of it — the research-mandated distinction",
+    "pre_commit_validation": "defer_or_apply_vector_insert validates dimensions against the index's established dimension at DEFER time (VectorIndex::validate_insert_dimensions) so a mismatched EMBEDDING() fails the statement pre-commit — post-commit apply errors would otherwise be silently logged",
+    "reverted_scope_creep": "an Array->Vector coercion for SQL vector literals was added mid-ticket and REVERTED after adversarial review live-reproduced its blast radius: pgwire wire-format/OID flip (FLOAT8_ARRAY -> TEXT Debug), f32-widened JSON output, COPY FROM and pgwire text-param hard failures, comparison queries aborting, no migration for legacy Array rows, restart poisoning via dimension-less validation. Vector-literal ingestion needs its own designed ticket (BENCHPROD-467)."
+  },
+  "sites": "3 trigram helpers rewritten to defer (dml/mod.rs); 8 HNSW sites migrated to defer_or_apply_vector_{insert,delete} (insert.rs x4 incl. a rustfmt-split site that single-line greps missed, update.rs, delete.rs, ddl/table.rs ALTER rewrite, ddl/index.rs backfill); MemoryStorage keeps direct application (no OCC, test-only)",
+  "verification": {
+    "fmt_clippy_diff": "clean",
+    "lib": "563",
+    "integration": "sql_index_cache +3 (trigram deferred: uncommitted invisible / rollback clean / commit applies; vector deferred via EMBEDDING(); OCC-abort drops loser's deltas, winner's postings only)",
+    "adversarial_review": "4-dimension find->verify (21 agents, ~1.74M tok, 16 confirmed / 1 rejected): the rejected one (empty-write-buffer commit drops deltas) was fixed mid-review; coercion findings resolved by REVERT; dimension-mismatch silent-swallow fixed by defer-time validation; overclaiming crash-recovery comment reworded; remaining confirmed items are disclosed trade-offs or pre-existing gaps ticketed separately",
+    "all_targets": "green (known reverse_seek_sidecar flaky excepted when it fires)"
+  },
+  "disclosures": [
+    "in-transaction read-your-own-writes narrowed: an uncommitted INSERT's text/vector is not visible to trigram-accelerated LIKE or HNSW search within the same explicit transaction until commit (was visible pre-465 via direct mutation); mitigations (search-side delta merge) are future work",
+    "trigram durability remains checkpoint-granular (pre-existing, unchanged): postings committed after the last checkpoint are lost on crash; vector index self-heals via startup rebuild",
+    "commit-time TrigramRemove/VectorDelete drop entries still MVCC-visible to older snapshots (narrower than the pre-465 pre-commit removal; candidates are re-verified so no wrong rows, only earlier index-miss for old snapshots)",
+    "CREATE INDEX USING HNSW registers the named index directly; an aborted CREATE INDEX can leave an empty registered index",
+    "post-commit apply errors (should now be structurally prevented by defer-time validation) are logged loudly, not raised"
+  ],
+  "followups": [
+    "BENCHPROD-467: SQL vector-literal ingestion end-to-end (coercion + pgwire/JSON wire format for Vector + pgvector-style string parsing + declared-dimension validation + legacy-Array migration + read-path index usage for literals)",
+    "BENCHPROD-466 series: Raft snapshot install rebuilds vector index but NOT trigram (replace_visible_storage) — fold into distributed coherence work",
+    "search-side merge of pending side-index deltas for in-txn RYOW"
+  ]
+}

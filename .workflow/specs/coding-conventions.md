@@ -1050,3 +1050,19 @@ CREATE TABLE and ALTER TABLE column identity now use sqlparser Ident.value via a
 执行层 row cache 自 4d2fcfc 起为 CachedRow{encoded: Arc<[u8]>, row},命中条件=调用方本次从存储解析出的字节与缓存字节 memcmp 相等(execution/mod.rs row_cache_lookup/row_cache_store)。禁止任何绕过 helper 的 row_cache.get/insert;禁止重新引入 per-key invalidate(正确性不依赖失效,唯一保留 Raft 快照 invalidate_all)。新点查路径顺序:covered → key_only_scan(零存储)→ txn.get → 字节验证 → 解码+store(仅全行)。row_read=每次存储取行(含验证命中)。测试契约:带外改写存储字节必须战胜缓存(*_tracks_storage_bytes/*_storage_truth 系列);投毒与旧快照回归测试在 execution::tests。
 
 </spec-entry>
+
+<spec-entry category="coding" keywords="unique,sentinel,occ,contract" date="2026-07-10" title="UNIQUE sentinel 契约(BENCHPROD-464)" source="main@3c5c35a">
+
+### UNIQUE sentinel 契约(BENCHPROD-464)
+
+自 8eea8af 起,单列非 PK UNIQUE 的并发安全由 sentinel 键保证:unique:<table>:<col>:<value_str>(分片变体 shard:N:unique:...,按值哈希路由),值编码=value_to_index_string,fallback FNV-1a-64(bincode,-0.0 规范化)。任何新的行写入路径(INSERT 变体/UPSERT/UPDATE/恢复/复制)必须调用 dml/mod.rs 的 put_unique_sentinels_for_row / migrate_unique_sentinels_for_update / delete_unique_sentinels_for_row;共享验证器 validate_unique_columns_for_update(old_row=&[] 表示全新行)负责已提交重复扫描,禁止再写内联 UNIQUE 扫描。sentinel 值(row_id)从不被读——只作 OCC 碰撞锚。已知良性:ALTER DROP/RENAME 孤儿 sentinel、列名含':'歧义(保守误杀)。
+
+</spec-entry>
+
+<spec-entry category="coding" keywords="side-index,trigram,hnsw,deferral,commit" date="2026-07-10" title="side-index 提交耦合契约(BENCHPROD-465)" source="main@3c5c35a">
+
+### side-index 提交耦合契约(BENCHPROD-465)
+
+自本票起,trigram/HNSW 在事务上下文中禁止直接修改:必须经 dml/mod.rs 的 update_trigram_index_for_* 与 defer_or_apply_vector_{insert,delete}(Fusion 后端缓冲 SideIndexDelta,commit 在 commit_lock 内 OCC+WAL+memtable 后、current_ts 前统一应用;rollback 丢弃)。向量插入在 defer 时必须过 validate_insert_dimensions(错维提交前报错)。多行调用形态用结构化搜索防漏检(单行 grep 曾漏 rustfmt 断行站点)。已知设计代价:事务内 RYOW 收窄(LIKE/向量搜索见不到本事务未提交写)。VECTOR 字面量摄入禁止随手加 coercion——线格式/OID/迁移影响面已实测,走 467 设计票。
+
+</spec-entry>
