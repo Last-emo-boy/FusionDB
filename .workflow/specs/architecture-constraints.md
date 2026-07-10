@@ -666,3 +666,11 @@ Two read-only subagents completed after the s3 fail-open tests. Keyspace subagen
 268 万行 xlarge 全量(afed057,468 修复后):索引/点查商业级(索引 7.2ms、点查 6ms、加速比 836×、单行事务写 10-24ms);LIKE 2.3×/DISTINCT 2.7× 优于 07-08 基线;但扫描/OLAP 出现基线不曾有的病态:Full scan 6.0s(基线 1.6s)、IN list 5.6s、Revenue 12.6s、Range id>N LIMIT 100 达 12s、Avg order value 37s、并发 read-heavy 60s 超时×6。已排除 SSTable 堆积(仅 3 个)与 bloom 饱和(468 已修)。BENCHPROD-469:用 8a12c0f 存档点 vs HEAD 同数据集受控 A/B,首刀 Range LIMIT 12s。教训:large(228k)全绿≠xlarge 无回归,规模敏感路径必须 xlarge 门禁。报告存档 .workflow/.csv-wave/20260710-xlarge-capability-snapshot.json
 
 </spec-entry>
+
+<spec-entry category="arch" keywords="xlarge,capability-report,对标,并发,limit-pushdown" date="2026-07-10" title="xlarge 能力报告解读 v1(2026-07-10,268 万行 103 项)" description="268万行xlarge全量基准的完整解读:二态系统格局、对标商业库位置评估、三层慢端问题与优先级" source="main@a1462d2">
+
+### xlarge 能力报告解读 v1(2026-07-10,268 万行 103 项)
+
+核心格局:二态系统——命中索引/摘要=商业级,跌落全表扫描=秒级(落后 1-2 数量级),无中间地带。【快端·商业级】GROUP BY 结果缓存 0.58ms;索引计数摘要 1.7-4.6ms(City distribution/Stock by category 等,不碰行);PK 点查 6.0-6.4ms、二级索引 7.2ms(50 万行表,HTTP 协议,pgwire 再快 ~10×)→ OLTP 点查/索引读与商业库同量级。【写入·合格】单行 8-23ms 真 fsync(Single UPDATE 8.2/INSERT 13.8/Record transfer 23.5),商业库 NVMe 1-5ms,差距 2-5×,主因 group commit 批次小+同步索引维护;装载 19.4k 行/s(468 修复后)。【慢端三层】①已修:bloom 定容装载塌方(468);②已定位未修(469):Range id>N LIMIT 100=12-29s——LIMIT 未下推到带谓词 PK 区间路径,25 万行物化后截断(对照:100 行小区间同查询 31ms,机制在、参数丢);val=42 LIMIT=6.2s 有索引不走;Avg order value 37s/Subquery IN 24s/Revenue 12.6s 为同类复合;③结构性:并发脆弱——Read-heavy 80:20 均值 8.6s+426 个 60s 超时错误,Balanced 247 错,机理=秒级扫描占满 32 线程→点查排队雪崩(队头阻塞),缺查询超时/准入控制/资源分组。【基线对比可信项】LIKE 2.3×、DISTINCT 2.7× 真实进步(7 月 trigram/块剪枝生效);Full scan 1591→6003ms 不完全可比(数据+17.5%、基线无 zone-map 层)但扣除后仍有真实回归(469 查)。【对标位置】OLTP 读=同量级✅;单行写=2-5×🟡;OLAP 扫描=1-2 数量级🔴(正解=批量列式 kernel,CRDB 同构证明 4× TPC-H);并发鲁棒=最弱🔴;正确性=463/464/465 修完后最接近商业标准(并发下不给错数据只会慢)。一句话:能当很快的 KV+索引库,不能当分析库,高并发需护栏。优先级:469 两缺陷(便宜收益大)→查询超时护栏→批量列式扫描。原始报告:.workflow/.csv-wave/20260710-xlarge-capability-snapshot.json(已入库 a1462d2)
+
+</spec-entry>
