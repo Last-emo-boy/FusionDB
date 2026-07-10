@@ -658,3 +658,11 @@ Two read-only subagents completed after the s3 fail-open tests. Keyspace subagen
 5 路带源调研(PG index-locking/GIN、CRDB/TiDB unique-key、Qdrant/Milvus/LanceDB、proposer-evaluated KV、CRDB vectorized)合成的分级清单。P0 正确性:①side-index(trigram/HNSW)提交耦合延迟应用——per-txn delta buffer,OCC 验证通过后在 commit lock 内应用,abort 即丢弃(InnoDB FTS 模式,零 undo);②UNIQUE sentinel key——复合唯一检查是未验证的 prefix 扫描(composite_index.rs:709-714),并发同值双提交;修复=向 write_buffer 额外写不含 row_id 的 sentinel key(值=row_id),现有 exact-key OCC 使败者确定性 abort(CRDB/TiDB 形态);NULL 跳过,DELETE 写墓碑,UPDATE 迁移;单列路径 insert.rs:481-503 同样审计;③Raft 复制 OCC 写集而非 SQL 文本(UUID/NOW 发散)+ pgwire DML 接入 Raft + vote/log 持久化。P1:读路径 candidate-then-verify(PG 核心不变式,残留索引垃圾无害化);向量索引=持久化列重建+delta map+tombstone 过滤(共识:不做 graph WAL,10x 放大且 hora 不支持;>1M 向量换 usearch);批量列式扫描 kernel(CRDB 同构证明 70x micro/4x TPC-H);fan-out 改为复制数据上的计算分区。P2:块级 PREWHERE、morsel 调度、自适应谓词重排、SSTable 侧车文本索引、HNSW 快照加速。冲突裁决:约束键必须进 OCC 写集,搜索索引 delta 必须不进——txn buffer 设计需显式编码此区分。全文:.workflow 调研 workflow wf_33111aa5-032 journal。
 
 </spec-entry>
+
+<spec-entry category="arch" keywords="xlarge,capability,regression,scan" date="2026-07-10" title="xlarge 能力快照与规模敏感回归(2026-07-10)" source="main@27935da">
+
+### xlarge 能力快照与规模敏感回归(2026-07-10)
+
+268 万行 xlarge 全量(afed057,468 修复后):索引/点查商业级(索引 7.2ms、点查 6ms、加速比 836×、单行事务写 10-24ms);LIKE 2.3×/DISTINCT 2.7× 优于 07-08 基线;但扫描/OLAP 出现基线不曾有的病态:Full scan 6.0s(基线 1.6s)、IN list 5.6s、Revenue 12.6s、Range id>N LIMIT 100 达 12s、Avg order value 37s、并发 read-heavy 60s 超时×6。已排除 SSTable 堆积(仅 3 个)与 bloom 饱和(468 已修)。BENCHPROD-469:用 8a12c0f 存档点 vs HEAD 同数据集受控 A/B,首刀 Range LIMIT 12s。教训:large(228k)全绿≠xlarge 无回归,规模敏感路径必须 xlarge 门禁。报告存档 .workflow/.csv-wave/20260710-xlarge-capability-snapshot.json
+
+</spec-entry>

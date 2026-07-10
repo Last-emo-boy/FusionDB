@@ -48,3 +48,11 @@ A parallel test run exposed an early EOF failure opening a freshly flushed SSTab
 多次 --all-targets 高负载运行中偶发失败的 lib 测试终于捕获名字:storage::sstable::tests::reverse_iterator_uses_persisted_reverse_seek_sidecar(FRSK 反向 seek sidecar)。单独运行稳定通过,仅在全量并行+高系统负载下偶发,疑似时序/文件系统竞态。与 BENCHPROD-463/464 改动无关(未触 sstable)。待专项修复:审查该测试的 sidecar 持久化等待逻辑。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="bloom,saturation,xlarge,metrics-delta" date="2026-07-10" title="bloom 定容塌方与定位方法(BENCHPROD-468)" source="main@27935da">
+
+### bloom 定容塌方与定位方法(BENCHPROD-468)
+
+xlarge 装载 O(n)/批塌方根因:SsTableBuilder 四个 bloom 硬编码 expected_items(100k),32MB memtable flush 携带 30-50 万键,饱和后不存在键 100% 假阳性,PK 查重每 SSTable 真实块读。修复=set_expected_filter_items 按 flush(memtable len)/compaction(输入 entry_count 和)定容。定位方法论:单批 /metrics 增量(filter positive==check 即铁证)>> 猜测;隔离微重现(单表千行批推到 50 万行看曲线)使二分不必要。中小规模永远暴露不了装不满 memtable 的缺陷——容量类改动必须过 xlarge。
+
+</spec-entry>
