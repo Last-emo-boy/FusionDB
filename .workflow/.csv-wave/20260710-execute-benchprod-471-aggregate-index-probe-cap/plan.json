@@ -1,0 +1,13 @@
+{
+  "id": "BENCHPROD-471",
+  "title": "Column-aggregate index scan: unbounded per-row point gets on low-selectivity predicates",
+  "phase": "Perf (xlarge Analytics hotspots)",
+  "status": "done",
+  "discovery": "Avg order value (SELECT AVG(total) FROM orders WHERE status='delivered') = 44s warm at xlarge. Metrics: 100,001 point probes — the aggregate-only projection routes to simple_column_aggregate_index_scan (column_scan.rs), which scans ALL index entries for the Eq value then point-gets EVERY row with NO candidate cap. status has ~50% selectivity -> 100k random gets @ ~440us. Dissection had two honest corrections (recorded): first suspected try_index_scan (it has a complete cap/abandon mechanism, index_candidate_cap default 1024 — innocent), then stats_guided gate (wrong family entirely). Lesson: the same logical query routes to DIFFERENT execution families per projection shape; gates must be audited per family.",
+  "fix": "COLUMN_AGGREGATE_INDEX_PROBE_CAP = 4096: the index-entry scan is bounded to cap+1, and exceeding the cap declines the fast path (Ok(None)) so the caller falls through to simple_column_aggregate_scan's batched full scan (breakeven ~point-get cost x cap vs sequential batch scan)",
+  "verification": {
+    "xlarge": "Avg order value 44,087ms -> 808ms warm (55x), aggregate value bit-identical (1277.5031...); COUNT same-shape 711ms; small-hit index path preserved (bench_idx val=42 via capped path)",
+    "gate": "fmt/clippy/--all-targets"
+  },
+  "followups": ["Revenue by category 10s = suspected group_by variant of the same family (group_by_count/aggregate_column_scan) — same cap pattern, measure first", "stats-aware refinement: when ANALYZE stats exist, decline before even scanning index entries"]
+}
