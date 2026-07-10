@@ -3855,3 +3855,64 @@ async fn test_occ_abort_drops_side_index_deltas() {
     );
     cleanup_storage_dir(&data_dir);
 }
+
+/// BENCHPROD-466d: a Raft snapshot install (replace_visible_entries_for_snapshot)
+/// previously rebuilt only the vector index; trigram postings survived from
+/// pre-snapshot state (or were missing on a fresh follower). It must now
+/// rebuild the trigram index from the installed rows.
+#[tokio::test]
+async fn test_snapshot_install_rebuilds_trigram_index() {
+    let (executor, fusion, data_dir) = setup_fusion_storage("snapshot_trigram").await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE snap_docs (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE INDEX idx_snap_docs_body ON snap_docs (body)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO snap_docs VALUES (1, 'snapshot needle text'), (2, 'other text')",
+    )
+    .await;
+
+    // Export the visible state the way the Raft snapshot path does.
+    let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+    let entries = {
+        let txn = storage.begin_transaction().await.unwrap();
+        txn.scan_range(b"", &[0xff], None).await.unwrap()
+    };
+
+    // Simulate a fresh follower: wipe the in-memory trigram index, then
+    // install the snapshot. The install must rebuild the postings.
+    *fusion.trigram_index.write().unwrap() = fusiondb::storage::trigram::TrigramIndex::new();
+    {
+        let guard = fusion.trigram_index.read().unwrap();
+        assert!(guard.search("snap_docs", "body", "%needle%").is_none());
+    }
+
+    fusion
+        .replace_visible_entries_for_snapshot(b"", &[0xff], &entries)
+        .await
+        .unwrap();
+
+    let row_keys = {
+        let guard = fusion.trigram_index.read().unwrap();
+        let ids = guard
+            .search("snap_docs", "body", "%needle%")
+            .expect("snapshot install must rebuild trigram postings");
+        guard.map_ids_to_row_keys("snap_docs", &ids)
+    };
+    assert_eq!(row_keys, vec![encoded_row_id(1)]);
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT id FROM snap_docs WHERE body LIKE '%needle%'",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+    cleanup_storage_dir(&data_dir);
+}

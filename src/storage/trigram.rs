@@ -22,6 +22,23 @@ pub fn trigrams_bytes(s: &str) -> Vec<u32> {
     out
 }
 
+/// Stable numeric id for a row key: comparable-encoded integers decode
+/// directly, plain integers parse, anything else hashes deterministically.
+/// (Moved from the executor so the storage-level rebuild can share it.)
+pub fn numeric_row_id_for_str(row_id: &str) -> u64 {
+    if let Some(n) = crate::common::encoding::decode_i64_comparable(row_id) {
+        n as u64
+    } else if let Ok(n) = row_id.parse::<u64>() {
+        n
+    } else {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        row_id.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TrigramIndex {
     // table_name -> column_name -> trigram -> bitmap(row_id)

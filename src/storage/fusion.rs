@@ -2084,7 +2084,78 @@ impl FusionStorage {
 
         self.vector_index.clear();
         self.rebuild_vector_index().await;
+        *self.trigram_index.write().unwrap() = crate::storage::trigram::TrigramIndex::new();
+        self.rebuild_trigram_index().await;
         Ok(())
+    }
+
+    /// Rebuild the trigram fuzzy-text index from visible rows. Mirrors
+    /// rebuild_vector_index; used after a Raft snapshot install, which
+    /// previously rebuilt only the vector index and left trigram-served
+    /// LIKE queries answering from pre-snapshot state (BENCHPROD-466d).
+    async fn rebuild_trigram_index(&self) {
+        println!("Rebuilding Trigram Index from Storage...");
+        let txn = match self.begin_transaction().await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Failed to begin transaction for trigram rebuild: {:?}", e);
+                return;
+            }
+        };
+
+        let prefix = "schema:";
+        let kv_pairs = match txn.scan_prefix(prefix.as_bytes(), None).await {
+            Ok(kv) => kv,
+            Err(e) => {
+                eprintln!("Failed to scan schemas: {:?}", e);
+                return;
+            }
+        };
+
+        for (k, v) in kv_pairs {
+            let Ok(key_str) = std::str::from_utf8(&k) else {
+                continue;
+            };
+            let Some(table_name) = key_str.strip_prefix(prefix) else {
+                continue;
+            };
+            let Ok(schema) = bincode::deserialize::<crate::catalog::TableSchema>(&v) else {
+                continue;
+            };
+            let trigram_cols: Vec<(usize, String)> = schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| col.is_trigram_text_column())
+                .map(|(idx, col)| (idx, col.name.clone()))
+                .collect();
+            if trigram_cols.is_empty() {
+                continue;
+            }
+
+            let data_prefix = vector_rebuild_data_prefix_for_table(table_name);
+            let Ok(data_pairs) = txn.scan_prefix(data_prefix.as_bytes(), None).await else {
+                continue;
+            };
+            let mut idx_lock = self.trigram_index.write().unwrap();
+            for (dk, dv) in data_pairs {
+                let Some(row_id) = std::str::from_utf8(&dk)
+                    .ok()
+                    .and_then(|key| key.rsplit(':').next())
+                else {
+                    continue;
+                };
+                let numeric_id = crate::storage::trigram::numeric_row_id_for_str(row_id);
+                for (col_idx, col_name) in &trigram_cols {
+                    if let Ok(Some(crate::common::Value::String(text))) =
+                        crate::common::encoding::RowDecoder::decode_column(&dv, *col_idx)
+                    {
+                        idx_lock.add_with_id_str(table_name, col_name, numeric_id, row_id, &text);
+                    }
+                }
+            }
+        }
+        println!("Trigram Index Rebuild Complete.");
     }
 
     async fn rebuild_vector_index(&self) {

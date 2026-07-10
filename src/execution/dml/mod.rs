@@ -301,10 +301,7 @@ impl Executor {
     pub(crate) fn indexed_trigram_text_columns(schema: &TableSchema) -> Vec<usize> {
         let mut indices = Vec::with_capacity(schema.columns.len());
         for (idx, col) in schema.columns.iter().enumerate() {
-            if is_trigram_text_data_type(&col.data_type)
-                && col.is_indexed
-                && matches!(col.index_type, IndexType::BTree | IndexType::FTS)
-            {
+            if col.is_trigram_text_column() {
                 indices.push(idx);
             }
         }
@@ -509,17 +506,7 @@ impl Executor {
     }
 
     pub(crate) fn trigram_numeric_row_id(row_id: &str) -> u64 {
-        if let Some(n) = crate::common::encoding::decode_i64_comparable(row_id) {
-            n as u64
-        } else if let Ok(n) = row_id.parse::<u64>() {
-            n
-        } else {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            row_id.hash(&mut hasher);
-            hasher.finish()
-        }
+        crate::storage::trigram::numeric_row_id_for_str(row_id)
     }
 
     pub(super) fn row_id_from_data_key(key: &[u8]) -> Result<&str> {

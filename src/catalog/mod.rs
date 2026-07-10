@@ -32,6 +32,32 @@ fn default_true() -> bool {
     true
 }
 
+fn column_type_starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    match value.as_bytes().get(..prefix.len()) {
+        Some(candidate) => candidate.eq_ignore_ascii_case(prefix.as_bytes()),
+        None => false,
+    }
+}
+
+impl Column {
+    /// Whether this column participates in the trigram fuzzy-text index:
+    /// an indexed text-typed column (BTree or FTS). Single source of truth
+    /// shared by DML maintenance and the storage-level rebuild.
+    pub fn is_trigram_text_column(&self) -> bool {
+        if !self.is_indexed || !matches!(self.index_type, IndexType::BTree | IndexType::FTS) {
+            return false;
+        }
+        let data_type = self.data_type.trim();
+        data_type.eq_ignore_ascii_case("TEXT")
+            || data_type.eq_ignore_ascii_case("STRING")
+            || data_type.eq_ignore_ascii_case("VARCHAR")
+            || data_type.eq_ignore_ascii_case("CHAR")
+            || column_type_starts_with_ascii_case_insensitive(data_type, "VARCHAR(")
+            || column_type_starts_with_ascii_case_insensitive(data_type, "CHAR(")
+            || column_type_starts_with_ascii_case_insensitive(data_type, "CHARACTER")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
     pub name: String,
