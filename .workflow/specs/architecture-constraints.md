@@ -690,3 +690,11 @@ Two read-only subagents completed after the s3 fail-open tests. Keyspace subagen
 part1 三阶段对照(原始快照→470 后):Range LIMIT 12,076→5.0ms(2438×);IN list 5,563→981ms(5.7×);BETWEEN 4,639→1,066ms(4.4×);Full scan narrow 4,413→1,043ms(4.2×);Full scan 6,003→2,232ms(2.7×);Base 均值 1,795→407ms(4.4×);全家族零回归。对 07-08 基线:BETWEEN/IN 已反超 2×+(且数据多 17.5%);Full scan 余 1.4× 差距=no-fill 重读(每查重解压全部未跳块)+串行物化,为下层地板成分。剩余 xlarge 热点:Revenue 10s/Avg order value 26s/Subquery 24s(聚合/JOIN 形态)、并发 read-heavy 超时(需查询超时护栏)。报告归档 .csv-wave/20260710-xlarge-part1-after-470.json
 
 </spec-entry>
+
+<spec-entry category="arch" keywords="revenue,join-floor,batch-kernel,472" date="2026-07-10" title="Revenue-JOIN 画像归位:JOIN 引擎地板,非病灶(2026-07-10)" source="main@33c6c81">
+
+### Revenue-JOIN 画像归位:JOIN 引擎地板,非病灶(2026-07-10)
+
+Revenue by category(order_items JOIN products GROUP BY)warm 17.6s 画像:10k 产品探测已 probe_cache 记忆化(row_read 恰 10,000,无重复探测);order_items 34MB bulk 扫描正常;主体=JOIN 引擎逐行开销 ~30µs/行 × ~50 万行。结论:非误选型/误分类病灶,归入调研 backlog P1『批量列式扫描 kernel』(CRDB 同构证明 70x micro/4x TPC-H)——即 472 候选的架构性工作。剩余热点分类:Subquery IN 24s/Never-ordered 8.5s(子查询物化形态,待画像,可能仍有快刀);并发超时(需查询超时护栏)。471 后 Analytics 家族快刀已尽,进入架构性优化区间。
+
+</spec-entry>
