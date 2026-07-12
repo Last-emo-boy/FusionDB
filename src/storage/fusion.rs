@@ -4248,11 +4248,6 @@ impl Transaction for FusionTransaction {
         // 1. Read-Your-Own-Writes
         for (k, v) in self.write_buffer.iter().rev() {
             if k == key {
-                if let Ok(_s) = std::str::from_utf8(key) {
-                    // if s.contains("9999999") {
-                    //    eprintln!("DEBUG: FusionTransaction::get HIT WriteBuffer. Key: {}, ValLen: {}, Val: {:?}", s, v.as_ref().map(|x| x.len()).unwrap_or(0), v);
-                    // }
-                }
                 return Ok(v.clone());
             }
         }

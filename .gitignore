@@ -17,7 +17,6 @@ test_*.wal
 test_explain_wal
 inverted_index.bin
 trigram_index.bin
-5000
 
 # Benchmark output
 benchmark_report_*.json
