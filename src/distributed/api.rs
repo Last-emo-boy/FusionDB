@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
@@ -54,29 +55,47 @@ pub fn raft_routes(state: RaftAppState) -> Router {
 }
 
 // --- Raft internal RPCs ---
+//
+// 失败必须映射为 500 而非 panic:对端 network.rs 会把非 JSON 响应解码失败
+// 归类为可重试的 RPCError::Network,而 panic 会击穿本节点的 HTTP worker。
 
 async fn raft_append(
     State(state): State<RaftAppState>,
     Json(req): Json<AppendEntriesRequest<TypeConfig>>,
-) -> Json<AppendEntriesResponse<NodeId>> {
-    let resp = state.raft.append_entries(req).await.unwrap();
-    Json(resp)
+) -> Result<Json<AppendEntriesResponse<NodeId>>, (StatusCode, String)> {
+    match state.raft.append_entries(req).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Raft append_entries failed: {error}"),
+        )),
+    }
 }
 
 async fn raft_snapshot(
     State(state): State<RaftAppState>,
     Json(req): Json<InstallSnapshotRequest<TypeConfig>>,
-) -> Json<InstallSnapshotResponse<NodeId>> {
-    let resp = state.raft.install_snapshot(req).await.unwrap();
-    Json(resp)
+) -> Result<Json<InstallSnapshotResponse<NodeId>>, (StatusCode, String)> {
+    match state.raft.install_snapshot(req).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Raft install_snapshot failed: {error}"),
+        )),
+    }
 }
 
 async fn raft_vote(
     State(state): State<RaftAppState>,
     Json(req): Json<VoteRequest<NodeId>>,
-) -> Json<VoteResponse<NodeId>> {
-    let resp = state.raft.vote(req).await.unwrap();
-    Json(resp)
+) -> Result<Json<VoteResponse<NodeId>>, (StatusCode, String)> {
+    match state.raft.vote(req).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Raft vote failed: {error}"),
+        )),
+    }
 }
 
 // --- Client-facing RPCs ---
