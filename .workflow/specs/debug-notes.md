@@ -175,3 +175,11 @@ SELECT * FROM users WHERE id IN (SELECT DISTINCT user_id FROM orders WHERE total
 reverse_iterator_uses_persisted_reverse_seek_sidecar flaky 根因确认并修复(对抗验证):GLOBAL_METRICS 为进程级共享原子计数器,lib 测试并行于同一进程,对其做 ==0/==N 精确差值断言必然被并发兄弟测试污染(至少 15 个反向迭代测试碰同族计数器);仅单调 >= 差值断言污染免疫。修复=SsTableReverseIterator 累计自身 ReverseBlockScanStats,精确断言全部本地化。规则:测试中禁止对 GLOBAL_METRICS 写 ==精确差值断言,一律用迭代器/组件本地统计;全局只留 >= 接线检查。已知同类待排查:fusion.rs 多处测试用全局差值模式(5739/5985/6147/6204/6617/6738/6837 附近),若再现 flaky 按同法迁移。H2(sidecar 文件系统竞态)已排除:finish() 内 fsync+原子改名,fingerprint 取自 sync 后稳定元数据。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="upsert,conflict-target,unique,闭环,insert" date="2026-07-12" title="UPSERT/UNIQUE 立案三项全部闭环(e9cce62/0cc1926/7cdf50f)" description="UPSERT 顺序缺陷、conflict_target 忽略、UPDATE/INSERT..SELECT O(N²) 均已修复;遗留 DO UPDATE 改 PK 列问题" source="main@7cdf50f">
+
+### UPSERT/UNIQUE 立案三项全部闭环(e9cce62/0cc1926/7cdf50f)
+
+2026-07-12 立案的三项全部落地:①UPSERT 顺序缺陷(e9cce62)——单列 UNIQUE 查重移到 ON CONFLICT 分支后,自冲突 upsert 不再误报;②conflict_target(0cc1926)——单列非 PK UNIQUE 目标按 值→owner row_id 映射解析并对 owner 行执行 DO UPDATE/DO NOTHING,复合 PK 全集目标=数据键冲突,其余目标与 DO UPDATE ... WHERE 一律 loud 报错(取代静默忽略),两路径 DO UPDATE 主体收敛为 apply_on_conflict_do_update;③UPDATE/INSERT..SELECT/upsert 批量 O(N²)(7cdf50f)——四个调用点统一到 UniqueColumnValueSets(自排除=owner row_id 比较),旧扫描验证器删除,UPDATE 106×/INSERT..SELECT 52×(2000 行)。契约:单列 UNIQUE 查重只能走 check_unique_columns_for_insert/for_update,不得再写内联扫描或逐行验证器。遗留(未立案):DO UPDATE 赋值改 PK 列时行仍写在旧 row_id 键下(数据键与 PK 值不一致,PK 冲突与 unique 冲突路径同病),需要 row_id 迁移或 loud 拒绝,待独立票。
+
+</spec-entry>
