@@ -201,7 +201,8 @@ enum ForwardSum {
 }
 
 /// Detect a JSON STRING holding a finite DECIMAL/NUMERIC number (the JSON form of `Value::Decimal`).
-/// Only the MIN/MAX (extremum) path needs this — `SUM`/`AVG` over DECIMAL return a float.
+/// The MIN/MAX (extremum) path and the DISTINCT-aggregate paths (which merge raw column values) need
+/// this — plain `SUM`/`AVG` over DECIMAL return a float.
 fn forward_decimal_f64(value: &serde_json::Value) -> Option<f64> {
     match value {
         serde_json::Value::String(s) => s.parse::<f64>().ok().filter(|v| v.is_finite()),
@@ -3728,7 +3729,13 @@ impl PgHandler {
     ) -> std::result::Result<Option<ForwardSum>, pgwire::error::ErrorInfo> {
         let mut total = None;
         for value in distinct_values.values() {
-            let parsed = Self::forward_sum_json_value(value)?;
+            // Distinct values are raw column values, so a DECIMAL column
+            // arrives in its JSON string form; map it like the extremum path.
+            let parsed = if let Some(decimal) = forward_decimal_f64(value) {
+                Some(ForwardSum::Float(decimal))
+            } else {
+                Self::forward_sum_json_value(value)?
+            };
             Self::add_forward_sum(&mut total, parsed)?;
         }
         Ok(total)

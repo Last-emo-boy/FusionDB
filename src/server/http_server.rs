@@ -3336,8 +3336,9 @@ enum FanoutSum {
 
 /// Detect a fan-out aggregate value that is a JSON STRING holding a finite DECIMAL/NUMERIC number (the
 /// JSON representation of `Value::Decimal`). `MIN`/`MAX` over a DECIMAL column return the value itself,
-/// which serializes as such a string; `SUM`/`AVG` over DECIMAL return a float, so only the extremum
-/// path needs this. Returns `None` for any non-string / non-finite value.
+/// which serializes as such a string, and the DISTINCT-aggregate paths merge raw column values;
+/// `SUM`/`AVG` over DECIMAL return a float, so only those paths need this. Returns `None` for any
+/// non-string / non-finite value.
 fn fanout_decimal_f64(value: &serde_json::Value) -> Option<f64> {
     match value {
         serde_json::Value::String(s) => s.parse::<f64>().ok().filter(|v| v.is_finite()),
@@ -3439,7 +3440,13 @@ fn fanout_sum_over_distinct_values(
 ) -> std::result::Result<Option<FanoutSum>, String> {
     let mut total = None;
     for value in distinct_values.values() {
-        let parsed = fanout_sum_json_value(value)?;
+        // Distinct values are raw column values, so a DECIMAL column arrives
+        // in its JSON string form; map it like the extremum path does.
+        let parsed = if let Some(decimal) = fanout_decimal_f64(value) {
+            Some(FanoutSum::Float(decimal))
+        } else {
+            fanout_sum_json_value(value)?
+        };
         add_fanout_sum(&mut total, parsed)?;
     }
     Ok(total)
@@ -7441,6 +7448,132 @@ mod tests {
         match &avg_distinct_envelope.data.expect("avg distinct data")[0] {
             QueryResultJson::Select { rows, .. } => {
                 assert_eq!(rows, &vec![vec![serde_json::json!(15.0)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout avg distinct"),
+        }
+
+        let _ = std::fs::remove_file(&local_wal_path);
+        let _ = std::fs::remove_file(&owner_wal_path);
+    }
+
+    #[test]
+    fn fanout_sum_over_distinct_values_maps_decimal_strings() {
+        let mut distinct_values = BTreeMap::new();
+        distinct_values.insert("\"10.50\"".to_string(), serde_json::json!("10.50"));
+        distinct_values.insert("\"20.25\"".to_string(), serde_json::json!("20.25"));
+        distinct_values.insert("5".to_string(), serde_json::json!(5));
+        let total = fanout_sum_over_distinct_values(&distinct_values).expect("decimal sum");
+        let Some(FanoutSum::Float(total)) = total else {
+            panic!("expected float total");
+        };
+        assert!((total - 35.75).abs() < 1e-9);
+
+        // Non-numeric strings still fail closed.
+        distinct_values.insert("\"abc\"".to_string(), serde_json::json!("abc"));
+        assert!(fanout_sum_over_distinct_values(&distinct_values).is_err());
+    }
+
+    #[tokio::test]
+    async fn http_query_fanouts_distinct_decimal_aggregates_across_shard_owners() {
+        let local_wal_path = format!(
+            "test_http_shard_owner_distinct_decimal_local_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let owner_wal_path = format!(
+            "test_http_shard_owner_distinct_decimal_owner_{}.wal",
+            uuid::Uuid::new_v4()
+        );
+        let local_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&local_wal_path).expect("local storage"));
+        let owner_storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(&owner_wal_path).expect("owner storage"));
+        let (owner_listener, owner_addr) = bind_test_http_listener().await;
+        let local_addr = "127.0.0.1:8091".to_string();
+        let local_config =
+            sharded_http_test_config_for_node(4, 1, local_addr.clone(), owner_addr.clone());
+        let owner_config = sharded_http_test_config_for_node(4, 2, local_addr, owner_addr.clone());
+        let local_shard_router = ShardRouter::from_config(&local_config).expect("local router");
+        let owner_shard_router = ShardRouter::from_config(&owner_config).expect("owner router");
+        let local_keys = integer_primary_keys_for_owner(&local_shard_router, "distinct_dec", 1, 2);
+        let remote_keys = integer_primary_keys_for_owner(&local_shard_router, "distinct_dec", 2, 2);
+
+        let local_app =
+            test_app_with_shard_router_forwarding(local_storage.clone(), local_shard_router, true);
+        let owner_app =
+            test_app_with_shard_router_forwarding(owner_storage.clone(), owner_shard_router, true);
+        tokio::spawn(async move {
+            axum::serve(owner_listener, owner_app)
+                .await
+                .expect("owner http server");
+        });
+
+        let client = reqwest::Client::new();
+        let create_sql = "CREATE TABLE distinct_dec (id INTEGER PRIMARY KEY, amount DECIMAL(6, 2))";
+        assert_eq!(
+            post_query(&local_app, create_sql).await.status(),
+            StatusCode::OK
+        );
+        let owner_create = client
+            .post(format!("http://{}/query", owner_addr))
+            .json(&serde_json::json!({ "sql": create_sql }))
+            .send()
+            .await
+            .expect("owner create response");
+        assert_eq!(owner_create.status(), StatusCode::OK);
+
+        // Local owner holds {10.50, 20.25}; remote owner holds {20.25, 20.25}.
+        // The decimal 20.25 appears on both owners: distinct union {10.50, 20.25}.
+        for (key, amount) in [(local_keys[0], "10.50"), (local_keys[1], "20.25")] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO distinct_dec (id, amount) VALUES ({}, CAST('{}' AS DECIMAL))",
+                        key, amount
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        for (key, amount) in [(remote_keys[0], "20.25"), (remote_keys[1], "20.25")] {
+            assert_eq!(
+                post_query(
+                    &local_app,
+                    &format!(
+                        "INSERT INTO distinct_dec (id, amount) VALUES ({}, CAST('{}' AS DECIMAL))",
+                        key, amount
+                    ),
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+
+        // SUM(DISTINCT) over the cross-owner decimal union {10.50, 20.25} = 30.75.
+        let sum_distinct_select =
+            post_query(&local_app, "SELECT SUM(DISTINCT amount) FROM distinct_dec").await;
+        assert_eq!(sum_distinct_select.status(), StatusCode::OK);
+        let sum_distinct_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(sum_distinct_select).await;
+        match &sum_distinct_envelope.data.expect("sum distinct data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(30.75)]]);
+            }
+            QueryResultJson::Success { .. } => panic!("expected fanout sum distinct"),
+        }
+
+        // AVG(DISTINCT) = 30.75 / 2 = 15.375.
+        let avg_distinct_select =
+            post_query(&local_app, "SELECT AVG(DISTINCT amount) FROM distinct_dec").await;
+        assert_eq!(avg_distinct_select.status(), StatusCode::OK);
+        let avg_distinct_envelope: Envelope<Vec<QueryResultJson>> =
+            response_json(avg_distinct_select).await;
+        match &avg_distinct_envelope.data.expect("avg distinct data")[0] {
+            QueryResultJson::Select { rows, .. } => {
+                assert_eq!(rows, &vec![vec![serde_json::json!(15.375)]]);
             }
             QueryResultJson::Success { .. } => panic!("expected fanout avg distinct"),
         }
