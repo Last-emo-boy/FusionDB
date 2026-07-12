@@ -122,6 +122,19 @@ struct ReverseBlockScanStats {
     sidecar_offset_probes: u64,
 }
 
+impl ReverseBlockScanStats {
+    fn accumulate(&mut self, other: ReverseBlockScanStats) {
+        self.decoded_entries += other.decoded_entries;
+        self.yielded_entries += other.yielded_entries;
+        self.span_scan_blocks += other.span_scan_blocks;
+        self.span_scan_entries += other.span_scan_entries;
+        self.span_materialized_entries += other.span_materialized_entries;
+        self.sidecar_index_entries += other.sidecar_index_entries;
+        self.sidecar_materialized_entries += other.sidecar_materialized_entries;
+        self.sidecar_offset_probes += other.sidecar_offset_probes;
+    }
+}
+
 fn key_user_part(key: &[u8], suffix_len: usize) -> &[u8] {
     key.len()
         .checked_sub(suffix_len)
@@ -2987,6 +3000,7 @@ impl SsTable {
             block_sql_index_prefix_filter,
             read_options,
             file: None,
+            scan_stats: ReverseBlockScanStats::default(),
         })
     }
 
@@ -3368,6 +3382,10 @@ pub struct SsTableReverseIterator {
     block_sql_index_prefix_filter: Option<Vec<u8>>,
     read_options: SsTableReadOptions,
     file: Option<File>,
+    // Per-iterator accumulation of the same per-block stats that feed the
+    // global metrics: tests must assert exact sidecar-vs-span-scan outcomes
+    // here, not on GLOBAL_METRICS, which concurrent lib tests also bump.
+    scan_stats: ReverseBlockScanStats,
 }
 
 impl SsTableReverseIterator {
@@ -3590,7 +3608,13 @@ impl SsTableReverseIterator {
                 stats.sidecar_materialized_entries,
             );
             monitor::add_sstable_reverse_seek_sidecar_offset_probes(stats.sidecar_offset_probes);
+            self.scan_stats.accumulate(stats);
         }
+    }
+
+    #[cfg(test)]
+    fn scan_stats(&self) -> ReverseBlockScanStats {
+        self.scan_stats
     }
 }
 
@@ -3808,21 +3832,16 @@ mod tests {
             "SSTable finish should persist reverse seek sidecar"
         );
 
+        // Global metric deltas may be bumped by concurrently running lib
+        // tests, so only monotonic >= assertions are safe on GLOBAL_METRICS;
+        // exact sidecar-vs-span-scan outcomes are asserted on the iterator's
+        // own scan_stats() below.
         let metrics = &crate::monitor::GLOBAL_METRICS;
         let hits_before = metrics
             .sstable_reverse_seek_sidecar_hit_count
             .load(std::sync::atomic::Ordering::Relaxed);
         let uses_before = metrics
             .sstable_reverse_seek_sidecar_use_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let fail_open_before = metrics
-            .sstable_reverse_seek_sidecar_fail_open_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let span_scans_before = metrics
-            .sstable_reverse_block_span_scan_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let span_scan_entries_before = metrics
-            .sstable_reverse_block_span_scan_entry_count
             .load(std::sync::atomic::Ordering::Relaxed);
         let offset_probes_before = metrics
             .sstable_reverse_seek_sidecar_offset_probe_count
@@ -3832,9 +3851,6 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed);
         let sidecar_materializes_before = metrics
             .sstable_reverse_seek_sidecar_entry_materialize_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let span_materializes_before = metrics
-            .sstable_reverse_block_span_materialize_entry_count
             .load(std::sync::atomic::Ordering::Relaxed);
 
         let table = SsTable::open(path.clone(), 41, Arc::new(Cache::new(16)))
@@ -3859,6 +3875,18 @@ mod tests {
                 b"k090".to_vec(),
             ]
         );
+        // Exact outcomes for THIS iterator: served all 5 in-bounds entries
+        // from the persisted sidecar, never fell back to a span scan (both
+        // fail-open sites and the sidecar-miss route set span_scan_blocks).
+        let scan_stats = iter.scan_stats();
+        assert_eq!(scan_stats.span_scan_blocks, 0);
+        assert_eq!(scan_stats.span_scan_entries, 0);
+        assert_eq!(scan_stats.span_materialized_entries, 0);
+        assert_eq!(scan_stats.sidecar_materialized_entries, 5);
+        assert_eq!(scan_stats.sidecar_index_entries, 100);
+        assert!(scan_stats.sidecar_offset_probes > 0);
+
+        // Global wiring still covered via pollution-proof monotonic deltas.
         assert!(
             metrics
                 .sstable_reverse_seek_sidecar_hit_count
@@ -3873,34 +3901,6 @@ mod tests {
                 .saturating_sub(uses_before)
                 >= 1
         );
-        assert_eq!(
-            metrics
-                .sstable_reverse_seek_sidecar_fail_open_count
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_sub(fail_open_before),
-            0
-        );
-        assert_eq!(
-            metrics
-                .sstable_reverse_block_span_scan_count
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_sub(span_scans_before),
-            0
-        );
-        assert_eq!(
-            metrics
-                .sstable_reverse_block_span_scan_entry_count
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_sub(span_scan_entries_before),
-            0
-        );
-        assert_eq!(
-            metrics
-                .sstable_reverse_block_span_materialize_entry_count
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_sub(span_materializes_before),
-            0
-        );
         assert!(
             metrics
                 .sstable_reverse_seek_sidecar_index_entry_count
@@ -3908,12 +3908,12 @@ mod tests {
                 .saturating_sub(sidecar_index_entries_before)
                 >= 100
         );
-        assert_eq!(
+        assert!(
             metrics
                 .sstable_reverse_seek_sidecar_entry_materialize_count
                 .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_sub(sidecar_materializes_before),
-            5
+                .saturating_sub(sidecar_materializes_before)
+                >= 5
         );
         assert!(
             metrics
