@@ -191,3 +191,11 @@ reverse_iterator_uses_persisted_reverse_seek_sidecar flaky 根因确认并修复
 ①PK 不可变(1990671):重现证实 UPDATE SET id=N 或 unique 目标 upsert SET id=EXCLUDED.id 会把行搁浅在旧 row_id 键下——全表扫描直接丢行、新旧 PK 点查双双失真(比预期严重)。reject_primary_key_change 覆盖单列 is_primary 与复合 _pkey 身份索引列,UPDATE 主循环与 apply_on_conflict_do_update 赋值后立即拒绝;同值赋值放行。两个 FK 测试原依赖父键变更报 FOREIGN KEY,现被 PK 守卫先截获(断言已更新;无子行时旧行为是静默腐蚀)。row_id 迁移(完整 PK 变更支持)仍待设计票。②DISTINCT DECIMAL(1f49bce):sum_distinct/avg_distinct 门放行 DECIMAL 但合并端对 JSON 字符串形态的原始值报 non-numeric——http/pg 两端合并循环先经 fanout_decimal_f64/forward_decimal_f64 映射,已双端修复+双节点集成测试。fusion.rs 全局差值断言测试群维持"再现 flaky 时按 sstable 同法迁移"的观察策略(需先给 FusionStorage 扫描 API 加本地统计管道,==0 断言不可安全弱化为 >=)。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="outer-join,谓词下推,null-padding,反连接,join" date="2026-07-12" title="外连接谓词下推两族静默错误闭环(613d440)" description="ON 保留侧谓词丢保留行 + NULL 侧 WHERE 被吞;按 join 类型门控提取点,残余走逐对求值/后置过滤" source="main@613d440">
+
+### 外连接谓词下推两族静默错误闭环(613d440)
+
+memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双族:①apply_join_step 把 ON 中仅引用保留侧的合取项无条件下推为扫描过滤(LEFT/FULL 左、RIGHT/FULL 右被丢行);②NULL 侧 WHERE 合取项被 take_* 提取吞掉后不再后置应用(NULL 填充行错误存活,IS NULL 反连接错乱)。修复原则:ON 保留侧合取项留在 join 谓词走 residual_expr 逐对求值(probe/expr-hash/hash/nested-loop 全路径已支持);链含 RIGHT/FULL 则整链禁 WHERE 下推(含首表与 comma 对谓词,后续步可 NULL 填充任何早先关系列),本步 LEFT/FULL 则右侧 WHERE 不提取——execute_join 尾部后置过滤兜底。教训:下推安全性 = f(谓词来源 ON/WHERE, 侧别, 本步与后续步的保留性),四维都要判;纯 INNER 链不受影响。遗留权衡:comma+RIGHT/FULL 混链的对谓词不再提取会退化为笛卡尔物化后过滤(极罕见,正确性优先);FULL JOIN ORDER BY 的 NULL 排序为 NULLS FIRST(asc)。
+
+</spec-entry>
