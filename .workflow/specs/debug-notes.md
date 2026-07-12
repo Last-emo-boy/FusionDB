@@ -160,3 +160,18 @@ try_index_scan 有完备弃用机制(index_candidate_cap(None,None)=1024,should_
 SELECT * FROM users WHERE id IN (SELECT DISTINCT user_id FROM orders WHERE total>500) LIMIT 20:warm 31s(应 ~1.5s:orders 扫描+DISTINCT 物化+users IN 集合扫描)。两轮测量均被重启后 compaction 波次污染(每轮数百 MB 混入),但查询自身增量含决定性异常:sstable_open_meta_bytes 67MB/查 + open_filter 39MB + open_total_us 297ms——单查询内反复 OPEN/解码 SSTable meta;另见首轮 762k 次 point_overlap_skip(IN 成员判定疑逐行点查而非哈希集)。嫌疑:①deferred IN-membership(subquery.rs:661-838 per-value cache)对每候选行做存储点查;②物化路径重复重扫 orders;③no-fill 下 meta/filter 不缓存导致每次子扫描重开。Never-ordered(NOT IN)26.5s 同族。解剖方法:待系统安静(compaction 彻底完成)后单查增量+subquery.rs 路径读码;或本地 fdb-idx-repro 造 orders/users 双表干净重现。
 
 </spec-entry>
+<spec-entry category="debug" keywords="upsert,unique,conflict-target,on-conflict,insert" date="2026-07-12" title="UPSERT 顺序缺陷与 conflict_target 被忽略(单列 UNIQUE 调查立案)" description="UPSERT 对 unique 列的顺序缺陷与 conflict_target 忽略,含 INSERT..SELECT/UPDATE 残留 O(N²)" source="main@c24e8b4">
+
+### UPSERT 顺序缺陷与 conflict_target 被忽略(单列 UNIQUE 调查立案)
+
+对抗验证过的两处正确性缺陷,待独立修复:①单列 UNIQUE 查重先于 ON CONFLICT 分支执行(insert.rs 两条路径),对自身持有相同 unique 值的已存在行执行 INSERT ... ON CONFLICT DO UPDATE/DO NOTHING 会先报 UNIQUE constraint violated 而非执行冲突动作;②oc.conflict_target 全文无引用,冲突只由数据键 txn.get 判定——非 PK unique 列上的真冲突(不同 PK、相同 unique 值)不触发 upsert 动作,与 PostgreSQL 语义不符。另:INSERT..SELECT 与 UPDATE 仍走 validate_unique_columns_for_update 每行全表扫描(批量 O(N²)),可复用本轮 UniqueColumnValueSets 机制(dml/mod.rs);完整根治方向=把复合 UNIQUE 的 sentinel-first + authoritative marker 模式移植到单列。
+
+</spec-entry>
+
+<spec-entry category="debug" keywords="flaky,全局计数器,测试污染,反向扫描,metrics" date="2026-07-12" title="flaky 根因关闭:全局 metrics 精确差值断言禁用,同类模式警示" description="reverse_seek_sidecar flaky 根因=并行测试污染共享计数器,已改迭代器本地统计;fusion.rs 同类全局差值测试待排查" source="main@c24e8b4">
+
+### flaky 根因关闭:全局 metrics 精确差值断言禁用,同类模式警示
+
+reverse_iterator_uses_persisted_reverse_seek_sidecar flaky 根因确认并修复(对抗验证):GLOBAL_METRICS 为进程级共享原子计数器,lib 测试并行于同一进程,对其做 ==0/==N 精确差值断言必然被并发兄弟测试污染(至少 15 个反向迭代测试碰同族计数器);仅单调 >= 差值断言污染免疫。修复=SsTableReverseIterator 累计自身 ReverseBlockScanStats,精确断言全部本地化。规则:测试中禁止对 GLOBAL_METRICS 写 ==精确差值断言,一律用迭代器/组件本地统计;全局只留 >= 接线检查。已知同类待排查:fusion.rs 多处测试用全局差值模式(5739/5985/6147/6204/6617/6738/6837 附近),若再现 flaky 按同法迁移。H2(sidecar 文件系统竞态)已排除:finish() 内 fsync+原子改名,fingerprint 取自 sync 后稳定元数据。
+
+</spec-entry>
