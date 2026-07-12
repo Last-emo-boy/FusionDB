@@ -183,3 +183,11 @@ reverse_iterator_uses_persisted_reverse_seek_sidecar flaky 根因确认并修复
 2026-07-12 立案的三项全部落地:①UPSERT 顺序缺陷(e9cce62)——单列 UNIQUE 查重移到 ON CONFLICT 分支后,自冲突 upsert 不再误报;②conflict_target(0cc1926)——单列非 PK UNIQUE 目标按 值→owner row_id 映射解析并对 owner 行执行 DO UPDATE/DO NOTHING,复合 PK 全集目标=数据键冲突,其余目标与 DO UPDATE ... WHERE 一律 loud 报错(取代静默忽略),两路径 DO UPDATE 主体收敛为 apply_on_conflict_do_update;③UPDATE/INSERT..SELECT/upsert 批量 O(N²)(7cdf50f)——四个调用点统一到 UniqueColumnValueSets(自排除=owner row_id 比较),旧扫描验证器删除,UPDATE 106×/INSERT..SELECT 52×(2000 行)。契约:单列 UNIQUE 查重只能走 check_unique_columns_for_insert/for_update,不得再写内联扫描或逐行验证器。遗留(未立案):DO UPDATE 赋值改 PK 列时行仍写在旧 row_id 键下(数据键与 PK 值不一致,PK 冲突与 unique 冲突路径同病),需要 row_id 迁移或 loud 拒绝,待独立票。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="pk-immutable,row_id,upsert,distinct-decimal,fanout" date="2026-07-12" title="PK 不可变守卫 + DISTINCT DECIMAL 合并闭环(1990671/1f49bce)" description="UPDATE/DO UPDATE 改 PK 的行键错位腐蚀已 loud 拒绝;462 遗留的 DISTINCT over DECIMAL 合并已修" source="main@1f49bce">
+
+### PK 不可变守卫 + DISTINCT DECIMAL 合并闭环(1990671/1f49bce)
+
+①PK 不可变(1990671):重现证实 UPDATE SET id=N 或 unique 目标 upsert SET id=EXCLUDED.id 会把行搁浅在旧 row_id 键下——全表扫描直接丢行、新旧 PK 点查双双失真(比预期严重)。reject_primary_key_change 覆盖单列 is_primary 与复合 _pkey 身份索引列,UPDATE 主循环与 apply_on_conflict_do_update 赋值后立即拒绝;同值赋值放行。两个 FK 测试原依赖父键变更报 FOREIGN KEY,现被 PK 守卫先截获(断言已更新;无子行时旧行为是静默腐蚀)。row_id 迁移(完整 PK 变更支持)仍待设计票。②DISTINCT DECIMAL(1f49bce):sum_distinct/avg_distinct 门放行 DECIMAL 但合并端对 JSON 字符串形态的原始值报 non-numeric——http/pg 两端合并循环先经 fanout_decimal_f64/forward_decimal_f64 映射,已双端修复+双节点集成测试。fusion.rs 全局差值断言测试群维持"再现 flaky 时按 sstable 同法迁移"的观察策略(需先给 FusionStorage 扫描 API 加本地统计管道,==0 断言不可安全弱化为 >=)。
+
+</spec-entry>
