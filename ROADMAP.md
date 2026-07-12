@@ -47,7 +47,7 @@
 - [x] **P2-30: Math functions** — CEIL, FLOOR, MOD, POWER, SQRT (Expr::Ceil/Floor as AST variants)
 - [x] **P2-31: NOW / CURRENT_TIMESTAMP** — Unix epoch seconds, CURRENT_DATE as epoch days
 - [x] **P2-32: RETURNING clause** — INSERT/UPDATE/DELETE ... RETURNING * or specific columns
-- [x] **P2-33: UPSERT** — INSERT ... ON CONFLICT DO UPDATE SET / DO NOTHING with EXCLUDED references
+- [x] **P2-33: UPSERT** — INSERT ... ON CONFLICT DO UPDATE SET / DO NOTHING with EXCLUDED references; conflict targets resolve to the primary key or a single-column UNIQUE constraint (owner-row update), unsupported targets and DO UPDATE ... WHERE are rejected loudly
 - [x] **P2-34: CROSS JOIN** — Cartesian product join support
 - [x] **P2-35: Multi-column ORDER BY** — Mixed ASC/DESC verified with tests
 - [x] **P2-36: Correlated subqueries** — EXISTS/NOT EXISTS outer row references, aggregate HAVING binding, and scalar projection materialization

@@ -1,7 +1,7 @@
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{BinaryOperator, Expr, TableFactor};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::Executor;
 
@@ -90,13 +90,14 @@ fn unique_column_indexes(schema: &TableSchema) -> impl Iterator<Item = usize> + 
         .map(|(idx, _)| idx)
 }
 
-/// Per-statement cache of the values currently held by every non-PK UNIQUE
-/// column: one table scan on first use instead of one scan per row and
-/// column, kept in sync as the statement writes rows. The scan check covers
-/// already-committed duplicates; concurrent same-value writers still collide
-/// through the unique sentinels (BENCHPROD-464).
+/// Per-statement cache mapping every non-PK UNIQUE column's values to their
+/// owner row_id: one table scan on first use instead of one scan per row and
+/// column, kept in sync as the statement writes rows. The owner row_id serves
+/// ON CONFLICT (unique_col) resolution and UPDATE self-exclusion. The scan
+/// check covers already-committed duplicates; concurrent same-value writers
+/// still collide through the unique sentinels (BENCHPROD-464).
 pub(crate) struct UniqueColumnValueSets {
-    sets: Option<HashMap<usize, HashSet<Value>>>,
+    sets: Option<HashMap<usize, HashMap<Value, String>>>,
 }
 
 impl UniqueColumnValueSets {
@@ -114,14 +115,16 @@ impl UniqueColumnValueSets {
         })
     }
 
+    fn loaded_sets(&self) -> Result<&HashMap<usize, HashMap<Value, String>>> {
+        self.sets.as_ref().ok_or_else(|| {
+            FusionError::Execution("unique column value sets consulted before load".to_string())
+        })
+    }
+
     /// Error if the row duplicates a tracked value in any non-PK UNIQUE
     /// column. Fails closed when the sets were never loaded.
     fn assert_row_absent(&self, schema: &TableSchema, row_values: &[Value]) -> Result<()> {
-        let Some(sets) = self.sets.as_ref() else {
-            return Err(FusionError::Execution(
-                "unique column value sets consulted before load".to_string(),
-            ));
-        };
+        let sets = self.loaded_sets()?;
         for idx in unique_column_indexes(schema) {
             let Some(value) = row_values.get(idx) else {
                 continue;
@@ -131,7 +134,7 @@ impl UniqueColumnValueSets {
             }
             let is_duplicate = sets
                 .get(&idx)
-                .is_some_and(|values| values.contains(&normalized_unique_set_value(value)));
+                .is_some_and(|values| values.contains_key(&normalized_unique_set_value(value)));
             if is_duplicate {
                 return Err(FusionError::Execution(format!(
                     "UNIQUE constraint violated for column '{}': duplicate value '{}'",
@@ -143,9 +146,28 @@ impl UniqueColumnValueSets {
         Ok(())
     }
 
+    /// The row_id owning `value` in unique column `col_idx`, if any. Fails
+    /// closed when the sets were never loaded.
+    pub(crate) fn conflict_owner_row_id(
+        &self,
+        col_idx: usize,
+        value: &Value,
+    ) -> Result<Option<&str>> {
+        let sets = self.loaded_sets()?;
+        Ok(sets
+            .get(&col_idx)
+            .and_then(|values| values.get(&normalized_unique_set_value(value)))
+            .map(String::as_str))
+    }
+
     /// Track a freshly inserted row. No-op when the sets were never loaded:
     /// a later load scans the post-write state through the transaction.
-    pub(crate) fn track_insert(&mut self, schema: &TableSchema, row_values: &[Value]) {
+    pub(crate) fn track_insert(
+        &mut self,
+        schema: &TableSchema,
+        row_values: &[Value],
+        row_id: &str,
+    ) {
         let Some(sets) = self.sets.as_mut() else {
             return;
         };
@@ -157,7 +179,7 @@ impl UniqueColumnValueSets {
                 continue;
             }
             if let Some(values) = sets.get_mut(&idx) {
-                values.insert(normalized_unique_set_value(value));
+                values.insert(normalized_unique_set_value(value), row_id.to_string());
             }
         }
     }
@@ -168,6 +190,7 @@ impl UniqueColumnValueSets {
         schema: &TableSchema,
         old_row: &[Value],
         new_row: &[Value],
+        row_id: &str,
     ) {
         let Some(sets) = self.sets.as_mut() else {
             return;
@@ -186,7 +209,7 @@ impl UniqueColumnValueSets {
             }
             if let Some(new_value) = new_row.get(idx) {
                 if *new_value != Value::Null {
-                    values.insert(normalized_unique_set_value(new_value));
+                    values.insert(normalized_unique_set_value(new_value), row_id.to_string());
                 }
             }
         }
@@ -232,14 +255,15 @@ impl Executor {
         if unique_sets.sets.is_some() {
             return Ok(());
         }
-        let mut sets: HashMap<usize, HashSet<Value>> = unique_column_indexes(schema)
-            .map(|idx| (idx, HashSet::new()))
+        let mut sets: HashMap<usize, HashMap<Value, String>> = unique_column_indexes(schema)
+            .map(|idx| (idx, HashMap::new()))
             .collect();
         if !sets.is_empty() {
             let existing = self
                 .scan_routed_data_prefixes_for_table(table_name, txn, None)
                 .await?;
             for (k, v) in &existing {
+                let row_id = self.legacy_row_id_from_routed_data_key(table_name, k)?;
                 let cached_row = std::str::from_utf8(k)
                     .ok()
                     .and_then(|key_str| self.row_cache_lookup(key_str, v));
@@ -252,7 +276,10 @@ impl Executor {
                             .unwrap_or(Value::Null)
                     };
                     if existing_value != Value::Null {
-                        values.insert(normalized_unique_set_value(&existing_value));
+                        values.insert(
+                            normalized_unique_set_value(&existing_value),
+                            row_id.to_string(),
+                        );
                     }
                 }
             }

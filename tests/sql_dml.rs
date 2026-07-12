@@ -2002,3 +2002,131 @@ async fn test_unique_column_upsert_self_conflict_takes_conflict_action() {
     assert!(err.contains("UNIQUE constraint violated"), "{err}");
     cleanup(&wal);
 }
+
+#[tokio::test]
+async fn test_on_conflict_unique_column_target_updates_owner_row() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE uniq_target (id INTEGER PRIMARY KEY, email TEXT UNIQUE, note TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_target VALUES (1, 'a@x.com', 'orig')",
+    )
+    .await;
+
+    // Conflict on the UNIQUE column resolves to the OWNER row (id=1), even
+    // though the incoming row has a different primary key.
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_target VALUES (2, 'a@x.com', 'fresh') \
+         ON CONFLICT (email) DO UPDATE SET note = EXCLUDED.note",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT id, email, note FROM uniq_target").await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::String("a@x.com".to_string()),
+            Value::String("fresh".to_string()),
+        ]]
+    );
+
+    // DO NOTHING skips the row on a unique-column conflict.
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_target VALUES (3, 'a@x.com', 'skipped') ON CONFLICT (email) DO NOTHING",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT COUNT(*) FROM uniq_target").await;
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // No conflict on the target: plain insert (NULL never conflicts).
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_target VALUES (4, 'b@x.com', NULL) ON CONFLICT (email) DO NOTHING",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_target VALUES (5, NULL, NULL) ON CONFLICT (email) DO NOTHING",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_target VALUES (6, NULL, NULL) ON CONFLICT (email) DO NOTHING",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT COUNT(*) FROM uniq_target").await;
+    assert_eq!(rows, vec![vec![Value::Integer(4)]]);
+
+    // A primary-key duplicate is NOT covered by the (email) target: loud error.
+    let stmts = executor
+        .prepare(
+            "INSERT INTO uniq_target VALUES (1, 'z@x.com', NULL) ON CONFLICT (email) DO NOTHING",
+        )
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("PRIMARY KEY constraint violated"), "{err}");
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_on_conflict_unsupported_targets_error_loudly() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE uniq_loud (id INTEGER PRIMARY KEY, email TEXT UNIQUE, note TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_loud VALUES (1, 'a@x.com', NULL)",
+    )
+    .await;
+
+    // Target column without a UNIQUE constraint.
+    let stmts = executor
+        .prepare("INSERT INTO uniq_loud VALUES (2, 'b@x.com', NULL) ON CONFLICT (note) DO NOTHING")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("has no UNIQUE constraint"), "{err}");
+
+    // Multi-column target that is not the primary key.
+    let stmts = executor
+        .prepare(
+            "INSERT INTO uniq_loud VALUES (2, 'b@x.com', NULL) \
+             ON CONFLICT (email, note) DO NOTHING",
+        )
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("ON CONFLICT target"), "{err}");
+
+    // Unknown target column.
+    let stmts = executor
+        .prepare("INSERT INTO uniq_loud VALUES (2, 'b@x.com', NULL) ON CONFLICT (nope) DO NOTHING")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("does not exist"), "{err}");
+
+    // DO UPDATE ... WHERE is unsupported (would otherwise be silently ignored).
+    let stmts = executor
+        .prepare(
+            "INSERT INTO uniq_loud VALUES (1, 'a@x.com', NULL) \
+             ON CONFLICT (id) DO UPDATE SET note = 'x' WHERE uniq_loud.note IS NULL",
+        )
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(
+        err.contains("DO UPDATE ... WHERE is not supported"),
+        "{err}"
+    );
+
+    // Nothing was silently written or updated.
+    let (_, rows) = query(&executor, "SELECT id, note FROM uniq_loud").await;
+    assert_eq!(rows, vec![vec![Value::Integer(1), Value::Null]]);
+    cleanup(&wal);
+}

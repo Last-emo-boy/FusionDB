@@ -74,6 +74,70 @@ fn insert_schema_key_for_table(table_name: &str) -> String {
     key
 }
 
+/// What an `ON CONFLICT` clause resolves to for conflict detection.
+enum ResolvedConflictTarget {
+    /// No target, or a target naming the primary key: conflict on the row's
+    /// data key (the pre-existing behavior).
+    RowKey,
+    /// A single non-PK UNIQUE column: conflict on that column's value.
+    UniqueColumn(usize),
+}
+
+fn resolve_conflict_target(
+    oc: &sqlparser::ast::OnConflict,
+    schema: &TableSchema,
+) -> Result<ResolvedConflictTarget> {
+    let Some(target) = &oc.conflict_target else {
+        return Ok(ResolvedConflictTarget::RowKey);
+    };
+    let columns = match target {
+        sqlparser::ast::ConflictTarget::OnConstraint(_) => {
+            return Err(FusionError::Execution(
+                "ON CONFLICT ON CONSTRAINT is not supported".to_string(),
+            ));
+        }
+        sqlparser::ast::ConflictTarget::Columns(columns) => columns,
+    };
+    let mut target_indexes = Vec::with_capacity(columns.len());
+    for ident in columns {
+        let Some(idx) = schema.get_column_index(&ident.value) else {
+            return Err(FusionError::Execution(format!(
+                "ON CONFLICT target column '{}' does not exist",
+                ident.value
+            )));
+        };
+        target_indexes.push(idx);
+    }
+    let mut primary_indexes: Vec<usize> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| col.is_primary)
+        .map(|(idx, _)| idx)
+        .collect();
+    let mut sorted_target = target_indexes.clone();
+    sorted_target.sort_unstable();
+    sorted_target.dedup();
+    primary_indexes.sort_unstable();
+    if !primary_indexes.is_empty() && sorted_target == primary_indexes {
+        return Ok(ResolvedConflictTarget::RowKey);
+    }
+    if let [idx] = target_indexes.as_slice() {
+        let column = &schema.columns[*idx];
+        if column.is_unique && !column.is_primary {
+            return Ok(ResolvedConflictTarget::UniqueColumn(*idx));
+        }
+        return Err(FusionError::Execution(format!(
+            "ON CONFLICT target column '{}' has no UNIQUE constraint",
+            column.name
+        )));
+    }
+    Err(FusionError::Execution(
+        "ON CONFLICT target must be the primary key or a single-column UNIQUE constraint"
+            .to_string(),
+    ))
+}
+
 fn is_serial_default_data_type(data_type: &str) -> bool {
     let data_type = data_type.trim();
     data_type.eq_ignore_ascii_case("SERIAL")
@@ -184,6 +248,170 @@ impl Executor {
                 other
             ))),
         }
+    }
+
+    /// Resolve the ON CONFLICT clause to the existing row it conflicts with,
+    /// if any: `(data key, row_id, encoded row)`. RowKey targets probe the
+    /// incoming row's own key; single-column UNIQUE targets look up the value
+    /// owner through the per-statement unique value sets.
+    #[allow(clippy::too_many_arguments)]
+    async fn find_on_conflict_row(
+        &self,
+        oc: &sqlparser::ast::OnConflict,
+        table_name: &str,
+        schema: &TableSchema,
+        row_values: &[Value],
+        row_key: &str,
+        row_id: &str,
+        unique_sets: &mut UniqueColumnValueSets,
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<(String, String, Vec<u8>)>> {
+        if let sqlparser::ast::OnConflictAction::DoUpdate(do_update) = &oc.action {
+            if do_update.selection.is_some() {
+                return Err(FusionError::Execution(
+                    "ON CONFLICT DO UPDATE ... WHERE is not supported".to_string(),
+                ));
+            }
+        }
+        match resolve_conflict_target(oc, schema)? {
+            ResolvedConflictTarget::RowKey => Ok(txn
+                .get(row_key.as_bytes())
+                .await?
+                .map(|bytes| (row_key.to_string(), row_id.to_string(), bytes))),
+            ResolvedConflictTarget::UniqueColumn(idx) => {
+                let Some(value) = row_values.get(idx) else {
+                    return Ok(None);
+                };
+                if *value == Value::Null {
+                    return Ok(None);
+                }
+                self.ensure_unique_column_value_sets(table_name, schema, unique_sets, txn)
+                    .await?;
+                let Some(owner_row_id) = unique_sets.conflict_owner_row_id(idx, value)? else {
+                    return Ok(None);
+                };
+                let owner_row_id = owner_row_id.to_string();
+                let owner_key = self.routed_data_key_for_row_id(table_name, &owner_row_id);
+                let bytes = txn.get(owner_key.as_bytes()).await?.ok_or_else(|| {
+                    FusionError::Execution(format!(
+                        "ON CONFLICT owner row for column '{}' is missing",
+                        schema.columns[idx].name
+                    ))
+                })?;
+                Ok(Some((owner_key, owner_row_id, bytes)))
+            }
+        }
+    }
+
+    /// Apply `DO UPDATE` to the conflicting existing row (which for a UNIQUE
+    /// conflict target is a different row than the incoming one). Returns the
+    /// updated row. Shared by the direct and prepared insert paths.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_on_conflict_do_update(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        composite_indexes: &[CompositeIndexMeta],
+        composite_unique_indexes: &[CompositeIndexMeta],
+        single_column_index_includes: &HashMap<usize, Vec<usize>>,
+        foreign_keys: &[super::super::ForeignKeyMeta],
+        trigram_column_indices: &[usize],
+        do_update: &sqlparser::ast::DoUpdate,
+        row_values: &[Value],
+        conflict_key: &str,
+        conflict_row_id: &str,
+        existing_bytes: &[u8],
+        unique_sets: &mut UniqueColumnValueSets,
+        txn: &mut dyn Transaction,
+    ) -> Result<Vec<Value>> {
+        let mut existing_row: Vec<Value> =
+            if let Some(row) = self.row_cache_lookup(conflict_key, existing_bytes) {
+                row
+            } else {
+                crate::common::encoding::RowDecoder::decode(existing_bytes)
+                    .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
+            };
+        let old_existing_row = existing_row.clone();
+        for assignment in &do_update.assignments {
+            let col_name = match &assignment.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => name.to_string(),
+                _ => continue,
+            };
+            if let Some(col_idx) = schema.get_column_index(&col_name) {
+                let new_val = self.evaluate_upsert_value(
+                    &assignment.value,
+                    &existing_row,
+                    row_values,
+                    schema,
+                )?;
+                existing_row[col_idx] =
+                    Self::coerce_value_to_column_type(new_val, &schema.columns[col_idx].data_type)?;
+            }
+        }
+        self.validate_child_foreign_keys(table_name, schema, &existing_row, foreign_keys, txn)
+            .await?;
+        self.validate_composite_unique_constraints(
+            composite_unique_indexes,
+            table_name,
+            schema,
+            &existing_row,
+            Some(conflict_row_id),
+            txn,
+        )
+        .await?;
+        self.validate_unique_columns_for_update(
+            table_name,
+            schema,
+            &old_existing_row,
+            &existing_row,
+            conflict_key.as_bytes(),
+            txn,
+        )
+        .await?;
+        let value = crate::common::encoding::RowEncoder::encode(&existing_row);
+        self.write_routed_data_row(table_name, conflict_row_id, &value, txn)
+            .await?;
+        self.migrate_unique_sentinels_for_update(
+            table_name,
+            schema,
+            &old_existing_row,
+            &existing_row,
+            conflict_row_id,
+            txn,
+        )
+        .await?;
+        unique_sets.track_update(schema, &old_existing_row, &existing_row, conflict_row_id);
+        self.update_trigram_index_for_update(
+            table_name,
+            schema,
+            &old_existing_row,
+            &existing_row,
+            conflict_row_id,
+            trigram_column_indices,
+            txn,
+        );
+        self.update_single_column_indexes_for_upsert(
+            table_name,
+            schema,
+            &old_existing_row,
+            &existing_row,
+            conflict_row_id,
+            single_column_index_includes,
+            txn,
+        )
+        .await?;
+        self.update_loaded_composite_indexes_for_row(
+            composite_indexes,
+            table_name,
+            schema,
+            &old_existing_row,
+            &existing_row,
+            conflict_row_id,
+            txn,
+        )
+        .await?;
+        monitor::inc_row_write();
+        Ok(existing_row)
     }
 
     async fn update_single_column_indexes_for_upsert(
@@ -504,112 +732,43 @@ impl Executor {
         let key = self.routed_data_key_for_row_id(&context.table_name, &row_id);
 
         if let Some(OnInsert::OnConflict(oc)) = on_conflict {
-            if let Some(existing_bytes) = txn.get(key.as_bytes()).await? {
+            let conflict = self
+                .find_on_conflict_row(
+                    oc,
+                    &context.table_name,
+                    &context.schema,
+                    &row_values,
+                    &key,
+                    &row_id,
+                    unique_sets,
+                    txn,
+                )
+                .await?;
+            if let Some((conflict_key, conflict_row_id, existing_bytes)) = conflict {
                 match &oc.action {
                     sqlparser::ast::OnConflictAction::DoNothing => {
                         return Ok(None);
                     }
                     sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
-                        let mut existing_row: Vec<Value> = if let Some(row) =
-                            self.row_cache_lookup(&key, &existing_bytes)
-                        {
-                            row
-                        } else {
-                            crate::common::encoding::RowDecoder::decode(&existing_bytes).map_err(
-                                |e| FusionError::Execution(format!("Decode error: {}", e)),
-                            )?
-                        };
-                        let old_existing_row = existing_row.clone();
-                        for assignment in &do_update.assignments {
-                            let col_name = match &assignment.target {
-                                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                                    name.to_string()
-                                }
-                                _ => continue,
-                            };
-                            if let Some(col_idx) = context.schema.get_column_index(&col_name) {
-                                let new_val = self.evaluate_upsert_value(
-                                    &assignment.value,
-                                    &existing_row,
-                                    &row_values,
-                                    &context.schema,
-                                )?;
-                                existing_row[col_idx] = Self::coerce_value_to_column_type(
-                                    new_val,
-                                    &context.schema.columns[col_idx].data_type,
-                                )?;
-                            }
-                        }
-                        self.validate_child_foreign_keys(
-                            &context.table_name,
-                            &context.schema,
-                            &existing_row,
-                            &context.foreign_keys,
-                            txn,
-                        )
-                        .await?;
-                        self.validate_composite_unique_constraints(
-                            &context.composite_unique_indexes,
-                            &context.table_name,
-                            &context.schema,
-                            &existing_row,
-                            Some(&row_id),
-                            txn,
-                        )
-                        .await?;
-                        self.validate_unique_columns_for_update(
-                            &context.table_name,
-                            &context.schema,
-                            &old_existing_row,
-                            &existing_row,
-                            key.as_bytes(),
-                            txn,
-                        )
-                        .await?;
-                        let value = crate::common::encoding::RowEncoder::encode(&existing_row);
-                        self.write_routed_data_row(&context.table_name, &row_id, &value, txn)
+                        let updated_row = self
+                            .apply_on_conflict_do_update(
+                                &context.table_name,
+                                &context.schema,
+                                &context.composite_indexes,
+                                &context.composite_unique_indexes,
+                                &context.single_column_index_includes,
+                                &context.foreign_keys,
+                                &context.trigram_column_indices,
+                                do_update,
+                                &row_values,
+                                &conflict_key,
+                                &conflict_row_id,
+                                &existing_bytes,
+                                unique_sets,
+                                txn,
+                            )
                             .await?;
-                        self.migrate_unique_sentinels_for_update(
-                            &context.table_name,
-                            &context.schema,
-                            &old_existing_row,
-                            &existing_row,
-                            &row_id,
-                            txn,
-                        )
-                        .await?;
-                        unique_sets.track_update(&context.schema, &old_existing_row, &existing_row);
-                        self.update_trigram_index_for_update(
-                            &context.table_name,
-                            &context.schema,
-                            &old_existing_row,
-                            &existing_row,
-                            &row_id,
-                            &context.trigram_column_indices,
-                            txn,
-                        );
-                        self.update_single_column_indexes_for_upsert(
-                            &context.table_name,
-                            &context.schema,
-                            &old_existing_row,
-                            &existing_row,
-                            &row_id,
-                            &context.single_column_index_includes,
-                            txn,
-                        )
-                        .await?;
-                        self.update_loaded_composite_indexes_for_row(
-                            &context.composite_indexes,
-                            &context.table_name,
-                            &context.schema,
-                            &old_existing_row,
-                            &existing_row,
-                            &row_id,
-                            txn,
-                        )
-                        .await?;
-                        monitor::inc_row_write();
-                        return Ok(Some(existing_row));
+                        return Ok(Some(updated_row));
                     }
                 }
             }
@@ -670,7 +829,7 @@ impl Executor {
             txn,
         )
         .await?;
-        unique_sets.track_insert(&context.schema, &row_values);
+        unique_sets.track_insert(&context.schema, &row_values, &row_id);
 
         self.update_trigram_index_for_insert(
             &context.table_name,
@@ -934,7 +1093,19 @@ impl Executor {
 
                     // Handle ON CONFLICT (UPSERT)
                     if let Some(sqlparser::ast::OnInsert::OnConflict(oc)) = on_conflict {
-                        if let Some(existing_bytes) = txn.get(key.as_bytes()).await? {
+                        let conflict = self
+                            .find_on_conflict_row(
+                                oc,
+                                &table_name_str,
+                                &schema,
+                                &row_values,
+                                &key,
+                                &row_id,
+                                &mut unique_sets,
+                                txn,
+                            )
+                            .await?;
+                        if let Some((conflict_key, conflict_row_id, existing_bytes)) = conflict {
                             match &oc.action {
                                 sqlparser::ast::OnConflictAction::DoNothing => {
                                     // Skip this row
@@ -942,124 +1113,26 @@ impl Executor {
                                     continue;
                                 }
                                 sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
-                                    // Load existing row, apply assignments using EXCLUDED references
-                                    let mut existing_row: Vec<Value> = if let Some(row) =
-                                        self.row_cache_lookup(&key, &existing_bytes)
-                                    {
-                                        row
-                                    } else {
-                                        crate::common::encoding::RowDecoder::decode(&existing_bytes)
-                                            .map_err(|e| {
-                                                FusionError::Execution(format!(
-                                                    "Decode error: {}",
-                                                    e
-                                                ))
-                                            })?
-                                    };
-                                    let old_existing_row = existing_row.clone();
-                                    for assignment in &do_update.assignments {
-                                        let col_name = match &assignment.target {
-                                            sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                                                name.to_string()
-                                            }
-                                            _ => continue,
-                                        };
-                                        if let Some(col_idx) = schema.get_column_index(&col_name) {
-                                            // Evaluate the value expression; EXCLUDED.col references map to the new row_values
-                                            let new_val = self.evaluate_upsert_value(
-                                                &assignment.value,
-                                                &existing_row,
-                                                &row_values,
-                                                &schema,
-                                            )?;
-                                            existing_row[col_idx] =
-                                                Self::coerce_value_to_column_type(
-                                                    new_val,
-                                                    &schema.columns[col_idx].data_type,
-                                                )?;
-                                        }
-                                    }
-                                    self.validate_child_foreign_keys(
-                                        &table_name_str,
-                                        &schema,
-                                        &existing_row,
-                                        &foreign_keys,
-                                        txn,
-                                    )
-                                    .await?;
-                                    self.validate_composite_unique_constraints(
-                                        &composite_unique_indexes,
-                                        &table_name_str,
-                                        &schema,
-                                        &existing_row,
-                                        Some(&row_id),
-                                        txn,
-                                    )
-                                    .await?;
-                                    self.validate_unique_columns_for_update(
-                                        &table_name_str,
-                                        &schema,
-                                        &old_existing_row,
-                                        &existing_row,
-                                        key.as_bytes(),
-                                        txn,
-                                    )
-                                    .await?;
-                                    let value =
-                                        crate::common::encoding::RowEncoder::encode(&existing_row);
-                                    self.write_routed_data_row(
-                                        &table_name_str,
-                                        &row_id,
-                                        &value,
-                                        txn,
-                                    )
-                                    .await?;
-                                    self.migrate_unique_sentinels_for_update(
-                                        &table_name_str,
-                                        &schema,
-                                        &old_existing_row,
-                                        &existing_row,
-                                        &row_id,
-                                        txn,
-                                    )
-                                    .await?;
-                                    unique_sets.track_update(
-                                        &schema,
-                                        &old_existing_row,
-                                        &existing_row,
-                                    );
-                                    self.update_trigram_index_for_update(
-                                        &table_name_str,
-                                        &schema,
-                                        &old_existing_row,
-                                        &existing_row,
-                                        &row_id,
-                                        &trigram_column_indices,
-                                        txn,
-                                    );
-                                    self.update_single_column_indexes_for_upsert(
-                                        &table_name_str,
-                                        &schema,
-                                        &old_existing_row,
-                                        &existing_row,
-                                        &row_id,
-                                        &single_column_index_includes,
-                                        txn,
-                                    )
-                                    .await?;
-                                    self.update_loaded_composite_indexes_for_row(
-                                        &composite_indexes,
-                                        &table_name_str,
-                                        &schema,
-                                        &old_existing_row,
-                                        &existing_row,
-                                        &row_id,
-                                        txn,
-                                    )
-                                    .await?;
-                                    monitor::inc_row_write();
+                                    let updated_row = self
+                                        .apply_on_conflict_do_update(
+                                            &table_name_str,
+                                            &schema,
+                                            &composite_indexes,
+                                            &composite_unique_indexes,
+                                            &single_column_index_includes,
+                                            &foreign_keys,
+                                            &trigram_column_indices,
+                                            do_update,
+                                            &row_values,
+                                            &conflict_key,
+                                            &conflict_row_id,
+                                            &existing_bytes,
+                                            &mut unique_sets,
+                                            txn,
+                                        )
+                                        .await?;
                                     if returning.is_some() {
-                                        inserted_rows.push(existing_row);
+                                        inserted_rows.push(updated_row);
                                     }
                                     count += 1;
                                     continue;
@@ -1122,7 +1195,7 @@ impl Executor {
                         txn,
                     )
                     .await?;
-                    unique_sets.track_insert(&schema, &row_values);
+                    unique_sets.track_insert(&schema, &row_values, &row_id);
 
                     self.update_trigram_index_for_insert(
                         &table_name_str,
