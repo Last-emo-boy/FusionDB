@@ -6,8 +6,9 @@ use super::manifest_edit::{
 use super::manifest_log;
 use super::wal::{WalEntry, WalManager};
 use super::{
-    ScanVisitor, SqlBlockZoneMapFailOpenReason, SqlBlockZoneMapPruningDecision,
-    SqlBlockZoneMapPruningPlan, Storage, StorageScanOptions, Transaction,
+    hnsw_index_name_for_column, ScanVisitor, SqlBlockZoneMapFailOpenReason,
+    SqlBlockZoneMapPruningDecision, SqlBlockZoneMapPruningPlan, Storage, StorageScanOptions,
+    Transaction,
 };
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result};
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
-use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify, OwnedRwLockReadGuard, RwLock as AsyncRwLock};
 
 // Fusion Storage Engine
 // Combines:
@@ -263,6 +264,7 @@ fn cdc_sequence_for(commit_ts: u64, event_index: usize) -> Result<u64> {
 
 fn cdc_should_capture_key(key: &[u8]) -> bool {
     !key.starts_with(CDC_KEY_PREFIX.as_bytes())
+        && crate::storage::keyspace::parse_data_key_exact(key).is_err()
 }
 
 fn encode_cdc_event(event: &CdcEvent) -> Result<Vec<u8>> {
@@ -275,6 +277,7 @@ fn decode_cdc_event(bytes: &[u8]) -> Result<CdcEvent> {
         .map_err(|error| FusionError::Storage(format!("CDC event decode error: {}", error)))
 }
 
+#[cfg(test)]
 fn vector_rebuild_data_prefix_for_table(table_name: &str) -> String {
     let mut prefix = String::with_capacity("data:".len() + table_name.len() + 1);
     prefix.push_str("data:");
@@ -283,13 +286,34 @@ fn vector_rebuild_data_prefix_for_table(table_name: &str) -> String {
     prefix
 }
 
-fn vector_rebuild_hnsw_index_name_for_column(table_name: &str, column_name: &str) -> String {
-    let mut name = String::with_capacity("hnsw_".len() + table_name.len() + 1 + column_name.len());
-    name.push_str("hnsw_");
-    name.push_str(table_name);
-    name.push('_');
-    name.push_str(column_name);
-    name
+fn side_index_data_key_payload(key: &[u8]) -> Result<Option<&[u8]>> {
+    if let Some(payload) = key.strip_prefix(b"data:") {
+        return Ok(Some(payload));
+    }
+    let Some(rest) = key.strip_prefix(b"shard:") else {
+        return Ok(None);
+    };
+    let shard_end = rest.iter().position(|byte| *byte == b':').ok_or_else(|| {
+        FusionError::Storage(format!(
+            "malformed sharded storage key '{}'",
+            String::from_utf8_lossy(key)
+        ))
+    })?;
+    let shard_id = std::str::from_utf8(&rest[..shard_end]).map_err(|error| {
+        FusionError::Storage(format!(
+            "sharded storage key has non-UTF-8 shard id: {error}"
+        ))
+    })?;
+    shard_id.parse::<u64>().map_err(|error| {
+        FusionError::Storage(format!("invalid shard id in storage key: {error}"))
+    })?;
+    Ok(rest[shard_end + 1..].strip_prefix(b"data:"))
+}
+
+struct SideIndexRebuildPlan {
+    table_name: String,
+    trigram_columns: Vec<(usize, String)>,
+    hnsw_columns: Vec<(usize, String)>,
 }
 
 use crate::storage::inverted_index::InvertedIndex;
@@ -1248,6 +1272,7 @@ pub struct FusionStorage {
     // Global Clock for MVCC
     current_ts: Arc<AtomicU64>,
     active_read_timestamps: Arc<StdMutex<BTreeMap<u64, usize>>>,
+    side_index_visibility: Arc<AsyncRwLock<()>>,
 
     // ID Generator for MemTables
     next_memtable_id: Arc<AtomicU64>,
@@ -1421,7 +1446,7 @@ impl FusionStorage {
             .unwrap_or(1);
         let next_id = active_memtable_id.saturating_add(1);
         let active = MemTable::new(active_memtable_id);
-        let max_sstable_ts = Self::restore_max_sstable_timestamp(&sstables_vec, sst_dir).await;
+        let max_sstable_ts = Self::restore_max_sstable_timestamp(&sstables_vec, sst_dir).await?;
 
         // Replay WAL
         // We need to replay committed transactions into the active memtable.
@@ -1441,6 +1466,7 @@ impl FusionStorage {
             wal: Arc::new(wal),
             current_ts: Arc::new(AtomicU64::new(0)), // Will be updated by replay
             active_read_timestamps: Arc::new(StdMutex::new(BTreeMap::new())),
+            side_index_visibility: Arc::new(AsyncRwLock::new(())),
             next_memtable_id: Arc::new(AtomicU64::new(next_id)),
             flush_notify: Arc::new(Notify::new()),
             columnar_store: Arc::new(RwLock::new(None)),
@@ -1453,10 +1479,10 @@ impl FusionStorage {
                 vi.create_index("default");
                 vi
             },
-            trigram_index: Arc::new(RwLock::new(
-                crate::storage::trigram::TrigramIndex::load(&paths.trigram_index_path)
-                    .unwrap_or_else(|_| crate::storage::trigram::TrigramIndex::new()),
-            )),
+            // Trigram/HNSW are derived indexes. Startup rebuilds them from the
+            // durable row state before serving requests, so a stale checkpoint
+            // file can never become the recovery source of truth.
+            trigram_index: Arc::new(RwLock::new(crate::storage::trigram::TrigramIndex::new())),
             block_cache,
             memtable_threshold,
             commit_lock: Arc::new(AsyncMutex::new(())),
@@ -1528,6 +1554,8 @@ impl FusionStorage {
         let restored_ts = max_sstable_ts.max(max_replay_ts);
         storage.current_ts.store(restored_ts, Ordering::SeqCst);
 
+        storage.rebuild_side_indexes().await?;
+
         // Start flush thread
         let s = storage.clone();
         tokio::spawn(async move {
@@ -1538,13 +1566,6 @@ impl FusionStorage {
         let s2 = storage.clone();
         tokio::spawn(async move {
             s2.compaction_loop().await;
-        });
-
-        // Rebuild Vector Index in background
-        let s3 = storage.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            s3.rebuild_vector_index().await;
         });
 
         let s4 = storage.clone();
@@ -1559,9 +1580,23 @@ impl FusionStorage {
         Ok(storage)
     }
 
-    fn register_active_read_ts(&self, read_ts: u64) {
+    fn register_current_read_ts(&self) -> u64 {
+        self.register_current_read_ts_with(|_| {})
+    }
+
+    fn register_current_read_ts_with<F>(&self, after_read_ts: F) -> u64
+    where
+        F: FnOnce(u64),
+    {
+        // This mutex is also the compaction watermark barrier. Loading the public
+        // timestamp and registering it must be one critical section; otherwise
+        // compaction can sample an empty registry after the load and discard the
+        // floor version before the transaction becomes visible to the registry.
         let mut active = self.active_read_timestamps.lock().unwrap();
+        let read_ts = self.current_ts.load(Ordering::SeqCst);
+        after_read_ts(read_ts);
         *active.entry(read_ts).or_insert(0) += 1;
+        read_ts
     }
 
     fn unregister_active_read_ts(&self, read_ts: u64) {
@@ -1616,7 +1651,8 @@ impl FusionStorage {
         }
     }
 
-    pub fn update_columnar_store(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) {
+    pub async fn update_columnar_store(&self, ids: Vec<String>, vectors: Vec<Vec<f32>>) {
+        let _visibility_guard = self.side_index_visibility.clone().write_owned().await;
         // New: HNSW Index
         for (id, vec) in ids.iter().zip(vectors.iter()) {
             let _ = self.vector_index.insert("default", id.clone(), vec.clone());
@@ -1634,11 +1670,16 @@ impl FusionStorage {
         guard.add_document(doc_id, text);
     }
 
-    pub fn vector_search(&self, query: &[f32], limit: usize) -> Vec<(String, f32)> {
+    fn vector_search_unlocked(&self, query: &[f32], limit: usize) -> Vec<(String, f32)> {
         // Use HNSW Index
         self.vector_index
             .search("default", query, limit)
             .unwrap_or_default()
+    }
+
+    pub async fn vector_search(&self, query: &[f32], limit: usize) -> Vec<(String, f32)> {
+        let _visibility_guard = self.side_index_visibility.clone().read_owned().await;
+        self.vector_search_unlocked(query, limit)
     }
 
     pub fn bm25_search(&self, query: &str, limit: usize) -> Vec<(String, f32)> {
@@ -1648,7 +1689,7 @@ impl FusionStorage {
     }
 
     // Hybrid Search: RRF (Reciprocal Rank Fusion)
-    pub fn hybrid_search(
+    pub async fn hybrid_search(
         &self,
         text_query: &str,
         vector_query: &[f32],
@@ -1658,9 +1699,11 @@ impl FusionStorage {
             return Vec::new();
         }
 
+        let _visibility_guard = self.side_index_visibility.clone().read_owned().await;
         // 1. Get results from both sources
-        let text_results = self.bm25_search(text_query, limit * 2); // Get more candidates
-        let vector_results = self.vector_search(vector_query, limit * 2);
+        let candidate_limit = limit.saturating_mul(2);
+        let text_results = self.bm25_search(text_query, candidate_limit); // Get more candidates
+        let vector_results = self.vector_search_unlocked(vector_query, candidate_limit);
 
         // 2. RRF Fusion
         // Score = 1 / (k + rank)
@@ -1754,9 +1797,12 @@ impl FusionStorage {
         Ok(())
     }
 
-    async fn restore_max_sstable_timestamp(sstables: &[Arc<SsTable>], sstable_dir: &Path) -> u64 {
+    async fn restore_max_sstable_timestamp(
+        sstables: &[Arc<SsTable>],
+        sstable_dir: &Path,
+    ) -> Result<u64> {
         if sstables.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let cache_path = sstable_timestamp_cache_path(sstable_dir);
@@ -1776,21 +1822,19 @@ impl FusionStorage {
                 }
             }
 
-            match Self::scan_sstable_max_timestamp(sst).await {
-                Ok(max_ts) => {
-                    scanned += 1;
-                    max_sstable_ts = max_sstable_ts.max(max_ts);
-                    if let Some(fingerprint) = fingerprint {
-                        cache.set(sst.id, fingerprint, max_ts);
-                        cache_dirty = true;
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to scan SSTable {} for timestamp restore: {:?}",
-                        sst.id, e
-                    );
-                }
+            let max_ts = Self::scan_sstable_max_timestamp(sst)
+                .await
+                .map_err(|error| {
+                    FusionError::Storage(format!(
+                        "failed to restore MVCC timestamp from live SSTable {}: {error}",
+                        sst.id
+                    ))
+                })?;
+            scanned += 1;
+            max_sstable_ts = max_sstable_ts.max(max_ts);
+            if let Some(fingerprint) = fingerprint {
+                cache.set(sst.id, fingerprint, max_ts);
+                cache_dirty = true;
             }
         }
 
@@ -1808,7 +1852,7 @@ impl FusionStorage {
             "Restored SSTable max timestamp {} ({} cached, {} scanned).",
             max_sstable_ts, cache_hits, scanned
         );
-        max_sstable_ts
+        Ok(max_sstable_ts)
     }
 
     async fn scan_sstable_max_timestamp(sst: &SsTable) -> Result<u64> {
@@ -2035,205 +2079,277 @@ impl FusionStorage {
         end: &[u8],
         entries: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<()> {
-        {
-            let _commit_guard = self.commit_lock.lock().await;
-            let read_ts = self.current_ts.load(Ordering::SeqCst);
-            let snapshot_txn = FusionTransaction {
-                storage: self.clone(),
-                write_buffer: transaction_write_buffer(),
-                read_ts,
-                read_ts_registered: false,
-                side_index_deltas: std::sync::Mutex::new(Vec::new()),
-            };
-            let existing = snapshot_txn.scan_range(start, end, None).await?;
-            let total_entries = existing.len().saturating_add(entries.len());
-            if total_entries > 0 {
-                let commit_ts = read_ts
-                    .checked_add(1)
-                    .ok_or_else(|| FusionError::Storage("MVCC timestamp exhausted".to_string()))?;
-                let mut wal_entries = Vec::with_capacity(total_entries);
-                let mut mem_entries = Vec::with_capacity(total_entries);
+        let _visibility_guard = self.side_index_visibility.clone().write_owned().await;
+        let _commit_guard = self.commit_lock.lock().await;
+        let read_ts = self.current_ts.load(Ordering::SeqCst);
+        let snapshot_txn = FusionTransaction {
+            storage: self.clone(),
+            write_buffer: transaction_write_buffer(),
+            read_ts,
+            read_ts_registered: false,
+            capture_cdc: AtomicBool::new(true),
+            side_index_deltas: std::sync::Mutex::new(Vec::new()),
+        };
+        let existing = snapshot_txn.scan_range(start, end, None).await?;
+        let mut future_entries = if start.is_empty() && end == [0xff] {
+            BTreeMap::new()
+        } else {
+            snapshot_txn
+                .scan_range(b"", &[0xff], None)
+                .await?
+                .into_iter()
+                .filter(|(key, _)| key.as_slice() < start || key.as_slice() >= end)
+                .collect()
+        };
+        for (key, value) in entries {
+            future_entries.insert(key.clone(), value.clone());
+        }
+        // Validate and fully build derived state before making the replacement
+        // durable. A malformed snapshot therefore cannot leave an unpublished
+        // WAL/MemTable commit that becomes visible only after restart.
+        let future_entries: Vec<_> = future_entries.into_iter().collect();
+        let (rebuilt_vector, rebuilt_trigram) =
+            Self::build_side_indexes_from_visible_entries(&future_entries)?;
+        let total_entries = existing.len().saturating_add(entries.len());
+        let mut publish_ts = read_ts;
+        let mut needs_rotate = false;
+        if total_entries > 0 {
+            let commit_ts = read_ts
+                .checked_add(1)
+                .ok_or_else(|| FusionError::Storage("MVCC timestamp exhausted".to_string()))?;
+            let mut wal_entries = Vec::with_capacity(total_entries);
+            let mut mem_entries = Vec::with_capacity(total_entries);
 
-                for (key, _) in existing {
-                    let encoded_key = FusionStorage::encode_key(&key, commit_ts);
-                    let encoded_value = FusionStorage::encode_value(false, &[]);
-                    wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
-                    mem_entries.push((encoded_key, encoded_value));
-                }
-                for (key, value) in entries {
-                    let encoded_key = FusionStorage::encode_key(key, commit_ts);
-                    let encoded_value = FusionStorage::encode_value(true, value);
-                    wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
-                    mem_entries.push((encoded_key, encoded_value));
-                }
-
-                self.wal.append_batch_async(wal_entries).await?;
-                let needs_rotate = {
-                    let active = self.active_memtable.write().unwrap();
-                    for (key, value) in mem_entries {
-                        active.insert(key, value);
-                    }
-                    active.size.load(Ordering::Relaxed) > self.memtable_threshold as u64
-                };
-                if needs_rotate {
-                    self.rotate_memtable().await;
-                }
-                self.current_ts.store(commit_ts, Ordering::SeqCst);
+            for (key, _) in existing {
+                let encoded_key = FusionStorage::encode_key(&key, commit_ts);
+                let encoded_value = FusionStorage::encode_value(false, &[]);
+                wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
+                mem_entries.push((encoded_key, encoded_value));
             }
+            for (key, value) in entries {
+                let encoded_key = FusionStorage::encode_key(key, commit_ts);
+                let encoded_value = FusionStorage::encode_value(true, value);
+                wal_entries.push(WalEntry::Put(encoded_key.clone(), encoded_value.clone()));
+                mem_entries.push((encoded_key, encoded_value));
+            }
+
+            self.wal.append_batch_async(wal_entries).await?;
+            needs_rotate = {
+                let active = self.active_memtable.write().unwrap();
+                for (key, value) in mem_entries {
+                    active.insert(key, value);
+                }
+                active.size.load(Ordering::Relaxed) > self.memtable_threshold as u64
+            };
+            publish_ts = commit_ts;
         }
 
-        self.vector_index.clear();
-        self.rebuild_vector_index().await;
-        *self.trigram_index.write().unwrap() = crate::storage::trigram::TrigramIndex::new();
-        self.rebuild_trigram_index().await;
+        self.vector_index.replace_with(rebuilt_vector);
+        *self.trigram_index.write().unwrap() = rebuilt_trigram;
+        self.current_ts.store(publish_ts, Ordering::SeqCst);
+
+        if needs_rotate {
+            self.rotate_memtable().await;
+        }
         Ok(())
     }
 
-    /// Rebuild the trigram fuzzy-text index from visible rows. Mirrors
-    /// rebuild_vector_index; used after a Raft snapshot install, which
-    /// previously rebuilt only the vector index and left trigram-served
-    /// LIKE queries answering from pre-snapshot state (BENCHPROD-466d).
-    async fn rebuild_trigram_index(&self) {
-        println!("Rebuilding Trigram Index from Storage...");
-        let txn = match self.begin_transaction().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Failed to begin transaction for trigram rebuild: {:?}", e);
-                return;
+    async fn build_side_indexes(
+        &self,
+        txn: &dyn Transaction,
+    ) -> Result<(VectorIndex, crate::storage::trigram::TrigramIndex)> {
+        let schema_entries = txn.scan_prefix(b"schema:", None).await?;
+        let (vector, mut trigram, plans) = Self::prepare_side_index_rebuild(
+            schema_entries
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice())),
+        )?;
+        let mut rebuild_error = None;
+        let mut visitor = |key: &[u8], row: &[u8]| {
+            if rebuild_error.is_some() {
+                return false;
+            }
+            match Self::apply_visible_side_index_row(key, row, &plans, &vector, &mut trigram) {
+                Ok(()) => true,
+                Err(error) => {
+                    rebuild_error = Some(error);
+                    false
+                }
             }
         };
+        txn.scan_range_for_each(b"", &[0xff], None, &mut visitor)
+            .await?;
+        drop(visitor);
+        if let Some(error) = rebuild_error {
+            return Err(error);
+        }
+        vector.build_all()?;
+        Ok((vector, trigram))
+    }
 
-        let prefix = "schema:";
-        let kv_pairs = match txn.scan_prefix(prefix.as_bytes(), None).await {
-            Ok(kv) => kv,
-            Err(e) => {
-                eprintln!("Failed to scan schemas: {:?}", e);
-                return;
-            }
-        };
+    fn build_side_indexes_from_visible_entries(
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(VectorIndex, crate::storage::trigram::TrigramIndex)> {
+        let (vector, mut trigram, plans) = Self::prepare_side_index_rebuild(
+            entries
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice())),
+        )?;
+        for (key, row) in entries {
+            Self::apply_visible_side_index_row(key, row, &plans, &vector, &mut trigram)?;
+        }
+        vector.build_all()?;
+        Ok((vector, trigram))
+    }
 
-        for (k, v) in kv_pairs {
-            let Ok(key_str) = std::str::from_utf8(&k) else {
+    fn prepare_side_index_rebuild<'a>(
+        entries: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    ) -> Result<(
+        VectorIndex,
+        crate::storage::trigram::TrigramIndex,
+        Vec<SideIndexRebuildPlan>,
+    )> {
+        let vector = VectorIndex::new();
+        vector.create_index("default");
+        let trigram = crate::storage::trigram::TrigramIndex::new();
+        let mut plans = Vec::new();
+
+        for (key, value) in entries {
+            let Some(table_bytes) = key.strip_prefix(b"schema:") else {
                 continue;
             };
-            let Some(table_name) = key_str.strip_prefix(prefix) else {
-                continue;
-            };
-            let Ok(schema) = bincode::deserialize::<crate::catalog::TableSchema>(&v) else {
-                continue;
-            };
-            let trigram_cols: Vec<(usize, String)> = schema
+            let table_name = std::str::from_utf8(table_bytes).map_err(|error| {
+                FusionError::Storage(format!("side-index schema key is not UTF-8: {error}"))
+            })?;
+            let schema =
+                bincode::deserialize::<crate::catalog::TableSchema>(value).map_err(|error| {
+                    FusionError::Storage(format!(
+                        "side-index rebuild failed to decode schema '{table_name}': {error}"
+                    ))
+                })?;
+            let trigram_columns: Vec<(usize, String)> = schema
                 .columns
                 .iter()
                 .enumerate()
-                .filter(|(_, col)| col.is_trigram_text_column())
-                .map(|(idx, col)| (idx, col.name.clone()))
+                .filter(|(_, column)| column.is_trigram_text_column())
+                .map(|(index, column)| (index, column.name.clone()))
                 .collect();
-            if trigram_cols.is_empty() {
-                continue;
-            }
-
-            let data_prefix = vector_rebuild_data_prefix_for_table(table_name);
-            let Ok(data_pairs) = txn.scan_prefix(data_prefix.as_bytes(), None).await else {
-                continue;
-            };
-            let mut idx_lock = self.trigram_index.write().unwrap();
-            for (dk, dv) in data_pairs {
-                let Some(row_id) = std::str::from_utf8(&dk)
-                    .ok()
-                    .and_then(|key| key.rsplit(':').next())
-                else {
-                    continue;
-                };
-                let numeric_id = crate::storage::trigram::numeric_row_id_for_str(row_id);
-                for (col_idx, col_name) in &trigram_cols {
-                    if let Ok(Some(crate::common::Value::String(text))) =
-                        crate::common::encoding::RowDecoder::decode_column(&dv, *col_idx)
-                    {
-                        idx_lock.add_with_id_str(table_name, col_name, numeric_id, row_id, &text);
-                    }
+            let mut hnsw_columns = Vec::new();
+            for (index, column) in schema.columns.iter().enumerate() {
+                if column.is_indexed && column.index_type == crate::catalog::IndexType::HNSW {
+                    let index_name = hnsw_index_name_for_column(&table_name, &column.name)?;
+                    vector.create_index(&index_name);
+                    hnsw_columns.push((index, index_name));
                 }
             }
+            if !trigram_columns.is_empty() || !hnsw_columns.is_empty() {
+                plans.push(SideIndexRebuildPlan {
+                    table_name: table_name.to_string(),
+                    trigram_columns,
+                    hnsw_columns,
+                });
+            }
         }
-        println!("Trigram Index Rebuild Complete.");
+        // Longest-name-first prevents `data:tenant:archive:*` from also being
+        // interpreted as a row of table `tenant`.
+        plans.sort_by(|left, right| {
+            right
+                .table_name
+                .len()
+                .cmp(&left.table_name.len())
+                .then(left.table_name.cmp(&right.table_name))
+        });
+        Ok((vector, trigram, plans))
     }
 
-    async fn rebuild_vector_index(&self) {
-        println!("Rebuilding Vector Index from Storage...");
-        let txn = match self.begin_transaction().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Failed to begin transaction for rebuild: {:?}", e);
-                return;
-            }
+    fn apply_visible_side_index_row(
+        key: &[u8],
+        row: &[u8],
+        plans: &[SideIndexRebuildPlan],
+        vector: &VectorIndex,
+        trigram: &mut crate::storage::trigram::TrigramIndex,
+    ) -> Result<()> {
+        let Some(payload) = side_index_data_key_payload(key)? else {
+            return Ok(());
         };
-
-        let prefix = "schema:";
-        let kv_pairs = match txn.scan_prefix(prefix.as_bytes(), None).await {
-            Ok(kv) => kv,
-            Err(e) => {
-                eprintln!("Failed to scan schemas: {:?}", e);
-                return;
-            }
+        let Some(plan) = plans.iter().find(|plan| {
+            let table = plan.table_name.as_bytes();
+            payload.get(..table.len()) == Some(table) && payload.get(table.len()) == Some(&b':')
+        }) else {
+            return Ok(());
         };
-
-        for (k, v) in kv_pairs {
-            if let Ok(key_str) = std::str::from_utf8(&k) {
-                if let Some(table_name) = key_str.strip_prefix(prefix) {
-                    if let Ok(schema) = bincode::deserialize::<crate::catalog::TableSchema>(&v) {
-                        let mut hnsw_cols = Vec::with_capacity(schema.columns.len());
-                        for (idx, col) in schema.columns.iter().enumerate() {
-                            if col.is_indexed && col.index_type == crate::catalog::IndexType::HNSW {
-                                let idx_name = vector_rebuild_hnsw_index_name_for_column(
-                                    table_name, &col.name,
-                                );
-                                self.vector_index.create_index(&idx_name);
-                                hnsw_cols.push((idx, idx_name));
-                            }
-                        }
-
-                        if hnsw_cols.is_empty() {
-                            continue;
-                        }
-
-                        let data_prefix = vector_rebuild_data_prefix_for_table(table_name);
-                        if let Ok(data_pairs) = txn.scan_prefix(data_prefix.as_bytes(), None).await
-                        {
-                            let mut batches: HashMap<String, Vec<(String, Vec<f32>)>> =
-                                HashMap::with_capacity(hnsw_cols.len());
-
-                            for (dk, dv) in data_pairs {
-                                let Some(row_id) = std::str::from_utf8(&dk)
-                                    .ok()
-                                    .and_then(|key| key.rsplit(':').next())
-                                    .map(|value| value.to_string())
-                                else {
-                                    continue;
-                                };
-
-                                for (col_idx, idx_name) in &hnsw_cols {
-                                    if let Ok(Some(crate::common::Value::Vector(vec))) =
-                                        crate::common::encoding::RowDecoder::decode_column(
-                                            &dv, *col_idx,
-                                        )
-                                    {
-                                        batches
-                                            .entry(idx_name.clone())
-                                            .or_default()
-                                            .push((row_id.clone(), vec));
-                                    }
-                                }
-                            }
-
-                            for (idx_name, items) in batches {
-                                let _ = self.vector_index.batch_insert(&idx_name, items);
-                            }
-                        }
-                    }
+        let row_id =
+            std::str::from_utf8(&payload[plan.table_name.len() + 1..]).map_err(|error| {
+                FusionError::Storage(format!(
+                    "side-index row id for '{}' is not UTF-8: {error}",
+                    plan.table_name
+                ))
+            })?;
+        let numeric_id = crate::storage::trigram::numeric_row_id_for_str(row_id);
+        for (column_index, column_name) in &plan.trigram_columns {
+            match crate::common::encoding::RowDecoder::decode_column(row, *column_index).map_err(
+                |error| {
+                    FusionError::Storage(format!(
+                        "trigram rebuild failed to decode {}.{} for row '{}': {}",
+                        plan.table_name, column_name, row_id, error
+                    ))
+                },
+            )? {
+                Some(crate::common::Value::String(text)) => trigram.add_with_id_str(
+                    &plan.table_name,
+                    column_name,
+                    numeric_id,
+                    row_id,
+                    &text,
+                ),
+                Some(crate::common::Value::Null) | None => {}
+                Some(value) => {
+                    return Err(FusionError::Storage(format!(
+                        "trigram rebuild found non-text value {value:?} in {}.{}",
+                        plan.table_name, column_name
+                    )));
                 }
             }
         }
-        println!("Vector Index Rebuild Complete.");
+        for (column_index, index_name) in &plan.hnsw_columns {
+            match crate::common::encoding::RowDecoder::decode_column(row, *column_index).map_err(
+                |error| {
+                    FusionError::Storage(format!(
+                        "vector rebuild failed to decode {} column {} for row '{}': {}",
+                        plan.table_name, column_index, row_id, error
+                    ))
+                },
+            )? {
+                Some(crate::common::Value::Vector(value)) => {
+                    vector.insert(index_name, row_id.to_string(), value)?;
+                }
+                Some(crate::common::Value::Null) | None => {}
+                Some(value) => {
+                    return Err(FusionError::Storage(format!(
+                        "vector rebuild found non-vector value {value:?} in index '{index_name}'"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn rebuild_side_indexes(&self) -> Result<()> {
+        println!("Rebuilding derived side indexes from storage...");
+        let txn = self.begin_transaction().await?;
+        let (vector, trigram) = self.build_side_indexes(txn.as_ref()).await?;
+        self.vector_index.replace_with(vector);
+        *self.trigram_index.write().unwrap() = trigram;
+        println!("Derived side-index rebuild complete.");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn rebuild_vector_index(&self) -> Result<()> {
+        let txn = self.begin_transaction().await?;
+        let (vector, _) = self.build_side_indexes(txn.as_ref()).await?;
+        self.vector_index.replace_with(vector);
+        Ok(())
     }
 
     fn next_memtable_to_flush(&self) -> Option<MemTable> {
@@ -2787,6 +2903,7 @@ pub struct FusionTransaction {
     pub write_buffer: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pub read_ts: u64,
     read_ts_registered: bool,
+    capture_cdc: AtomicBool,
     side_index_deltas: std::sync::Mutex<Vec<SideIndexDelta>>,
 }
 
@@ -2795,6 +2912,54 @@ impl FusionTransaction {
     /// commits (after OCC validation and WAL durability). See SideIndexDelta.
     pub fn defer_side_index_delta(&self, delta: SideIndexDelta) {
         self.side_index_deltas.lock().unwrap().push(delta);
+    }
+
+    /// Raft replicates the exact logical mutation batch. Per-node CDC records
+    /// contain local MVCC timestamps, so state-machine apply must not derive
+    /// them independently on every replica.
+    pub(crate) fn disable_cdc_capture(&self) {
+        self.capture_cdc.store(false, Ordering::Release);
+    }
+
+    /// Side indexes represent only the latest visibility epoch. An older
+    /// snapshot must fall back to its MVCC row scan instead of consulting an
+    /// index that has already been updated in place.
+    pub(crate) async fn current_side_index_read_guard(&self) -> Option<OwnedRwLockReadGuard<()>> {
+        let guard = self
+            .storage
+            .side_index_visibility
+            .clone()
+            .read_owned()
+            .await;
+        (self.read_ts == self.storage.current_ts.load(Ordering::SeqCst)).then_some(guard)
+    }
+
+    /// Transfer deferred side-index work to a deterministic Raft mutation
+    /// batch before the leader rolls its evaluation transaction back.
+    pub(crate) fn take_side_index_deltas(&self) -> Vec<SideIndexDelta> {
+        std::mem::take(&mut *self.side_index_deltas.lock().unwrap())
+    }
+
+    fn validate_side_index_deltas(&self) -> Result<()> {
+        let deltas = self.side_index_deltas.lock().unwrap();
+        let mut pending_dimensions = HashMap::new();
+        for delta in deltas.iter() {
+            let SideIndexDelta::VectorInsert { index, vector, .. } = delta else {
+                continue;
+            };
+            self.storage
+                .vector_index
+                .validate_insert_dimensions(index, vector.len())?;
+            if let Some(expected) = pending_dimensions.insert(index.as_str(), vector.len()) {
+                if expected != vector.len() {
+                    return Err(FusionError::Execution(format!(
+                        "Vector dimension mismatch within transaction for index '{index}': expected {expected}, got {}",
+                        vector.len()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply the buffered side-index deltas. Called from commit after the
@@ -2806,10 +2971,10 @@ impl FusionTransaction {
     /// remain checkpoint-granular as before: postings committed after the
     /// last checkpoint are not replayed; the vector index self-heals via the
     /// startup rebuild from rows.)
-    fn apply_side_index_deltas(&self) {
+    fn apply_side_index_deltas(&self) -> Result<()> {
         let deltas = std::mem::take(&mut *self.side_index_deltas.lock().unwrap());
         if deltas.is_empty() {
-            return;
+            return Ok(());
         }
 
         let mut trigram_lock = None;
@@ -2844,22 +3009,15 @@ impl FusionTransaction {
         for delta in deltas {
             match delta {
                 SideIndexDelta::VectorInsert { index, id, vector } => {
-                    if let Err(e) = self.storage.vector_index.insert(&index, id, vector) {
-                        eprintln!(
-                            "[fusion] post-commit vector index insert failed for '{index}': {e}"
-                        );
-                    }
+                    self.storage.vector_index.insert(&index, id, vector)?;
                 }
                 SideIndexDelta::VectorDelete { index, id } => {
-                    if let Err(e) = self.storage.vector_index.delete(&index, &id) {
-                        eprintln!(
-                            "[fusion] post-commit vector index delete failed for '{index}': {e}"
-                        );
-                    }
+                    self.storage.vector_index.delete(&index, &id)?;
                 }
                 SideIndexDelta::TrigramAdd { .. } | SideIndexDelta::TrigramRemove { .. } => {}
             }
         }
+        Ok(())
     }
 
     /// Snapshot the visible memtables (active + immutable, newest-first) as a cheap Arc clone.
@@ -4529,10 +4687,30 @@ impl Transaction for FusionTransaction {
         if self.write_buffer.is_empty() {
             // No KV writes means nothing to validate or log, but buffered
             // side-index deltas must still apply rather than vanish.
-            self.apply_side_index_deltas();
+            if self.side_index_deltas.lock().unwrap().is_empty() {
+                return Ok(());
+            }
+            let _visibility_guard = self
+                .storage
+                .side_index_visibility
+                .clone()
+                .write_owned()
+                .await;
+            let _commit_guard = self.storage.commit_lock.lock().await;
+            self.validate_side_index_deltas()?;
+            self.apply_side_index_deltas()?;
             return Ok(());
         }
 
+        // The trigram and HNSW structures are not MVCC-versioned. Drain old
+        // snapshots, then block new ones until the KV versions, side indexes,
+        // and public timestamp have been published as one visibility epoch.
+        let _visibility_guard = self
+            .storage
+            .side_index_visibility
+            .clone()
+            .write_owned()
+            .await;
         let _commit_guard = self.storage.commit_lock.lock().await;
         for (user_key, _) in &self.write_buffer {
             if let Some(timestamp) = self.storage.latest_committed_timestamp(user_key).await? {
@@ -4544,6 +4722,7 @@ impl Transaction for FusionTransaction {
                 }
             }
         }
+        self.validate_side_index_deltas()?;
 
         let commit_ts = self
             .storage
@@ -4555,17 +4734,22 @@ impl Transaction for FusionTransaction {
 
         // Prepare encoded keys/values for both WAL and MemTable
         // We use Put for both Put and Delete (Delete is Put with Tombstone Flag)
-        let cdc_event_count = write_buffer
-            .iter()
-            .filter(|(key, _)| cdc_should_capture_key(key))
-            .count();
+        let capture_cdc = self.capture_cdc.load(Ordering::Acquire);
+        let cdc_event_count = if capture_cdc {
+            write_buffer
+                .iter()
+                .filter(|(key, _)| cdc_should_capture_key(key))
+                .count()
+        } else {
+            0
+        };
         let total_entries = write_buffer.len().saturating_add(cdc_event_count);
         let mut wal_entries = Vec::with_capacity(total_entries);
         let mut mem_entries = Vec::with_capacity(total_entries);
         let mut cdc_event_index = 0usize;
 
         for (k, v) in write_buffer {
-            if cdc_should_capture_key(&k) {
+            if capture_cdc && cdc_should_capture_key(&k) {
                 let sequence = cdc_sequence_for(commit_ts, cdc_event_index)?;
                 cdc_event_index += 1;
                 let event = CdcEvent::from_write(sequence, commit_ts, &k, v.as_deref());
@@ -4603,19 +4787,22 @@ impl Transaction for FusionTransaction {
             active.size.load(Ordering::Relaxed) > self.storage.memtable_threshold as u64
         };
 
-        if needs_rotate {
-            self.storage.rotate_memtable().await;
-        }
-
         // Side-index deltas apply only now — after OCC validation and WAL
         // durability, so an aborted transaction never touches the shared
         // trigram/vector indexes — and before the visibility watermark, so a
         // visible row is never missing its index entries.
-        self.apply_side_index_deltas();
+        self.apply_side_index_deltas()?;
 
         // current_ts is the public visibility watermark. It must move only after WAL durability
         // and complete source publication, otherwise a new reader can observe a partial commit.
         self.storage.current_ts.store(commit_ts, Ordering::SeqCst);
+
+        // Rotation comes after the visibility watermark. Otherwise a newly
+        // committed version can reach an SSTable (and therefore compaction)
+        // while begin_transaction still selects the previous read_ts.
+        if needs_rotate {
+            self.storage.rotate_memtable().await;
+        }
 
         Ok(())
     }
@@ -4632,13 +4819,13 @@ impl Transaction for FusionTransaction {
 #[async_trait]
 impl Storage for FusionStorage {
     async fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
-        let read_ts = self.current_ts.load(Ordering::SeqCst);
-        self.register_active_read_ts(read_ts);
+        let read_ts = self.register_current_read_ts();
         Ok(Box::new(FusionTransaction {
             storage: self.clone(),
             write_buffer: transaction_write_buffer(),
             read_ts,
             read_ts_registered: true,
+            capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
         }))
     }
@@ -4877,6 +5064,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fusion_revalidates_deferred_vector_dimensions_before_wal() {
+        let (storage, data_dir) = test_fusion_storage("vector_commit_validation").await;
+        let mut first = storage.begin_transaction().await.unwrap();
+        let mut second = storage.begin_transaction().await.unwrap();
+        first.put(b"data:vector:one", b"one").await.unwrap();
+        second.put(b"data:vector:two", b"two").await.unwrap();
+
+        first
+            .as_any()
+            .downcast_ref::<FusionTransaction>()
+            .unwrap()
+            .defer_side_index_delta(SideIndexDelta::VectorInsert {
+                index: "hnsw_commit_validation".to_string(),
+                id: "one".to_string(),
+                vector: vec![1.0, 2.0],
+            });
+        second
+            .as_any()
+            .downcast_ref::<FusionTransaction>()
+            .unwrap()
+            .defer_side_index_delta(SideIndexDelta::VectorInsert {
+                index: "hnsw_commit_validation".to_string(),
+                id: "two".to_string(),
+                vector: vec![1.0, 2.0, 3.0],
+            });
+
+        first.commit().await.unwrap();
+        let error = second.commit().await.unwrap_err();
+        assert!(error.to_string().contains("Vector dimension mismatch"));
+
+        let reader = storage.begin_transaction().await.unwrap();
+        assert_eq!(
+            reader.get(b"data:vector:one").await.unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(reader.get(b"data:vector:two").await.unwrap(), None);
+        let hits = storage
+            .vector_index
+            .search("hnsw_commit_validation", &[1.0, 2.0], 5)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "one");
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_falls_back_from_latest_only_side_indexes_without_blocking_commit() {
+        let (storage, data_dir) = test_fusion_storage("side_index_epoch_guard").await;
+        let old_snapshot = storage.begin_transaction().await.unwrap();
+
+        let mut writer = storage.begin_transaction().await.unwrap();
+        writer
+            .put(b"data:side_epoch:new", b"new-row")
+            .await
+            .unwrap();
+        writer
+            .as_any()
+            .downcast_ref::<FusionTransaction>()
+            .unwrap()
+            .defer_side_index_delta(SideIndexDelta::VectorInsert {
+                index: "hnsw_side_epoch".to_string(),
+                id: "new".to_string(),
+                vector: vec![1.0, 2.0],
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer.commit())
+            .await
+            .expect("a long-lived snapshot must not deadlock side-index publication")
+            .unwrap();
+
+        let old_fusion = old_snapshot
+            .as_any()
+            .downcast_ref::<FusionTransaction>()
+            .unwrap();
+        assert!(old_fusion.current_side_index_read_guard().await.is_none());
+
+        let current_snapshot = storage.begin_transaction().await.unwrap();
+        let current_fusion = current_snapshot
+            .as_any()
+            .downcast_ref::<FusionTransaction>()
+            .unwrap();
+        assert!(current_fusion
+            .current_side_index_read_guard()
+            .await
+            .is_some());
+
+        drop(current_snapshot);
+        drop(old_snapshot);
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
     async fn fusion_occ_detects_conflict_after_newer_version_is_flushed() {
         let (storage, data_dir) = test_fusion_storage("occ_conflict_in_sstable").await;
         let mut stale_writer = storage.begin_transaction().await.unwrap();
@@ -5036,6 +5315,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fusion_cdc_suppresses_structured_data_shadow_events() {
+        let (storage, data_dir) = test_fusion_storage("cdc_structured_data_shadow").await;
+        let shadow_key = crate::storage::keyspace::encode_data_key(
+            crate::storage::keyspace::DataRoute::Unsharded,
+            b"cdc_shadow",
+            b"row:001",
+        )
+        .unwrap();
+
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(b"data:cdc_shadow:row:001", b"one").await.unwrap();
+            txn.put(&shadow_key, b"one").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.delete(b"data:cdc_shadow:row:001").await.unwrap();
+            txn.delete(&shadow_key).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let events = storage.cdc_events_since(0, 10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation, CdcOperation::Put);
+        assert_eq!(events[0].key.data, "data:cdc_shadow:row:001");
+        assert_eq!(events[1].operation, CdcOperation::Delete);
+        assert_eq!(events[1].key.data, "data:cdc_shadow:row:001");
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[test]
+    fn cdc_only_suppresses_exact_structured_data_keys() {
+        let mut malformed = crate::storage::keyspace::encode_data_key(
+            crate::storage::keyspace::DataRoute::Unsharded,
+            b"cdc_shadow",
+            b"row",
+        )
+        .unwrap();
+        malformed.push(0x7f);
+
+        assert!(cdc_should_capture_key(&malformed));
+        assert!(!cdc_should_capture_key(
+            &crate::storage::keyspace::encode_data_key(
+                crate::storage::keyspace::DataRoute::Unsharded,
+                b"cdc_shadow",
+                b"row",
+            )
+            .unwrap()
+        ));
+    }
+
+    #[tokio::test]
     async fn fusion_cdc_since_and_limit_resume_from_sequence() {
         let (storage, data_dir) = test_fusion_storage("cdc_since_limit").await;
 
@@ -5098,11 +5431,66 @@ mod tests {
     }
 
     #[test]
-    fn vector_rebuild_hnsw_index_name_for_column_preallocates_exact_name() {
-        let name = vector_rebuild_hnsw_index_name_for_column("docs", "embedding");
+    fn side_index_rebuild_assigns_prefix_overlapping_tables_once() {
+        let text_column = || crate::catalog::Column {
+            name: "body".to_string(),
+            data_type: "TEXT".to_string(),
+            is_primary: false,
+            is_indexed: true,
+            index_type: crate::catalog::IndexType::BTree,
+            default_value: None,
+            is_nullable: true,
+            is_unique: false,
+            check_expr: None,
+        };
+        let base_schema =
+            crate::catalog::TableSchema::new("tenant".to_string(), vec![text_column()]);
+        let archive_schema =
+            crate::catalog::TableSchema::new("tenant:archive".to_string(), vec![text_column()]);
+        let entries = vec![
+            (
+                b"schema:tenant".to_vec(),
+                bincode::serialize(&base_schema).unwrap(),
+            ),
+            (
+                b"schema:tenant:archive".to_vec(),
+                bincode::serialize(&archive_schema).unwrap(),
+            ),
+            (
+                b"data:tenant:base-row".to_vec(),
+                crate::common::encoding::RowEncoder::encode(&[crate::common::Value::String(
+                    "base needle".to_string(),
+                )]),
+            ),
+            (
+                b"data:tenant:archive:archive-row".to_vec(),
+                crate::common::encoding::RowEncoder::encode(&[crate::common::Value::String(
+                    "archive needle".to_string(),
+                )]),
+            ),
+        ];
 
-        assert_eq!(name, "hnsw_docs_embedding");
-        assert!(name.capacity() >= name.len());
+        let (_, trigram) =
+            FusionStorage::build_side_indexes_from_visible_entries(&entries).unwrap();
+        let base_ids = trigram.search("tenant", "body", "%needle%").unwrap();
+        let archive_ids = trigram
+            .search("tenant:archive", "body", "%needle%")
+            .unwrap();
+        assert_eq!(
+            trigram.map_ids_to_row_keys("tenant", &base_ids),
+            vec!["base-row".to_string()]
+        );
+        assert_eq!(
+            trigram.map_ids_to_row_keys("tenant:archive", &archive_ids),
+            vec!["archive-row".to_string()]
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_uses_structured_hnsw_identity() {
+        let name = hnsw_index_name_for_column("docs", "embedding").unwrap();
+
+        assert_eq!(name, "hnsw_v2_AEZEQksCBwAAAARkb2NzAAAACWVtYmVkZGluZw");
     }
 
     #[test]
@@ -5240,6 +5628,7 @@ mod tests {
             write_buffer: transaction_write_buffer(),
             read_ts: 3,
             read_ts_registered: false,
+            capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
         };
         txn.put(b"data:rev:009", b"wb9").await.unwrap();
@@ -5296,6 +5685,7 @@ mod tests {
             write_buffer: transaction_write_buffer(),
             read_ts: 1,
             read_ts_registered: false,
+            capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -5896,16 +6286,18 @@ mod tests {
         storage.update_inverted_index("doc1".to_string(), "apple apple apple apple");
         storage.update_inverted_index("doc2".to_string(), "apple apple");
         storage.update_inverted_index("doc3".to_string(), "banana");
-        storage.update_columnar_store(
-            vec!["doc1".to_string(), "doc2".to_string(), "doc3".to_string()],
-            vec![
-                vec![0.0, 0.0, 0.0],
-                vec![1.0, 0.0, 0.0],
-                vec![9.0, 0.0, 0.0],
-            ],
-        );
+        storage
+            .update_columnar_store(
+                vec!["doc1".to_string(), "doc2".to_string(), "doc3".to_string()],
+                vec![
+                    vec![0.0, 0.0, 0.0],
+                    vec![1.0, 0.0, 0.0],
+                    vec![9.0, 0.0, 0.0],
+                ],
+            )
+            .await;
 
-        let results = storage.hybrid_search("apple", &[0.0, 0.0, 0.0], 2);
+        let results = storage.hybrid_search("apple", &[0.0, 0.0, 0.0], 2).await;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "doc1");
@@ -5928,8 +6320,127 @@ mod tests {
 
         assert!(storage
             .hybrid_search("apple", &[0.0, 0.0, 0.0], 0)
+            .await
             .is_empty());
 
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_startup_rebuilds_trigram_from_sharded_rows_before_returning() {
+        let data_dir = unique_storage_dir("startup_trigram_rebuild");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        let schema = crate::catalog::TableSchema::new(
+            "rebuild_docs".to_string(),
+            vec![
+                crate::catalog::Column {
+                    name: "id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    is_primary: true,
+                    is_indexed: true,
+                    index_type: crate::catalog::IndexType::BTree,
+                    default_value: None,
+                    is_nullable: false,
+                    is_unique: true,
+                    check_expr: None,
+                },
+                crate::catalog::Column {
+                    name: "body".to_string(),
+                    data_type: "TEXT".to_string(),
+                    is_primary: false,
+                    is_indexed: true,
+                    index_type: crate::catalog::IndexType::BTree,
+                    default_value: None,
+                    is_nullable: true,
+                    is_unique: false,
+                    check_expr: None,
+                },
+            ],
+        );
+        let schema_bytes = bincode::serialize(&schema).unwrap();
+        let row_id = crate::common::encoding::encode_i64_comparable(1);
+        let row = crate::common::encoding::RowEncoder::encode(&[
+            crate::common::Value::Integer(1),
+            crate::common::Value::String("durable recovery needle".to_string()),
+        ]);
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(b"schema:rebuild_docs", &schema_bytes)
+            .await
+            .unwrap();
+        txn.put(
+            format!("shard:3:data:rebuild_docs:{row_id}").as_bytes(),
+            &row,
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        storage.shutdown().await;
+        drop(storage);
+
+        // The derived checkpoint is intentionally unusable. Startup must use
+        // durable rows as truth rather than accepting an empty/stale index.
+        std::fs::write(config.trigram_index_path(), b"corrupt derived index").unwrap();
+        let reopened = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        let row_keys = {
+            let index = reopened.trigram_index.read().unwrap();
+            let ids = index
+                .search("rebuild_docs", "body", "%needle%")
+                .expect("startup rebuild must publish postings before open returns");
+            index.map_ids_to_row_keys("rebuild_docs", &ids)
+        };
+        assert_eq!(row_keys, vec![row_id]);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fusion_snapshot_rejects_invalid_derived_state_before_wal_publication() {
+        let (storage, data_dir) = test_fusion_storage("snapshot_prebuild_failure").await;
+        let schema = crate::catalog::TableSchema::new(
+            "invalid_snapshot".to_string(),
+            vec![crate::catalog::Column {
+                name: "embedding".to_string(),
+                data_type: "VECTOR".to_string(),
+                is_primary: false,
+                is_indexed: true,
+                index_type: crate::catalog::IndexType::HNSW,
+                default_value: None,
+                is_nullable: true,
+                is_unique: false,
+                check_expr: None,
+            }],
+        );
+        let entries = vec![
+            (
+                b"schema:invalid_snapshot".to_vec(),
+                bincode::serialize(&schema).unwrap(),
+            ),
+            (b"data:invalid_snapshot:1".to_vec(), vec![0xff]),
+        ];
+        let timestamp_before = storage.current_ts.load(Ordering::SeqCst);
+        let wal_path = data_dir.join(StorageConfig::default().wal_file);
+        let wal_len_before = std::fs::metadata(&wal_path).unwrap().len();
+
+        let error = storage
+            .replace_visible_entries_for_snapshot(b"", &[0xff], &entries)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("decode"));
+        assert_eq!(storage.current_ts.load(Ordering::SeqCst), timestamp_before);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len_before);
+        let reader = storage.begin_transaction().await.unwrap();
+        assert_eq!(reader.get(b"schema:invalid_snapshot").await.unwrap(), None);
+
+        drop(reader);
         cleanup_storage_dir(&data_dir);
     }
 
@@ -6005,11 +6516,15 @@ mod tests {
             txn.commit().await.unwrap();
         }
 
-        storage.rebuild_vector_index().await;
+        storage.rebuild_vector_index().await.unwrap();
 
         let results = storage
             .vector_index
-            .search("hnsw_vec_rebuild_embedding", &[1.0, 0.0], 1)
+            .search(
+                "hnsw_v2_AEZEQksCBwAAAAt2ZWNfcmVidWlsZAAAAAllbWJlZGRpbmc",
+                &[1.0, 0.0],
+                1,
+            )
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "0000000000000001");
@@ -7625,6 +8140,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fusion_read_ts_registration_closes_compaction_watermark_race() {
+        let (storage, data_dir) = test_fusion_storage("read_ts_registration_barrier").await;
+        const SNAPSHOT_TS: u64 = 41;
+        const NEXT_COMMIT_TS: u64 = 42;
+        storage.current_ts.store(SNAPSHOT_TS, Ordering::SeqCst);
+
+        let read_ts = storage.register_current_read_ts_with(|loaded_read_ts| {
+            assert_eq!(loaded_read_ts, SNAPSHOT_TS);
+
+            // Reproduce the old race window: a commit publishes a newer timestamp
+            // after begin_transaction has selected its snapshot but before that
+            // snapshot is entered in the active-reader registry.
+            storage.current_ts.store(NEXT_COMMIT_TS, Ordering::SeqCst);
+
+            // Compaction samples the registry through this same mutex. It must be
+            // unable to observe the pre-registration window while the selected
+            // snapshot is stale relative to current_ts.
+            match storage.active_read_timestamps.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Ok(_) => panic!("compaction watermark barrier was not held during registration"),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("active read timestamp registry was poisoned")
+                }
+            }
+        });
+
+        assert_eq!(read_ts, SNAPSHOT_TS);
+        assert_eq!(
+            storage.oldest_active_read_ts(),
+            Some(SNAPSHOT_TS),
+            "the first compaction sample after the barrier must retain the stale snapshot floor"
+        );
+        storage.unregister_active_read_ts(read_ts);
+        assert_eq!(storage.oldest_active_read_ts(), None);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
     async fn fusion_compaction_preserves_versions_visible_to_existing_snapshot() {
         let data_dir = unique_storage_dir("snapshot_reads_after_compaction");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -7708,6 +8262,7 @@ mod tests {
             write_buffer: transaction_write_buffer(),
             read_ts: 1,
             read_ts_registered: false,
+            capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
         };
         assert_eq!(

@@ -85,7 +85,7 @@ async fn main() {
             };
             fusion.update_inverted_index(id, text);
         }
-        fusion.update_columnar_store(ids, vecs);
+        fusion.update_columnar_store(ids, vecs).await;
     }
 
     println!("\n[Scenario: Vector Search (Binary TCP Protocol)]");

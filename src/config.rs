@@ -50,6 +50,9 @@ pub struct StorageConfig {
     pub block_cache_capacity: u64,
     /// Use no-fill SSTable block-cache reads for SQL bulk scans
     pub sql_bulk_scan_no_fill: bool,
+    /// Mirror base-row writes into the versioned Data V2 shadow keyspace.
+    /// Legacy keys remain authoritative until a fenced migration cutover.
+    pub structured_data_shadow_v2: bool,
     /// Slow query threshold in milliseconds
     pub slow_query_threshold_ms: u64,
 }
@@ -172,6 +175,7 @@ impl Default for StorageConfig {
             statement_cache_capacity: 1_000,
             block_cache_capacity: 25_000,
             sql_bulk_scan_no_fill: true,
+            structured_data_shadow_v2: false,
             slow_query_threshold_ms: 100,
         }
     }
@@ -281,6 +285,31 @@ impl Config {
                 "[distributed].forwarding_secret is required when distributed mode is enabled",
             ));
         }
+        if self.distributed.enabled && self.auth.http_legacy_unsafe {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[auth].http_legacy_unsafe must be false when distributed mode is enabled",
+            ));
+        }
+        if self.server.redis_enabled {
+            if self.distributed.enabled {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Redis-compatible writes do not participate in Raft; disable [server].redis_enabled in distributed mode",
+                ));
+            }
+            let bind = self.server.bind.trim();
+            let loopback = bind.eq_ignore_ascii_case("localhost")
+                || bind
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+            if !loopback {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Redis-compatible endpoint has no TLS support and must bind to a loopback address",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -320,6 +349,7 @@ mod tests {
         assert_eq!(config.storage.data_dir, "data");
         assert_eq!(config.storage.block_cache_capacity_bytes(), 102_400_000);
         assert!(config.storage.sql_bulk_scan_no_fill);
+        assert!(!config.storage.structured_data_shadow_v2);
         assert_eq!(config.auth.password, "fusiondb");
         assert!(!config.auth.http_legacy_unsafe);
         assert!(config.distributed.forwarding_secret.is_empty());
@@ -383,6 +413,7 @@ addr = "127.0.0.1:8091"
         assert_eq!(config.storage.data_dir, "/var/fusiondb");
         assert_eq!(config.storage.memtable_flush_mb, 64);
         assert!(!config.storage.sql_bulk_scan_no_fill);
+        assert!(!config.storage.structured_data_shadow_v2);
         assert_eq!(config.auth.password, "secret123");
         // Defaults for unset fields
         assert_eq!(config.storage.wal_file, "fusion.wal");
@@ -439,6 +470,39 @@ addr = "127.0.0.1:8091"
 
         config.distributed.forwarding_secret = "cluster-test-secret".to_string();
         assert!(config.validate_security().is_ok());
+
+        config.auth.http_legacy_unsafe = true;
+        assert!(config
+            .validate_security()
+            .unwrap_err()
+            .to_string()
+            .contains("http_legacy_unsafe"));
+    }
+
+    #[test]
+    fn redis_endpoint_requires_loopback_bind() {
+        let mut config = Config::default();
+        config.server.redis_enabled = true;
+        config.server.bind = "0.0.0.0".to_string();
+        assert!(config
+            .validate_security()
+            .unwrap_err()
+            .to_string()
+            .contains("loopback"));
+
+        config.server.bind = "127.0.0.1".to_string();
+        assert!(config.validate_security().is_ok());
+        config.server.bind = "::1".to_string();
+        assert!(config.validate_security().is_ok());
+
+        config.distributed.enabled = true;
+        config.tls.enabled = true;
+        config.distributed.forwarding_secret = "cluster-secret".to_string();
+        assert!(config
+            .validate_security()
+            .unwrap_err()
+            .to_string()
+            .contains("do not participate in Raft"));
     }
 
     #[test]

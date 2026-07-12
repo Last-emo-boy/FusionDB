@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { fetchAuthContext, fetchTables, executeQuery } from '../lib/api';
 import type { AuthContextInfo, TableInfo } from '../lib/api';
+import { primaryKeySqlLiteral, sqlIdentifier, sqlStringLiteral } from '../lib/sql';
 
 function formatValue(val: unknown): string {
   if (val === null || val === undefined) return 'NULL';
@@ -29,12 +30,6 @@ function formatValue(val: unknown): string {
     return JSON.stringify(val) ?? String(val);
   }
   return String(val);
-}
-
-function hasNumericTag(value: unknown): boolean {
-  return typeof value === 'object'
-    && value !== null
-    && ('Integer' in value || 'Float' in value);
 }
 
 function DataTypeIcon({ type }: { type: string }) {
@@ -88,9 +83,10 @@ export default function TableEditorPage() {
     setInsertError(null);
     setDeleteConfirm(null);
     const activeFilter = filterRef.current.trim();
+    const quotedTable = sqlIdentifier(tableName);
     const limitSql = activeFilter
-      ? `SELECT * FROM ${tableName} WHERE ${activeFilter} LIMIT 200`
-      : `SELECT * FROM ${tableName} LIMIT 200`;
+      ? `SELECT * FROM ${quotedTable} WHERE ${activeFilter} LIMIT 200`
+      : `SELECT * FROM ${quotedTable} LIMIT 200`;
     const res = await executeQuery(limitSql);
     if (res.status === 'ok' && res.data && res.data[0]?.type === 'select') {
       const r = res.data[0];
@@ -101,7 +97,7 @@ export default function TableEditorPage() {
       setRows([]);
     }
     // Get count
-    const countRes = await executeQuery(`SELECT COUNT(*) FROM ${tableName}`);
+    const countRes = await executeQuery(`SELECT COUNT(*) FROM ${quotedTable}`);
     if (countRes.status === 'ok' && countRes.data && countRes.data[0]?.type === 'select' && countRes.data[0].rows[0]) {
       const v = countRes.data[0].rows[0][0];
       setRowCount(
@@ -140,10 +136,11 @@ export default function TableEditorPage() {
       if (/^-?\d+$/.test(v.trim())) return v.trim();
       if (/^-?\d+\.\d+$/.test(v.trim())) return v.trim();
       if (v.trim().toLowerCase() === 'true' || v.trim().toLowerCase() === 'false') return v.trim();
-      return `'${v.replace(/'/g, "''")}'`;
+      return sqlStringLiteral(v);
     });
 
-    const sql = `INSERT INTO ${selectedTable} (${cols.join(', ')}) VALUES (${vals.join(', ')})`;
+    const quotedColumns = cols.map(sqlIdentifier).join(', ');
+    const sql = `INSERT INTO ${sqlIdentifier(selectedTable)} (${quotedColumns}) VALUES (${vals.join(', ')})`;
     const res = await executeQuery(sql);
     if (res.status === 'error' || res.error) {
       setInsertError(res.error ?? 'Insert failed');
@@ -162,11 +159,9 @@ export default function TableEditorPage() {
     const pkIdx = columns.indexOf(pkCol.name);
     if (pkIdx === -1) return;
     const pkVal = row[pkIdx];
-    const formatted = formatValue(pkVal);
-    const isNum = hasNumericTag(pkVal);
-    const whereVal = isNum ? formatted : `'${formatted}'`;
+    const whereVal = primaryKeySqlLiteral(pkVal);
 
-    const sql = `DELETE FROM ${selectedTable} WHERE ${pkCol.name} = ${whereVal}`;
+    const sql = `DELETE FROM ${sqlIdentifier(selectedTable)} WHERE ${sqlIdentifier(pkCol.name)} = ${whereVal}`;
     await executeQuery(sql);
     setDeleteConfirm(null);
     loadTableData(selectedTable);

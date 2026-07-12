@@ -19,6 +19,54 @@ use tokio_postgres::NoTls;
 
 static NEXT_PG_TEST_PORT: AtomicU16 = AtomicU16::new(20000);
 static NEXT_HTTP_TEST_PORT: AtomicU16 = AtomicU16::new(21000);
+const SHARD_FORWARDING_SECRET: &str = "pg-integration-shard-forwarding-secret";
+
+async fn start_sharded_http_test_server(
+    executor: Arc<Executor>,
+    storage: Arc<dyn Storage>,
+    port: u16,
+    router: ShardRouter,
+) {
+    http_server::start_http_server_with_security(
+        executor,
+        storage,
+        "127.0.0.1",
+        port,
+        None,
+        None,
+        "raft(node_id=2)".to_string(),
+        Some(router),
+        http_server::HttpServerSecurity {
+            postgres_password: "fusiondb".to_string(),
+            http_legacy_unsafe: false,
+            forwarding_secret: SHARD_FORWARDING_SECRET.to_string(),
+            peer_scheme: "http".to_string(),
+        },
+    )
+    .await
+    .expect("start sharded HTTP test server");
+}
+
+async fn start_sharded_pg_test_server(
+    executor: Arc<Executor>,
+    storage: Arc<dyn Storage>,
+    port: u16,
+) {
+    pg_server::start_pg_server_with_connection_limit_and_security(
+        executor,
+        storage,
+        "127.0.0.1",
+        port,
+        "fusiondb",
+        None,
+        100,
+        SHARD_FORWARDING_SECRET,
+        "http",
+        false,
+        false,
+    )
+    .await;
+}
 
 fn next_pg_test_port() -> u16 {
     next_test_port(&NEXT_PG_TEST_PORT)
@@ -910,6 +958,7 @@ async fn test_pg_protocol_jdbc_get_index_info_derived_pg_catalog_variant() {
     let wal_path = format!("test_pg_jdbc_indexes_{}.wal", std::process::id());
     let storage: Arc<dyn Storage> =
         Arc::new(MemoryStorage::new(&wal_path).expect("Failed to create storage"));
+    let metadata_storage = storage.clone();
     let executor = Arc::new(Executor::new(storage.clone()));
     let port = next_pg_test_port();
 
@@ -954,6 +1003,21 @@ async fn test_pg_protocol_jdbc_get_index_info_derived_pg_catalog_variant() {
         )
         .await
         .expect("Failed to create customer name index");
+    client
+        .simple_query(
+            "CREATE UNIQUE INDEX idx_customer_unique ON customer (c_w_id, c_d_id, c_last) INCLUDE (c_first)",
+        )
+        .await
+        .expect("Failed to create customer unique index");
+    let mut metadata_txn = metadata_storage.begin_transaction().await.unwrap();
+    metadata_txn
+        .put(
+            b"index_meta:idx_customer_legacy_u5",
+            b"u5:8:customer2:6:c_w_id6:c_d_id1:6:c_last",
+        )
+        .await
+        .unwrap();
+    metadata_txn.commit().await.unwrap();
 
     let rows = client
         .query(
@@ -1021,6 +1085,24 @@ async fn test_pg_protocol_jdbc_get_index_info_derived_pg_catalog_variant() {
             true
         )),
         "metadata rows should include customer name index final column"
+    );
+    assert!(
+        index_columns.contains(&(
+            "idx_customer_unique".to_string(),
+            3,
+            "c_last".to_string(),
+            false
+        )),
+        "new unique metadata must report NON_UNIQUE=false"
+    );
+    assert!(
+        index_columns.contains(&(
+            "idx_customer_legacy_u5".to_string(),
+            2,
+            "c_d_id".to_string(),
+            false
+        )),
+        "legacy u5 metadata must report NON_UNIQUE=false"
     );
 
     let _ = std::fs::remove_file(&wal_path);
@@ -1834,16 +1916,11 @@ async fn test_pg_protocol_copy_from_stdin_forwards_non_local_shard_owner_rows() 
         Some(owner_router.clone()),
     ));
     tokio::spawn(async move {
-        #[allow(deprecated)]
-        http_server::start_http_server(
+        start_sharded_http_test_server(
             owner_executor,
             owner_storage,
-            "127.0.0.1",
             owner_http_port,
-            None,
-            None,
-            "raft(node_id=2)".to_string(),
-            Some(owner_router),
+            owner_router,
         )
         .await;
     });
@@ -1853,6 +1930,7 @@ async fn test_pg_protocol_copy_from_stdin_forwards_non_local_shard_owner_rows() 
     let owner_query_url = format!("http://{}/query", owner_addr);
     let owner_create_response = http_client
         .post(&owner_query_url)
+        .basic_auth("postgres", Some("fusiondb"))
         .json(&serde_json::json!({
             "sql": "CREATE TABLE pg_route_copy_forward (id INTEGER PRIMARY KEY, name TEXT)"
         }))
@@ -1873,15 +1951,7 @@ async fn test_pg_protocol_copy_from_stdin_forwards_non_local_shard_owner_rows() 
     let local_storage_probe = local_storage.clone();
     let pg_port = next_pg_test_port();
     tokio::spawn(async move {
-        pg_server::start_pg_server(
-            local_executor,
-            local_storage,
-            "127.0.0.1",
-            pg_port,
-            "fusiondb",
-            None,
-        )
-        .await;
+        start_sharded_pg_test_server(local_executor, local_storage, pg_port).await;
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
@@ -1922,6 +1992,7 @@ async fn test_pg_protocol_copy_from_stdin_forwards_non_local_shard_owner_rows() 
 
     let owner_select_response = http_client
         .post(&owner_query_url)
+        .basic_auth("postgres", Some("fusiondb"))
         .json(&serde_json::json!({
             "sql": format!("SELECT * FROM pg_route_copy_forward WHERE id = {}", remote_key)
         }))
@@ -2004,16 +2075,11 @@ async fn test_pg_grouped_aggregate_order_by_limit_global_top_k_across_owners() {
         Some(owner_router.clone()),
     ));
     tokio::spawn(async move {
-        #[allow(deprecated)]
-        http_server::start_http_server(
+        start_sharded_http_test_server(
             owner_executor,
             owner_storage,
-            "127.0.0.1",
             owner_http_port,
-            None,
-            None,
-            "raft(node_id=2)".to_string(),
-            Some(owner_router),
+            owner_router,
         )
         .await;
     });
@@ -2027,6 +2093,7 @@ async fn test_pg_grouped_aggregate_order_by_limit_global_top_k_across_owners() {
         async move {
             let response = client
                 .post(&url)
+                .basic_auth("postgres", Some("fusiondb"))
                 .json(&serde_json::json!({ "sql": sql }))
                 .send()
                 .await
@@ -2064,15 +2131,7 @@ async fn test_pg_grouped_aggregate_order_by_limit_global_top_k_across_owners() {
     ));
     let pg_port = next_pg_test_port();
     tokio::spawn(async move {
-        pg_server::start_pg_server(
-            local_executor,
-            local_storage,
-            "127.0.0.1",
-            pg_port,
-            "fusiondb",
-            None,
-        )
-        .await;
+        start_sharded_pg_test_server(local_executor, local_storage, pg_port).await;
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
@@ -2884,16 +2943,11 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
         Some(owner_router.clone()),
     ));
     tokio::spawn(async move {
-        #[allow(deprecated)]
-        http_server::start_http_server(
+        start_sharded_http_test_server(
             owner_executor,
             owner_storage,
-            "127.0.0.1",
             owner_http_port,
-            None,
-            None,
-            "raft(node_id=2)".to_string(),
-            Some(owner_router),
+            owner_router,
         )
         .await;
     });
@@ -2903,6 +2957,7 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
     let owner_query_url = format!("http://{}/query", owner_addr);
     let owner_create_response = http_client
         .post(&owner_query_url)
+        .basic_auth("postgres", Some("fusiondb"))
         .json(&serde_json::json!({
             "sql": "CREATE TABLE pg_route_forward (id INTEGER PRIMARY KEY, name TEXT, amount INTEGER, bucket TEXT)"
         }))
@@ -2923,15 +2978,7 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
     let local_storage_probe = local_storage.clone();
     let pg_port = next_pg_test_port();
     tokio::spawn(async move {
-        pg_server::start_pg_server(
-            local_executor,
-            local_storage,
-            "127.0.0.1",
-            pg_port,
-            "fusiondb",
-            None,
-        )
-        .await;
+        start_sharded_pg_test_server(local_executor, local_storage, pg_port).await;
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
@@ -2973,6 +3020,7 @@ async fn test_pg_protocol_simple_query_forwards_non_local_shard_owner_insert() {
 
     let owner_select_response = http_client
         .post(&owner_query_url)
+        .basic_auth("postgres", Some("fusiondb"))
         .json(&serde_json::json!({
             "sql": format!("SELECT * FROM pg_route_forward WHERE id = {}", remote_key)
         }))
@@ -3312,16 +3360,11 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
         Some(owner_router.clone()),
     ));
     tokio::spawn(async move {
-        #[allow(deprecated)]
-        http_server::start_http_server(
+        start_sharded_http_test_server(
             owner_executor,
             owner_storage,
-            "127.0.0.1",
             owner_http_port,
-            None,
-            None,
-            "raft(node_id=2)".to_string(),
-            Some(owner_router),
+            owner_router,
         )
         .await;
     });
@@ -3331,6 +3374,7 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
     let owner_query_url = format!("http://{}/query", owner_addr);
     let owner_create_response = http_client
         .post(&owner_query_url)
+        .basic_auth("postgres", Some("fusiondb"))
         .json(&serde_json::json!({
             "sql": "CREATE TABLE pg_route_extended_forward (id BIGINT PRIMARY KEY, name TEXT, amount BIGINT, bucket TEXT)"
         }))
@@ -3351,15 +3395,7 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
     let local_storage_probe = local_storage.clone();
     let pg_port = next_pg_test_port();
     tokio::spawn(async move {
-        pg_server::start_pg_server(
-            local_executor,
-            local_storage,
-            "127.0.0.1",
-            pg_port,
-            "fusiondb",
-            None,
-        )
-        .await;
+        start_sharded_pg_test_server(local_executor, local_storage, pg_port).await;
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
@@ -3403,6 +3439,7 @@ async fn test_pg_protocol_extended_query_forwards_non_local_shard_owner_insert()
 
     let owner_select_response = http_client
         .post(&owner_query_url)
+        .basic_auth("postgres", Some("fusiondb"))
         .json(&serde_json::json!({
             "sql": format!(
                 "SELECT * FROM pg_route_extended_forward WHERE id = {}",

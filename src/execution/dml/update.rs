@@ -223,7 +223,7 @@ impl Executor {
                     txn,
                 )
                 .await?;
-                let row_id = Self::row_id_from_data_key(&k)?;
+                let row_id = self.legacy_row_id_from_routed_data_key(&table_name_str, &k)?;
                 self.validate_composite_unique_constraints(
                     &composite_unique_indexes,
                     &table_name_str,
@@ -245,7 +245,8 @@ impl Executor {
                 .await?;
 
                 let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
-                txn.put(&k, &new_value_bytes).await?;
+                self.write_routed_data_row(&table_name_str, row_id, &new_value_bytes, txn)
+                    .await?;
                 self.migrate_unique_sentinels_for_update(
                     &table_name_str,
                     &schema,
@@ -313,7 +314,7 @@ impl Executor {
                                     continue;
                                 }
                                 let idx_name =
-                                    Self::hnsw_index_name_for_column(&table_name_str, &col.name);
+                                    Self::hnsw_index_name_for_column(&table_name_str, &col.name)?;
                                 if matches!(old_val, Value::Vector(_)) {
                                     self.defer_or_apply_vector_delete(&idx_name, row_id, txn)?;
                                 }
@@ -464,18 +465,10 @@ impl Executor {
         {
             cached
         } else {
-            let has_composite_index = txn
-                .scan_prefix(
-                    Self::composite_index_table_prefix(table_name).as_bytes(),
-                    Some(2),
-                )
+            let has_composite_index = !self
+                .load_composite_indexes_for_table(table_name, txn)
                 .await?
-                .iter()
-                .any(|(key, _)| {
-                    std::str::from_utf8(key)
-                        .ok()
-                        .is_some_and(|key| !key.ends_with(":__marker"))
-                });
+                .is_empty();
             let foreign_key_child_prefix = Self::foreign_key_child_prefix_for_table(table_name);
             let foreign_key_parent_prefix = Self::foreign_key_parent_prefix_for_table(table_name);
             let has_foreign_key = txn
@@ -489,8 +482,11 @@ impl Executor {
                     .len()
                     > 0;
             let allowed = !has_composite_index && !has_foreign_key;
-            self.simple_pk_update_fast_path_cache
-                .insert(metadata_cache_key, allowed);
+            // 肯定结果只对当前快照成立；并发 DDL 后重试时必须重新读取元数据。
+            if !allowed {
+                self.simple_pk_update_fast_path_cache
+                    .insert(metadata_cache_key, false);
+            }
             allowed
         };
         if !metadata_allows_fast_path {
@@ -541,8 +537,11 @@ impl Executor {
         )
         .await?;
 
+        self.touch_index_build_barrier_for_row(table_name, row_id, txn)
+            .await?;
         let new_value_bytes = crate::common::encoding::RowEncoder::encode(&row);
-        txn.put(key.as_bytes(), &new_value_bytes).await?;
+        self.write_routed_data_row(table_name, row_id, &new_value_bytes, txn)
+            .await?;
         self.migrate_unique_sentinels_for_update(table_name, schema, &old_row, &row, row_id, txn)
             .await?;
         monitor::inc_row_write();

@@ -117,10 +117,11 @@ pub async fn start_server(
     let pg_forwarding_secret = config.distributed.forwarding_secret.clone();
     let pg_peer_scheme = peer_scheme.to_string();
     let pg_require_tls = config.tls.enabled;
+    let pg_raft_writes_required = config.distributed.enabled;
 
     tokio::spawn(async move {
         tokio::select! {
-            _ = pg_server::start_pg_server_with_connection_limit_and_security(pg_executor, pg_storage, &pg_bind, pg_port, &pg_password, pg_tls, pg_max_connections, &pg_forwarding_secret, &pg_peer_scheme, pg_require_tls) => {},
+            _ = pg_server::start_pg_server_with_connection_limit_and_security(pg_executor, pg_storage, &pg_bind, pg_port, &pg_password, pg_tls, pg_max_connections, &pg_forwarding_secret, &pg_peer_scheme, pg_require_tls, pg_raft_writes_required) => {},
             _ = pg_rx.recv() => {
                 println!("[shutdown] Postgres server stopping...");
             },
@@ -132,10 +133,12 @@ pub async fn start_server(
         let redis_storage = storage.clone();
         let redis_port = config.server.redis_port;
         let redis_bind = config.server.bind.clone();
+        let redis_password = config.auth.password.clone();
+        let redis_max_connections = config.server.max_connections;
 
         tokio::spawn(async move {
             tokio::select! {
-                _ = redis_server::start_redis_server(redis_storage, &redis_bind, redis_port) => {},
+                _ = redis_server::start_redis_server(redis_storage, &redis_bind, redis_port, redis_password, redis_max_connections) => {},
                 _ = redis_rx.recv() => {
                     println!("[shutdown] Redis-compatible server stopping...");
                 },
@@ -155,7 +158,8 @@ async fn start_raft_node(
     raft_config.cluster_name = config.distributed.cluster_name.clone();
     let raft_config = raft_config.validate()?;
 
-    let raft_store = FusionRaftStore::new(executor, storage);
+    let raft_state_dir = std::path::Path::new(&config.storage.data_dir).join("raft");
+    let raft_store = FusionRaftStore::open_durable(executor, storage, raft_state_dir).await?;
     let peer_scheme = if config.tls.enabled { "https" } else { "http" };
     let network =
         FusionNetworkFactory::with_security(&config.distributed.forwarding_secret, peer_scheme);

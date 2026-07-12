@@ -11,6 +11,11 @@ struct TablePrimaryKeySpec {
     columns: Vec<String>,
 }
 
+struct TableUniqueSpec {
+    name: Option<String>,
+    columns: Vec<String>,
+}
+
 impl TablePrimaryKeySpec {
     fn single_primary_column(&self) -> Option<&String> {
         (self.columns.len() == 1).then_some(&self.columns[0])
@@ -201,7 +206,23 @@ impl Executor {
                 )));
             }
         }
+        for column in columns {
+            for option in &column.options {
+                if let ColumnOption::Unique(unique) = &option.option {
+                    if matches!(
+                        unique.nulls_distinct,
+                        sqlparser::ast::NullsDistinctOption::NotDistinct
+                    ) {
+                        return Err(FusionError::Execution(
+                            "UNIQUE NULLS NOT DISTINCT is not supported".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
         let table_primary_key = Self::extract_table_primary_key(columns, constraints)?;
+        let table_unique_constraints =
+            Self::extract_table_unique_constraints(columns, constraints)?;
         let mut cols = Vec::with_capacity(columns.len());
         for c in columns {
             let col_name = sql_identifier_name(&c.name);
@@ -225,7 +246,7 @@ impl Executor {
                 }
             });
             cols.push(Column {
-                name: col_name,
+                name: col_name.clone(),
                 data_type: format!("{}", c.data_type),
                 is_primary,
                 is_indexed: is_primary,
@@ -242,6 +263,10 @@ impl Executor {
                         .iter()
                         .any(|opt| matches!(&opt.option, ColumnOption::NotNull)),
                 is_unique: is_primary
+                    || table_unique_constraints.iter().any(|constraint| {
+                        constraint.columns.len() == 1
+                            && constraint.columns[0].eq_ignore_ascii_case(&col_name)
+                    })
                     || c.options
                         .iter()
                         .any(|opt| matches!(&opt.option, ColumnOption::Unique(_))),
@@ -300,6 +325,12 @@ impl Executor {
         if let Some(primary_key) = table_primary_key.as_ref() {
             if primary_key.columns.len() > 1 {
                 self.store_composite_primary_key_index(&table_name, primary_key, txn)
+                    .await?;
+            }
+        }
+        for unique in &table_unique_constraints {
+            if unique.columns.len() > 1 {
+                self.store_composite_unique_index(&table_name, unique, txn)
                     .await?;
             }
         }
@@ -407,6 +438,78 @@ impl Executor {
         }))
     }
 
+    fn extract_table_unique_constraints(
+        columns: &[sqlparser::ast::ColumnDef],
+        constraints: &[TableConstraint],
+    ) -> Result<Vec<TableUniqueSpec>> {
+        let mut unique_constraints = Vec::new();
+        for constraint in constraints {
+            let TableConstraint::Unique(unique) = constraint else {
+                continue;
+            };
+            if matches!(
+                unique.nulls_distinct,
+                sqlparser::ast::NullsDistinctOption::NotDistinct
+            ) {
+                return Err(FusionError::Execution(
+                    "UNIQUE NULLS NOT DISTINCT is not supported".to_string(),
+                ));
+            }
+            if unique
+                .index_type
+                .as_ref()
+                .is_some_and(|index_type| !matches!(index_type, sqlparser::ast::IndexType::BTree))
+            {
+                return Err(FusionError::Execution(
+                    "UNIQUE constraints only support BTree indexes".to_string(),
+                ));
+            }
+
+            let mut unique_columns = Vec::with_capacity(unique.columns.len());
+            let mut seen_columns = HashSet::with_capacity(unique.columns.len());
+            for column in &unique.columns {
+                let column_name = match &column.column.expr {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    _ => {
+                        return Err(FusionError::Execution(
+                            "UNIQUE only supports simple column references".to_string(),
+                        ))
+                    }
+                };
+                let schema_column = columns
+                    .iter()
+                    .find(|column| column.name.value.eq_ignore_ascii_case(&column_name))
+                    .ok_or_else(|| {
+                        FusionError::Execution(format!("Column {} not found", column_name))
+                    })?;
+                let canonical_name = sql_identifier_name(&schema_column.name);
+                if !seen_columns.insert(canonical_name.to_ascii_lowercase()) {
+                    return Err(FusionError::Execution(format!(
+                        "Duplicate UNIQUE column {}",
+                        canonical_name
+                    )));
+                }
+                unique_columns.push(canonical_name);
+            }
+            if unique_columns.is_empty() {
+                return Err(FusionError::Execution(
+                    "UNIQUE requires at least one column".to_string(),
+                ));
+            }
+
+            unique_constraints.push(TableUniqueSpec {
+                name: unique
+                    .name
+                    .as_ref()
+                    .or(unique.index_name.as_ref())
+                    .map(|ident| ident.value.clone()),
+                columns: unique_columns,
+            });
+        }
+
+        Ok(unique_constraints)
+    }
+
     async fn store_composite_primary_key_index(
         &self,
         table_name: &str,
@@ -424,7 +527,30 @@ impl Executor {
                 index_name
             )));
         }
-        let meta_val = Self::composite_unique_meta_value(table_name, &primary_key.columns);
+        let meta_val = Self::composite_primary_meta_value(table_name, &primary_key.columns);
+        txn.put(meta_key.as_bytes(), meta_val.as_bytes()).await?;
+        self.rebuild_composite_index_directory_for_table(table_name, txn)
+            .await
+    }
+
+    async fn store_composite_unique_index(
+        &self,
+        table_name: &str,
+        unique: &TableUniqueSpec,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let index_name = unique
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}_{}_key", table_name, unique.columns.join("_")));
+        let meta_key = table_index_meta_key_for_index(&index_name);
+        if txn.get(meta_key.as_bytes()).await?.is_some() {
+            return Err(FusionError::Execution(format!(
+                "Index {} already exists",
+                index_name
+            )));
+        }
+        let meta_val = Self::composite_unique_meta_value(table_name, &unique.columns);
         txn.put(meta_key.as_bytes(), meta_val.as_bytes()).await?;
         self.rebuild_composite_index_directory_for_table(table_name, txn)
             .await
@@ -469,14 +595,19 @@ impl Executor {
                 )));
             }
 
-            txn.delete(schema_key.as_bytes()).await?;
+            self.touch_all_index_build_barriers(&table_name, txn)
+                .await?;
 
             let kv_pairs = self
                 .scan_routed_data_prefixes_for_table(&table_name, txn, None)
                 .await?;
             for (k, _) in kv_pairs {
-                txn.delete(&k).await?;
+                let row_id = self.legacy_row_id_from_routed_data_key(&table_name, &k)?;
+                self.delete_routed_data_row(&table_name, row_id, txn)
+                    .await?;
             }
+            self.delete_structured_data_shadows_for_table(&table_name, txn)
+                .await?;
 
             let mut index_entries = self
                 .scan_routed_prefixes(self.routed_index_prefixes_for_table(&table_name), txn, None)
@@ -500,6 +631,7 @@ impl Executor {
                 .await?;
             self.delete_index_meta_for_table(&table_name, txn).await?;
             self.delete_foreign_keys_for_table(&table_name, txn).await?;
+            txn.delete(schema_key.as_bytes()).await?;
 
             dropped_count += 1;
         }
@@ -524,13 +656,19 @@ impl Executor {
             let schema: TableSchema = bincode::deserialize(&schema_bytes).map_err(|e| {
                 FusionError::Execution(format!("Schema deserialization error: {}", e))
             })?;
+            self.touch_all_index_build_barriers(&table_name, txn)
+                .await?;
 
             let kv_pairs = self
                 .scan_routed_data_prefixes_for_table(&table_name, txn, None)
                 .await?;
             for (k, _) in &kv_pairs {
-                txn.delete(k).await?;
+                let row_id = self.legacy_row_id_from_routed_data_key(&table_name, k)?;
+                self.delete_routed_data_row(&table_name, row_id, txn)
+                    .await?;
             }
+            self.delete_structured_data_shadows_for_table(&table_name, txn)
+                .await?;
             count += kv_pairs.len();
 
             let mut index_entries = self
@@ -691,7 +829,17 @@ impl Executor {
                                             row.remove(idx);
                                             let new_v =
                                                 crate::common::encoding::RowEncoder::encode(&row);
-                                            txn.put(&k, &new_v).await?;
+                                            let row_id = self.legacy_row_id_from_routed_data_key(
+                                                &table_name,
+                                                &k,
+                                            )?;
+                                            self.write_routed_data_row(
+                                                &table_name,
+                                                row_id,
+                                                &new_v,
+                                                txn,
+                                            )
+                                            .await?;
                                         }
                                     }
                                 }
@@ -856,10 +1004,8 @@ impl Executor {
         for (key, value) in rows {
             let key_str = std::str::from_utf8(&key)
                 .map_err(|e| FusionError::Execution(format!("Data key decode error: {}", e)))?;
-            let old_row_id = key_str
-                .rsplit(':')
-                .next()
-                .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?
+            let old_row_id = self
+                .legacy_row_id_from_routed_data_key(table_name, &key)?
                 .to_string();
 
             let pk_value = if let Some(row) = self.row_cache_lookup(key_str, &value) {
@@ -925,8 +1071,10 @@ impl Executor {
                         column_name
                     )));
                 }
-                txn.delete(&old_key).await?;
-                txn.put(new_key.as_bytes(), &value).await?;
+                self.delete_routed_data_row(table_name, &old_row_id, txn)
+                    .await?;
+                self.write_routed_data_row(table_name, &new_row_id, &value, txn)
+                    .await?;
                 self.rewrite_row_id_references_for_primary_key(
                     table_name,
                     schema,
@@ -943,8 +1091,7 @@ impl Executor {
             .scan_routed_data_prefixes_for_table(table_name, txn, None)
             .await?;
         for (key, value) in rows_after_rewrite {
-            let row_id = Self::row_id_from_key(&key)
-                .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))?;
+            let row_id = self.legacy_row_id_from_routed_data_key(table_name, &key)?;
             let pk_value = crate::common::encoding::RowDecoder::decode_column(&value, column_idx)
                 .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
                 .unwrap_or(Value::Null);
@@ -1042,7 +1189,7 @@ impl Executor {
                             })?
                         {
                             let index_name =
-                                Self::hnsw_index_name_for_column(table_name, &column.name);
+                                Self::hnsw_index_name_for_column(table_name, &column.name)?;
                             self.defer_or_apply_vector_delete(&index_name, old_row_id, txn)?;
                             self.defer_or_apply_vector_insert(
                                 &index_name,

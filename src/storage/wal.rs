@@ -3,7 +3,7 @@ use crate::monitor;
 use crc32fast::Hasher as Crc32Hasher;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -20,6 +20,8 @@ const WAL_BATCH_VERSION: u8 = 1;
 const WAL_BATCH_HEADER_BYTES: u64 = 4 + 1 + 4;
 const WAL_BATCH_CRC_BYTES: u64 = 4;
 const WAL_BATCH_ENTRY_COUNT_BYTES: usize = 4;
+const MAX_WAL_BATCH_PAYLOAD_BYTES: usize =
+    MAX_SEGMENT_SIZE as usize - WAL_BATCH_HEADER_BYTES as usize - WAL_BATCH_CRC_BYTES as usize;
 
 #[derive(Debug)]
 pub enum WalEntry {
@@ -47,26 +49,80 @@ enum WalJob {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WalDurablePosition {
+    segment_id: u64,
+    offset: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalFaultPoint {
+    AfterWrite,
+    AfterFlush,
+    AfterSync,
+    AfterRotateSync,
+    AfterRotateFileSync,
+    AfterRollbackSync,
+}
+
 /// WAL state shared between main thread and writer thread.
 struct WalState {
     writer: Option<BufWriter<File>>,
     segment_id: u64,
     segment_size: u64,
     base_path: String,
+    poisoned: Option<String>,
+    #[cfg(test)]
+    faults: Vec<WalFaultPoint>,
+    #[cfg(test)]
+    force_rotation: bool,
 }
 
 impl WalState {
+    fn refresh_durable_position(&mut self) -> Result<WalDurablePosition> {
+        let offset = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| FusionError::Storage("WAL closed".to_string()))?
+            .get_ref()
+            .metadata()
+            .map_err(WalManager::io_err)?
+            .len();
+        self.segment_size = offset;
+        Ok(WalDurablePosition {
+            segment_id: self.segment_id,
+            offset,
+        })
+    }
+
+    fn rotation_required(&self) -> bool {
+        if self.segment_size >= MAX_SEGMENT_SIZE {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            return self.force_rotation;
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     fn rotate(&mut self) -> std::result::Result<(), FusionError> {
         if let Some(ref mut w) = self.writer {
             w.flush().map_err(WalManager::io_err)?;
             w.get_ref().sync_data().map_err(WalManager::io_err)?;
         }
+        #[cfg(test)]
+        self.fail_if(WalFaultPoint::AfterRotateSync)?;
+
         let next_segment_id = self
             .segment_id
             .checked_add(1)
             .ok_or_else(|| FusionError::Storage("WAL segment ID overflow".to_string()))?;
         let new_path = segment_path(&self.base_path, next_segment_id);
-        let created = !Path::new(&new_path).exists();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -74,14 +130,113 @@ impl WalState {
             .map_err(|e| {
                 FusionError::Storage(format!("Failed to open WAL segment {}: {}", new_path, e))
             })?;
-        if created {
-            file.sync_all().map_err(WalManager::io_err)?;
-            WalManager::sync_parent_directory(&new_path)?;
-        }
+        // A prior failed rotation may have left this segment path behind
+        // before its directory entry was confirmed. Always sync both the file
+        // and parent directory, including when the path already exists.
+        file.sync_all().map_err(WalManager::io_err)?;
+        #[cfg(test)]
+        self.fail_if(WalFaultPoint::AfterRotateFileSync)?;
+        WalManager::sync_parent_directory(&new_path)?;
+        let new_size = file.metadata().map_err(WalManager::io_err)?.len();
         self.segment_id = next_segment_id;
-        self.segment_size = file.metadata().map_err(WalManager::io_err)?.len();
+        self.segment_size = new_size;
+        self.writer = Some(BufWriter::new(file));
+        #[cfg(test)]
+        {
+            self.force_rotation = false;
+        }
+        Ok(())
+    }
+
+    fn rollback_failed_group(
+        &mut self,
+        start: WalDurablePosition,
+        cause: FusionError,
+    ) -> FusionError {
+        match self.rollback_to(start) {
+            Ok(()) => FusionError::Storage(format!(
+                "WAL group write failed and was rolled back: {}",
+                cause
+            )),
+            Err(rollback_error) => {
+                let reason = format!(
+                    "WAL writer poisoned: group outcome is ambiguous after {}; rollback to segment {} offset {} could not be confirmed: {}",
+                    cause, start.segment_id, start.offset, rollback_error
+                );
+                self.discard_writer_buffer();
+                self.poisoned = Some(reason.clone());
+                FusionError::Storage(reason)
+            }
+        }
+    }
+
+    fn discard_writer_buffer(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            let (file, buffered) = writer.into_parts();
+            drop(buffered);
+            drop(file);
+        }
+    }
+
+    fn rollback_to(&mut self, start: WalDurablePosition) -> Result<()> {
+        if self.segment_id != start.segment_id {
+            return Err(FusionError::Storage(format!(
+                "WAL active segment changed from {} to {} during group rollback",
+                start.segment_id, self.segment_id
+            )));
+        }
+
+        let writer = self
+            .writer
+            .take()
+            .ok_or_else(|| FusionError::Storage("WAL writer unavailable during rollback".into()))?;
+        let (mut file, buffered) = writer.into_parts();
+        drop(buffered);
+
+        file.set_len(start.offset).map_err(|error| {
+            FusionError::Storage(format!(
+                "Failed to truncate WAL segment {} to durable offset {}: {}",
+                start.segment_id, start.offset, error
+            ))
+        })?;
+        file.seek(SeekFrom::Start(start.offset)).map_err(|error| {
+            FusionError::Storage(format!(
+                "Failed to reset WAL segment {} cursor to durable offset {}: {}",
+                start.segment_id, start.offset, error
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            FusionError::Storage(format!(
+                "Failed to sync WAL segment {} after rollback to offset {}: {}",
+                start.segment_id, start.offset, error
+            ))
+        })?;
+        #[cfg(test)]
+        self.fail_if(WalFaultPoint::AfterRollbackSync)?;
+
+        let actual_len = file.metadata().map_err(WalManager::io_err)?.len();
+        if actual_len != start.offset {
+            return Err(FusionError::Storage(format!(
+                "WAL rollback length mismatch for segment {}: expected {}, found {}",
+                start.segment_id, start.offset, actual_len
+            )));
+        }
+
+        self.segment_size = start.offset;
         self.writer = Some(BufWriter::new(file));
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_if(&mut self, point: WalFaultPoint) -> Result<()> {
+        let Some(index) = self.faults.iter().position(|candidate| *candidate == point) else {
+            return Ok(());
+        };
+        self.faults.remove(index);
+        Err(FusionError::Storage(format!(
+            "injected WAL fault at {:?}",
+            point
+        )))
     }
 }
 
@@ -237,6 +392,11 @@ impl WalManager {
             segment_id: active_id,
             segment_size: file_size,
             base_path: path.to_string(),
+            poisoned: None,
+            #[cfg(test)]
+            faults: Vec::new(),
+            #[cfg(test)]
+            force_rotation: false,
         };
 
         let state = Arc::new(Mutex::new(wal_state));
@@ -259,6 +419,23 @@ impl WalManager {
         })
     }
 
+    #[cfg(test)]
+    fn inject_faults(&self, faults: &[WalFaultPoint]) {
+        self.state
+            .lock()
+            .expect("WAL state lock should be available for fault injection")
+            .faults
+            .extend_from_slice(faults);
+    }
+
+    #[cfg(test)]
+    fn force_rotation_on_next_append(&self) {
+        self.state
+            .lock()
+            .expect("WAL state lock should be available for rotation injection")
+            .force_rotation = true;
+    }
+
     fn wal_writer_loop(rx: Receiver<WalJob>, state: Arc<Mutex<WalState>>) {
         loop {
             let first_job = match rx.recv() {
@@ -277,50 +454,10 @@ impl WalManager {
                 }
             }
 
-            let mut write_result = Ok(());
-            {
-                if let Ok(mut ws) = state.lock() {
-                    // Check for segment rotation before writing
-                    if ws.segment_size >= MAX_SEGMENT_SIZE {
-                        if let Err(e) = ws.rotate() {
-                            write_result = Err(e);
-                        }
-                    }
-
-                    if write_result.is_ok() {
-                        if let Some(ref mut writer) = ws.writer {
-                            let mut batch_bytes = 0u64;
-                            for job in &batch {
-                                let WalJob::Append { entries, .. } = job;
-                                match Self::write_batch_record(writer, entries) {
-                                    Ok(n) => batch_bytes += n as u64,
-                                    Err(e) => {
-                                        write_result = Err(e);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if write_result.is_ok() {
-                                if let Err(e) = writer.flush().map_err(Self::io_err) {
-                                    write_result = Err(e);
-                                } else if let Err(e) =
-                                    writer.get_ref().sync_data().map_err(Self::io_err)
-                                {
-                                    write_result = Err(e);
-                                } else {
-                                    ws.segment_size += batch_bytes;
-                                    monitor::inc_wal_write();
-                                }
-                            }
-                        } else {
-                            write_result = Err(FusionError::Storage("WAL closed".to_string()));
-                        }
-                    }
-                } else {
-                    write_result = Err(FusionError::Storage("WAL Lock poisoned".to_string()));
-                }
-            }
+            let write_result = match state.lock() {
+                Ok(mut ws) => Self::write_group(&mut ws, &batch),
+                Err(_) => Err(FusionError::Storage("WAL Lock poisoned".to_string())),
+            };
 
             for job in batch {
                 match job {
@@ -334,6 +471,78 @@ impl WalManager {
                 }
             }
         }
+    }
+
+    fn write_group(ws: &mut WalState, batch: &[WalJob]) -> Result<()> {
+        if let Some(reason) = &ws.poisoned {
+            return Err(FusionError::Storage(format!(
+                "WAL writer poisoned; refusing append because the durable tail is ambiguous: {}",
+                reason
+            )));
+        }
+
+        let mut group_start = ws.refresh_durable_position()?;
+        if ws.rotation_required() {
+            if let Err(error) = ws.rotate() {
+                return Err(ws.rollback_failed_group(group_start, error));
+            }
+            group_start = WalDurablePosition {
+                segment_id: ws.segment_id,
+                offset: ws.segment_size,
+            };
+        }
+
+        match Self::write_group_at_current_position(ws, batch, group_start) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(ws.rollback_failed_group(group_start, error)),
+        }
+    }
+
+    fn write_group_at_current_position(
+        ws: &mut WalState,
+        batch: &[WalJob],
+        group_start: WalDurablePosition,
+    ) -> Result<()> {
+        let mut batch_bytes = 0u64;
+        for job in batch {
+            let WalJob::Append { entries, .. } = job;
+            let written = {
+                let writer = ws
+                    .writer
+                    .as_mut()
+                    .ok_or_else(|| FusionError::Storage("WAL closed".to_string()))?;
+                Self::write_batch_record(writer, entries)?
+            };
+            batch_bytes = batch_bytes
+                .checked_add(written as u64)
+                .ok_or_else(|| FusionError::Storage("WAL group byte count overflow".to_string()))?;
+            #[cfg(test)]
+            ws.fail_if(WalFaultPoint::AfterWrite)?;
+        }
+
+        ws.writer
+            .as_mut()
+            .ok_or_else(|| FusionError::Storage("WAL closed".to_string()))?
+            .flush()
+            .map_err(Self::io_err)?;
+        #[cfg(test)]
+        ws.fail_if(WalFaultPoint::AfterFlush)?;
+
+        ws.writer
+            .as_ref()
+            .ok_or_else(|| FusionError::Storage("WAL closed".to_string()))?
+            .get_ref()
+            .sync_data()
+            .map_err(Self::io_err)?;
+        #[cfg(test)]
+        ws.fail_if(WalFaultPoint::AfterSync)?;
+
+        ws.segment_size = group_start
+            .offset
+            .checked_add(batch_bytes)
+            .ok_or_else(|| FusionError::Storage("WAL segment size overflow".to_string()))?;
+        monitor::inc_wal_write();
+        Ok(())
     }
 
     fn encode_entry(encoded: &mut Vec<u8>, entry: &WalEntry) -> Result<()> {
@@ -367,11 +576,37 @@ impl WalManager {
         let entry_count = u32::try_from(entries.len()).map_err(|_| {
             FusionError::Storage("WAL batch exceeds u32 entry-count boundary".to_string())
         })?;
-        let mut payload = Vec::new();
+        let mut expected_payload_len = WAL_BATCH_ENTRY_COUNT_BYTES;
+        for entry in entries {
+            let entry_len = match entry {
+                WalEntry::Put(key, value) => 1usize
+                    .checked_add(4)
+                    .and_then(|len| len.checked_add(key.len()))
+                    .and_then(|len| len.checked_add(4))
+                    .and_then(|len| len.checked_add(value.len())),
+                WalEntry::Delete(key) => 1usize
+                    .checked_add(4)
+                    .and_then(|len| len.checked_add(key.len())),
+            }
+            .ok_or_else(|| FusionError::Storage("WAL batch payload size overflow".to_string()))?;
+            expected_payload_len =
+                expected_payload_len.checked_add(entry_len).ok_or_else(|| {
+                    FusionError::Storage("WAL batch payload size overflow".to_string())
+                })?;
+            if expected_payload_len > MAX_WAL_BATCH_PAYLOAD_BYTES {
+                return Err(FusionError::Storage(format!(
+                    "WAL batch payload is {} bytes; maximum is {}",
+                    expected_payload_len, MAX_WAL_BATCH_PAYLOAD_BYTES
+                )));
+            }
+        }
+
+        let mut payload = Vec::with_capacity(expected_payload_len);
         payload.extend_from_slice(&entry_count.to_le_bytes());
         for entry in entries {
             Self::encode_entry(&mut payload, entry)?;
         }
+        debug_assert_eq!(payload.len(), expected_payload_len);
         let payload_len = u32::try_from(payload.len()).map_err(|_| {
             FusionError::Storage("WAL batch exceeds u32 payload-length boundary".to_string())
         })?;
@@ -732,6 +967,12 @@ impl WalManager {
         let mut payload_len_bytes = [0u8; 4];
         Self::read_replay_exact(reader, &mut payload_len_bytes)?;
         let payload_len = u32::from_le_bytes(payload_len_bytes);
+        if payload_len as usize > MAX_WAL_BATCH_PAYLOAD_BYTES {
+            return Err(FusionError::Storage(format!(
+                "WAL batch payload length {} at offset {} exceeds maximum {}",
+                payload_len, record_start, MAX_WAL_BATCH_PAYLOAD_BYTES
+            )));
+        }
         let frame_len = WAL_BATCH_HEADER_BYTES
             .checked_add(payload_len as u64)
             .and_then(|size| size.checked_add(WAL_BATCH_CRC_BYTES))
@@ -845,11 +1086,18 @@ impl WalManager {
         len: usize,
         record_len: &mut u64,
     ) -> Result<Vec<u8>> {
-        let mut bytes = vec![0u8; len];
-        Self::read_replay_exact(reader, &mut bytes)?;
-        *record_len = record_len
+        let next_record_len = record_len
             .checked_add(len as u64)
             .ok_or_else(|| FusionError::Storage("WAL record length overflow".to_string()))?;
+        if next_record_len > MAX_SEGMENT_SIZE {
+            return Err(FusionError::Storage(format!(
+                "Legacy WAL record length {} exceeds maximum {}",
+                next_record_len, MAX_SEGMENT_SIZE
+            )));
+        }
+        let mut bytes = vec![0u8; len];
+        Self::read_replay_exact(reader, &mut bytes)?;
+        *record_len = next_record_len;
         Ok(bytes)
     }
 
@@ -929,6 +1177,7 @@ impl WalManager {
         ws.writer = Some(BufWriter::new(file));
         ws.segment_id = 0;
         ws.segment_size = 0;
+        ws.poisoned = None;
         self.segment_id.store(0, Ordering::Relaxed);
 
         Ok(())
@@ -1001,6 +1250,7 @@ impl WalManager {
             ws.writer = Some(BufWriter::new(file));
             ws.segment_id = 0;
             ws.segment_size = size;
+            ws.poisoned = None;
         }
 
         Ok(())
@@ -1114,6 +1364,16 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         )
+    }
+
+    fn put_keys(entries: &[WalEntry]) -> Vec<Vec<u8>> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                WalEntry::Put(key, _) => key.clone(),
+                WalEntry::Delete(key) => panic!("unexpected delete entry for key {:?}", key),
+            })
+            .collect()
     }
 
     #[test]
@@ -1255,6 +1515,325 @@ mod tests {
             }
             other => panic!("unexpected async WAL entries: {:?}", other),
         }
+
+        wal.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_group_io_failures_rollback_failed_batch_before_retry() {
+        for (label, fault) in [
+            ("write_failure", WalFaultPoint::AfterWrite),
+            ("flush_failure", WalFaultPoint::AfterFlush),
+            ("sync_failure", WalFaultPoint::AfterSync),
+        ] {
+            let path = unique_wal_path(label);
+            let wal = WalManager::new(&path).unwrap();
+            wal.append(&WalEntry::Put(
+                b"durable-key".to_vec(),
+                b"durable-value".to_vec(),
+            ))
+            .unwrap();
+            let durable_len = std::fs::metadata(&path).unwrap().len();
+
+            wal.inject_faults(&[fault]);
+            let error = wal
+                .append_batch(&[
+                    WalEntry::Put(b"failed-key-1".to_vec(), b"failed-value-1".to_vec()),
+                    WalEntry::Put(b"failed-key-2".to_vec(), b"failed-value-2".to_vec()),
+                ])
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("rolled back"),
+                "unexpected {label} error: {error}"
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), durable_len);
+            assert_eq!(
+                wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+                [b"durable-key".to_vec()]
+            );
+
+            wal.append(&WalEntry::Put(
+                b"retry-key".to_vec(),
+                b"retry-value".to_vec(),
+            ))
+            .unwrap();
+            assert_eq!(
+                wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+                [b"durable-key".to_vec(), b"retry-key".to_vec()]
+            );
+            let mut expected_bytes = WalManager::encode_batch_record(&[WalEntry::Put(
+                b"durable-key".to_vec(),
+                b"durable-value".to_vec(),
+            )])
+            .unwrap();
+            expected_bytes.extend_from_slice(
+                &WalManager::encode_batch_record(&[WalEntry::Put(
+                    b"retry-key".to_vec(),
+                    b"retry-value".to_vec(),
+                )])
+                .unwrap(),
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), expected_bytes);
+
+            wal.truncate().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn test_wal_group_rollback_refreshes_offset_after_replay_truncation() {
+        let path = unique_wal_path("rollback_after_replay_truncate");
+        let durable_frame = WalManager::encode_batch_record(&[WalEntry::Put(
+            b"durable-key".to_vec(),
+            b"durable-value".to_vec(),
+        )])
+        .unwrap();
+        let partial_frame = WalManager::encode_batch_record(&[WalEntry::Put(
+            b"partial-key".to_vec(),
+            b"partial-value".to_vec(),
+        )])
+        .unwrap();
+        let mut initial_bytes = durable_frame.clone();
+        initial_bytes.extend_from_slice(&partial_frame[..5]);
+        std::fs::write(&path, initial_bytes).unwrap();
+
+        let wal = WalManager::new(&path).unwrap();
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"durable-key".to_vec()]
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            durable_frame.len() as u64
+        );
+
+        wal.inject_faults(&[WalFaultPoint::AfterSync]);
+        let error = wal
+            .append(&WalEntry::Put(
+                b"failed-key".to_vec(),
+                b"failed-value".to_vec(),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("rolled back"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            durable_frame.len() as u64
+        );
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"durable-key".to_vec()]
+        );
+
+        wal.truncate().unwrap();
+        wal.append(&WalEntry::Put(
+            b"recovered-key".to_vec(),
+            b"recovered-value".to_vec(),
+        ))
+        .expect("a fully durable WAL rebuild clears the poison state");
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"recovered-key".to_vec()]
+        );
+        wal.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_checkpoint_rebuild_clears_poison_state() {
+        let path = unique_wal_path("checkpoint_clears_poison");
+        let wal = WalManager::new(&path).unwrap();
+        wal.append(&WalEntry::Put(b"old".to_vec(), b"value".to_vec()))
+            .unwrap();
+        wal.inject_faults(&[WalFaultPoint::AfterSync, WalFaultPoint::AfterRollbackSync]);
+        wal.append(&WalEntry::Put(b"ambiguous".to_vec(), b"value".to_vec()))
+            .expect_err("fault must poison the writer");
+
+        wal.create_checkpoint(std::iter::once((b"checkpoint".to_vec(), b"value".to_vec())))
+            .unwrap();
+        wal.append(&WalEntry::Put(b"after".to_vec(), b"value".to_vec()))
+            .expect("a durable checkpoint replacement clears poison");
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"checkpoint".to_vec(), b"after".to_vec()]
+        );
+
+        wal.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_replay_rejects_oversized_batch_before_allocating_payload() {
+        let path = unique_wal_path("oversized_batch_payload");
+        let oversized = u32::try_from(MAX_WAL_BATCH_PAYLOAD_BYTES + 1).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&WAL_BATCH_MAGIC).unwrap();
+        file.write_all(&[WAL_BATCH_VERSION]).unwrap();
+        file.write_all(&oversized.to_le_bytes()).unwrap();
+        file.set_len(WAL_BATCH_HEADER_BYTES + u64::from(oversized) + WAL_BATCH_CRC_BYTES)
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let wal = WalManager::new(&path).unwrap();
+        let error = wal
+            .replay()
+            .expect_err("oversized declared payload must fail before allocation");
+        assert!(error.to_string().contains("exceeds maximum"));
+
+        drop(wal);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_failed_batch_after_rotation_rolls_back_new_segment() {
+        let path = unique_wal_path("rotated_group_failure");
+        let segment_one = segment_path(&path, 1);
+        let wal = WalManager::new(&path).unwrap();
+        wal.append(&WalEntry::Put(b"base-key".to_vec(), b"base-value".to_vec()))
+            .unwrap();
+
+        wal.force_rotation_on_next_append();
+        wal.inject_faults(&[WalFaultPoint::AfterSync]);
+        let error = wal
+            .append(&WalEntry::Put(
+                b"failed-rotated-key".to_vec(),
+                b"failed-rotated-value".to_vec(),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("rolled back"));
+        assert_eq!(std::fs::metadata(&segment_one).unwrap().len(), 0);
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"base-key".to_vec()]
+        );
+
+        wal.append(&WalEntry::Put(
+            b"retry-rotated-key".to_vec(),
+            b"retry-rotated-value".to_vec(),
+        ))
+        .unwrap();
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"base-key".to_vec(), b"retry-rotated-key".to_vec()]
+        );
+
+        wal.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_rotation_sync_failure_rolls_back_before_writing_group() {
+        let path = unique_wal_path("rotation_sync_failure");
+        let segment_one = segment_path(&path, 1);
+        let wal = WalManager::new(&path).unwrap();
+        wal.append(&WalEntry::Put(b"base-key".to_vec(), b"base-value".to_vec()))
+            .unwrap();
+
+        wal.force_rotation_on_next_append();
+        wal.inject_faults(&[WalFaultPoint::AfterRotateSync]);
+        let error = wal
+            .append(&WalEntry::Put(
+                b"failed-key".to_vec(),
+                b"failed-value".to_vec(),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("rolled back"));
+        assert!(!Path::new(&segment_one).exists());
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"base-key".to_vec()]
+        );
+
+        wal.append(&WalEntry::Put(
+            b"retry-key".to_vec(),
+            b"retry-value".to_vec(),
+        ))
+        .unwrap();
+        assert!(Path::new(&segment_one).exists());
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"base-key".to_vec(), b"retry-key".to_vec()]
+        );
+
+        wal.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_rotation_reconfirms_orphan_segment_on_retry() {
+        let path = unique_wal_path("rotation_orphan_retry");
+        let segment_one = segment_path(&path, 1);
+        let wal = WalManager::new(&path).unwrap();
+        wal.append(&WalEntry::Put(b"base-key".to_vec(), b"base-value".to_vec()))
+            .unwrap();
+
+        wal.force_rotation_on_next_append();
+        wal.inject_faults(&[WalFaultPoint::AfterRotateFileSync]);
+        let error = wal
+            .append(&WalEntry::Put(
+                b"failed-key".to_vec(),
+                b"failed-value".to_vec(),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("rolled back"));
+        assert!(Path::new(&segment_one).exists());
+
+        wal.append(&WalEntry::Put(
+            b"retry-key".to_vec(),
+            b"retry-value".to_vec(),
+        ))
+        .unwrap();
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"base-key".to_vec(), b"retry-key".to_vec()]
+        );
+
+        wal.truncate().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_unconfirmed_rollback_permanently_poisons_writer() {
+        let path = unique_wal_path("rollback_poison");
+        let wal = WalManager::new(&path).unwrap();
+        wal.append(&WalEntry::Put(
+            b"durable-key".to_vec(),
+            b"durable-value".to_vec(),
+        ))
+        .unwrap();
+        let durable_len = std::fs::metadata(&path).unwrap().len();
+
+        wal.inject_faults(&[WalFaultPoint::AfterSync, WalFaultPoint::AfterRollbackSync]);
+        let ambiguous_error = wal
+            .append(&WalEntry::Put(
+                b"ambiguous-key".to_vec(),
+                b"ambiguous-value".to_vec(),
+            ))
+            .unwrap_err();
+        let ambiguous_message = ambiguous_error.to_string();
+        assert!(ambiguous_message.contains("poisoned"));
+        assert!(ambiguous_message.contains("ambiguous"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), durable_len);
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"durable-key".to_vec()]
+        );
+
+        let rejected_error = wal
+            .append(&WalEntry::Put(
+                b"must-not-write".to_vec(),
+                b"must-not-write".to_vec(),
+            ))
+            .unwrap_err();
+        let rejected_message = rejected_error.to_string();
+        assert!(rejected_message.contains("poisoned"));
+        assert!(rejected_message.contains("refusing append"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), durable_len);
+        assert_eq!(
+            wal.replay().map(|entries| put_keys(&entries)).unwrap(),
+            [b"durable-key".to_vec()]
+        );
 
         wal.truncate().unwrap();
         let _ = std::fs::remove_file(&path);

@@ -140,6 +140,7 @@ pub struct PgHandler {
     http_client: reqwest::Client,
     forwarding_auth: Option<ForwardingAuth>,
     peer_scheme: String,
+    raft_writes_required: bool,
 }
 
 enum PgShardWriteRouteAction {
@@ -241,7 +242,7 @@ impl PgHandler {
     const POSTGRES_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
     pub fn new(executor: Arc<Executor>, storage: Arc<dyn Storage>) -> Self {
-        Self::new_with_forwarding_security(executor, storage, "", "http")
+        Self::new_with_forwarding_security(executor, storage, "", "http", false)
     }
 
     fn new_with_forwarding_security(
@@ -249,6 +250,7 @@ impl PgHandler {
         storage: Arc<dyn Storage>,
         forwarding_secret: &str,
         peer_scheme: &str,
+        raft_writes_required: bool,
     ) -> Self {
         Self {
             executor,
@@ -264,7 +266,25 @@ impl PgHandler {
             http_client: reqwest::Client::new(),
             forwarding_auth: ForwardingAuth::new(forwarding_secret.as_bytes()),
             peer_scheme: peer_scheme.to_string(),
+            raft_writes_required,
         }
+    }
+
+    fn ensure_pgwire_write_is_replicated(&self, sql: &str) -> crate::common::Result<()> {
+        if !self.raft_writes_required {
+            return Ok(());
+        }
+        let normalized = sql.trim().to_ascii_uppercase();
+        let copy_from_stdin = normalized.starts_with("COPY ")
+            && normalized.contains(" FROM STDIN")
+            && !normalized.contains(" TO STDOUT");
+        if copy_from_stdin || self.executor.sql_requires_raft_write(sql)? {
+            return Err(FusionError::Execution(
+                "PostgreSQL writes are disabled while distributed Raft mode is enabled; submit writes through the authenticated HTTP /query endpoint so they are replicated"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn username_for_client<C: ClientInfo>(client: &C) -> String {
@@ -4417,7 +4437,7 @@ impl PgHandler {
                 if !meta.table.eq_ignore_ascii_case(&schema.name) {
                     continue;
                 }
-                let non_unique = !meta_str.starts_with("u3:") && !index_name.ends_with("_pkey");
+                let non_unique = !meta.is_unique && !index_name.ends_with("_pkey");
                 for (idx, column_name) in meta.columns.iter().enumerate() {
                     if schema
                         .columns
@@ -8874,6 +8894,7 @@ impl PgHandler {
         query: &str,
         params: &[Value],
     ) -> std::result::Result<QueryResult, FusionError> {
+        self.ensure_pgwire_write_is_replicated(query)?;
         let statements = parse_sql(query)
             .map_err(|e| FusionError::Execution(format!("Parse Error: {:?}", e)))?;
         let Some(stmt) = statements.first() else {
@@ -9125,6 +9146,22 @@ impl SimpleQueryHandler for PgHandler {
                         .map_err(|_| Self::sink_error())?;
                     return Ok(());
                 }
+                if let Err(e) = self.ensure_pgwire_write_is_replicated(&query_string) {
+                    client
+                        .send(PgWireBackendMessage::ErrorResponse(
+                            Self::fusion_error("Execution Error", &e).into(),
+                        ))
+                        .await
+                        .map_err(|_| Self::sink_error())?;
+                    client.set_state(PgWireConnectionState::ReadyForQuery);
+                    client
+                        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                            client.transaction_status().to_error_state(),
+                        )))
+                        .await
+                        .map_err(|_| Self::sink_error())?;
+                    return Ok(());
+                }
 
                 let response = Self::copy_in_response_for_statement(&stmt);
                 {
@@ -9208,6 +9245,12 @@ impl SimpleQueryHandler for PgHandler {
                 "Authorization Error: {:?}",
                 e
             ))))]);
+        }
+        if let Err(e) = self.ensure_pgwire_write_is_replicated(query) {
+            return Ok(vec![Response::Error(Box::new(Self::fusion_error(
+                "Execution Error",
+                &e,
+            )))]);
         }
 
         match self.try_execute_pg_metadata_query(query, &[]).await {
@@ -9627,6 +9670,15 @@ impl ExtendedQueryHandler for PgHandler {
             client
                 .send(PgWireBackendMessage::ErrorResponse(
                     Self::auth_error(format!("Authorization Error: {:?}", e)).into(),
+                ))
+                .await
+                .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
+            return Ok(());
+        }
+        if let Err(e) = self.ensure_pgwire_write_is_replicated(&message.query) {
+            client
+                .send(PgWireBackendMessage::ErrorResponse(
+                    Self::fusion_error("Execution Error", &e).into(),
                 ))
                 .await
                 .map_err(|_| PgWireError::IoError(std::io::Error::other("Sink Error")))?;
@@ -10583,6 +10635,8 @@ impl CopyHandler for PgHandler {
                 copy_in.simple_query,
                 copy_in.data.len()
             ));
+            self.ensure_pgwire_write_is_replicated(&copy_in.query)
+                .map_err(|e| PgWireError::UserError(Box::new(Self::copy_error(e))))?;
             if let Some(txn) = session.transaction.as_mut() {
                 let count = self
                     .executor
@@ -10770,6 +10824,7 @@ pub async fn start_pg_server_with_connection_limit(
         "",
         "http",
         require_tls,
+        false,
     )
     .await
 }
@@ -10786,6 +10841,7 @@ pub async fn start_pg_server_with_connection_limit_and_security(
     forwarding_secret: &str,
     peer_scheme: &str,
     require_tls: bool,
+    raft_writes_required: bool,
 ) {
     let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).await.unwrap();
@@ -10826,6 +10882,7 @@ pub async fn start_pg_server_with_connection_limit_and_security(
                 storage.clone(),
                 &forwarding_secret,
                 &peer_scheme,
+                raft_writes_required,
             ));
             let auth_source = Arc::new(FusionAuthSource { password, storage });
             let startup = Arc::new(FusionStartupHandler {
@@ -10864,5 +10921,41 @@ mod tests {
 
         assert_eq!(limiter.semaphore.available_permits(), 1);
         assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn distributed_pgwire_rejects_unreplicated_writes_but_allows_reads() {
+        let wal_path = format!("test_pg_raft_guard_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(
+            crate::storage::memory::MemoryStorage::new(&wal_path).expect("memory storage"),
+        );
+        let executor = Arc::new(Executor::new(storage.clone()));
+        let handler = PgHandler::new_with_forwarding_security(
+            executor,
+            storage,
+            "forwarding-secret",
+            "https",
+            true,
+        );
+
+        assert!(handler
+            .ensure_pgwire_write_is_replicated("SELECT 1")
+            .is_ok());
+        assert!(handler.ensure_pgwire_write_is_replicated("BEGIN").is_ok());
+        for sql in [
+            "INSERT INTO items (id) VALUES (1)",
+            "COPY items FROM STDIN",
+            "CREATE USER alice WITH PASSWORD 'secret'",
+        ] {
+            let error = handler
+                .ensure_pgwire_write_is_replicated(sql)
+                .expect_err("distributed pgwire write must fail closed");
+            assert!(
+                error.to_string().contains("HTTP /query"),
+                "unexpected guard error for {sql}: {error}"
+            );
+        }
+
+        let _ = std::fs::remove_file(wal_path);
     }
 }

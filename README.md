@@ -52,8 +52,8 @@
 | **Read Path** | MVCC Snapshot Isolation, Row Cache (Moka), Bloom Filters |
 | **Indexes** | BTree (secondary), FB+-Tree (MemTable), HNSW (vector), Inverted (FTS), Trigram |
 | **Transactions** | OCC (Optimistic Concurrency Control), Snapshot Isolation, `BEGIN`/`COMMIT`/`ROLLBACK` |
-| **Durability** | Synchronously persisted, CRC32-protected transaction frames in a segmented WAL; staged and atomically published SSTables with CRC32 blocks and LZ4 compression |
-| **Compaction** | 4-way merge with MVCC key deduplication |
+| **Durability** | CRC32-protected segmented WAL with confirmed rollback/poison-on-ambiguity failure semantics; staged SSTables with strict structural decoding, CRC32 blocks, and LZ4 compression |
+| **Compaction** | 4-way merge with active-reader-aware MVCC version retention |
 | **Columnar Analytics** | Arrow RecordBatch conversion, vectorized COUNT/SUM/AVG/MIN/MAX |
 | **Performance** | Optimized merge iterator, parallel range-merge full scans, jemalloc allocator, streaming COUNT(*), pre-allocated scan buffers, hash join for equi-joins, ANALYZE statistics, cost-based comma/inner join reordering |
 
@@ -63,11 +63,11 @@
 |---|---|
 | **Protocol** | PostgreSQL wire protocol (pgwire) + HTTP JSON API + optional Redis-compatible RESP endpoint |
 | **Configuration** | TOML config file (`fusiondb.toml`) with all server/storage/auth settings |
-| **Authentication** | HTTP Basic / pgwire password auth, salted PBKDF2 user hashes, RBAC (CREATE USER, GRANT, REVOKE) |
+| **Authentication** | HTTP Basic / pgwire password auth, Redis `AUTH`, salted PBKDF2 user hashes, RBAC (CREATE USER, GRANT, REVOKE) |
 | **Graceful Shutdown** | Ctrl+C or `SIGTERM` → stop commits → flush every MemTable → persist the manifest and indexes → truncate WAL |
 | **Observability** | Slow query log, Prometheus `/metrics/prometheus`, `/slow_queries` JSON |
 | **Dashboard UI** | Supabase-style web dashboard — SQL Editor, Table Browser, Metrics Dashboard |
-| **Distributed** | OpenRaft consensus framework with mandatory TLS and body-bound HMAC authentication for inter-node requests |
+| **Distributed** | OpenRaft with durable vote/log/state/snapshot metadata and leader-evaluated deterministic mutation batches; inter-node traffic requires TLS and body-bound HMAC authentication |
 | **Backend API** | `BackendConfig` factory for embedded callers; the server binary uses FusionStorage |
 
 ---
@@ -297,7 +297,7 @@ curl -X POST http://127.0.0.1:8091/execute \
 CREATE TABLE users (
     id INTEGER PRIMARY KEY,
     name TEXT,
-    email TEXT,
+    email TEXT UNIQUE,
     score FLOAT,
     embedding VECTOR(128)
 );
@@ -318,8 +318,8 @@ CREATE TABLE orders (
 -- Create BTree index (speeds up WHERE / JOIN)
 CREATE INDEX idx_name ON users (name);
 
--- Create unique index
-CREATE UNIQUE INDEX idx_email ON users (email);
+-- Create a composite unique index
+CREATE UNIQUE INDEX idx_user_name_email ON users (name, email);
 
 -- Create HNSW vector index
 CREATE INDEX idx_vec ON users (embedding) USING HNSW;
@@ -838,7 +838,7 @@ http_port = 8091          # HTTP JSON API port
 pg_port = 8092            # PostgreSQL wire protocol port
 redis_enabled = false     # Optional Redis-compatible RESP endpoint for native memtier probes
 redis_port = 6379         # Redis-compatible RESP endpoint port
-bind = "127.0.0.1"        # Bind address (use "0.0.0.0" for all interfaces)
+bind = "127.0.0.1"        # Redis mode requires loopback; distributed mode requires Redis disabled
 max_connections = 100     # Max concurrent PostgreSQL wire protocol connections
 
 [storage]
@@ -850,6 +850,7 @@ row_cache_capacity = 10000 # Row cache entries (LRU)
 statement_cache_capacity = 1000  # Prepared statement cache size
 block_cache_capacity = 25000     # SSTable block cache (4KB blocks)
 sql_bulk_scan_no_fill = true     # Avoid block-cache pollution for SQL bulk scans
+structured_data_shadow_v2 = false # Experimental mirror; legacy rows remain read-authoritative
 slow_query_threshold_ms = 100    # Slow query log threshold (ms)
 
 [auth]
@@ -878,13 +879,20 @@ shard_count = 16           # Hash shard count; range uses boundaries + 1
 range_boundaries = []      # Optional lexicographic range upper bounds
 ```
 
+`structured_data_shadow_v2` is a migration-capacity switch, not a read cutover.
+When enabled, committed base-row writes are mirrored into the versioned Data V2
+keyspace in the same transaction, while every SQL read still uses the legacy
+key. Deletes and table cleanup remove both forms, and CDC emits only the logical
+legacy write. Keep it disabled unless validating the shadow format; the durable
+backfill, verifier, writer fence, and read-publication phases are not complete.
+
 ### Ports Summary
 
 | Service | Default Port | Protocol | Description |
 |---|---|---|---|
 | HTTP API | `8091` | HTTP/JSON | REST API, metrics, health check |
 | PostgreSQL | `8092` | pgwire | Standard PostgreSQL wire protocol |
-| Redis-compatible | `6379` | RESP | Optional endpoint for `memtier_benchmark --protocol=redis` (`PING`, `ECHO`, `SELECT 0`, `INFO`, `SET`, `SETEX`, `GET`, `MGET`, `MSET`, `EXISTS`, `DEL`, `INCR`, `QUIT`) |
+| Redis-compatible | `6379` | RESP | Loopback-only optional endpoint for `memtier_benchmark`; requires `AUTH` with `[auth].password` and is disabled in distributed mode |
 
 ### Authentication
 
@@ -896,9 +904,13 @@ RBAC users authenticate with the password stored by `CREATE USER`. Setting
 `http_legacy_unsafe = true` restores the old anonymous/header identity behavior
 only for migration and is not suitable for exposed services. When TLS is
 enabled, invalid certificates or keys fail startup instead of falling back to
-plaintext. Distributed mode additionally requires TLS and a non-empty
-`forwarding_secret`; internal signatures cover the method, path and query,
-timestamp, delegated user, and request body digest.
+plaintext. Raft, sharding, and any non-isolated HTTP mode reject legacy unsafe
+authentication at the server boundary. Distributed mode additionally requires
+TLS and a non-empty `forwarding_secret`; internal signatures cover the method,
+path and query, timestamp, delegated user, and request body digest.
+The Redis-compatible endpoint uses the same configured password, enforces the
+global connection limit and bounded RESP frames, and intentionally has no
+non-loopback/TLS deployment mode.
 
 ### Data Directory Layout
 
@@ -907,6 +919,12 @@ data/
 ├── fusion.wal            # Active WAL segment
 ├── fusion.wal.seg.1      # Rotated WAL segments (64MB each)
 ├── fusion.wal.seg.2
+├── raft/
+│   ├── vote.bin          # Versioned, CRC-protected Raft vote
+│   ├── log.bin           # Durable Raft log state
+│   ├── state-machine.bin # Applied boundary and membership
+│   ├── snapshot.bin      # Durable Raft snapshot metadata/payload
+│   └── snapshot-install.bin # Recoverable snapshot-install intent (only while pending)
 └── sstables/
     ├── 1.sst             # SSTable files (with CRC32 checksums)
     ├── 2.sst
@@ -978,6 +996,7 @@ FusionDB/
 │   │   ├── mod.rs                  # Raft node factory
 │   │   ├── typ.rs                  # OpenRaft TypeConfig
 │   │   ├── store.rs                # FusionRaftStore (RaftStorage impl)
+│   │   ├── persistence.rs          # Atomic, versioned, CRC-protected Raft files
 │   │   ├── network.rs              # HTTP-based RaftNetwork
 │   │   └── api.rs                  # Raft HTTP API routes (append/vote/snapshot/write)
 │   ├── execution/
@@ -996,6 +1015,7 @@ FusionDB/
 │   │   ├── pg_server.rs            # pgwire PostgreSQL protocol handler
 │   │   ├── security.rs             # Signed internal forwarding authentication
 │   │   ├── tls.rs                  # Shared rustls certificate/config loader
+│   │   ├── redis_server.rs          # Bounded, authenticated loopback RESP endpoint
 │   │   └── tcp_server.rs           # Raw TCP server (legacy)
 │   └── storage/
 │       ├── mod.rs                  # Storage + Transaction traits
@@ -1023,7 +1043,8 @@ FusionDB/
 │   │   ├── pages/SqlEditorPage.tsx # SQL editor (CodeMirror)
 │   │   ├── pages/TableEditorPage.tsx # Table browser + inline editor
 │   │   ├── pages/SettingsPage.tsx  # Connection & capabilities
-│   │   └── lib/api.ts             # HTTP API client
+│   │   ├── lib/api.ts              # HTTP API client
+│   │   └── lib/sql.ts              # SQL identifier/literal encoding helpers
 │   ├── package.json
 │   └── vite.config.ts             # Vite + TailwindCSS + API proxy
 ├── benchmark.py                    # Comprehensive performance benchmark
@@ -1040,11 +1061,18 @@ These are known gaps that should be addressed before production use:
 
 ### SQL Completeness
 - No stored procedures / user-defined functions / triggers
+- Single-column `CREATE UNIQUE INDEX` is rejected; use a column/table `UNIQUE` constraint. Composite `CREATE UNIQUE INDEX` is supported
+- `NULLS NOT DISTINCT` unique semantics are not supported; unique constraints use SQL `NULLS DISTINCT` behavior
+- `ON CONFLICT (a, b)` does not yet select a composite unique index as its conflict target
+- Indexes on the same physical key columns must use an identical ordered `INCLUDE` layout until index identity is part of the physical key codec
 
 ### Storage & Reliability
 - No online backup / point-in-time recovery
-- No disk space reclamation after DELETE (tombstones persist until compaction)
+- Final tombstones do not yet have a complete global garbage-collection protocol
 - No configurable compression algorithm/tuning yet; SSTable blocks use LZ4 when the encoded block is smaller
+- Data V2 now has a typed, versioned binary codec and an opt-in legacy-authoritative shadow-write phase. Durable backfill/checkpoints, exact equivalence verification, a cluster writer fence, v2 read publication, and legacy garbage collection are not implemented, and other physical key families still use delimiter-based formats
+- Tables with a text primary key deliberately bypass legacy delimiter-based secondary/composite index read fast paths and use base-row scans. This prevents silent `(index_value, row_id)` collisions when either value contains `:`; structured index keys are required before those fast paths can be re-enabled safely
+- HNSW and trigram indexes are rebuilt with a streaming visible-row scan at startup; HNSW now derives a collision-free structured `(table, column)` identity, so a normal restart rebuilds under the v2 name, but mixed-version in-process identities are not supported. Streaming avoids a second full-keyspace materialization, while recovery time and intrinsic index memory still grow with index size
 
 ### Transactions
 - OCC may have high abort rates under write-heavy contention
@@ -1052,15 +1080,14 @@ These are known gaps that should be addressed before production use:
 - No savepoints (`SAVEPOINT` / `RELEASE`)
 
 ### Distributed
-- OpenRaft can be enabled via `[distributed]`, with `/raft/*` HTTP RPCs, leader-forwarded writes, and local follower reads; startup requires TLS and a non-empty forwarding secret
-- Raft log/state metadata is currently in-memory and intended as the control-plane wiring foundation
-- Snapshot transfer serializes visible key-value state for new node bootstrap
-- Sharding has a configurable hash/range control plane, route API, local row-data shard key layout (`shard:{id}:data:{table}:{row_id}`), and local secondary-index KV shard layouts (`shard:{id}:index:*`, `shard:{id}:fts:*`)
-- HTTP and pgwire SQL execution now reject deterministic non-local shard-owner point writes (`INSERT ... VALUES` with an explicit primary key, pgwire `COPY FROM STDIN` rows with an explicit primary key, plus `UPDATE`/`DELETE` by primary-key equality) with a route hint instead of silently executing them on the wrong node, including pgwire writes against schemas created earlier in the same session transaction
-- HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query plus `COPY FROM STDIN` can forward deterministic point writes whose routed rows all target one non-local shard owner to that owner's HTTP endpoint
-- HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query can forward deterministic primary-key point reads to a non-local shard owner
-- HTTP `/query`, HTTP prepared `/execute`, and pgwire simple/extended query can fan out simple single-table SELECT scans across shard owners and merge row results, including distributed `COUNT(*)`, `COUNT(DISTINCT column)`, `SUM(column)`, `SUM(DISTINCT column)`, `MIN(column)`, `MAX(column)`, `AVG(column)`, and `AVG(DISTINCT column)` aggregation, plus `GROUP BY col[, ...], COUNT(*)`, `GROUP BY col[, ...], SUM/MIN/MAX(col)`, and `GROUP BY col[, ...], AVG(col)` (single- and multi-column, re-grouped across shard owners; AVG merges partial sums and non-null counts, then divides); HAVING, grouped ORDER BY/LIMIT, DISTINCT projections, joins, subqueries, and broader distributed planning are still conservative
-- Mixed local/remote writes, multi-owner writes, distributed index ownership/maintenance, and broader cross-node query planning remain in progress
+- OpenRaft vote, log, state-machine boundary, and snapshot state are durable, versioned, CRC-protected files. Snapshot installation uses a hashed durable intent plus an application-state marker; data plus marker is the commit point, and later metadata/cleanup failures retain the intent for startup reconciliation without falsely reporting a failed install. Leader SQL evaluation is replicated as deterministic key/value mutation batches, not raw SQL
+- In Raft mode, mutating SQL is accepted only through the authenticated HTTP `/query` endpoint. Pgwire writes, HTTP prepared writes, and `COPY FROM STDIN` fail closed instead of bypassing consensus
+- The Raft evaluator currently rejects custom RBAC statements, `VACUUM`, and HNSW index creation. Replicated CDC emission is not implemented
+- Snapshot transfer is a monolithic payload and internal HTTP bodies are capped at 16 MiB; resumable chunked snapshots remain required for large databases
+- The durable Raft log currently rewrites one complete log file on mutation rather than using segmented append-only storage
+- Upgrading from the pre-mutation-batch Raft format requires a stop-the-world cluster upgrade. New nodes decode old JSON requests only to reject raw SQL fail closed; old nodes cannot apply mutation batches
+- Local follower reads can be stale. Linearizable reads, lease reads, and bounded-staleness policy are not exposed as a complete user-facing contract
+- Sharding has routing and conservative read fan-out, but mixed/multi-owner atomic writes, distributed index ownership, automatic rebalancing, and broader distributed query planning remain in progress
 - No dedicated read-replica topology management
 - No distributed transactions (2PC)
 
@@ -1068,11 +1095,13 @@ These are known gaps that should be addressed before production use:
 - HTTP Basic and pgwire cleartext password authentication must only be used over the built-in TLS listeners outside local development
 - SCRAM-SHA-256 is not implemented
 - No row-level security
+- Direct global `/vector_search` and `/hybrid_search` APIs are superuser-only because their indexes are not table-scoped
 
 ### Operations
 - No client-side connection pooling library; pgwire has configurable server-side connection slots and backpressure
 - No automatic compaction tuning / maintenance scheduler
-- CDC is currently a resumable event feed; distributed streaming replication remains future work
+- CDC is currently a resumable local event feed; distributed ordered delivery and sink checkpoints remain future work
+- Redis expiration semantics are not implemented; `SETEX` and `SET EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL` fail closed instead of storing non-expiring values
 
 ---
 
@@ -1082,12 +1111,13 @@ See [ROADMAP.md](ROADMAP.md) for the detailed checklist. Summary:
 
 | Phase | Status | Highlights |
 |---|---|---|
-| **1. Data Integrity** | ✅ Done | Atomic WAL frames, synchronized commits, checkpoint-safe WAL truncation, staged SSTables, CRC32 validation |
-| **2. SQL Completeness** | ✅ Done | ALTER TABLE, UNION/INTERSECT/EXCEPT, subqueries, CASE WHEN, TRUNCATE, functions |
-| **3. Security** | 🔲 In progress | Built-in HTTP/pgwire TLS, Basic/password auth, PBKDF2 RBAC and signed internal forwarding; SCRAM and row-level security remain |
-| **4. Performance** | ✅ Done | Connection slots, parallel scan, LZ4 SSTable compression, cost-based optimizer |
-| **5. Distributed** | 🔲 In progress | OpenRaft main-loop wiring and snapshot transfer; sharding control plane, local row/index shard layouts, and point-write owner guard |
-| **6. Operations** | ✅ Done | Slow query log, Prometheus metrics, config file, admin CLI, CDC feed |
+| **1. Data Integrity** | ✅ Hardened | Confirmed WAL rollback, reader-aware MVCC retention, strict SSTable decoding, atomic derived-index publication |
+| **2. SQL Completeness** | 🔲 In progress | Composite UNIQUE is sentinel-backed; remaining compatibility gaps are listed above |
+| **3. Security** | 🔲 In progress | TLS, fail-closed auth, Redis bounds/AUTH, PBKDF2 RBAC and signed internal forwarding; SCRAM and row-level security remain |
+| **4. Performance** | ✅ Implemented | Connection slots, parallel scan, LZ4 SSTable compression, cost-based optimizer |
+| **5. Distributed** | 🔲 In progress | Durable Raft metadata and deterministic mutation batches; segmented logs, chunked snapshots and full write-path coverage remain |
+| **6. Operations** | 🔲 In progress | Metrics, admin CLI and local CDC exist; backup/PITR, distributed CDC and automated maintenance remain |
+| **10. Production Hardening** | 🔲 In progress | See [Production Hardening Plan](docs/PRODUCTION_HARDENING.md) for evidence-backed next steps |
 
 ---
 

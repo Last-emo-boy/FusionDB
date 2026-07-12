@@ -1,5 +1,6 @@
 use crate::catalog::TableSchema;
-use crate::common::{Result, Value};
+use crate::common::{FusionError, Result, Value};
+use crate::storage::keyspace::{encode_identifier_key, KeyNamespace};
 use crate::storage::Transaction;
 use base64::Engine;
 use sqlparser::ast::{BinaryOperator, Expr, OrderByKind};
@@ -15,6 +16,9 @@ pub(crate) struct CompositeIndexMeta {
     pub columns: Vec<String>,
     pub include_columns: Vec<String>,
     pub ordered_encoding: bool,
+    pub is_unique: bool,
+    pub unique_sentinel_authoritative: bool,
+    pub is_primary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,14 +62,33 @@ fn join_composite_index_parts(parts: &[String], separator: &str) -> String {
 
 impl Executor {
     const MAX_C5_COMPOSITE_META_PARTS: usize = 1024;
+    const INDEX_BUILD_BARRIER_SHARDS: usize = 64;
+    const COMPOSITE_INDEX_DIRECTORY_MARKER_VALUE_V2: &'static [u8] = b"v2";
 
-    fn composite_index_table_marker_key(table_name: &str) -> String {
+    fn composite_index_table_marker_key(table_name: &str) -> Result<Vec<u8>> {
+        encode_identifier_key(
+            KeyNamespace::Catalog,
+            &[b"composite-index-directory", table_name.as_bytes()],
+        )
+        .map_err(|error| {
+            FusionError::Execution(format!(
+                "Composite index directory key encoding failed: {error}"
+            ))
+        })
+    }
+
+    fn legacy_composite_index_table_marker_key(table_name: &str) -> String {
         let mut key =
             String::with_capacity("index_meta_table:".len() + table_name.len() + ":__marker".len());
         key.push_str("index_meta_table:");
         key.push_str(table_name);
         key.push_str(":__marker");
         key
+    }
+
+    fn is_legacy_composite_index_table_marker(table_name: &str, key: &[u8], value: &[u8]) -> bool {
+        value == b"v1"
+            && key == Self::legacy_composite_index_table_marker_key(table_name).as_bytes()
     }
 
     pub(crate) fn composite_index_table_prefix(table_name: &str) -> String {
@@ -91,30 +114,9 @@ impl Executor {
         "|"
     }
 
-    fn composite_index_meta_value_for_prefix(
-        prefix: &str,
-        table: &str,
-        columns: &[String],
-    ) -> String {
-        let columns_len: usize = columns.iter().map(|column| column.len()).sum();
-        let mut value = String::with_capacity(
-            prefix.len() + 1 + table.len() + 1 + columns_len + columns.len().saturating_sub(1),
-        );
-        value.push_str(prefix);
-        value.push(':');
-        value.push_str(table);
-        value.push(':');
-        for (idx, column) in columns.iter().enumerate() {
-            if idx > 0 {
-                value.push(',');
-            }
-            value.push_str(column);
-        }
-        value
-    }
-
+    #[cfg(test)]
     pub(crate) fn composite_index_meta_value(table: &str, columns: &[String]) -> String {
-        Self::composite_index_meta_value_for_prefix("v3", table, columns)
+        Self::composite_index_meta_value_with_include_and_unique(table, columns, &[], false)
     }
 
     fn append_c5_meta_count(value: &mut String, count: usize) {
@@ -146,7 +148,10 @@ impl Executor {
         Some(part.to_string())
     }
 
-    fn parse_c5_index_meta_payload(meta: &str) -> Option<(String, Vec<String>, Vec<String>)> {
+    fn parse_length_prefixed_index_meta_payload(
+        meta: &str,
+        require_include_columns: bool,
+    ) -> Option<(String, Vec<String>, Vec<String>)> {
         let mut cursor = 0;
         let table = Self::read_c5_meta_part(meta, &mut cursor)?;
         let column_count = Self::read_c5_meta_count(meta, &mut cursor)?;
@@ -168,7 +173,7 @@ impl Executor {
         }
 
         let include_count = Self::read_c5_meta_count(meta, &mut cursor)?;
-        if include_count == 0
+        if (require_include_columns && include_count == 0)
             || include_count > Self::MAX_C5_COMPOSITE_META_PARTS
             || include_count > meta.len()
         {
@@ -191,20 +196,30 @@ impl Executor {
         columns: &[String],
         include_columns: &[String],
     ) -> String {
-        if include_columns.is_empty() {
-            return Self::composite_index_meta_value(table, columns);
-        }
+        Self::composite_index_meta_value_with_include_and_unique(
+            table,
+            columns,
+            include_columns,
+            false,
+        )
+    }
 
+    pub(crate) fn composite_index_meta_value_with_include_and_unique(
+        table: &str,
+        columns: &[String],
+        include_columns: &[String],
+        is_unique: bool,
+    ) -> String {
         let columns_len: usize = columns.iter().map(String::len).sum();
         let include_len: usize = include_columns.iter().map(String::len).sum();
         let mut value = String::with_capacity(
-            "c5:".len()
+            "c6:".len()
                 + table.len()
                 + columns_len
                 + include_len
                 + (columns.len() + include_columns.len() + 3) * 8,
         );
-        value.push_str("c5:");
+        value.push_str(if is_unique { "u6:" } else { "c6:" });
         Self::append_c5_meta_part(&mut value, table);
         Self::append_c5_meta_count(&mut value, columns.len());
         for column in columns {
@@ -218,7 +233,12 @@ impl Executor {
     }
 
     pub(crate) fn composite_unique_meta_value(table: &str, columns: &[String]) -> String {
-        Self::composite_index_meta_value_for_prefix("u3", table, columns)
+        Self::composite_index_meta_value_with_include_and_unique(table, columns, &[], true)
+    }
+
+    pub(crate) fn composite_primary_meta_value(table: &str, columns: &[String]) -> String {
+        let unique = Self::composite_unique_meta_value(table, columns);
+        unique.replacen("u6:", "p6:", 1)
     }
 
     pub(crate) fn single_column_index_meta_value(table: &str, column: &str) -> String {
@@ -266,7 +286,8 @@ impl Executor {
 
     pub(crate) fn parse_index_meta(index_name: &str, meta_str: &str) -> Option<CompositeIndexMeta> {
         if let Some(rest) = meta_str.strip_prefix("s3:") {
-            let (table, columns, include_columns) = Self::parse_c5_index_meta_payload(rest)?;
+            let (table, columns, include_columns) =
+                Self::parse_length_prefixed_index_meta_payload(rest, true)?;
             if columns.len() != 1 {
                 return None;
             }
@@ -277,6 +298,9 @@ impl Executor {
                 columns,
                 include_columns,
                 ordered_encoding: false,
+                is_unique: false,
+                unique_sentinel_authoritative: false,
+                is_primary: false,
             });
         }
 
@@ -301,17 +325,48 @@ impl Executor {
                 columns: vec![column.to_string()],
                 include_columns,
                 ordered_encoding: false,
+                is_unique: false,
+                unique_sentinel_authoritative: false,
+                is_primary: false,
             });
         }
 
-        if let Some(rest) = meta_str.strip_prefix("c5:") {
-            let (table, columns, include_columns) = Self::parse_c5_index_meta_payload(rest)?;
+        if let Some((rest, is_unique, is_primary)) = meta_str
+            .strip_prefix("c6:")
+            .map(|rest| (rest, false, false))
+            .or_else(|| meta_str.strip_prefix("u6:").map(|rest| (rest, true, false)))
+            .or_else(|| meta_str.strip_prefix("p6:").map(|rest| (rest, true, true)))
+        {
+            let (table, columns, include_columns) =
+                Self::parse_length_prefixed_index_meta_payload(rest, false)?;
             return Some(CompositeIndexMeta {
                 name: index_name.to_string(),
                 table,
                 columns,
                 include_columns,
                 ordered_encoding: true,
+                is_unique,
+                unique_sentinel_authoritative: is_unique,
+                is_primary,
+            });
+        }
+
+        if let Some((rest, is_unique)) = meta_str
+            .strip_prefix("c5:")
+            .map(|rest| (rest, false))
+            .or_else(|| meta_str.strip_prefix("u5:").map(|rest| (rest, true)))
+        {
+            let (table, columns, include_columns) =
+                Self::parse_length_prefixed_index_meta_payload(rest, true)?;
+            return Some(CompositeIndexMeta {
+                name: index_name.to_string(),
+                table,
+                columns,
+                include_columns,
+                ordered_encoding: true,
+                is_unique,
+                unique_sentinel_authoritative: false,
+                is_primary: false,
             });
         }
 
@@ -345,13 +400,17 @@ impl Executor {
                 columns: parsed_columns,
                 include_columns,
                 ordered_encoding: true,
+                is_unique: false,
+                unique_sentinel_authoritative: false,
+                is_primary: false,
             });
         }
 
-        let rest = meta_str
+        let versioned = meta_str
             .strip_prefix("v3:")
-            .or_else(|| meta_str.strip_prefix("u3:"));
-        if let Some(rest) = rest {
+            .map(|rest| (rest, false))
+            .or_else(|| meta_str.strip_prefix("u3:").map(|rest| (rest, true)));
+        if let Some((rest, is_unique)) = versioned {
             let (table, columns) = rest.split_once(':')?;
             let mut parsed_columns = Vec::with_capacity(columns.matches(',').count() + 1);
             for column in columns.split(',') {
@@ -371,6 +430,9 @@ impl Executor {
                 columns: parsed_columns,
                 include_columns: Vec::new(),
                 ordered_encoding: true,
+                is_unique,
+                unique_sentinel_authoritative: false,
+                is_primary: false,
             })
         } else if let Some(rest) = meta_str.strip_prefix("v2:") {
             let (table, columns) = rest.split_once(':')?;
@@ -392,6 +454,9 @@ impl Executor {
                 columns: parsed_columns,
                 include_columns: Vec::new(),
                 ordered_encoding: false,
+                is_unique: false,
+                unique_sentinel_authoritative: false,
+                is_primary: false,
             })
         } else {
             let (table, column) = meta_str.split_once(':')?;
@@ -405,6 +470,9 @@ impl Executor {
                 columns: vec![column.to_string()],
                 include_columns: Vec::new(),
                 ordered_encoding: false,
+                is_unique: false,
+                unique_sentinel_authoritative: false,
+                is_primary: false,
             })
         }
     }
@@ -500,8 +568,20 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<Vec<CompositeIndexMeta>> {
-        let marker_key = Self::composite_index_table_marker_key(table_name);
-        if txn.get(marker_key.as_bytes()).await?.is_some() {
+        let marker_key = Self::composite_index_table_marker_key(table_name)?;
+        let has_structured_marker = txn
+            .get(&marker_key)
+            .await?
+            .is_some_and(|value| value == Self::COMPOSITE_INDEX_DIRECTORY_MARKER_VALUE_V2);
+        let has_legacy_marker = if has_structured_marker {
+            false
+        } else {
+            let legacy_marker_key = Self::legacy_composite_index_table_marker_key(table_name);
+            txn.get(legacy_marker_key.as_bytes())
+                .await?
+                .is_some_and(|value| value == b"v1")
+        };
+        if has_structured_marker || has_legacy_marker {
             return self
                 .load_composite_indexes_for_table_directory(table_name, txn)
                 .await;
@@ -521,7 +601,7 @@ impl Executor {
             .await?;
         let mut unique_indexes = Vec::with_capacity(indexes.len());
         for index in indexes {
-            if index.name.ends_with("_pkey") {
+            if index.is_unique {
                 unique_indexes.push(index);
             }
         }
@@ -539,15 +619,15 @@ impl Executor {
         let mut indexes = Vec::with_capacity(entries.len());
 
         for (key, value) in entries {
+            if Self::is_legacy_composite_index_table_marker(table_name, &key, &value) {
+                continue;
+            }
             let Ok(key_str) = std::str::from_utf8(&key) else {
                 continue;
             };
             let Some(index_name) = key_str.strip_prefix(&prefix) else {
                 continue;
             };
-            if index_name == "__marker" {
-                continue;
-            }
 
             let meta_str = String::from_utf8(value).unwrap_or_default();
             let Some(meta) = Self::parse_index_meta(index_name, &meta_str) else {
@@ -596,8 +676,9 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<()> {
-        let marker_key = Self::composite_index_table_marker_key(table_name);
-        txn.put(marker_key.as_bytes(), b"v1").await
+        let marker_key = Self::composite_index_table_marker_key(table_name)?;
+        txn.put(&marker_key, Self::COMPOSITE_INDEX_DIRECTORY_MARKER_VALUE_V2)
+            .await
     }
 
     pub(crate) async fn rebuild_composite_index_directory_for_table(
@@ -605,6 +686,9 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<()> {
+        let marker_key = Self::composite_index_table_marker_key(table_name)?;
+        txn.delete(&marker_key).await?;
+
         let prefix = Self::composite_index_table_prefix(table_name);
         let existing_entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
         for (key, value) in existing_entries {
@@ -645,8 +729,7 @@ impl Executor {
         key: &[u8],
         value: &[u8],
     ) -> bool {
-        let marker_key = Self::composite_index_table_marker_key(table_name);
-        if key == marker_key.as_bytes() {
+        if Self::is_legacy_composite_index_table_marker(table_name, key, value) {
             return true;
         }
 
@@ -721,6 +804,90 @@ impl Executor {
         value_prefix.push_str(value_key);
         value_prefix.push(':');
         value_prefix
+    }
+
+    fn composite_unique_sentinel_identity(index: &CompositeIndexMeta) -> String {
+        let encoded_name =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(index.name.as_bytes());
+        let mut identity = String::with_capacity("\0composite-index:".len() + encoded_name.len());
+        identity.push_str("\0composite-index:");
+        identity.push_str(&encoded_name);
+        identity
+    }
+
+    fn index_build_barrier_bucket(row_id: &str) -> usize {
+        let hash = row_id
+            .as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        hash as usize % Self::INDEX_BUILD_BARRIER_SHARDS
+    }
+
+    fn index_build_barrier_key(table_name: &str, bucket: usize) -> String {
+        let mut key =
+            String::with_capacity("index_build_barrier:".len() + 20 + table_name.len() + 1 + 2);
+        key.push_str("index_build_barrier:");
+        key.push_str(&table_name.len().to_string());
+        key.push(':');
+        key.push_str(table_name);
+        key.push(':');
+        key.push_str(&format!("{bucket:02x}"));
+        key
+    }
+
+    pub(crate) async fn touch_index_build_barrier_for_row(
+        &self,
+        table_name: &str,
+        row_id: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let key =
+            Self::index_build_barrier_key(table_name, Self::index_build_barrier_bucket(row_id));
+        txn.put(key.as_bytes(), b"v1").await
+    }
+
+    pub(crate) async fn touch_all_index_build_barriers(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        for bucket in 0..Self::INDEX_BUILD_BARRIER_SHARDS {
+            let key = Self::index_build_barrier_key(table_name, bucket);
+            txn.put(key.as_bytes(), b"v1").await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn composite_unique_sentinel_key_for_value(
+        &self,
+        table_name: &str,
+        index: &CompositeIndexMeta,
+        value_key: &str,
+    ) -> String {
+        self.routed_unique_sentinel_key_for_value(
+            table_name,
+            &Self::composite_unique_sentinel_identity(index),
+            value_key,
+        )
+    }
+
+    pub(crate) fn composite_unique_sentinel_prefixes(
+        &self,
+        table_name: &str,
+        index: &CompositeIndexMeta,
+    ) -> Vec<String> {
+        let identity = Self::composite_unique_sentinel_identity(index);
+        self.routed_unique_sentinel_prefixes_for_table(table_name)
+            .into_iter()
+            .map(|mut prefix| {
+                prefix.reserve(identity.len() + 1);
+                prefix.push_str(&identity);
+                prefix.push(':');
+                prefix
+            })
+            .collect()
     }
 
     fn composite_index_components_prefix(prefix: &str, components: &str) -> String {
@@ -823,6 +990,44 @@ impl Executor {
             &parts,
             Self::composite_index_component_separator(),
         ))
+    }
+
+    pub(crate) fn composite_unique_value_key(
+        &self,
+        index: &CompositeIndexMeta,
+        row: &[Value],
+        schema: &TableSchema,
+    ) -> Result<Option<String>> {
+        let mut parts = Vec::with_capacity(index.columns.len());
+        for column in &index.columns {
+            let idx = schema.get_column_index(column).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "UNIQUE index {} references missing column {}",
+                    index.name, column
+                ))
+            })?;
+            let value = row.get(idx).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "UNIQUE index {} cannot read column {} from row",
+                    index.name, column
+                ))
+            })?;
+            if matches!(value, Value::Null) {
+                return Ok(None);
+            }
+            let part = self.index_component_for_meta(value, index).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "UNIQUE index {} does not support value '{}' in column {}",
+                    index.name, value, column
+                ))
+            })?;
+            parts.push(part);
+        }
+
+        Ok(Some(join_composite_index_parts(
+            &parts,
+            Self::composite_index_component_separator(),
+        )))
     }
 
     fn legacy_encoded_index_component(&self, value: &Value) -> Option<String> {
@@ -1060,13 +1265,25 @@ impl Executor {
         row_id: &str,
         txn: &mut dyn Transaction,
     ) -> Result<()> {
+        self.touch_index_build_barrier_for_row(table_name, row_id, txn)
+            .await?;
         for index in indexes {
+            let unique_value_key = if index.is_unique {
+                self.composite_unique_value_key(index, row, schema)?
+            } else {
+                None
+            };
             if let Some(index_key) =
                 self.composite_index_key_for_meta(index, table_name, row, schema, row_id)
             {
                 let payload =
                     Self::composite_index_payload_for_row(schema, index, row).unwrap_or_default();
                 txn.put(index_key.as_bytes(), &payload).await?;
+            }
+            if let Some(value_key) = unique_value_key {
+                let sentinel_key =
+                    self.composite_unique_sentinel_key_for_value(table_name, index, &value_key);
+                txn.put(sentinel_key.as_bytes(), row_id.as_bytes()).await?;
             }
         }
         Ok(())
@@ -1082,16 +1299,41 @@ impl Executor {
         txn: &mut dyn Transaction,
     ) -> Result<()> {
         for index in indexes {
-            let Some(value_key) =
-                self.composite_index_value_key_for_columns(&index.columns, row, schema)
-            else {
+            if !index.is_unique {
+                continue;
+            }
+            let Some(value_key) = self.composite_unique_value_key(index, row, schema)? else {
                 continue;
             };
+            let sentinel_key =
+                self.composite_unique_sentinel_key_for_value(table_name, index, &value_key);
+            if let Some(owner) = txn.get(sentinel_key.as_bytes()).await? {
+                let owner = std::str::from_utf8(&owner).map_err(|_| {
+                    FusionError::Execution(format!(
+                        "UNIQUE sentinel for index {} contains an invalid row id",
+                        index.name
+                    ))
+                })?;
+                if !current_row_id.is_some_and(|current| current == owner) {
+                    return Err(FusionError::Execution(format!(
+                        "UNIQUE constraint violated for columns '{}'",
+                        index.columns.join(", ")
+                    )));
+                }
+                continue;
+            }
+            if index.unique_sentinel_authoritative {
+                continue;
+            }
             for index_prefix in self.routed_composite_index_prefixes(table_name, &index.columns) {
                 let prefix = Self::composite_index_value_prefix(&index_prefix, &value_key);
                 let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
                 for (key, _) in entries {
-                    let Some(row_id) = Self::row_id_from_key(&key) else {
+                    let Some(row_id) = std::str::from_utf8(&key)
+                        .ok()
+                        .and_then(|key| key.strip_prefix(&prefix))
+                        .filter(|row_id| !row_id.is_empty())
+                    else {
                         continue;
                     };
                     if current_row_id.is_some_and(|current| current == row_id) {
@@ -1115,7 +1357,7 @@ impl Executor {
     ) -> String {
         if let Some(primary_key) = composite_unique_indexes
             .iter()
-            .find(|index| index.name.ends_with("_pkey"))
+            .find(|index| index.is_primary)
         {
             if let Some(value_key) =
                 self.composite_index_value_key_for_columns(&primary_key.columns, row, schema)
@@ -1144,11 +1386,23 @@ impl Executor {
         row_id: &str,
         txn: &mut dyn Transaction,
     ) -> Result<()> {
+        self.touch_index_build_barrier_for_row(table_name, row_id, txn)
+            .await?;
         for index in indexes {
+            let unique_value_key = if index.is_unique {
+                self.composite_unique_value_key(index, row, schema)?
+            } else {
+                None
+            };
             if let Some(index_key) =
                 self.composite_index_key_for_meta(index, table_name, row, schema, row_id)
             {
                 txn.delete(index_key.as_bytes()).await?;
+            }
+            if let Some(value_key) = unique_value_key {
+                let sentinel_key =
+                    self.composite_unique_sentinel_key_for_value(table_name, index, &value_key);
+                txn.delete(sentinel_key.as_bytes()).await?;
             }
         }
         Ok(())
@@ -1164,6 +1418,8 @@ impl Executor {
         row_id: &str,
         txn: &mut dyn Transaction,
     ) -> Result<()> {
+        self.touch_index_build_barrier_for_row(table_name, row_id, txn)
+            .await?;
         for index in indexes {
             let touches_index_key = index.columns.iter().any(|column| {
                 schema
@@ -1180,6 +1436,18 @@ impl Executor {
             }
 
             if touches_index_key {
+                if index.is_unique {
+                    if let Some(old_value_key) =
+                        self.composite_unique_value_key(index, old_row, schema)?
+                    {
+                        let old_sentinel_key = self.composite_unique_sentinel_key_for_value(
+                            table_name,
+                            index,
+                            &old_value_key,
+                        );
+                        txn.delete(old_sentinel_key.as_bytes()).await?;
+                    }
+                }
                 if let Some(old_key) =
                     self.composite_index_key_for_meta(index, table_name, old_row, schema, row_id)
                 {
@@ -1193,6 +1461,19 @@ impl Executor {
                 let payload = Self::composite_index_payload_for_row(schema, index, new_row)
                     .unwrap_or_default();
                 txn.put(new_key.as_bytes(), &payload).await?;
+            }
+            if touches_index_key && index.is_unique {
+                if let Some(new_value_key) =
+                    self.composite_unique_value_key(index, new_row, schema)?
+                {
+                    let new_sentinel_key = self.composite_unique_sentinel_key_for_value(
+                        table_name,
+                        index,
+                        &new_value_key,
+                    );
+                    txn.put(new_sentinel_key.as_bytes(), row_id.as_bytes())
+                        .await?;
+                }
             }
         }
         Ok(())
@@ -1980,6 +2261,9 @@ impl Executor {
             }
         }
 
+        let marker_key = Self::composite_index_table_marker_key(table_name)?;
+        txn.delete(&marker_key).await?;
+
         Ok(())
     }
 
@@ -1996,6 +2280,7 @@ mod tests {
     use super::{join_composite_index_parts, CompositeIndexMeta, Executor};
     use crate::catalog::{Column, IndexType, TableSchema};
     use crate::common::{FusionError, Result, Value};
+    use crate::storage::keyspace::{parse_identifier_key_exact, KeyNamespace};
     use crate::storage::memory::MemoryStorage;
     use crate::storage::{ScanVisitor, Transaction};
     use async_trait::async_trait;
@@ -2065,7 +2350,9 @@ mod tests {
     impl Transaction for RecordingCompositeTxn {
         async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
             if key == self.marker_key.as_slice() {
-                Ok(Some(Vec::new()))
+                Ok(Some(
+                    Executor::COMPOSITE_INDEX_DIRECTORY_MARKER_VALUE_V2.to_vec(),
+                ))
             } else {
                 Ok(None)
             }
@@ -2238,8 +2525,23 @@ mod tests {
     }
 
     #[test]
-    fn composite_index_table_marker_key_preallocates_exact_key() {
-        let key = Executor::composite_index_table_marker_key("stock");
+    fn composite_index_table_marker_key_uses_structured_catalog_identity() {
+        let key = Executor::composite_index_table_marker_key("stock").unwrap();
+        let decoded = parse_identifier_key_exact(&key, KeyNamespace::Catalog, 2).unwrap();
+
+        assert_eq!(
+            decoded.components(),
+            &[b"composite-index-directory".as_slice(), b"stock".as_slice()]
+        );
+        assert_ne!(
+            key,
+            Executor::legacy_composite_index_table_marker_key("stock").into_bytes()
+        );
+    }
+
+    #[test]
+    fn legacy_composite_index_table_marker_key_is_kept_for_compatibility() {
+        let key = Executor::legacy_composite_index_table_marker_key("stock");
 
         assert_eq!(key, "index_meta_table:stock:__marker");
         assert!(key.capacity() >= key.len());
@@ -2337,7 +2639,7 @@ mod tests {
         let columns = vec!["warehouse_id".to_string(), "district_id".to_string()];
         let value = Executor::composite_index_meta_value("stock", &columns);
 
-        assert_eq!(value, "v3:stock:warehouse_id,district_id");
+        assert_eq!(value, "c6:5:stock2:12:warehouse_id11:district_id0:");
         assert!(value.capacity() >= value.len());
     }
 
@@ -2417,13 +2719,35 @@ mod tests {
 
         assert_eq!(
             value,
-            "c5:5:stock2:12:warehouse_id11:district_id2:7:payload6:metric"
+            "c6:5:stock2:12:warehouse_id11:district_id2:7:payload6:metric"
         );
         let meta = Executor::parse_index_meta("idx_stock_cover", &value).unwrap();
         assert_eq!(meta.table, "stock");
         assert_eq!(meta.columns, columns);
         assert_eq!(meta.include_columns, include_columns);
         assert!(meta.ordered_encoding);
+        assert!(!meta.is_unique);
+    }
+
+    #[test]
+    fn composite_unique_meta_with_include_roundtrips_u6() {
+        let columns = vec!["tenant".to_string(), "external_id".to_string()];
+        let include_columns = vec!["payload".to_string()];
+        let value = Executor::composite_index_meta_value_with_include_and_unique(
+            "accounts",
+            &columns,
+            &include_columns,
+            true,
+        );
+
+        assert!(value.starts_with("u6:"));
+        let meta = Executor::parse_index_meta("accounts_tenant_external_key", &value).unwrap();
+        assert_eq!(meta.table, "accounts");
+        assert_eq!(meta.columns, columns);
+        assert_eq!(meta.include_columns, include_columns);
+        assert!(meta.ordered_encoding);
+        assert!(meta.is_unique);
+        assert!(meta.unique_sentinel_authoritative);
     }
 
     #[test]
@@ -2436,7 +2760,7 @@ mod tests {
             &include_columns,
         );
 
-        assert!(value.starts_with("c5:"));
+        assert!(value.starts_with("c6:"));
         let meta = Executor::parse_index_meta("idx_stock_cover", &value).unwrap();
         assert_eq!(meta.table, "stock:west,1");
         assert_eq!(meta.columns, columns);
@@ -2462,6 +2786,35 @@ mod tests {
             vec!["payload".to_string(), "metric".to_string()]
         );
         assert!(meta.ordered_encoding);
+    }
+
+    #[test]
+    fn composite_index_metadata_reads_legacy_v3_u3_c5_and_u5() {
+        let cases = [
+            ("v3:stock:warehouse_id,district_id", false, false),
+            ("u3:stock:warehouse_id,district_id", true, false),
+            (
+                "c5:5:stock2:12:warehouse_id11:district_id1:7:payload",
+                false,
+                false,
+            ),
+            (
+                "u5:5:stock2:12:warehouse_id11:district_id1:7:payload",
+                true,
+                false,
+            ),
+        ];
+
+        for (value, is_unique, sentinel_authoritative) in cases {
+            let meta = Executor::parse_index_meta("idx_legacy", value).unwrap();
+            assert_eq!(meta.table, "stock");
+            assert_eq!(
+                meta.columns,
+                vec!["warehouse_id".to_string(), "district_id".to_string()]
+            );
+            assert_eq!(meta.is_unique, is_unique);
+            assert_eq!(meta.unique_sentinel_authoritative, sentinel_authoritative);
+        }
     }
 
     #[test]
@@ -2495,6 +2848,9 @@ mod tests {
             &["host_id".to_string(), "ts".to_string()],
             &["payload".to_string()],
         );
+        let real_marker_value =
+            Executor::composite_unique_meta_value("a", &["host_id".to_string(), "ts".to_string()]);
+        let legacy_marker_key = Executor::legacy_composite_index_table_marker_key("a");
 
         assert!(
             Executor::composite_index_table_directory_entry_belongs_to_table(
@@ -2513,8 +2869,20 @@ mod tests {
         assert!(
             Executor::composite_index_table_directory_entry_belongs_to_table(
                 "a",
-                Executor::composite_index_table_marker_key("a").as_bytes(),
+                legacy_marker_key.as_bytes(),
                 b"v1"
+            )
+        );
+        assert!(!Executor::is_legacy_composite_index_table_marker(
+            "a",
+            legacy_marker_key.as_bytes(),
+            real_marker_value.as_bytes()
+        ));
+        assert!(
+            Executor::composite_index_table_directory_entry_belongs_to_table(
+                "a",
+                legacy_marker_key.as_bytes(),
+                real_marker_value.as_bytes()
             )
         );
     }
@@ -2524,8 +2892,10 @@ mod tests {
         let columns = vec!["warehouse_id".to_string(), "district_id".to_string()];
         let value = Executor::composite_unique_meta_value("stock", &columns);
 
-        assert_eq!(value, "u3:stock:warehouse_id,district_id");
+        assert_eq!(value, "u6:5:stock2:12:warehouse_id11:district_id0:");
         assert!(value.capacity() >= value.len());
+        assert!(Executor::parse_index_meta("stock_key", &value)
+            .is_some_and(|meta| meta.is_unique && meta.unique_sentinel_authoritative));
     }
 
     #[test]
@@ -2562,6 +2932,9 @@ mod tests {
             columns: vec!["warehouse_id".to_string(), "district_id".to_string()],
             include_columns: Vec::new(),
             ordered_encoding: true,
+            is_unique: false,
+            unique_sentinel_authoritative: false,
+            is_primary: false,
         };
         let encoded = meta.encoded_columns();
 
@@ -2620,6 +2993,9 @@ mod tests {
             columns: vec!["host_id".to_string(), "ts".to_string()],
             include_columns: Vec::new(),
             ordered_encoding: true,
+            is_unique: false,
+            unique_sentinel_authoritative: false,
+            is_primary: false,
         };
         let entries = [1000_i64, 2000, 3000, 4000]
             .into_iter()
@@ -2648,7 +3024,7 @@ mod tests {
         let table_meta_key = Executor::composite_index_table_meta_key("tsbs", &meta.name);
         let table_meta_value = Executor::composite_index_meta_value("tsbs", &meta.columns);
         let mut txn = RecordingCompositeTxn::new(
-            Executor::composite_index_table_marker_key("tsbs").into_bytes(),
+            Executor::composite_index_table_marker_key("tsbs").unwrap(),
             Executor::composite_index_table_prefix("tsbs").into_bytes(),
             (table_meta_key.into_bytes(), table_meta_value.into_bytes()),
             entries,
@@ -2722,6 +3098,9 @@ mod tests {
             columns: vec!["host_id".to_string(), "ts".to_string()],
             include_columns: Vec::new(),
             ordered_encoding: true,
+            is_unique: false,
+            unique_sentinel_authoritative: false,
+            is_primary: false,
         };
         let row_ids = [1_i64, 2, 3, 4]
             .into_iter()
@@ -2758,7 +3137,7 @@ mod tests {
         let table_meta_key = Executor::composite_index_table_meta_key("tsbs", &meta.name);
         let table_meta_value = Executor::composite_index_meta_value("tsbs", &meta.columns);
         let mut txn = RecordingCompositeTxn::new(
-            Executor::composite_index_table_marker_key("tsbs").into_bytes(),
+            Executor::composite_index_table_marker_key("tsbs").unwrap(),
             Executor::composite_index_table_prefix("tsbs").into_bytes(),
             (table_meta_key.into_bytes(), table_meta_value.into_bytes()),
             entries,
@@ -2836,6 +3215,9 @@ mod tests {
             columns: vec!["host_id".to_string(), "ts".to_string()],
             include_columns: vec!["payload".to_string(), "metric".to_string()],
             ordered_encoding: true,
+            is_unique: false,
+            unique_sentinel_authoritative: false,
+            is_primary: false,
         };
         let include_indices = vec![3, 4];
         let rows = [
@@ -2892,7 +3274,7 @@ mod tests {
             &meta.include_columns,
         );
         let mut txn = RecordingCompositeTxn::new(
-            Executor::composite_index_table_marker_key("tsbs").into_bytes(),
+            Executor::composite_index_table_marker_key("tsbs").unwrap(),
             Executor::composite_index_table_prefix("tsbs").into_bytes(),
             (table_meta_key.into_bytes(), table_meta_value.into_bytes()),
             entries,
@@ -2974,6 +3356,9 @@ mod tests {
             columns: vec!["host_id".to_string(), "ts".to_string()],
             include_columns: Vec::new(),
             ordered_encoding: true,
+            is_unique: false,
+            unique_sentinel_authoritative: false,
+            is_primary: false,
         };
         let entries = [1000_i64, 2000, 3000, 4000]
             .into_iter()
@@ -3002,7 +3387,7 @@ mod tests {
         let table_meta_key = Executor::composite_index_table_meta_key("tsbs", &meta.name);
         let table_meta_value = Executor::composite_index_meta_value("tsbs", &meta.columns);
         let mut txn = RecordingCompositeTxn::new(
-            Executor::composite_index_table_marker_key("tsbs").into_bytes(),
+            Executor::composite_index_table_marker_key("tsbs").unwrap(),
             Executor::composite_index_table_prefix("tsbs").into_bytes(),
             (table_meta_key.into_bytes(), table_meta_value.into_bytes()),
             entries,

@@ -150,6 +150,13 @@ impl VectorIndex {
         self.indexes.write().clear();
     }
 
+    /// Atomically publish a fully rebuilt set of indexes. Rebuild callers use
+    /// a detached VectorIndex so a failure cannot expose a partially populated
+    /// HNSW graph to concurrent searches.
+    pub(crate) fn replace_with(&self, rebuilt: VectorIndex) {
+        *self.indexes.write() = rebuilt.indexes.into_inner();
+    }
+
     /// Pre-commit validation for a deferred insert: fails if the vector's
     /// dimension conflicts with the index's established dimension, WITHOUT
     /// mutating anything. Lets callers reject the statement before commit
@@ -189,6 +196,14 @@ impl VectorIndex {
         }
 
         wrapper.ensure_built()
+    }
+
+    pub(crate) fn build_all(&self) -> Result<()> {
+        let wrappers: Vec<_> = self.indexes.read().values().cloned().collect();
+        for wrapper in wrappers {
+            wrapper.write().ensure_built()?;
+        }
+        Ok(())
     }
 
     pub fn delete(&self, name: &str, id: &str) -> Result<bool> {

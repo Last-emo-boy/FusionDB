@@ -1,6 +1,7 @@
 use crate::catalog::{IndexType, TableSchema};
-use crate::common::{Result, Value};
+use crate::common::{FusionError, Result, Value};
 use async_trait::async_trait;
+use base64::Engine as _;
 use std::sync::Arc;
 
 pub mod backend;
@@ -18,6 +19,24 @@ pub mod sstable;
 pub mod trigram;
 pub mod vector_index;
 pub mod wal;
+
+/// Stable, collision-free identity for the derived HNSW index of one table column.
+pub(crate) fn hnsw_index_name_for_column(table_name: &str, column_name: &str) -> Result<String> {
+    let identity = keyspace::encode_identifier_key(
+        keyspace::KeyNamespace::VectorIndex,
+        &[table_name.as_bytes(), column_name.as_bytes()],
+    )
+    .map_err(|error| {
+        FusionError::Storage(format!(
+            "failed to encode HNSW index identity for '{table_name}.{column_name}': {error}"
+        ))
+    })?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identity);
+    let mut name = String::with_capacity("hnsw_v2_".len() + encoded.len());
+    name.push_str("hnsw_v2_");
+    name.push_str(&encoded);
+    Ok(name)
+}
 
 pub use fusion::FusionStorage;
 pub use fusion::FusionTransaction;
@@ -659,6 +678,22 @@ pub trait Storage: Send + Sync + Any {
 mod tests {
     use super::*;
     use crate::storage::sstable::SsTableSqlZoneMap;
+
+    #[test]
+    fn hnsw_index_name_is_stable_ascii() {
+        let name = hnsw_index_name_for_column("docs", "embedding").unwrap();
+
+        assert_eq!(name, "hnsw_v2_AEZEQksCBwAAAARkb2NzAAAACWVtYmVkZGluZw");
+        assert!(name.is_ascii());
+    }
+
+    #[test]
+    fn hnsw_index_name_separates_underscore_ambiguous_identifiers() {
+        let left = hnsw_index_name_for_column("a_b", "c").unwrap();
+        let right = hnsw_index_name_for_column("a", "b_c").unwrap();
+
+        assert_ne!(left, right);
+    }
 
     fn zone_map_plan(kind: SqlBlockZoneMapPredicateKind) -> SqlBlockZoneMapPruningPlan {
         SqlBlockZoneMapPruningPlan {

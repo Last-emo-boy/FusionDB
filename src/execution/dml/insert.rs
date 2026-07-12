@@ -234,7 +234,7 @@ impl Executor {
                 if !key_changed {
                     continue;
                 }
-                let idx_name = Self::hnsw_index_name_for_column(table_name, &col.name);
+                let idx_name = Self::hnsw_index_name_for_column(table_name, &col.name)?;
                 if matches!(old_val, Value::Vector(_)) {
                     self.defer_or_apply_vector_delete(&idx_name, row_id, txn)?;
                 }
@@ -589,7 +589,8 @@ impl Executor {
                         )
                         .await?;
                         let value = crate::common::encoding::RowEncoder::encode(&existing_row);
-                        txn.put(key.as_bytes(), &value).await?;
+                        self.write_routed_data_row(&context.table_name, &row_id, &value, txn)
+                            .await?;
                         self.migrate_unique_sentinels_for_update(
                             &context.table_name,
                             &context.schema,
@@ -667,7 +668,8 @@ impl Executor {
         ));
 
         let value = crate::common::encoding::RowEncoder::encode(&row_values);
-        txn.put(key.as_bytes(), &value).await?;
+        self.write_routed_data_row(&context.table_name, &row_id, &value, txn)
+            .await?;
         monitor::inc_row_write();
         self.put_unique_sentinels_for_row(
             &context.table_name,
@@ -706,7 +708,7 @@ impl Executor {
                 } else if col.index_type == IndexType::HNSW {
                     if let Value::Vector(vec) = val {
                         let idx_name =
-                            Self::hnsw_index_name_for_column(&context.table_name, &col.name);
+                            Self::hnsw_index_name_for_column(&context.table_name, &col.name)?;
                         self.defer_or_apply_vector_insert(
                             &idx_name,
                             row_id.clone(),
@@ -1050,7 +1052,13 @@ impl Executor {
                                     .await?;
                                     let value =
                                         crate::common::encoding::RowEncoder::encode(&existing_row);
-                                    txn.put(key.as_bytes(), &value).await?;
+                                    self.write_routed_data_row(
+                                        &table_name_str,
+                                        &row_id,
+                                        &value,
+                                        txn,
+                                    )
+                                    .await?;
                                     self.migrate_unique_sentinels_for_update(
                                         &table_name_str,
                                         &schema,
@@ -1132,7 +1140,8 @@ impl Executor {
                     ));
 
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
-                    txn.put(key.as_bytes(), &value).await?;
+                    self.write_routed_data_row(&table_name_str, &row_id, &value, txn)
+                        .await?;
                     monitor::inc_row_write();
                     self.put_unique_sentinels_for_row(
                         &table_name_str,
@@ -1173,7 +1182,7 @@ impl Executor {
                                     let idx_name = Self::hnsw_index_name_for_column(
                                         &table_name_str,
                                         &col.name,
-                                    );
+                                    )?;
                                     self.defer_or_apply_vector_insert(
                                         &idx_name,
                                         row_id.clone(),
@@ -1300,7 +1309,8 @@ impl Executor {
                     )
                     .await?;
                     let value = crate::common::encoding::RowEncoder::encode(&row_values);
-                    txn.put(key.as_bytes(), &value).await?;
+                    self.write_routed_data_row(&table_name_str, &row_id, &value, txn)
+                        .await?;
                     monitor::inc_row_write();
                     self.put_unique_sentinels_for_row(
                         &table_name_str,
@@ -1340,7 +1350,7 @@ impl Executor {
                                     let idx_name = Self::hnsw_index_name_for_column(
                                         &table_name_str,
                                         &col.name,
-                                    );
+                                    )?;
                                     self.defer_or_apply_vector_insert(
                                         &idx_name,
                                         row_id.clone(),

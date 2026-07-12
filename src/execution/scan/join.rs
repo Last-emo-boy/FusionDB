@@ -343,7 +343,11 @@ impl Executor {
 
         let (left_expr, right_key_index) = probe?;
         let column = &right_schema.columns[right_key_index];
-        if !(column.is_primary || (column.is_indexed && column.index_type == IndexType::BTree)) {
+        if !(column.is_primary
+            || (Self::legacy_delimited_index_row_ids_are_unambiguous(right_schema)
+                && column.is_indexed
+                && column.index_type == IndexType::BTree))
+        {
             return None;
         }
 
@@ -861,13 +865,18 @@ impl Executor {
         right_key_indices: &[usize],
         right_schema: &TableSchema,
     ) -> Option<(usize, usize)> {
+        let delimited_row_ids_are_unambiguous =
+            Self::legacy_delimited_index_row_ids_are_unambiguous(right_schema);
         left_key_indices
             .iter()
             .copied()
             .zip(right_key_indices.iter().copied())
             .find(|(_, right_idx)| {
                 let column = &right_schema.columns[*right_idx];
-                column.is_primary || (column.is_indexed && column.index_type == IndexType::BTree)
+                column.is_primary
+                    || (delimited_row_ids_are_unambiguous
+                        && column.is_indexed
+                        && column.index_type == IndexType::BTree)
             })
     }
 

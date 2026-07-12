@@ -56,12 +56,19 @@ struct ExistsJoinMembershipCache {
 struct InSubqueryMembershipCache {
     values: HashSet<Value>,
     contains_null: bool,
+    column_type: String,
 }
 
 enum ExistsCache {
     Single(ExistsMembershipCache),
     Join(ExistsJoinMembershipCache),
     InSubquery(InSubqueryMembershipCache),
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+enum DeferredSubqueryCacheKey {
+    Named(String),
+    InSubquery { probe_expr: usize, subquery: usize },
 }
 
 fn subquery_schema_key_for_table(table_name: &str) -> String {
@@ -166,14 +173,15 @@ fn subquery_exists_join_membership_cache_key(
 fn subquery_in_membership_cache_key(
     probe_expr: &Expr,
     subquery: &Query,
-    column_type: &str,
-) -> String {
-    let mut key = String::with_capacity(column_type.len() + 2);
-    key.push_str("in|");
-    key.push_str(column_type);
-    key.push('|');
-    write!(&mut key, "{probe_expr}|{subquery}").expect("writing to String cannot fail");
-    key
+) -> DeferredSubqueryCacheKey {
+    // The cache lives only for one filter_rows_with_subqueries call, while
+    // the borrowed expression tree remains fixed. Pointer identity therefore
+    // uniquely names an IN occurrence without formatting the full AST for
+    // every outer row.
+    DeferredSubqueryCacheKey::InSubquery {
+        probe_expr: probe_expr as *const Expr as usize,
+        subquery: subquery as *const Query as usize,
+    }
 }
 
 impl Executor {
@@ -526,7 +534,7 @@ impl Executor {
         schema: &crate::catalog::TableSchema,
         txn: &mut dyn Transaction,
         params: &[Value],
-        membership_caches: &mut HashMap<String, ExistsCache>,
+        membership_caches: &mut HashMap<DeferredSubqueryCacheKey, ExistsCache>,
     ) -> Result<SqlTruth> {
         match expr {
             Expr::BinaryOp { left, op, right } => match op {
@@ -667,8 +675,21 @@ impl Executor {
         outer_schema: &crate::catalog::TableSchema,
         txn: &mut dyn Transaction,
         params: &[Value],
-        membership_caches: &mut HashMap<String, ExistsCache>,
+        membership_caches: &mut HashMap<DeferredSubqueryCacheKey, ExistsCache>,
     ) -> Result<SqlTruth> {
+        let key = subquery_in_membership_cache_key(probe_expr, subquery);
+        if let Some(ExistsCache::InSubquery(cache)) = membership_caches.get(&key) {
+            return self.evaluate_cached_in_subquery_membership(
+                probe_expr,
+                negated,
+                cache,
+                &cache.column_type,
+                outer_row,
+                outer_schema,
+                params,
+            );
+        }
+
         let Some(column_type) = self
             .comparison_column_type(probe_expr, outer_schema)
             .map(str::to_string)
@@ -703,43 +724,25 @@ impl Executor {
                 .await;
         }
 
-        let key = subquery_in_membership_cache_key(probe_expr, subquery, &column_type);
-        if !membership_caches.contains_key(&key) {
-            let (values, contains_null) = self
-                .materialize_in_subquery_membership(subquery, &column_type, txn, params)
-                .await?;
-            membership_caches.insert(
-                key.clone(),
-                ExistsCache::InSubquery(InSubqueryMembershipCache {
-                    values,
-                    contains_null,
-                }),
-            );
-        }
-
-        let Some(ExistsCache::InSubquery(cache)) = membership_caches.get(&key) else {
-            return self
-                .evaluate_in_subquery_via_materialization(
-                    probe_expr,
-                    subquery,
-                    negated,
-                    outer_row,
-                    outer_schema,
-                    txn,
-                    params,
-                )
-                .await;
+        let (values, contains_null) = self
+            .materialize_in_subquery_membership(subquery, &column_type, txn, params)
+            .await?;
+        let cache = InSubqueryMembershipCache {
+            values,
+            contains_null,
+            column_type,
         };
-
-        self.evaluate_cached_in_subquery_membership(
+        let result = self.evaluate_cached_in_subquery_membership(
             probe_expr,
             negated,
-            cache,
-            &column_type,
+            &cache,
+            &cache.column_type,
             outer_row,
             outer_schema,
             params,
-        )
+        );
+        membership_caches.insert(key, ExistsCache::InSubquery(cache));
+        result
     }
 
     async fn materialize_in_subquery_membership(
@@ -844,9 +847,9 @@ impl Executor {
         outer_schema: &crate::catalog::TableSchema,
         txn: &mut dyn Transaction,
         params: &[Value],
-        membership_caches: &mut HashMap<String, ExistsCache>,
+        membership_caches: &mut HashMap<DeferredSubqueryCacheKey, ExistsCache>,
     ) -> Result<bool> {
-        let key = self.exists_membership_cache_key(plan);
+        let key = DeferredSubqueryCacheKey::Named(self.exists_membership_cache_key(plan));
         if !membership_caches.contains_key(&key) {
             let (local_schema, local_rows) = self
                 .scan_table_base(&plan.table_factor, txn, params)
@@ -887,9 +890,9 @@ impl Executor {
         outer_schema: &crate::catalog::TableSchema,
         txn: &mut dyn Transaction,
         params: &[Value],
-        membership_caches: &mut HashMap<String, ExistsCache>,
+        membership_caches: &mut HashMap<DeferredSubqueryCacheKey, ExistsCache>,
     ) -> Result<bool> {
-        let key = self.exists_join_membership_cache_key(plan);
+        let key = DeferredSubqueryCacheKey::Named(self.exists_join_membership_cache_key(plan));
         if !membership_caches.contains_key(&key) {
             let (left_schema, left_rows) = self
                 .scan_table_base(&plan.left_table_factor, txn, params)

@@ -446,7 +446,9 @@ impl Executor {
         let Some(order_by) = order_by else {
             return Ok(None);
         };
-        if self.shard_router.is_some() {
+        if self.shard_router.is_some()
+            || !Self::legacy_delimited_index_row_ids_are_unambiguous(schema)
+        {
             return Ok(None);
         }
 
@@ -821,20 +823,24 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<Option<IndexScanPlan>>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if let Some(plan) = self
-                .try_composite_index_scan(
-                    expr,
-                    table_name,
-                    schema,
-                    txn,
-                    params,
-                    limit,
-                    order_by,
-                    ordered_limit,
-                )
-                .await?
-            {
-                return Ok(Some(plan));
+            let delimited_row_ids_are_unambiguous =
+                Self::legacy_delimited_index_row_ids_are_unambiguous(schema);
+            if delimited_row_ids_are_unambiguous {
+                if let Some(plan) = self
+                    .try_composite_index_scan(
+                        expr,
+                        table_name,
+                        schema,
+                        txn,
+                        params,
+                        limit,
+                        order_by,
+                        ordered_limit,
+                    )
+                    .await?
+                {
+                    return Ok(Some(plan));
+                }
             }
 
             let pk_index = schema.get_primary_key_index();
@@ -848,7 +854,8 @@ impl Executor {
                     if let Some((col_idx, storage_col_name, value_expr)) =
                         self.equality_schema_column_value_expr(left, right, schema)
                     {
-                        if schema.columns[col_idx].is_indexed
+                        if delimited_row_ids_are_unambiguous
+                            && schema.columns[col_idx].is_indexed
                             && schema.columns[col_idx].index_type == IndexType::BTree
                         {
                             let val = self
@@ -989,7 +996,11 @@ impl Executor {
                         self.schema_column_range_value_expr(left, op, right, schema)
                     {
                         let col = &schema.columns[col_idx];
-                        if col.is_indexed && col.index_type == IndexType::BTree && !col.is_primary {
+                        if delimited_row_ids_are_unambiguous
+                            && col.is_indexed
+                            && col.index_type == IndexType::BTree
+                            && !col.is_primary
+                        {
                             let val = self
                                 .evaluate_value(value_expr, &[], schema, params)
                                 .unwrap_or(Value::Null);
@@ -1071,7 +1082,8 @@ impl Executor {
                         let col_name = col_ident.to_string();
 
                         if let Some(col_idx) = schema.get_column_index(&col_name) {
-                            if schema.columns[col_idx].is_indexed
+                            if delimited_row_ids_are_unambiguous
+                                && schema.columns[col_idx].is_indexed
                                 && schema.columns[col_idx].index_type == IndexType::FTS
                             {
                                 monitor::inc_fts_search();
@@ -1164,7 +1176,7 @@ impl Executor {
                         self.resolve_schema_column_name(col_expr, schema)
                     {
                         let col = &schema.columns[col_idx];
-                        if col.is_indexed {
+                        if col.is_indexed && (col.is_primary || delimited_row_ids_are_unambiguous) {
                             let mut all_row_ids = HashSet::with_capacity(list.len());
                             let mut covered_rows = if col.is_primary {
                                 None
@@ -1287,7 +1299,9 @@ impl Executor {
                         if let SqlValue::SingleQuotedString(pattern_str) = &val_with_span.value {
                             if let Some(prefix) = Self::scan_predicate_like_prefix(pattern_str) {
                                 let col = &schema.columns[col_idx];
-                                if col.is_indexed {
+                                if col.is_indexed
+                                    && (col.is_primary || delimited_row_ids_are_unambiguous)
+                                {
                                     let all_row_ids = if col.is_primary {
                                         let mut kv = Vec::new();
                                         for mut key_prefix in
@@ -1309,9 +1323,10 @@ impl Executor {
                                         }
                                         let mut row_ids = HashSet::with_capacity(kv.len());
                                         for (k, _) in kv {
-                                            if let Some(row_id) = Self::row_id_from_key(&k) {
-                                                row_ids.insert(row_id.to_string());
-                                            }
+                                            let row_id = self.legacy_row_id_from_routed_data_key(
+                                                table_name, &k,
+                                            )?;
+                                            row_ids.insert(row_id.to_string());
                                         }
                                         row_ids
                                     } else {
@@ -1354,25 +1369,32 @@ impl Executor {
                                     txn.as_any()
                                         .downcast_ref::<crate::storage::fusion::FusionTransaction>()
                                 {
-                                    let storage = &ftxn.storage;
-                                    let idx_guard = storage.trigram_index.read().unwrap();
-                                    if let Some(ids) =
-                                        idx_guard.search(table_name, &storage_col_name, pattern_str)
+                                    if let Some(_visibility_guard) =
+                                        ftxn.current_side_index_read_guard().await
                                     {
-                                        let row_keys =
-                                            idx_guard.map_ids_to_row_keys(table_name, &ids);
-                                        if !row_keys.is_empty() {
-                                            let mut set = HashSet::with_capacity(row_keys.len());
-                                            for s in row_keys {
-                                                set.insert(s);
+                                        let storage = &ftxn.storage;
+                                        let idx_guard = storage.trigram_index.read().unwrap();
+                                        if let Some(ids) = idx_guard.search(
+                                            table_name,
+                                            &storage_col_name,
+                                            pattern_str,
+                                        ) {
+                                            let row_keys =
+                                                idx_guard.map_ids_to_row_keys(table_name, &ids);
+                                            if !row_keys.is_empty() {
+                                                let mut set =
+                                                    HashSet::with_capacity(row_keys.len());
+                                                for s in row_keys {
+                                                    set.insert(s);
+                                                }
+                                                return Ok(Some(IndexScanPlan {
+                                                    row_ids: set,
+                                                    ordered_row_ids: None,
+                                                    exact: false,
+                                                    ordered_topk_counted: false,
+                                                    covered: None,
+                                                }));
                                             }
-                                            return Ok(Some(IndexScanPlan {
-                                                row_ids: set,
-                                                ordered_row_ids: None,
-                                                exact: false,
-                                                ordered_topk_counted: false,
-                                                covered: None,
-                                            }));
                                         }
                                     }
                                 }
@@ -1435,9 +1457,9 @@ impl Executor {
                                 }
                                 let mut row_ids = HashSet::with_capacity(kv.len());
                                 for (k, _) in kv {
-                                    if let Some(row_id) = Self::row_id_from_key(&k) {
-                                        row_ids.insert(row_id.to_string());
-                                    }
+                                    let row_id =
+                                        self.legacy_row_id_from_routed_data_key(table_name, &k)?;
+                                    row_ids.insert(row_id.to_string());
                                 }
                                 return Ok(Some(IndexScanPlan {
                                     row_ids,
@@ -1448,7 +1470,11 @@ impl Executor {
                                 }));
                             }
                         }
-                        if col.is_indexed && col.index_type == IndexType::BTree && !col.is_primary {
+                        if delimited_row_ids_are_unambiguous
+                            && col.is_indexed
+                            && col.index_type == IndexType::BTree
+                            && !col.is_primary
+                        {
                             if let (Some(low_key), Some(high_key)) = (
                                 self.secondary_index_range_value_key(&low_val),
                                 self.secondary_index_range_value_key(&high_val),

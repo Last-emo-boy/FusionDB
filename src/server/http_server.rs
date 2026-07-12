@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Extension, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, Request, State},
     http::{
         header::{AUTHORIZATION, WWW_AUTHENTICATE},
         HeaderValue, StatusCode,
@@ -21,6 +21,7 @@ use crate::catalog::TableSchema;
 use crate::common::{FusionError, Value};
 use crate::distributed::api::{raft_routes, submit_raft_write, RaftAppState};
 use crate::distributed::sharding::ShardRouter;
+use crate::distributed::typ::{ReplicatedQueryResult, ReplicatedValue};
 use crate::distributed::FusionRaft;
 use crate::execution::{
     Executor, GroupMultiAggregate, PreparedStatementRecord, SqlShardExtremum,
@@ -38,6 +39,7 @@ use crate::storage::memory::MemoryStorage;
 const DISABLE_SQL_BLOCK_ZONE_MAP_PRUNE_HINT: &str =
     "/*+ FUSIONDB_DISABLE_SQL_BLOCK_ZONE_MAP_PRUNE */";
 const MAX_FORWARDED_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DIRECT_SEARCH_LIMIT: usize = 1_000;
 
 fn strip_sql_block_zone_map_prune_hint(sql: &str) -> (&str, bool) {
     let trimmed = sql.trim_start();
@@ -124,6 +126,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .merge(protected)
+        .layer(DefaultBodyLimit::max(MAX_FORWARDED_BODY_BYTES))
         .layer(CorsLayer::permissive())
 }
 
@@ -144,6 +147,33 @@ impl HttpServerSecurity {
             peer_scheme: "http".to_string(),
         }
     }
+}
+
+fn validate_http_server_security_boundary(
+    security: &HttpServerSecurity,
+    raft_enabled: bool,
+    distributed_mode: &str,
+    sharding_enabled: bool,
+) -> std::io::Result<()> {
+    let distributed_topology = raft_enabled
+        || sharding_enabled
+        || !distributed_mode.trim().eq_ignore_ascii_case("isolated");
+    if !distributed_topology {
+        return Ok(());
+    }
+    if security.http_legacy_unsafe {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy unauthenticated HTTP is forbidden for distributed or sharded servers",
+        ));
+    }
+    if security.forwarding_secret.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a forwarding secret is required for distributed or sharded HTTP servers",
+        ));
+    }
+    Ok(())
 }
 
 #[deprecated(
@@ -187,6 +217,12 @@ pub async fn start_http_server_with_security(
     shard_router: Option<ShardRouter>,
     security: HttpServerSecurity,
 ) -> std::io::Result<()> {
+    validate_http_server_security_boundary(
+        &security,
+        raft.is_some(),
+        &distributed_mode,
+        shard_router.is_some(),
+    )?;
     let forwarding_auth = ForwardingAuth::new(security.forwarding_secret.as_bytes());
     let state = AppState {
         executor,
@@ -285,7 +321,7 @@ async fn auth_context_middleware(
 
     let (username, shard_forwarded, auth_mode) = if let Some(username) = internal_username {
         (Some(username), true, "internal_hmac")
-    } else if has_forwarded_marker && !state.http_legacy_unsafe {
+    } else if has_forwarded_marker {
         return unauthorized_response();
     } else if let Some((username, password)) = headers
         .get(AUTHORIZATION)
@@ -1088,33 +1124,45 @@ async fn handle_prometheus() -> String {
 
 async fn handle_vector_search(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Json(payload): Json<VectorSearchRequest>,
-) -> (StatusCode, Json<VectorSearchResponse>) {
+) -> ApiResponse<VectorSearchResponse> {
+    match authorize_direct_search(&state, &context, payload.limit, 1).await {
+        Ok(()) => {}
+        Err(response) => return response,
+    }
+
     if let Some(fusion) = state.storage.as_any().downcast_ref::<FusionStorage>() {
-        let results = fusion.vector_search(&payload.query, payload.limit);
-        let resp = VectorSearchResponse {
+        let results = fusion.vector_search(&payload.query, payload.limit).await;
+        json_ok(VectorSearchResponse {
             results: results
                 .into_iter()
                 .map(|(id, dist)| VectorSearchResult { id, distance: dist })
                 .collect(),
-        };
-        (StatusCode::OK, Json(resp))
+        })
     } else {
-        (
+        json_error(
             StatusCode::NOT_IMPLEMENTED,
-            Json(VectorSearchResponse { results: vec![] }),
+            "Direct vector search is not available on this backend",
         )
     }
 }
 
 async fn handle_hybrid_search(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Json(payload): Json<HybridSearchRequest>,
-) -> (StatusCode, Json<VectorSearchResponse>) {
+) -> ApiResponse<VectorSearchResponse> {
+    match authorize_direct_search(&state, &context, payload.limit, 2).await {
+        Ok(()) => {}
+        Err(response) => return response,
+    }
+
     if let Some(fusion) = state.storage.as_any().downcast_ref::<FusionStorage>() {
-        let results =
-            fusion.hybrid_search(&payload.text_query, &payload.vector_query, payload.limit);
-        let resp = VectorSearchResponse {
+        let results = fusion
+            .hybrid_search(&payload.text_query, &payload.vector_query, payload.limit)
+            .await;
+        json_ok(VectorSearchResponse {
             // Reusing VectorSearchResult but distance field is now RRF score
             results: results
                 .into_iter()
@@ -1123,14 +1171,47 @@ async fn handle_hybrid_search(
                     distance: score,
                 })
                 .collect(),
-        };
-        (StatusCode::OK, Json(resp))
+        })
     } else {
-        (
+        json_error(
             StatusCode::NOT_IMPLEMENTED,
-            Json(VectorSearchResponse { results: vec![] }),
+            "Direct hybrid search is not available on this backend",
         )
     }
+}
+
+async fn authorize_direct_search(
+    state: &AppState,
+    context: &RequestContext,
+    limit: usize,
+    candidate_multiplier: usize,
+) -> std::result::Result<(), ApiResponse<VectorSearchResponse>> {
+    if limit == 0 || limit > MAX_DIRECT_SEARCH_LIMIT {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!("Search limit must be between 1 and {MAX_DIRECT_SEARCH_LIMIT}"),
+        ));
+    }
+    if limit.checked_mul(candidate_multiplier).is_none() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "Search candidate limit overflow",
+        ));
+    }
+
+    let username = context.username.as_deref().unwrap_or_default();
+    // The current default vector and BM25 indexes are global resources: IDs
+    // are not namespaced by SQL table/column. A caller cannot be authorized
+    // safely with table-level grants until those index keys are scoped, so
+    // direct search remains superuser-only.
+    if let Err(error) = state.executor.require_superuser(username).await {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            format!("Authorization Error: {error:?}"),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn handle_checkpoint(
@@ -1332,6 +1413,7 @@ async fn handle_query(
             Ok(true) => {
                 return match submit_raft_write(
                     raft,
+                    &state.executor,
                     &state.raft_client,
                     sql.to_string(),
                     state.forwarding_auth.as_ref(),
@@ -1339,6 +1421,12 @@ async fn handle_query(
                 )
                 .await
                 {
+                    Ok(resp) if !resp.results.is_empty() => json_ok(
+                        resp.results
+                            .into_iter()
+                            .map(QueryResultJson::from)
+                            .collect(),
+                    ),
                     Ok(resp) => json_ok(vec![QueryResultJson::Success {
                         r#type: "success".to_string(),
                         message: resp.message,
@@ -1376,6 +1464,12 @@ async fn handle_copy_stdin(
 
     if let Err(e) = state.executor.authorize_sql(&username, &copy_sql).await {
         return json_error(StatusCode::FORBIDDEN, format!("{:?}", e));
+    }
+    if state.raft.is_some() {
+        return json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "COPY FROM STDIN is disabled in distributed Raft mode until its decoded mutation batch can be replicated",
+        );
     }
 
     let copy_payload =
@@ -3580,6 +3674,18 @@ async fn handle_execute(
             let params: Vec<Value> = payload.params.iter().map(Value::from_json).collect();
             let return_results = payload.return_results.unwrap_or(true);
 
+            if state.raft.is_some()
+                && record
+                    .statements
+                    .iter()
+                    .any(Executor::statement_may_change_query_results)
+            {
+                return json_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "Prepared writes are disabled in distributed Raft mode until bound parameters can be captured in a replicated mutation batch",
+                );
+            }
+
             match shard_write_route_action_for_statements(
                 &state,
                 &record.statements,
@@ -5590,6 +5696,56 @@ impl From<crate::execution::QueryResult> for QueryResultJson {
     }
 }
 
+impl From<ReplicatedQueryResult> for QueryResultJson {
+    fn from(result: ReplicatedQueryResult) -> Self {
+        match result {
+            ReplicatedQueryResult::Select { columns, rows } => QueryResultJson::Select {
+                r#type: "select".to_string(),
+                columns,
+                rows: rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|value| replicated_value_to_common(value).to_json())
+                            .collect()
+                    })
+                    .collect(),
+            },
+            ReplicatedQueryResult::Success { message } => QueryResultJson::Success {
+                r#type: "success".to_string(),
+                message,
+            },
+        }
+    }
+}
+
+fn replicated_value_to_common(value: ReplicatedValue) -> crate::common::Value {
+    match value {
+        ReplicatedValue::Null => crate::common::Value::Null,
+        ReplicatedValue::Boolean(value) => crate::common::Value::Boolean(value),
+        ReplicatedValue::Integer(value) => crate::common::Value::Integer(value),
+        ReplicatedValue::FloatBits(value) => crate::common::Value::Float(f64::from_bits(value)),
+        ReplicatedValue::Decimal(value) => crate::common::Value::Decimal(value),
+        ReplicatedValue::String(value) => crate::common::Value::String(value),
+        ReplicatedValue::Date(value) => crate::common::Value::Date(value),
+        ReplicatedValue::Timestamp(value) => crate::common::Value::Timestamp(value),
+        ReplicatedValue::Interval(value) => crate::common::Value::Interval(value),
+        ReplicatedValue::Blob(value) => crate::common::Value::Blob(value),
+        ReplicatedValue::VectorBits(value) => {
+            crate::common::Value::Vector(value.into_iter().map(f32::from_bits).collect())
+        }
+        ReplicatedValue::Array(values) => crate::common::Value::Array(
+            values.into_iter().map(replicated_value_to_common).collect(),
+        ),
+        ReplicatedValue::Object(values) => crate::common::Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, replicated_value_to_common(value)))
+                .collect(),
+        ),
+    }
+}
+
 impl From<PreparedStatementRecord> for PreparedStatementInfo {
     fn from(record: PreparedStatementRecord) -> Self {
         Self {
@@ -6054,6 +6210,44 @@ mod tests {
     use tower::util::ServiceExt;
 
     #[test]
+    fn distributed_http_boundary_rejects_legacy_auth_and_missing_hmac_secret() {
+        let legacy = HttpServerSecurity::legacy_unsafe();
+        for (raft_enabled, mode, sharding_enabled) in [
+            (true, "isolated", false),
+            (false, "raft(node_id=1)", false),
+            (false, "isolated", true),
+        ] {
+            let error = validate_http_server_security_boundary(
+                &legacy,
+                raft_enabled,
+                mode,
+                sharding_enabled,
+            )
+            .expect_err("distributed topology must reject legacy unauthenticated HTTP");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("legacy unauthenticated HTTP"));
+        }
+
+        let secure_without_secret = HttpServerSecurity {
+            postgres_password: "fusiondb".to_string(),
+            http_legacy_unsafe: false,
+            forwarding_secret: String::new(),
+            peer_scheme: "https".to_string(),
+        };
+        let error = validate_http_server_security_boundary(
+            &secure_without_secret,
+            true,
+            "raft(node_id=1)",
+            false,
+        )
+        .expect_err("distributed topology must require an HMAC secret");
+        assert!(error.to_string().contains("forwarding secret"));
+
+        validate_http_server_security_boundary(&legacy, false, "isolated", false)
+            .expect("legacy mode remains an explicit isolated-server compatibility option");
+    }
+
+    #[test]
     fn strips_sql_block_zone_map_prune_hint_from_leading_comment() {
         let sql = "  /*+ FUSIONDB_DISABLE_SQL_BLOCK_ZONE_MAP_PRUNE */ SELECT id FROM metrics";
         let (stripped, disabled) = strip_sql_block_zone_map_prune_hint(sql);
@@ -6130,7 +6324,7 @@ mod tests {
             shard_owner_forwarding_enabled: false,
             postgres_password: Arc::from("fusiondb"),
             http_legacy_unsafe: true,
-            forwarding_auth: None,
+            forwarding_auth: ForwardingAuth::new(b"test-shard-forwarding-secret"),
             peer_scheme: "http".to_string(),
         })
     }
@@ -6204,7 +6398,7 @@ mod tests {
             shard_owner_forwarding_enabled,
             postgres_password: Arc::from("fusiondb"),
             http_legacy_unsafe: true,
-            forwarding_auth: None,
+            forwarding_auth: ForwardingAuth::new(b"test-shard-forwarding-secret"),
             peer_scheme: "http".to_string(),
         })
     }
@@ -6446,6 +6640,46 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
 
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn legacy_unsafe_http_never_trusts_an_unsigned_forwarded_identity() {
+        let wal_path = format!("test_http_unsigned_forwarded_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = test_app_with_distributed_mode(storage, "raft(node_id=1)");
+        let forged = HttpRequest::builder()
+            .uri("/auth/context")
+            .header(FORWARDED_HEADER, FORWARDED_VALUE)
+            .header(FORWARDED_USER_HEADER, "postgres")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(
+            app.oneshot(forged).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn json_extractors_accept_authenticated_bodies_above_axum_default_limit() {
+        let wal_path = format!("test_http_body_limit_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = test_app(storage);
+        let body = serde_json::json!({
+            "sql": " ".repeat(2 * 1024 * 1024 + 1024),
+        })
+        .to_string();
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let _ = std::fs::remove_file(wal_path);
     }
 
@@ -9873,6 +10107,112 @@ mod tests {
             .expect("tables response");
         let tables_envelope: Envelope<Vec<TableInfo>> = response_json(tables_response).await;
         assert_eq!(tables_envelope.data.expect("tables data").len(), 1);
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn direct_search_requires_superuser_for_global_indexes() {
+        let wal_path = format!("test_http_search_rbac_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+
+        {
+            let mut txn = storage.begin_transaction().await.expect("begin txn");
+            let mut alice = UserRecord::new("alice-password", false);
+            alice.grant("allowed_search", "SELECT");
+            save_user(&mut *txn, "alice", &alice)
+                .await
+                .expect("save user");
+            txn.commit().await.expect("commit user txn");
+        }
+
+        let app = secure_test_app(storage, "search-forwarding-secret");
+        for (path, body) in [
+            ("/vector_search", r#"{"query":[0.1,0.2],"limit":5}"#),
+            (
+                "/hybrid_search",
+                r#"{"text_query":"needle","vector_query":[0.1,0.2],"limit":5}"#,
+            ),
+        ] {
+            let forbidden = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header(
+                            "authorization",
+                            basic_authorization("alice", "alice-password"),
+                        )
+                        .body(Body::from(body))
+                        .expect("non-superuser search request"),
+                )
+                .await
+                .expect("non-superuser search response");
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+            let allowed = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header(
+                            "authorization",
+                            basic_authorization("postgres", "secure-password"),
+                        )
+                        .body(Body::from(body))
+                        .expect("superuser search request"),
+                )
+                .await
+                .expect("superuser search response");
+            assert_eq!(allowed.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn direct_search_rejects_missing_zero_and_oversized_limits() {
+        let wal_path = format!("test_http_search_limit_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).expect("storage"));
+        let app = secure_test_app(storage, "search-forwarding-secret");
+        let authorization = basic_authorization("postgres", "secure-password");
+
+        for (path, body, expected) in [
+            (
+                "/vector_search",
+                r#"{"query":[0.1,0.2]}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/vector_search",
+                r#"{"query":[0.1,0.2],"limit":0}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/hybrid_search",
+                r#"{"text_query":"needle","vector_query":[0.1,0.2],"limit":1001}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", &authorization)
+                        .body(Body::from(body))
+                        .expect("search request"),
+                )
+                .await
+                .expect("search response");
+            assert_eq!(response.status(), expected);
+        }
 
         let _ = std::fs::remove_file(&wal_path);
     }

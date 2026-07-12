@@ -138,7 +138,10 @@ impl Executor {
                 if let Some(row_id) = &target_row_id {
                     let key = self.routed_data_key_for_row_id(&table_name_str, row_id);
                     if txn.get(key.as_bytes()).await?.is_some() {
-                        txn.delete(key.as_bytes()).await?;
+                        self.touch_index_build_barrier_for_row(&table_name_str, row_id, txn)
+                            .await?;
+                        self.delete_routed_data_row(&table_name_str, row_id, txn)
+                            .await?;
                         return Ok(QueryResult::Success {
                             message: "Deleted 1 rows".to_string(),
                         });
@@ -155,7 +158,12 @@ impl Executor {
                         .await?;
                     let deleted_count = kv_pairs.len();
                     for (k, _) in kv_pairs {
-                        txn.delete(&k).await?;
+                        let row_id =
+                            self.legacy_row_id_from_routed_data_key(&table_name_str, &k)?;
+                        self.touch_index_build_barrier_for_row(&table_name_str, row_id, txn)
+                            .await?;
+                        self.delete_routed_data_row(&table_name_str, row_id, txn)
+                            .await?;
                     }
 
                     return Ok(QueryResult::Success {
@@ -214,11 +222,12 @@ impl Executor {
                 )
                 .await?;
 
-                txn.delete(&k).await?;
+                let row_id = self.legacy_row_id_from_routed_data_key(&table_name_str, &k)?;
+                self.delete_routed_data_row(&table_name_str, row_id, txn)
+                    .await?;
                 self.delete_unique_sentinels_for_row(&table_name_str, &schema, &row, txn)
                     .await?;
 
-                let row_id = Self::row_id_from_data_key(&k)?;
                 self.update_trigram_index_for_delete(
                     &table_name_str,
                     &schema,
@@ -246,7 +255,7 @@ impl Executor {
                             }
                         } else if col.index_type == IndexType::HNSW {
                             let idx_name =
-                                Self::hnsw_index_name_for_column(&table_name_str, &col.name);
+                                Self::hnsw_index_name_for_column(&table_name_str, &col.name)?;
                             self.defer_or_apply_vector_delete(&idx_name, row_id, txn)?;
                         } else if let Some(val_str) = self.value_to_index_string(val) {
                             let index_key = self.routed_index_key_for_value(

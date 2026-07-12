@@ -1,5 +1,6 @@
 pub mod api;
 pub mod network;
+mod persistence;
 pub mod sharding;
 pub mod store;
 pub mod typ;

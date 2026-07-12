@@ -5,12 +5,17 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 const KEY_PREFIX: &[u8] = b"redis:";
-const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+const MAX_BULK_LEN: usize = 16 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ARRAY_ITEMS: usize = 1024;
+const MAX_RESP_HEADER_BYTES: usize = 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 enum RedisCommand {
+    Auth(Vec<u8>),
     Ping(Option<Vec<u8>>),
     Echo(Vec<u8>),
     Select(Vec<u8>),
@@ -21,7 +26,6 @@ enum RedisCommand {
         condition: SetCondition,
         return_old: bool,
     },
-    SetEx(Vec<u8>, Vec<u8>),
     Get(Vec<u8>),
     MGet(Vec<Vec<u8>>),
     MSet(Vec<(Vec<u8>, Vec<u8>)>),
@@ -38,12 +42,20 @@ enum SetCondition {
     IfNotExists,
 }
 
-pub async fn start_redis_server(storage: Arc<dyn Storage>, bind: &str, port: u16) {
+pub async fn start_redis_server(
+    storage: Arc<dyn Storage>,
+    bind: &str,
+    port: u16,
+    password: String,
+    max_connections: usize,
+) {
     let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr)
         .await
         .expect("Failed to bind Redis-compatible listener");
     println!("FusionDB Redis-compatible Server running on {}", addr);
+    let password: Arc<[u8]> = Arc::from(password.into_bytes());
+    let connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
 
     loop {
         let (socket, _) = match listener.accept().await {
@@ -54,19 +66,30 @@ pub async fn start_redis_server(storage: Arc<dyn Storage>, bind: &str, port: u16
             }
         };
         let storage = storage.clone();
+        let password = password.clone();
+        let permit = match connection_limit.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, storage).await {
+            let _permit = permit;
+            if let Err(e) = handle_connection(socket, storage, &password).await {
                 eprintln!("Redis-compatible connection error: {}", e);
             }
         });
     }
 }
 
-async fn handle_connection(socket: TcpStream, storage: Arc<dyn Storage>) -> std::io::Result<()> {
+async fn handle_connection(
+    socket: TcpStream,
+    storage: Arc<dyn Storage>,
+    password: &[u8],
+) -> std::io::Result<()> {
     let (reader, writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
+    let mut authenticated = false;
 
     loop {
         let frame = match read_resp_array(&mut reader).await {
@@ -75,15 +98,26 @@ async fn handle_connection(socket: TcpStream, storage: Arc<dyn Storage>) -> std:
             Err(e) => {
                 write_error(&mut writer, &e.to_string()).await?;
                 writer.flush().await?;
-                continue;
+                return Ok(());
             }
         };
 
         match parse_command(frame) {
+            Ok(RedisCommand::Auth(candidate)) => {
+                if constant_time_bytes_eq(&candidate, password) {
+                    authenticated = true;
+                    write_simple(&mut writer, "OK").await?;
+                } else {
+                    write_error(&mut writer, "WRONGPASS invalid username-password pair").await?;
+                }
+            }
             Ok(RedisCommand::Quit) => {
                 write_simple(&mut writer, "OK").await?;
                 writer.flush().await?;
                 return Ok(());
+            }
+            Ok(_) if !authenticated => {
+                write_error(&mut writer, "NOAUTH Authentication required").await?;
             }
             Ok(command) => {
                 if let Err(e) = execute_command(&storage, &mut writer, command).await {
@@ -105,6 +139,10 @@ where
     W: AsyncWrite + Unpin,
 {
     match command {
+        RedisCommand::Auth(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ERR AUTH is handled at the connection boundary",
+        )),
         RedisCommand::Ping(payload) => match payload {
             Some(bytes) => write_bulk(writer, Some(&bytes)).await,
             None => write_simple(writer, "PONG").await,
@@ -162,17 +200,6 @@ where
             } else {
                 write_bulk(writer, None).await
             }
-        }
-        RedisCommand::SetEx(key, value) => {
-            let mut txn = storage
-                .begin_transaction()
-                .await
-                .map_err(storage_io_error)?;
-            txn.put(&redis_key(&key), &value)
-                .await
-                .map_err(storage_io_error)?;
-            txn.commit().await.map_err(storage_io_error)?;
-            write_simple(writer, "OK").await
         }
         RedisCommand::Get(key) => {
             let txn = storage
@@ -282,6 +309,17 @@ fn storage_io_error(error: FusionError) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
+
 fn redis_key(key: &[u8]) -> Vec<u8> {
     let mut namespaced = Vec::with_capacity(KEY_PREFIX.len() + key.len());
     namespaced.extend_from_slice(KEY_PREFIX);
@@ -294,7 +332,7 @@ where
     R: AsyncBufRead + Unpin,
 {
     let mut line = Vec::new();
-    let read = reader.read_until(b'\n', &mut line).await?;
+    let read = read_resp_header_line(reader, &mut line).await?;
     if read == 0 {
         return Ok(None);
     }
@@ -308,11 +346,20 @@ where
     if item_count <= 0 {
         return Err(FusionError::Parser("empty Redis command".to_string()));
     }
+    let item_count = usize::try_from(item_count)
+        .map_err(|_| FusionError::Parser("Redis array length overflows usize".to_string()))?;
+    if item_count > MAX_ARRAY_ITEMS {
+        return Err(FusionError::Parser(format!(
+            "Redis command exceeds max array items {}",
+            MAX_ARRAY_ITEMS
+        )));
+    }
 
-    let mut items = Vec::with_capacity(item_count as usize);
+    let mut items = Vec::with_capacity(item_count);
+    let mut request_bytes = 0usize;
     for _ in 0..item_count {
         let mut header = Vec::new();
-        let read = reader.read_until(b'\n', &mut header).await?;
+        let read = read_resp_header_line(reader, &mut header).await?;
         if read == 0 {
             return Err(FusionError::Parser(
                 "unexpected EOF in RESP bulk".to_string(),
@@ -337,7 +384,19 @@ where
                 MAX_BULK_LEN
             )));
         }
-        let mut bulk = vec![0_u8; len + 2];
+        request_bytes = request_bytes
+            .checked_add(len)
+            .ok_or_else(|| FusionError::Parser("Redis command byte length overflow".to_string()))?;
+        if request_bytes > MAX_REQUEST_BYTES {
+            return Err(FusionError::Parser(format!(
+                "Redis command exceeds max request bytes {}",
+                MAX_REQUEST_BYTES
+            )));
+        }
+        let frame_len = len
+            .checked_add(2)
+            .ok_or_else(|| FusionError::Parser("Redis bulk frame length overflow".to_string()))?;
+        let mut bulk = vec![0_u8; frame_len];
         reader.read_exact(&mut bulk).await?;
         if &bulk[len..] != b"\r\n" {
             return Err(FusionError::Parser(
@@ -349,6 +408,22 @@ where
     }
 
     Ok(Some(items))
+}
+
+async fn read_resp_header_line<R>(reader: &mut R, line: &mut Vec<u8>) -> Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    line.clear();
+    let mut limited = reader.take((MAX_RESP_HEADER_BYTES + 1) as u64);
+    let read = limited.read_until(b'\n', line).await?;
+    if line.len() > MAX_RESP_HEADER_BYTES {
+        return Err(FusionError::Parser(format!(
+            "RESP header exceeds max length {}",
+            MAX_RESP_HEADER_BYTES
+        )));
+    }
+    Ok(read)
 }
 
 fn strip_crlf(line: &mut Vec<u8>) -> Result<()> {
@@ -376,6 +451,15 @@ fn parse_command(items: Vec<Vec<u8>>) -> Result<RedisCommand> {
         .map_err(|_| FusionError::Parser("Redis command is not UTF-8".to_string()))?
         .to_ascii_uppercase();
     match command.as_str() {
+        "AUTH" => match items.len() {
+            2 => Ok(RedisCommand::Auth(items[1].clone())),
+            3 if items[1].eq_ignore_ascii_case(b"default") => {
+                Ok(RedisCommand::Auth(items[2].clone()))
+            }
+            _ => Err(FusionError::Parser(
+                "ERR wrong number of arguments for 'auth' command".to_string(),
+            )),
+        },
         "PING" => match items.len() {
             1 => Ok(RedisCommand::Ping(None)),
             2 => Ok(RedisCommand::Ping(Some(items[1].clone()))),
@@ -427,7 +511,10 @@ fn parse_command(items: Vec<Vec<u8>>) -> Result<RedisCommand> {
                 ));
             }
             validate_positive_integer(&items[2], "expire time")?;
-            Ok(RedisCommand::SetEx(items[1].clone(), items[3].clone()))
+            Err(FusionError::Parser(
+                "ERR SETEX is not supported because this endpoint does not implement TTL"
+                    .to_string(),
+            ))
         }
         "GET" => {
             if items.len() != 2 {
@@ -526,10 +613,16 @@ fn parse_set_options(options: &[Vec<u8>]) -> Result<SetOptions> {
                     )));
                 }
                 validate_positive_integer(&options[index + 1], "expire time")?;
-                index += 2;
+                return Err(FusionError::Parser(format!(
+                    "ERR SET {} is not supported because this endpoint does not implement TTL",
+                    option
+                )));
             }
             "KEEPTTL" => {
-                index += 1;
+                return Err(FusionError::Parser(
+                    "ERR SET KEEPTTL is not supported because this endpoint does not implement TTL"
+                        .to_string(),
+                ));
             }
             "GET" => {
                 parsed.return_old = true;
@@ -621,7 +714,7 @@ where
 mod tests {
     use super::*;
     use crate::storage::memory::MemoryStorage;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn resp_parser_reads_array_bulk_command() {
@@ -663,6 +756,127 @@ mod tests {
             parse_command(second).unwrap(),
             RedisCommand::Echo(b"hello".to_vec())
         );
+    }
+
+    #[test]
+    fn redis_password_comparison_covers_length_and_content() {
+        assert!(constant_time_bytes_eq(b"secret", b"secret"));
+        assert!(!constant_time_bytes_eq(b"secret", b"secrex"));
+        assert!(!constant_time_bytes_eq(b"secret", b"secret-longer"));
+    }
+
+    #[tokio::test]
+    async fn redis_connection_requires_successful_authentication() {
+        let wal_path = format!("test_redis_auth_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_storage = storage.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, server_storage, b"correct-password")
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                b"*1\r\n$4\r\nPING\r\n\
+                  *2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n\
+                  *2\r\n$4\r\nAUTH\r\n$16\r\ncorrect-password\r\n\
+                  *1\r\n$4\r\nPING\r\n\
+                  *1\r\n$4\r\nQUIT\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            String::from_utf8(response).unwrap(),
+            "-NOAUTH Authentication required\r\n\
+             -WRONGPASS invalid username-password pair\r\n\
+             +OK\r\n+PONG\r\n+OK\r\n"
+        );
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn resp_parser_rejects_oversized_command_arrays_before_allocation() {
+        let input = format!("*{}\r\n", MAX_ARRAY_ITEMS + 1);
+        let mut reader = BufReader::new(input.as_bytes());
+        let error = read_resp_array(&mut reader).await.unwrap_err();
+        assert!(error.to_string().contains("max array items"));
+    }
+
+    #[tokio::test]
+    async fn resp_parser_caps_headers_before_a_newline_arrives() {
+        let input = vec![b'*'; MAX_RESP_HEADER_BYTES + 1];
+        let mut reader = BufReader::new(input.as_slice());
+        let error = read_resp_array(&mut reader).await.unwrap_err();
+        assert!(error.to_string().contains("RESP header exceeds max length"));
+    }
+
+    #[tokio::test]
+    async fn redis_connection_closes_after_resp_framing_error() {
+        let wal_path = format!("test_redis_framing_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_storage = storage.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, server_storage, b"correct-password")
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut request = vec![b'*'; MAX_RESP_HEADER_BYTES];
+        request.extend_from_slice(
+            b"\n*2\r\n$4\r\nAUTH\r\n$16\r\ncorrect-password\r\n\
+              *1\r\n$4\r\nPING\r\n\
+              *1\r\n$4\r\nQUIT\r\n",
+        );
+        client.write_all(&request).await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("RESP header exceeds max length"));
+        assert_eq!(response.lines().count(), 1);
+        assert!(!response.contains("+OK"));
+        assert!(!response.contains("+PONG"));
+
+        drop(storage);
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn ttl_commands_fail_closed_instead_of_persisting_forever() {
+        let setex = vec![
+            b"SETEX".to_vec(),
+            b"session".to_vec(),
+            b"60".to_vec(),
+            b"value".to_vec(),
+        ];
+        let error = parse_command(setex).unwrap_err();
+        assert!(error.to_string().contains("does not implement TTL"));
+
+        for options in [
+            vec![b"EX".to_vec(), b"60".to_vec()],
+            vec![b"PX".to_vec(), b"1000".to_vec()],
+            vec![b"KEEPTTL".to_vec()],
+        ] {
+            let mut command = vec![b"SET".to_vec(), b"key".to_vec(), b"value".to_vec()];
+            command.extend(options);
+            let error = parse_command(command).unwrap_err();
+            assert!(error.to_string().contains("does not implement TTL"));
+        }
     }
 
     #[tokio::test]
@@ -775,18 +989,10 @@ mod tests {
         execute_command(
             &storage,
             &mut out,
-            RedisCommand::SetEx(b"ttl".to_vec(), b"v".to_vec()),
-        )
-        .await
-        .unwrap();
-        execute_command(
-            &storage,
-            &mut out,
             RedisCommand::MGet(vec![
                 b"existing".to_vec(),
                 b"missing".to_vec(),
                 b"a".to_vec(),
-                b"ttl".to_vec(),
             ]),
         )
         .await
@@ -798,7 +1004,6 @@ mod tests {
                 b"existing".to_vec(),
                 b"missing".to_vec(),
                 b"b".to_vec(),
-                b"ttl".to_vec(),
             ]),
         )
         .await
@@ -808,9 +1013,9 @@ mod tests {
             .unwrap();
 
         let output = String::from_utf8(out).unwrap();
-        assert!(output.starts_with("+OK\r\n$3\r\nold\r\n$-1\r\n$-1\r\n+OK\r\n+OK\r\n"));
-        assert!(output.contains("*4\r\n$3\r\nnew\r\n$-1\r\n$1\r\n1\r\n$1\r\nv\r\n"));
-        assert!(output.contains(":3\r\n"));
+        assert!(output.starts_with("+OK\r\n$3\r\nold\r\n$-1\r\n$-1\r\n+OK\r\n"));
+        assert!(output.contains("*3\r\n$3\r\nnew\r\n$-1\r\n$1\r\n1\r\n"));
+        assert!(output.contains(":2\r\n"));
         assert!(output.contains("# Server\r\nredis_version:7.0.0-fusiondb"));
     }
 }

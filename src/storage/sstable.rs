@@ -1611,34 +1611,47 @@ impl SsTable {
         Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
 
-    fn decoded_block_entry_spans(block_data: &[u8]) -> Option<Vec<BlockEntrySpan>> {
+    fn decoded_block_entry_spans(block_data: &[u8]) -> Result<Vec<BlockEntrySpan>> {
         let mut cursor = 0usize;
-        let count = Self::read_block_u32_at(block_data, &mut cursor)?;
+        let count = Self::read_block_u32_at(block_data, &mut cursor)
+            .ok_or_else(|| Self::decode_meta_error("SSTable block is missing its entry count"))?;
         let mut spans = Vec::with_capacity(block_entry_reserve_count(count, block_data.len()));
 
-        for _ in 0..count {
-            let Some(key_len) = Self::read_block_u32_at(block_data, &mut cursor) else {
-                break;
-            };
+        for entry_index in 0..count {
+            let key_len = Self::read_block_u32_at(block_data, &mut cursor).ok_or_else(|| {
+                Self::decode_meta_error(format!(
+                    "SSTable block entry {entry_index} is missing its key length"
+                ))
+            })?;
             let key_len = key_len as usize;
-            let Some(key_end) = cursor.checked_add(key_len) else {
-                break;
-            };
+            let key_end = cursor.checked_add(key_len).ok_or_else(|| {
+                Self::decode_meta_error(format!(
+                    "SSTable block entry {entry_index} key length overflows"
+                ))
+            })?;
             if key_end > block_data.len() {
-                break;
+                return Err(Self::decode_meta_error(format!(
+                    "SSTable block entry {entry_index} key is truncated"
+                )));
             }
             let key_start = cursor;
             cursor = key_end;
 
-            let Some(value_len) = Self::read_block_u32_at(block_data, &mut cursor) else {
-                break;
-            };
+            let value_len = Self::read_block_u32_at(block_data, &mut cursor).ok_or_else(|| {
+                Self::decode_meta_error(format!(
+                    "SSTable block entry {entry_index} is missing its value length"
+                ))
+            })?;
             let value_len = value_len as usize;
-            let Some(value_end) = cursor.checked_add(value_len) else {
-                break;
-            };
+            let value_end = cursor.checked_add(value_len).ok_or_else(|| {
+                Self::decode_meta_error(format!(
+                    "SSTable block entry {entry_index} value length overflows"
+                ))
+            })?;
             if value_end > block_data.len() {
-                break;
+                return Err(Self::decode_meta_error(format!(
+                    "SSTable block entry {entry_index} value is truncated"
+                )));
             }
             let value_start = cursor;
             cursor = value_end;
@@ -1651,7 +1664,14 @@ impl SsTable {
             });
         }
 
-        Some(spans)
+        if cursor != block_data.len() {
+            return Err(Self::decode_meta_error(format!(
+                "SSTable block has {} trailing bytes after {count} entries",
+                block_data.len() - cursor
+            )));
+        }
+
+        Ok(spans)
     }
 
     fn span_user_key_before_bound(
@@ -1670,10 +1690,8 @@ impl SsTable {
         user_key_upper_bound: Option<&[u8]>,
         suffix_len: usize,
         out: &mut VecDeque<(Vec<u8>, Vec<u8>)>,
-    ) -> ReverseBlockScanStats {
-        let Some(spans) = Self::decoded_block_entry_spans(block_data) else {
-            return ReverseBlockScanStats::default();
-        };
+    ) -> Result<ReverseBlockScanStats> {
+        let spans = Self::decoded_block_entry_spans(block_data)?;
         let mut stats = ReverseBlockScanStats {
             span_scan_blocks: 1,
             span_scan_entries: spans.len() as u64,
@@ -1695,7 +1713,7 @@ impl SsTable {
             .unwrap_or(spans.len());
 
         if lower_idx >= upper_idx {
-            return stats;
+            return Ok(stats);
         }
 
         let bounded_spans = &spans[lower_idx..upper_idx];
@@ -1708,7 +1726,7 @@ impl SsTable {
             stats.span_materialized_entries += 1;
             out.push_back((key, value));
         }
-        stats
+        Ok(stats)
     }
 
     fn entry_at_offset(block_data: &[u8], offset: u32) -> Option<(&[u8], &[u8])> {
@@ -2348,37 +2366,14 @@ impl SsTable {
             )
             .await?;
 
-            let mut cursor = std::io::Cursor::new(block_data.as_ref());
-
-            let mut count_buf = [0u8; 4];
-            if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_err() {
-                continue;
-            }
-            let count = u32::from_le_bytes(count_buf);
-
-            for _ in 0..count {
-                let mut len_buf = [0u8; 4];
-                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
-                    break;
-                }
-                let k_len = u32::from_le_bytes(len_buf) as usize;
-                let mut k_buf = vec![0u8; k_len];
-                if std::io::Read::read_exact(&mut cursor, &mut k_buf).is_err() {
-                    break;
-                }
-
-                let mut len_buf = [0u8; 4];
-                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
-                    break;
-                }
-                let v_len = u32::from_le_bytes(len_buf) as usize;
-                let mut v_buf = vec![0u8; v_len];
-                if std::io::Read::read_exact(&mut cursor, &mut v_buf).is_err() {
-                    break;
-                }
-
-                if k_buf.as_slice() >= search_key {
-                    return Ok(Some((k_buf, v_buf)));
+            let spans = Self::decoded_block_entry_spans(block_data.as_ref())?;
+            for span in spans {
+                let key = &block_data[span.key_start..span.key_end];
+                if key >= search_key {
+                    return Ok(Some((
+                        key.to_vec(),
+                        block_data[span.value_start..span.value_end].to_vec(),
+                    )));
                 }
             }
         }
@@ -3329,46 +3324,25 @@ impl SsTableIterator {
             )
             .await?;
 
-            // Parse Block
-            let mut cursor = std::io::Cursor::new(block_data.as_ref());
+            let spans = SsTable::decoded_block_entry_spans(block_data.as_ref())?;
+            self.current_block_entries.reserve(spans.len());
 
-            let mut count_buf = [0u8; 4];
-            if std::io::Read::read_exact(&mut cursor, &mut count_buf).is_err() {
-                continue;
-            }
-            let count = u32::from_le_bytes(count_buf);
-            self.current_block_entries
-                .reserve(block_entry_reserve_count(count, cursor.get_ref().len()));
+            for span in spans {
+                let key = &block_data[span.key_start..span.key_end];
 
-            for _ in 0..count {
-                let mut len_buf = [0u8; 4];
-                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
-                    break;
-                }
-                let k_len = u32::from_le_bytes(len_buf) as usize;
-                let mut k_buf = vec![0u8; k_len];
-                if std::io::Read::read_exact(&mut cursor, &mut k_buf).is_err() {
+                if self.key_at_or_after_upper_bound(key) {
                     break;
                 }
 
-                let mut len_buf = [0u8; 4];
-                if std::io::Read::read_exact(&mut cursor, &mut len_buf).is_err() {
-                    break;
-                }
-                let v_len = u32::from_le_bytes(len_buf) as usize;
-                let mut v_buf = vec![0u8; v_len];
-                if std::io::Read::read_exact(&mut cursor, &mut v_buf).is_err() {
-                    break;
-                }
-
-                if self.key_at_or_after_upper_bound(&k_buf) {
-                    break;
-                }
-
-                if self.lower_bound.as_ref().map_or(true, |lower_bound| {
-                    k_buf.as_slice() >= lower_bound.as_slice()
-                }) {
-                    self.current_block_entries.push_back((k_buf, v_buf));
+                if self
+                    .lower_bound
+                    .as_ref()
+                    .map_or(true, |lower_bound| key >= lower_bound.as_slice())
+                {
+                    self.current_block_entries.push_back((
+                        key.to_vec(),
+                        block_data[span.value_start..span.value_end].to_vec(),
+                    ));
                 }
             }
         }
@@ -3583,7 +3557,7 @@ impl SsTableReverseIterator {
                             self.user_key_upper_bound.as_deref(),
                             self.suffix_len,
                             &mut self.current_block_entries,
-                        )
+                        )?
                     }
                 } else {
                     monitor::inc_sstable_reverse_seek_sidecar_fail_open();
@@ -3593,7 +3567,7 @@ impl SsTableReverseIterator {
                         self.user_key_upper_bound.as_deref(),
                         self.suffix_len,
                         &mut self.current_block_entries,
-                    )
+                    )?
                 }
             } else {
                 SsTable::append_reverse_block_entries_in_bounds(
@@ -3602,7 +3576,7 @@ impl SsTableReverseIterator {
                     self.user_key_upper_bound.as_deref(),
                     self.suffix_len,
                     &mut self.current_block_entries,
-                )
+                )?
             };
             monitor::add_sstable_reverse_block_entry_decodes(stats.decoded_entries);
             monitor::add_sstable_reverse_block_entry_yields(stats.yielded_entries);
@@ -3765,7 +3739,8 @@ mod tests {
             Some(b"k095"),
             0,
             &mut out,
-        );
+        )
+        .unwrap();
 
         assert_eq!(stats.decoded_entries, 5);
         assert_eq!(stats.yielded_entries, 5);
@@ -3786,6 +3761,27 @@ mod tests {
                 b"k090".to_vec(),
             ]
         );
+    }
+
+    #[test]
+    fn block_decoder_rejects_declared_entries_that_are_missing() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&2u32.to_le_bytes());
+        append_block_entry(&mut block, b"k001", b"value-1");
+
+        let error = SsTable::decoded_block_entry_spans(&block).unwrap_err();
+        assert!(error.to_string().contains("entry 1"));
+    }
+
+    #[test]
+    fn block_decoder_rejects_trailing_bytes_after_declared_entries() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&1u32.to_le_bytes());
+        append_block_entry(&mut block, b"k001", b"value-1");
+        block.extend_from_slice(b"unclaimed");
+
+        let error = SsTable::decoded_block_entry_spans(&block).unwrap_err();
+        assert!(error.to_string().contains("trailing bytes"));
     }
 
     #[tokio::test]

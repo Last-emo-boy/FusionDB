@@ -461,6 +461,7 @@ pub struct Executor {
     prepared_statements: RwLock<PreparedStatementStore>,
     pub(crate) row_cache: Cache<String, CachedRow>,
     pub(crate) sql_bulk_scan_no_fill: bool,
+    structured_data_shadow_v2: bool,
     pub(crate) vector_index: Arc<VectorIndex>,
     pub(crate) embedding_registry: Arc<EmbeddingRegistry>,
 }
@@ -558,6 +559,7 @@ impl Executor {
             prepared_statements: RwLock::new(PreparedStatementStore::default()),
             row_cache: Cache::new(config.row_cache_capacity),
             sql_bulk_scan_no_fill: config.sql_bulk_scan_no_fill,
+            structured_data_shadow_v2: config.structured_data_shadow_v2,
             vector_index: shared_vector_index,
             embedding_registry: Arc::new(EmbeddingRegistry::new()),
         }
@@ -769,6 +771,108 @@ impl Executor {
         }
 
         Self::legacy_data_key_for_row_id(table_name, row_id)
+    }
+
+    pub(crate) fn legacy_delimited_index_row_ids_are_unambiguous(schema: &TableSchema) -> bool {
+        schema
+            .get_primary_key_index()
+            .and_then(|index| schema.columns.get(index))
+            .is_none_or(|column| !Self::is_text_type_name(&column.data_type))
+    }
+
+    fn structured_data_route_for_row_id(
+        &self,
+        table_name: &str,
+        row_id: &str,
+    ) -> crate::storage::keyspace::DataRoute {
+        self.shard_router
+            .as_ref()
+            .map(|router| {
+                crate::storage::keyspace::DataRoute::Shard(
+                    router.route_key(table_name, row_id).shard_id,
+                )
+            })
+            .unwrap_or(crate::storage::keyspace::DataRoute::Unsharded)
+    }
+
+    pub(crate) fn routed_structured_data_key_for_row_id(
+        &self,
+        table_name: &str,
+        row_id: &str,
+    ) -> Result<Vec<u8>> {
+        crate::storage::keyspace::encode_data_key(
+            self.structured_data_route_for_row_id(table_name, row_id),
+            table_name.as_bytes(),
+            row_id.as_bytes(),
+        )
+        .map_err(|error| {
+            FusionError::Execution(format!("Structured data key encoding failed: {error}"))
+        })
+    }
+
+    pub(crate) async fn write_routed_data_row(
+        &self,
+        table_name: &str,
+        row_id: &str,
+        value: &[u8],
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let legacy_key = self.routed_data_key_for_row_id(table_name, row_id);
+        let shadow_key = self
+            .structured_data_shadow_v2
+            .then(|| self.routed_structured_data_key_for_row_id(table_name, row_id))
+            .transpose()?;
+
+        txn.put(legacy_key.as_bytes(), value).await?;
+        if let Some(shadow_key) = shadow_key {
+            txn.put(&shadow_key, value).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn delete_routed_data_row(
+        &self,
+        table_name: &str,
+        row_id: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let legacy_key = self.routed_data_key_for_row_id(table_name, row_id);
+        let shadow_key = self.routed_structured_data_key_for_row_id(table_name, row_id)?;
+        txn.delete(legacy_key.as_bytes()).await?;
+        txn.delete(&shadow_key).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_structured_data_shadows_for_table(
+        &self,
+        table_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let namespace_prefix = crate::storage::keyspace::data_namespace_prefix();
+        for (key, _) in txn.scan_prefix(&namespace_prefix, None).await? {
+            let parsed = crate::storage::keyspace::parse_data_key_exact(&key).map_err(|error| {
+                FusionError::Execution(format!(
+                    "Malformed key in the structured Data V2 namespace: {error}"
+                ))
+            })?;
+            if parsed.table() == table_name.as_bytes() {
+                txn.delete(&key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn legacy_row_id_from_routed_data_key<'a>(
+        &self,
+        table_name: &str,
+        key: &'a [u8],
+    ) -> Result<&'a str> {
+        self.routed_data_prefixes_for_table(table_name)
+            .iter()
+            .find_map(|prefix| key.strip_prefix(prefix.as_bytes()))
+            .and_then(|row_id| std::str::from_utf8(row_id).ok())
+            .filter(|row_id| !row_id.is_empty())
+            .ok_or_else(|| FusionError::Execution("Invalid routed data key".to_string()))
     }
 
     pub(crate) fn routed_data_prefixes_for_table(&self, table_name: &str) -> Vec<String> {
@@ -1289,11 +1393,9 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<usize> {
-        let mut count = 0usize;
-        for prefix in self.routed_data_prefixes_for_table(table_name) {
-            count = count.saturating_add(txn.count_prefix(prefix.as_bytes()).await?);
-        }
-        Ok(count)
+        let mut visitor = |_key: &[u8], _value: &[u8]| true;
+        self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
+            .await
     }
 
     pub(crate) async fn shard_routing_decisions_for_sql(
@@ -4275,6 +4377,7 @@ impl Executor {
                     &create_index.columns,
                     &create_index.include,
                     create_index.unique,
+                    create_index.nulls_distinct,
                     &create_index.index_options,
                     txn,
                 )
@@ -4571,6 +4674,9 @@ impl Executor {
         let res = self.execute_in_transaction(stmt, &mut *txn).await;
         if res.is_ok() {
             txn.commit().await?;
+            if Self::statement_may_change_update_fast_path_metadata(stmt) {
+                self.invalidate_update_fast_path_cache();
+            }
             if Self::statement_may_change_query_results(stmt) {
                 self.invalidate_query_result_cache();
             }
@@ -4700,8 +4806,11 @@ impl Executor {
         let mut txn = self.storage.begin_transaction().await?;
         let mut results = Vec::with_capacity(stmts.len());
         let mut may_change_query_results = false;
+        let mut may_change_update_fast_path_metadata = false;
         for stmt in &stmts {
             may_change_query_results |= Self::statement_may_change_query_results(stmt);
+            may_change_update_fast_path_metadata |=
+                Self::statement_may_change_update_fast_path_metadata(stmt);
             match self.execute_in_transaction(stmt, &mut *txn).await {
                 Ok(result) => results.push(result),
                 Err(error) => {
@@ -4713,6 +4822,9 @@ impl Executor {
         }
 
         txn.commit().await?;
+        if may_change_update_fast_path_metadata {
+            self.invalidate_update_fast_path_cache();
+        }
         if may_change_query_results {
             self.invalidate_query_result_cache();
         }
@@ -6111,8 +6223,320 @@ mod tests {
             .expect("limited scan exact table");
         assert_eq!(limited_rows.len(), 1);
         assert_eq!(limited_rows[0].0, tenant_key.as_bytes());
+
+        let exact_count = executor
+            .count_routed_data_prefixes_for_table("tenant", &mut *txn)
+            .await
+            .expect("count exact table");
+        assert_eq!(exact_count, 1);
         drop(txn);
+
+        let counted = executor
+            .execute_sql("SELECT COUNT(*) FROM tenant")
+            .await
+            .expect("SQL count exact table");
+        match counted.as_slice() {
+            [QueryResult::Select { columns, rows }] => {
+                assert_eq!(columns, &vec!["COUNT(*)".to_string()]);
+                assert_eq!(rows, &vec![vec![Value::Integer(1)]]);
+            }
+            other => panic!("expected count result, got {other:?}"),
+        }
         let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn structured_data_shadow_v2_tracks_crud_and_transaction_rollback() {
+        let wal_path = format!("test_structured_data_shadow_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let mut config = crate::config::StorageConfig::default();
+        config.structured_data_shadow_v2 = true;
+        let executor = Executor::with_config(storage.clone(), &config);
+
+        executor
+            .execute_sql(
+                "CREATE TABLE shadow_rows (id TEXT PRIMARY KEY, payload TEXT); \
+                 INSERT INTO shadow_rows VALUES ('row:1', 'one')",
+            )
+            .await
+            .expect("create and insert shadow row");
+
+        let legacy_key = executor.routed_data_key_for_row_id("shadow_rows", "row:1");
+        let shadow_key = executor
+            .routed_structured_data_key_for_row_id("shadow_rows", "row:1")
+            .expect("encode structured row key");
+        {
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            let legacy = txn
+                .get(legacy_key.as_bytes())
+                .await
+                .expect("read legacy row")
+                .expect("legacy row exists");
+            let shadow = txn
+                .get(&shadow_key)
+                .await
+                .expect("read structured row")
+                .expect("structured row exists");
+            assert_eq!(shadow, legacy);
+        }
+
+        executor
+            .execute_sql("UPDATE shadow_rows SET payload = 'two' WHERE id = 'row:1'")
+            .await
+            .expect("update shadow row");
+        {
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert_eq!(
+                txn.get(legacy_key.as_bytes())
+                    .await
+                    .expect("read legacy row"),
+                txn.get(&shadow_key)
+                    .await
+                    .expect("read structured row after update")
+            );
+        }
+
+        let rollback = executor
+            .execute_sql(
+                "INSERT INTO shadow_rows VALUES ('row:2', 'rollback'); \
+                 UPDATE missing_shadow_table SET payload = 'fail' WHERE id = 'row:2'",
+            )
+            .await;
+        assert!(rollback.is_err());
+        let rollback_legacy = executor.routed_data_key_for_row_id("shadow_rows", "row:2");
+        let rollback_shadow = executor
+            .routed_structured_data_key_for_row_id("shadow_rows", "row:2")
+            .expect("encode rollback shadow key");
+        {
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert!(txn
+                .get(rollback_legacy.as_bytes())
+                .await
+                .expect("read rolled back legacy row")
+                .is_none());
+            assert!(txn
+                .get(&rollback_shadow)
+                .await
+                .expect("read rolled back shadow row")
+                .is_none());
+        }
+
+        executor
+            .execute_sql("DELETE FROM shadow_rows WHERE id = 'row:1'")
+            .await
+            .expect("delete shadow row");
+        {
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert!(txn
+                .get(legacy_key.as_bytes())
+                .await
+                .expect("read deleted legacy row")
+                .is_none());
+            assert!(txn
+                .get(&shadow_key)
+                .await
+                .expect("read deleted structured row")
+                .is_none());
+        }
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn structured_data_shadow_is_opt_in_and_table_cleanup_removes_orphans() {
+        let wal_path = format!("test_structured_data_cleanup_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+
+        executor
+            .execute_sql(
+                "CREATE TABLE shadow_cleanup (id TEXT PRIMARY KEY, payload TEXT); \
+                 INSERT INTO shadow_cleanup VALUES ('row:1', 'one')",
+            )
+            .await
+            .expect("create cleanup table");
+        let shadow_key = executor
+            .routed_structured_data_key_for_row_id("shadow_cleanup", "row:1")
+            .expect("encode structured row key");
+        let historical_shard_key = crate::storage::keyspace::encode_data_key(
+            crate::storage::keyspace::DataRoute::Shard(99),
+            b"shadow_cleanup",
+            b"row:historical",
+        )
+        .expect("encode historical shard key");
+        let neighboring_table_key = crate::storage::keyspace::encode_data_key(
+            crate::storage::keyspace::DataRoute::Shard(99),
+            b"shadow_cleanup:archive",
+            b"row:neighbor",
+        )
+        .expect("encode neighboring table key");
+        {
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert!(txn
+                .get(&shadow_key)
+                .await
+                .expect("read disabled shadow")
+                .is_none());
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.expect("begin orphan txn");
+            txn.put(&shadow_key, b"orphan")
+                .await
+                .expect("put structured orphan");
+            txn.put(&historical_shard_key, b"historical orphan")
+                .await
+                .expect("put historical shard orphan");
+            txn.put(&neighboring_table_key, b"neighbor")
+                .await
+                .expect("put neighboring table shadow");
+            txn.commit().await.expect("commit orphan");
+        }
+        executor
+            .execute_sql("TRUNCATE TABLE shadow_cleanup")
+            .await
+            .expect("truncate cleanup table");
+        {
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert!(txn
+                .get(&shadow_key)
+                .await
+                .expect("read truncated shadow")
+                .is_none());
+            assert!(txn
+                .get(&historical_shard_key)
+                .await
+                .expect("read historical shard shadow")
+                .is_none());
+            assert_eq!(
+                txn.get(&neighboring_table_key)
+                    .await
+                    .expect("read neighboring table shadow"),
+                Some(b"neighbor".to_vec())
+            );
+        }
+
+        {
+            let mut txn = storage.begin_transaction().await.expect("begin orphan txn");
+            txn.put(&shadow_key, b"orphan")
+                .await
+                .expect("put structured orphan before drop");
+            txn.put(&historical_shard_key, b"historical orphan")
+                .await
+                .expect("put historical shard orphan before drop");
+            txn.commit().await.expect("commit orphan before drop");
+        }
+        executor
+            .execute_sql("DROP TABLE shadow_cleanup")
+            .await
+            .expect("drop cleanup table");
+        {
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert!(txn
+                .get(&shadow_key)
+                .await
+                .expect("read dropped shadow")
+                .is_none());
+            assert!(txn
+                .get(&historical_shard_key)
+                .await
+                .expect("read dropped historical shard shadow")
+                .is_none());
+            assert_eq!(
+                txn.get(&neighboring_table_key)
+                    .await
+                    .expect("read neighboring table shadow after drop"),
+                Some(b"neighbor".to_vec())
+            );
+        }
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn structured_data_shadow_cleanup_survives_fusion_flush_and_reopen() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "fusiondb_structured_shadow_reopen_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let mut config = crate::config::StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        config.structured_data_shadow_v2 = true;
+        let wal_path = config.wal_path();
+
+        let shadow_key = {
+            let fusion =
+                crate::storage::FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                    .await
+                    .expect("open FusionStorage");
+            let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+            let executor = Executor::with_config(storage.clone(), &config);
+            executor
+                .execute_sql(
+                    "CREATE TABLE shadow_reopen (id TEXT PRIMARY KEY, payload TEXT); \
+                     INSERT INTO shadow_reopen VALUES ('row:1', 'one')",
+                )
+                .await
+                .expect("create persisted shadow");
+            let shadow_key = executor
+                .routed_structured_data_key_for_row_id("shadow_reopen", "row:1")
+                .expect("encode persisted shadow key");
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert!(txn
+                .get(&shadow_key)
+                .await
+                .expect("read persisted shadow")
+                .is_some());
+            drop(txn);
+            fusion
+                .create_snapshot_now()
+                .await
+                .expect("flush persisted shadow");
+            shadow_key
+        };
+
+        {
+            let fusion =
+                crate::storage::FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                    .await
+                    .expect("reopen FusionStorage");
+            let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+            let executor = Executor::with_config(storage.clone(), &config);
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert!(txn
+                .get(&shadow_key)
+                .await
+                .expect("read reopened shadow")
+                .is_some());
+            drop(txn);
+            executor
+                .execute_sql("TRUNCATE TABLE shadow_reopen")
+                .await
+                .expect("truncate reopened shadow table");
+            fusion
+                .create_snapshot_now()
+                .await
+                .expect("flush shadow deletion");
+        }
+
+        {
+            let fusion =
+                crate::storage::FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                    .await
+                    .expect("reopen after shadow cleanup");
+            let storage: Arc<dyn Storage> = Arc::new(fusion);
+            let txn = storage.begin_transaction().await.expect("begin read txn");
+            assert!(txn
+                .get(&shadow_key)
+                .await
+                .expect("read cleaned shadow")
+                .is_none());
+        }
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
@@ -6123,9 +6547,11 @@ mod tests {
         let config = sharded_test_config();
         let shard_router =
             crate::distributed::sharding::ShardRouter::from_config(&config).expect("router");
+        let mut storage_config = crate::config::StorageConfig::default();
+        storage_config.structured_data_shadow_v2 = true;
         let executor = Executor::with_config_and_shard_router(
             storage.clone(),
-            &crate::config::StorageConfig::default(),
+            &storage_config,
             Some(shard_router),
         );
 
@@ -6140,13 +6566,22 @@ mod tests {
 
         let first_row_id = crate::common::encoding::encode_i64_comparable(1);
         let first_sharded_key = executor.routed_data_key_for_row_id("sharded_users", &first_row_id);
+        let first_shadow_key = executor
+            .routed_structured_data_key_for_row_id("sharded_users", &first_row_id)
+            .expect("encode sharded shadow key");
         {
             let txn = storage.begin_transaction().await.expect("begin txn");
-            assert!(txn
+            let legacy = txn
                 .get(first_sharded_key.as_bytes())
                 .await
-                .expect("get sharded key")
-                .is_some());
+                .expect("get sharded key");
+            assert!(legacy.is_some());
+            assert_eq!(
+                txn.get(&first_shadow_key)
+                    .await
+                    .expect("get sharded shadow key"),
+                legacy
+            );
             assert!(txn
                 .get(b"data:sharded_users:10000000000000001")
                 .await
@@ -6330,6 +6765,14 @@ mod tests {
                 assert!(rows.is_empty());
             }
             other => panic!("expected empty select result, got {other:?}"),
+        }
+        {
+            let txn = storage.begin_transaction().await.expect("begin txn");
+            assert!(txn
+                .get(&first_shadow_key)
+                .await
+                .expect("get deleted sharded shadow key")
+                .is_none());
         }
 
         let _ = std::fs::remove_file(wal_path);

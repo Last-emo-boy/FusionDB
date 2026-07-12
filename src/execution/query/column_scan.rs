@@ -1328,6 +1328,11 @@ impl Executor {
         let Some((column_index, column_name, value)) = index_probe else {
             return Ok(None);
         };
+        if !schema.columns[column_index].is_primary
+            && !Self::legacy_delimited_index_row_ids_are_unambiguous(schema)
+        {
+            return Ok(None);
+        }
 
         let mut states = column_aggregate_states(plans);
         let mut visitor = ColumnAggregateScanVisitor {
@@ -1719,7 +1724,9 @@ impl Executor {
         schema: &TableSchema,
         txn: &mut dyn Transaction,
     ) -> Result<Option<i64>> {
-        if self.shard_router.is_some() {
+        if self.shard_router.is_some()
+            || !Self::legacy_delimited_index_row_ids_are_unambiguous(schema)
+        {
             return Ok(None);
         }
 
@@ -1874,7 +1881,9 @@ impl Executor {
         schema: &TableSchema,
         txn: &mut dyn Transaction,
     ) -> Result<Option<Vec<Vec<Value>>>> {
-        if self.shard_router.is_some() {
+        if self.shard_router.is_some()
+            || !Self::legacy_delimited_index_row_ids_are_unambiguous(schema)
+        {
             return Ok(None);
         }
 
@@ -2096,7 +2105,9 @@ impl Executor {
         schema: &TableSchema,
         txn: &mut dyn Transaction,
     ) -> Result<Option<Vec<Vec<Value>>>> {
-        if self.shard_router.is_some() {
+        if self.shard_router.is_some()
+            || !Self::legacy_delimited_index_row_ids_are_unambiguous(schema)
+        {
             return Ok(None);
         }
 

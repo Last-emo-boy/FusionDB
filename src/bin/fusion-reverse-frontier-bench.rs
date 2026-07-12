@@ -205,6 +205,7 @@ async fn create_storage(
         statement_cache_capacity: 0,
         block_cache_capacity: config.block_cache_capacity,
         sql_bulk_scan_no_fill: true,
+        structured_data_shadow_v2: false,
         slow_query_threshold_ms: 100,
     };
     let wal_path = storage_config.wal_path();

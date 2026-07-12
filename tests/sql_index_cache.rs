@@ -3765,7 +3765,11 @@ async fn test_vector_index_mutations_are_commit_deferred() {
         .unwrap();
     let hits = fusion
         .vector_index
-        .search("hnsw_defer_vecs_emb", &query_vec, 5)
+        .search(
+            "hnsw_v2_AEZEQksCBwAAAApkZWZlcl92ZWNzAAAAA2VtYg",
+            &query_vec,
+            5,
+        )
         .unwrap();
     assert!(
         hits.is_empty(),
@@ -3775,7 +3779,11 @@ async fn test_vector_index_mutations_are_commit_deferred() {
     txn.rollback().await.unwrap();
     let hits = fusion
         .vector_index
-        .search("hnsw_defer_vecs_emb", &query_vec, 5)
+        .search(
+            "hnsw_v2_AEZEQksCBwAAAApkZWZlcl92ZWNzAAAAA2VtYg",
+            &query_vec,
+            5,
+        )
         .unwrap();
     assert!(hits.is_empty(), "rolled-back vector insert must vanish");
 
@@ -3786,7 +3794,11 @@ async fn test_vector_index_mutations_are_commit_deferred() {
     .await;
     let hits = fusion
         .vector_index
-        .search("hnsw_defer_vecs_emb", &query_vec, 5)
+        .search(
+            "hnsw_v2_AEZEQksCBwAAAApkZWZlcl92ZWNzAAAAA2VtYg",
+            &query_vec,
+            5,
+        )
         .unwrap();
     assert_eq!(hits.len(), 1, "committed vector insert must be searchable");
     cleanup_storage_dir(&data_dir);

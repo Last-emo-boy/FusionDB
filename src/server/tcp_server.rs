@@ -323,7 +323,7 @@ async fn handle_vector_search<W: AsyncWriteExt + Unpin>(
     // Execute
     // We assume storage is FusionStorage. If not, empty result.
     let results = if let Some(fusion) = storage.as_any().downcast_ref::<FusionStorage>() {
-        fusion.vector_search(&query, limit)
+        fusion.vector_search(&query, limit).await
     } else {
         Vec::new()
     };

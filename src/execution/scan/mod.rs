@@ -1322,10 +1322,8 @@ impl Executor {
         }
 
         let row = if key_only_scan {
-            match Self::row_id_from_key(key) {
-                Some(pk_str) => Self::primary_key_row_from_id(schema, pk_index, pk_str),
-                None => return Ok(None),
-            }
+            let pk_str = self.legacy_row_id_from_routed_data_key(&schema.name, key)?;
+            Self::primary_key_row_from_id(schema, pk_index, pk_str)
         } else if zero_column_projection {
             Vec::new()
         } else {
@@ -1613,42 +1611,60 @@ impl Executor {
                                                     params,
                                                 )?;
                                                 if let Value::Vector(query_vec) = query_val {
-                                                    let idx_name = Self::hnsw_index_name_for_column(
-                                                        &table_name,
-                                                        &storage_col_name,
-                                                    );
-                                                    let search_results = self
-                                                        .vector_index
-                                                        .search(&idx_name, &query_vec, l)?;
+                                                    let fusion_txn = txn.as_any().downcast_ref::<
+                                                        crate::storage::fusion::FusionTransaction,
+                                                    >();
+                                                    let side_index_guard = if let Some(ftxn) =
+                                                        fusion_txn
+                                                    {
+                                                        ftxn.current_side_index_read_guard().await
+                                                    } else {
+                                                        None
+                                                    };
+                                                    if fusion_txn.is_none()
+                                                        || side_index_guard.is_some()
+                                                    {
+                                                        let idx_name =
+                                                            Self::hnsw_index_name_for_column(
+                                                                &table_name,
+                                                                &storage_col_name,
+                                                            )?;
+                                                        let search_results = self
+                                                            .vector_index
+                                                            .search(&idx_name, &query_vec, l)?;
 
-                                                    for (id, _dist) in search_results {
-                                                        let key = self.routed_data_key_for_row_id(
-                                                            &table_name,
-                                                            &id,
-                                                        );
-                                                        if let Some(data) =
-                                                            txn.get(key.as_bytes()).await?
-                                                        {
-                                                            if let Some(row) =
-                                                                self.row_cache_lookup(&key, &data)
+                                                        for (id, _dist) in search_results {
+                                                            let key = self
+                                                                .routed_data_key_for_row_id(
+                                                                    &table_name,
+                                                                    &id,
+                                                                );
+                                                            if let Some(data) =
+                                                                txn.get(key.as_bytes()).await?
                                                             {
-                                                                rows.push(row);
-                                                            } else if let Ok(row) =
-                                                                Self::decode_row_for_projection(
-                                                                    &data,
-                                                                    projection_indices.as_deref(),
-                                                                )
-                                                            {
-                                                                if projection_indices.is_none() {
-                                                                    self.row_cache_store(
-                                                                        key, &data, &row,
-                                                                    );
+                                                                if let Some(row) = self
+                                                                    .row_cache_lookup(&key, &data)
+                                                                {
+                                                                    rows.push(row);
+                                                                } else if let Ok(row) =
+                                                                    Self::decode_row_for_projection(
+                                                                        &data,
+                                                                        projection_indices
+                                                                            .as_deref(),
+                                                                    )
+                                                                {
+                                                                    if projection_indices.is_none()
+                                                                    {
+                                                                        self.row_cache_store(
+                                                                            key, &data, &row,
+                                                                        );
+                                                                    }
+                                                                    rows.push(row);
                                                                 }
-                                                                rows.push(row);
                                                             }
                                                         }
+                                                        index_used = true;
                                                     }
-                                                    index_used = true;
                                                 }
                                             }
                                         }
@@ -1831,11 +1847,9 @@ impl Executor {
 
                             for (k, v) in kv_pairs {
                                 let row = if key_only_scan {
-                                    if let Some(pk_str) = Self::row_id_from_key(&k) {
-                                        Self::primary_key_row_from_id(&schema, pk_index, pk_str)
-                                    } else {
-                                        continue;
-                                    }
+                                    let pk_str =
+                                        self.legacy_row_id_from_routed_data_key(&table_name, &k)?;
+                                    Self::primary_key_row_from_id(&schema, pk_index, pk_str)
                                 } else {
                                     let cache_key = std::str::from_utf8(&k).ok();
                                     if let Some(key_str) = cache_key {
@@ -2524,11 +2538,9 @@ impl Executor {
 
                     for (k, v) in kv_pairs {
                         let row_res = if key_only_scan {
-                            if let Some(pk_str) = Self::row_id_from_key(&k) {
-                                Some(Self::primary_key_row_from_id(&schema, pk_index, pk_str))
-                            } else {
-                                None
-                            }
+                            let pk_str =
+                                self.legacy_row_id_from_routed_data_key(&table_name, &k)?;
+                            Some(Self::primary_key_row_from_id(&schema, pk_index, pk_str))
                         } else if zero_column_projection {
                             Some(Vec::new())
                         } else {
@@ -2743,12 +2755,17 @@ impl OrderTopKScanVisitor<'_> {
 impl ScanVisitor for OrderTopKScanVisitor<'_> {
     fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
         let row = if self.key_only_scan {
-            match Executor::row_id_from_key(key) {
-                Some(pk_str) => {
-                    Executor::primary_key_row_from_id(self.schema, self.pk_index, pk_str)
+            let pk_str = match self
+                .executor
+                .legacy_row_id_from_routed_data_key(&self.schema.name, key)
+            {
+                Ok(pk_str) => pk_str,
+                Err(error) => {
+                    self.error = Some(error);
+                    return false;
                 }
-                None => return true,
-            }
+            };
+            Executor::primary_key_row_from_id(self.schema, self.pk_index, pk_str)
         } else if self.zero_column_projection {
             Vec::new()
         } else {
@@ -2815,20 +2832,20 @@ struct FilteredScanVisitor<'a> {
 }
 
 impl FilteredScanVisitor<'_> {
-    fn decode_output_row(&self, key: &[u8], value: &[u8]) -> Option<Vec<Value>> {
+    fn decode_output_row(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<Value>>> {
         if self.key_only_scan {
-            match Executor::row_id_from_key(key) {
-                Some(pk_str) => Some(Executor::primary_key_row_from_id(
-                    self.schema,
-                    self.pk_index,
-                    pk_str,
-                )),
-                None => None,
-            }
+            let pk_str = self
+                .executor
+                .legacy_row_id_from_routed_data_key(&self.schema.name, key)?;
+            Ok(Some(Executor::primary_key_row_from_id(
+                self.schema,
+                self.pk_index,
+                pk_str,
+            )))
         } else if self.zero_column_projection {
-            Some(Vec::new())
+            Ok(Some(Vec::new()))
         } else {
-            match std::str::from_utf8(key) {
+            Ok(match std::str::from_utf8(key) {
                 Ok(key_str) => {
                     if let Some(row) = self.executor.row_cache_lookup(key_str, value) {
                         Some(row)
@@ -2845,7 +2862,7 @@ impl FilteredScanVisitor<'_> {
                     }
                 }
                 Err(_) => Executor::decode_row_for_projection(value, self.projection_indices).ok(),
-            }
+            })
         }
     }
 
@@ -2880,8 +2897,13 @@ impl ScanVisitor for FilteredScanVisitor<'_> {
             };
         }
 
-        let Some(row) = self.decode_output_row(key, value) else {
-            return true;
+        let row = match self.decode_output_row(key, value) {
+            Ok(Some(row)) => row,
+            Ok(None) => return true,
+            Err(error) => {
+                self.error = Some(error);
+                return false;
+            }
         };
 
         match self

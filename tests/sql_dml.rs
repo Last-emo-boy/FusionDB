@@ -1171,6 +1171,11 @@ async fn test_composite_index_dml_falls_back_to_legacy_metadata_scan() {
         txn.delete(b"index_meta_table:stock_legacy:idx_stock_legacy_warehouse_item")
             .await
             .unwrap();
+        for (key, value) in txn.scan_prefix(b"\0FDBK", None).await.unwrap() {
+            if value == b"v2" {
+                txn.delete(&key).await.unwrap();
+            }
+        }
         txn.commit().await.unwrap();
     }
 

@@ -1,4 +1,4 @@
-use crate::catalog::{IndexType, TableSchema};
+use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{BinaryOperator, Expr, TableFactor};
 
@@ -10,6 +10,7 @@ mod insert;
 mod returning;
 mod update;
 
+#[cfg(test)]
 fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
     match value.as_bytes().get(..prefix.len()) {
         Some(candidate) => candidate.eq_ignore_ascii_case(prefix.as_bytes()),
@@ -17,6 +18,7 @@ fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn is_trigram_text_data_type(data_type: &str) -> bool {
     let data_type = data_type.trim();
     data_type.eq_ignore_ascii_case("TEXT")
@@ -288,14 +290,11 @@ impl Executor {
         prefix
     }
 
-    pub(crate) fn hnsw_index_name_for_column(table_name: &str, column_name: &str) -> String {
-        let mut name =
-            String::with_capacity("hnsw_".len() + table_name.len() + 1 + column_name.len());
-        name.push_str("hnsw_");
-        name.push_str(table_name);
-        name.push('_');
-        name.push_str(column_name);
-        name
+    pub(crate) fn hnsw_index_name_for_column(
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<String> {
+        crate::storage::hnsw_index_name_for_column(table_name, column_name)
     }
 
     pub(crate) fn indexed_trigram_text_columns(schema: &TableSchema) -> Vec<usize> {
@@ -509,14 +508,6 @@ impl Executor {
         crate::storage::trigram::numeric_row_id_for_str(row_id)
     }
 
-    pub(super) fn row_id_from_data_key(key: &[u8]) -> Result<&str> {
-        std::str::from_utf8(key)
-            .ok()
-            .and_then(|key| key.rsplit(':').next())
-            .filter(|row_id| !row_id.is_empty())
-            .ok_or_else(|| FusionError::Execution("Invalid data key".to_string()))
-    }
-
     pub(super) fn primary_key_row_id_from_eq_selection(
         &self,
         selection: Option<&Expr>,
@@ -717,10 +708,9 @@ mod tests {
     }
 
     #[test]
-    fn hnsw_index_name_for_column_preallocates_exact_name() {
-        let name = Executor::hnsw_index_name_for_column("docs", "embedding");
+    fn hnsw_index_name_for_column_uses_structured_identity() {
+        let name = Executor::hnsw_index_name_for_column("docs", "embedding").unwrap();
 
-        assert_eq!(name, "hnsw_docs_embedding");
-        assert!(name.capacity() >= name.len());
+        assert_eq!(name, "hnsw_v2_AEZEQksCBwAAAARkb2NzAAAACWVtYmVkZGluZw");
     }
 }
