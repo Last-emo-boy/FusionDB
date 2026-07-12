@@ -348,6 +348,13 @@ impl Executor {
                     Self::coerce_value_to_column_type(new_val, &schema.columns[col_idx].data_type)?;
             }
         }
+        super::reject_primary_key_change(
+            schema,
+            composite_unique_indexes,
+            &old_existing_row,
+            &existing_row,
+            "ON CONFLICT DO UPDATE",
+        )?;
         self.validate_child_foreign_keys(table_name, schema, &existing_row, foreign_keys, txn)
             .await?;
         self.validate_composite_unique_constraints(

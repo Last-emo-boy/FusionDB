@@ -2225,3 +2225,111 @@ async fn test_unique_column_insert_select_checks_duplicates() {
     assert_eq!(rows, vec![vec![Value::Integer(3)]]);
     cleanup(&wal);
 }
+
+#[tokio::test]
+async fn test_primary_key_change_is_rejected_loudly() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_immutable (id INTEGER PRIMARY KEY, v TEXT)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO pk_immutable VALUES (1, 'a')").await;
+
+    // Changing the PK strands the row under its old key: rejected loudly.
+    let stmts = executor
+        .prepare("UPDATE pk_immutable SET id = 2 WHERE id = 1")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(
+        err.contains("cannot change PRIMARY KEY column 'id'"),
+        "{err}"
+    );
+
+    // Assigning the PK its own value is allowed.
+    exec_ok(
+        &executor,
+        "UPDATE pk_immutable SET id = 1, v = 'b' WHERE id = 1",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT id, v FROM pk_immutable WHERE id = 1").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Integer(1), Value::String("b".to_string())]]
+    );
+
+    // Row-key upsert: SET id = EXCLUDED.id is a same-value no-op and passes.
+    exec_ok(
+        &executor,
+        "INSERT INTO pk_immutable VALUES (1, 'c') \
+         ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id, v = EXCLUDED.v",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT v FROM pk_immutable WHERE id = 1").await;
+    assert_eq!(rows, vec![vec![Value::String("c".to_string())]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_unique_target_upsert_cannot_change_owner_primary_key() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_owner (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO pk_owner VALUES (10, 'a@x.com')").await;
+
+    // The unique-target conflict row is a DIFFERENT row (id=10); assigning it
+    // the incoming id (20) would change its PK: rejected loudly.
+    let stmts = executor
+        .prepare(
+            "INSERT INTO pk_owner VALUES (20, 'a@x.com') \
+             ON CONFLICT (email) DO UPDATE SET id = EXCLUDED.id",
+        )
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(
+        err.contains("cannot change PRIMARY KEY column 'id'"),
+        "{err}"
+    );
+
+    // The table is intact on both scan and point paths.
+    let (_, rows) = query(&executor, "SELECT id, email FROM pk_owner").await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Integer(10),
+            Value::String("a@x.com".to_string()),
+        ]]
+    );
+    let (_, rows) = query(&executor, "SELECT id FROM pk_owner WHERE id = 10").await;
+    assert_eq!(rows, vec![vec![Value::Integer(10)]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_composite_primary_key_change_is_rejected() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE pk_comp (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO pk_comp VALUES (1, 2, 'x')").await;
+
+    let stmts = executor
+        .prepare("UPDATE pk_comp SET b = 3 WHERE a = 1")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(
+        err.contains("cannot change PRIMARY KEY column 'b'"),
+        "{err}"
+    );
+
+    // Non-PK columns still update normally.
+    exec_ok(&executor, "UPDATE pk_comp SET v = 'y' WHERE a = 1").await;
+    let (_, rows) = query(&executor, "SELECT v FROM pk_comp WHERE a = 1 AND b = 2").await;
+    assert_eq!(rows, vec![vec![Value::String("y".to_string())]]);
+    cleanup(&wal);
+}

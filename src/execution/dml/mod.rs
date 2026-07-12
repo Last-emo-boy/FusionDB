@@ -81,6 +81,43 @@ fn normalized_unique_set_value(value: &Value) -> Value {
     }
 }
 
+/// Row keys are derived from PRIMARY KEY values (a single `is_primary`
+/// column or the columns of the `is_primary` composite index), so changing a
+/// PK column in place strands the row under its old key (full scans lose the
+/// row; point lookups on old and new key both misbehave). Reject loudly
+/// until row-id migration exists.
+pub(crate) fn reject_primary_key_change(
+    schema: &TableSchema,
+    composite_unique_indexes: &[super::composite_index::CompositeIndexMeta],
+    old_row: &[Value],
+    new_row: &[Value],
+    statement_kind: &str,
+) -> Result<()> {
+    for (idx, col) in schema.columns.iter().enumerate() {
+        if col.is_primary && old_row.get(idx) != new_row.get(idx) {
+            return Err(FusionError::Execution(format!(
+                "{statement_kind} cannot change PRIMARY KEY column '{}'",
+                col.name
+            )));
+        }
+    }
+    if let Some(primary) = composite_unique_indexes
+        .iter()
+        .find(|index| index.is_primary)
+    {
+        for col_name in &primary.columns {
+            if let Some(idx) = schema.get_column_index(col_name) {
+                if old_row.get(idx) != new_row.get(idx) {
+                    return Err(FusionError::Execution(format!(
+                        "{statement_kind} cannot change PRIMARY KEY column '{col_name}'"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn unique_column_indexes(schema: &TableSchema) -> impl Iterator<Item = usize> + '_ {
     schema
         .columns

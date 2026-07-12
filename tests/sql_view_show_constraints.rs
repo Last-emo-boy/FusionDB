@@ -452,6 +452,8 @@ async fn test_foreign_key_insert_update_and_parent_delete_checks() {
         "UPDATE fk_orders SET customer_id = 2 WHERE id = 10",
     )
     .await;
+    // Parent-key changes are now rejected by the earlier PK-immutability
+    // guard (row keys derive from PK values); the statement stays blocked.
     let result = executor
         .execute(
             &executor
@@ -460,7 +462,7 @@ async fn test_foreign_key_insert_update_and_parent_delete_checks() {
         )
         .await;
     assert!(result.is_err());
-    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+    assert!(format!("{}", result.unwrap_err()).contains("cannot change PRIMARY KEY"));
     cleanup(&wal);
 }
 
@@ -546,6 +548,8 @@ async fn test_composite_foreign_key_insert_update_and_parent_checks() {
     assert!(result.is_err());
     assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
 
+    // Composite-parent-key changes are now rejected by the earlier
+    // PK-immutability guard; the statement stays blocked.
     let result = executor
         .execute(
             &executor
@@ -554,7 +558,7 @@ async fn test_composite_foreign_key_insert_update_and_parent_checks() {
         )
         .await;
     assert!(result.is_err());
-    assert!(format!("{}", result.unwrap_err()).contains("FOREIGN KEY"));
+    assert!(format!("{}", result.unwrap_err()).contains("cannot change PRIMARY KEY"));
 
     cleanup(&wal);
 }

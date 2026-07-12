@@ -187,6 +187,14 @@ impl Executor {
                     }
                 }
 
+                super::reject_primary_key_change(
+                    &schema,
+                    &composite_unique_indexes,
+                    &old_row,
+                    &row,
+                    "UPDATE",
+                )?;
+
                 // Enforce NOT NULL constraints after UPDATE
                 for (idx, col) in schema.columns.iter().enumerate() {
                     if !col.is_nullable && row[idx] == Value::Null {
