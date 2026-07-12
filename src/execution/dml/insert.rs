@@ -491,15 +491,6 @@ impl Executor {
             }
         }
 
-        self.check_unique_columns_for_insert(
-            &context.table_name,
-            &context.schema,
-            &row_values,
-            unique_sets,
-            txn,
-        )
-        .await?;
-
         let row_id = self.row_id_for_insert(
             &context.schema,
             &row_values,
@@ -641,6 +632,18 @@ impl Executor {
             "row composite unique start table={} row_index={}",
             context.table_name, row_index
         ));
+        // Single-column UNIQUE runs after the ON CONFLICT branch: a row that
+        // takes the conflict action is never inserted, so its incoming values
+        // must not be duplicate-checked (the DO UPDATE path validates the
+        // updated row itself).
+        self.check_unique_columns_for_insert(
+            &context.table_name,
+            &context.schema,
+            &row_values,
+            unique_sets,
+            txn,
+        )
+        .await?;
         self.validate_composite_unique_constraints(
             &context.composite_unique_indexes,
             &context.table_name,
@@ -920,16 +923,6 @@ impl Executor {
                         }
                     }
 
-                    // Enforce UNIQUE constraints (non-PK unique columns)
-                    self.check_unique_columns_for_insert(
-                        &table_name_str,
-                        &schema,
-                        &row_values,
-                        &mut unique_sets,
-                        txn,
-                    )
-                    .await?;
-
                     let row_id =
                         self.row_id_for_insert(&schema, &row_values, &composite_unique_indexes);
                     Self::insert_trace(format!(
@@ -1092,6 +1085,17 @@ impl Executor {
                         "row composite unique start table={} row_index={}",
                         table_name_str, count
                     ));
+                    // Single-column UNIQUE runs after the ON CONFLICT branch:
+                    // a row that takes the conflict action is never inserted,
+                    // so its incoming values must not be duplicate-checked.
+                    self.check_unique_columns_for_insert(
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &mut unique_sets,
+                        txn,
+                    )
+                    .await?;
                     self.validate_composite_unique_constraints(
                         &composite_unique_indexes,
                         &table_name_str,

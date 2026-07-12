@@ -1966,3 +1966,39 @@ async fn test_unique_column_upsert_keeps_statement_value_sets_in_sync() {
     assert!(err.contains("UNIQUE constraint violated"), "{err}");
     cleanup(&wal);
 }
+
+#[tokio::test]
+async fn test_unique_column_upsert_self_conflict_takes_conflict_action() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE uniq_self (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO uniq_self VALUES (1, 'a@x.com')").await;
+
+    // A row upserting onto itself with an unchanged unique value must take
+    // the conflict action instead of reporting a UNIQUE violation.
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_self VALUES (1, 'a@x.com') \
+         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_self VALUES (1, 'a@x.com') ON CONFLICT (id) DO NOTHING",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT email FROM uniq_self").await;
+    assert_eq!(rows, vec![vec![Value::String("a@x.com".to_string())]]);
+
+    // A UNIQUE violation not covered by the conflict action still errors:
+    // id=2 does not conflict, so the row is inserted and checked.
+    let stmts = executor
+        .prepare("INSERT INTO uniq_self VALUES (2, 'a@x.com') ON CONFLICT (id) DO NOTHING")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("UNIQUE constraint violated"), "{err}");
+    cleanup(&wal);
+}
