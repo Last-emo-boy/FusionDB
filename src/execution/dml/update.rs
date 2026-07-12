@@ -5,6 +5,7 @@ use crate::storage::Transaction;
 use sqlparser::ast::TableFactor;
 
 use super::super::{Executor, QueryResult};
+use super::UniqueColumnValueSets;
 
 #[cfg(test)]
 fn update_data_prefix_for_table(table_name: &str) -> String {
@@ -138,6 +139,7 @@ impl Executor {
         } else {
             Vec::new()
         };
+        let mut unique_sets = UniqueColumnValueSets::new();
         for (k, v) in kv_pairs {
             let mut row: Vec<Value> = if let Ok(key_str) = std::str::from_utf8(&k) {
                 if let Some(row) = self.row_cache_lookup(key_str, &v) {
@@ -234,12 +236,13 @@ impl Executor {
                 )
                 .await?;
 
-                self.validate_unique_columns_for_update(
+                self.check_unique_columns_for_update(
                     &table_name_str,
                     &schema,
                     &old_row,
                     &row,
-                    &k,
+                    row_id,
+                    &mut unique_sets,
                     txn,
                 )
                 .await?;
@@ -256,6 +259,7 @@ impl Executor {
                     txn,
                 )
                 .await?;
+                unique_sets.track_update(&schema, &old_row, &row, row_id);
 
                 self.update_trigram_index_for_update(
                     &table_name_str,
@@ -527,12 +531,14 @@ impl Executor {
             }
         }
 
-        self.validate_unique_columns_for_update(
+        let mut unique_sets = UniqueColumnValueSets::new();
+        self.check_unique_columns_for_update(
             table_name,
             schema,
             &old_row,
             &row,
-            key.as_bytes(),
+            row_id,
+            &mut unique_sets,
             txn,
         )
         .await?;

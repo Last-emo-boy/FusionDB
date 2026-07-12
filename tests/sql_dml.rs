@@ -2130,3 +2130,98 @@ async fn test_on_conflict_unsupported_targets_error_loudly() {
     assert_eq!(rows, vec![vec![Value::Integer(1), Value::Null]]);
     cleanup(&wal);
 }
+
+#[tokio::test]
+async fn test_unique_column_update_checks_and_frees_values_within_statement() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE uniq_upd (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_upd VALUES (1, 'a@x.com'), (2, 'b@x.com')",
+    )
+    .await;
+
+    // Taking a value owned by another row errors.
+    let stmts = executor
+        .prepare("UPDATE uniq_upd SET email = 'b@x.com' WHERE id = 1")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("UNIQUE constraint violated"), "{err}");
+
+    // Re-assigning a row its own current value is a no-op, not a violation.
+    exec_ok(
+        &executor,
+        "UPDATE uniq_upd SET email = 'a@x.com' WHERE id = 1",
+    )
+    .await;
+
+    // Within one statement, a value freed by an earlier row may be taken by
+    // a later row (row order follows the data-key order: id 1 before id 2).
+    exec_ok(
+        &executor,
+        "UPDATE uniq_upd SET email = CASE id WHEN 1 THEN 'z@x.com' ELSE 'a@x.com' END",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT email FROM uniq_upd ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("z@x.com".to_string())],
+            vec![Value::String("a@x.com".to_string())],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_unique_column_insert_select_checks_duplicates() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE uniq_src (id INTEGER PRIMARY KEY, email TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE uniq_dst (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO uniq_dst VALUES (1, 'a@x.com')").await;
+
+    // Duplicate against a committed row.
+    exec_ok(&executor, "INSERT INTO uniq_src VALUES (10, 'a@x.com')").await;
+    let stmts = executor
+        .prepare("INSERT INTO uniq_dst SELECT * FROM uniq_src")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("UNIQUE constraint violated"), "{err}");
+
+    // Duplicate within the SELECT source itself.
+    exec_ok(&executor, "DELETE FROM uniq_src").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_src VALUES (11, 'c@x.com'), (12, 'c@x.com')",
+    )
+    .await;
+    let stmts = executor
+        .prepare("INSERT INTO uniq_dst SELECT * FROM uniq_src")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("UNIQUE constraint violated"), "{err}");
+
+    // Distinct values insert cleanly.
+    exec_ok(&executor, "DELETE FROM uniq_src").await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_src VALUES (13, 'd@x.com'), (14, 'e@x.com')",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO uniq_dst SELECT * FROM uniq_src").await;
+    let (_, rows) = query(&executor, "SELECT COUNT(*) FROM uniq_dst").await;
+    assert_eq!(rows, vec![vec![Value::Integer(3)]]);
+    cleanup(&wal);
+}

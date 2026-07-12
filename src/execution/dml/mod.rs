@@ -146,6 +146,38 @@ impl UniqueColumnValueSets {
         Ok(())
     }
 
+    /// UPDATE-side check: error when a changed unique column's new value is
+    /// already owned by a different row. Fails closed when never loaded.
+    fn assert_update_values_available(
+        &self,
+        schema: &TableSchema,
+        old_row: &[Value],
+        new_row: &[Value],
+        row_id: &str,
+    ) -> Result<()> {
+        let sets = self.loaded_sets()?;
+        for idx in unique_column_indexes(schema) {
+            let Some(new_value) = new_row.get(idx) else {
+                continue;
+            };
+            if *new_value == Value::Null || old_row.get(idx) == Some(new_value) {
+                continue;
+            }
+            let owned_by_other = sets
+                .get(&idx)
+                .and_then(|values| values.get(&normalized_unique_set_value(new_value)))
+                .is_some_and(|owner| owner != row_id);
+            if owned_by_other {
+                return Err(FusionError::Execution(format!(
+                    "UNIQUE constraint violated for column '{}': duplicate value '{}'",
+                    schema.columns[idx].name,
+                    crate::common::encoding::encode_key(new_value)
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The row_id owning `value` in unique column `col_idx`, if any. Fails
     /// closed when the sets were never loaded.
     pub(crate) fn conflict_owner_row_id(
@@ -288,6 +320,32 @@ impl Executor {
         Ok(())
     }
 
+    /// UPDATE-side duplicate check for unique columns whose value changed,
+    /// against the per-statement value sets (loaded with one table scan on
+    /// first use), excluding values owned by the row being updated.
+    pub(crate) async fn check_unique_columns_for_update(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        old_row: &[Value],
+        new_row: &[Value],
+        row_id: &str,
+        unique_sets: &mut UniqueColumnValueSets,
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        let has_changed_unique_value = unique_column_indexes(schema).any(|idx| {
+            new_row
+                .get(idx)
+                .is_some_and(|value| *value != Value::Null && old_row.get(idx) != Some(value))
+        });
+        if !has_changed_unique_value {
+            return Ok(());
+        }
+        self.ensure_unique_column_value_sets(table_name, schema, unique_sets, txn)
+            .await?;
+        unique_sets.assert_update_values_available(schema, old_row, new_row, row_id)
+    }
+
     /// Stage unique-constraint sentinel keys for every non-PK UNIQUE column
     /// of a freshly written row. Sentinels carry no row-id suffix, so they
     /// enter the OCC write set and concurrent same-value writers collide at
@@ -387,69 +445,6 @@ impl Executor {
                         );
                         txn.put(key.as_bytes(), row_id.as_bytes()).await?;
                     }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// UPDATE-side duplicate check for unique columns whose value changed.
-    /// Mirrors the INSERT-side scan check (which UPDATE previously skipped
-    /// entirely), excluding the row being updated.
-    pub(crate) async fn validate_unique_columns_for_update(
-        &self,
-        table_name: &str,
-        schema: &TableSchema,
-        old_row: &[Value],
-        new_row: &[Value],
-        current_row_key: &[u8],
-        txn: &mut dyn crate::storage::Transaction,
-    ) -> Result<()> {
-        // One table scan serves every changed unique column of this row.
-        let mut changed_unique_columns = Vec::new();
-        for (idx, col) in schema.columns.iter().enumerate() {
-            if !col.is_unique || col.is_primary {
-                continue;
-            }
-            let Some(new_value) = new_row.get(idx) else {
-                continue;
-            };
-            if *new_value == Value::Null || old_row.get(idx) == Some(new_value) {
-                continue;
-            }
-            changed_unique_columns.push((idx, &col.name, new_value));
-        }
-        if changed_unique_columns.is_empty() {
-            return Ok(());
-        }
-
-        let existing = self
-            .scan_routed_data_prefixes_for_table(table_name, txn, None)
-            .await?;
-        for (k, v) in &existing {
-            if k.as_slice() == current_row_key {
-                continue;
-            }
-            for &(idx, col_name, new_value) in &changed_unique_columns {
-                let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
-                    if let Some(row) = self.row_cache_lookup(key_str, v) {
-                        row.get(idx).cloned().unwrap_or(Value::Null)
-                    } else {
-                        crate::common::encoding::RowDecoder::decode_column(v, idx)
-                            .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
-                            .unwrap_or(Value::Null)
-                    }
-                } else {
-                    crate::common::encoding::RowDecoder::decode_column(v, idx)
-                        .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
-                        .unwrap_or(Value::Null)
-                };
-                if existing_value == *new_value {
-                    return Err(FusionError::Execution(format!(
-                        "UNIQUE constraint violated for column '{}': duplicate value '{}'",
-                        col_name,
-                        crate::common::encoding::encode_key(new_value)
-                    )));
                 }
             }
         }

@@ -359,12 +359,13 @@ impl Executor {
             txn,
         )
         .await?;
-        self.validate_unique_columns_for_update(
+        self.check_unique_columns_for_update(
             table_name,
             schema,
             &old_existing_row,
             &existing_row,
-            conflict_key.as_bytes(),
+            conflict_row_id,
+            unique_sets,
             txn,
         )
         .await?;
@@ -1309,6 +1310,7 @@ impl Executor {
             } = query_result
             {
                 let mut count = 0;
+                let mut unique_sets = UniqueColumnValueSets::new();
                 for row_values in select_rows {
                     if row_values.len() != schema.columns.len() {
                         return Err(FusionError::Execution(
@@ -1341,15 +1343,11 @@ impl Executor {
                         txn,
                     )
                     .await?;
-                    // INSERT..SELECT previously skipped the single-column
-                    // UNIQUE scan check entirely; an empty old row makes the
-                    // shared validator treat every unique column as changed.
-                    self.validate_unique_columns_for_update(
+                    self.check_unique_columns_for_insert(
                         &table_name_str,
                         &schema,
-                        &[],
                         &row_values,
-                        key.as_bytes(),
+                        &mut unique_sets,
                         txn,
                     )
                     .await?;
@@ -1365,6 +1363,7 @@ impl Executor {
                         txn,
                     )
                     .await?;
+                    unique_sets.track_insert(&schema, &row_values, &row_id);
                     self.update_trigram_index_for_insert(
                         &table_name_str,
                         &schema,
