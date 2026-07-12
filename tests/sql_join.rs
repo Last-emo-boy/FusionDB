@@ -2750,3 +2750,180 @@ async fn test_full_outer_join_non_equi() {
     assert_eq!(sorted(rows), expected);
     cleanup(&wal);
 }
+
+async fn setup_outer_join_pushdown_tables(executor: &Executor) {
+    exec_ok(
+        executor,
+        "CREATE TABLE oj_left (id INTEGER PRIMARY KEY, x INTEGER)",
+    )
+    .await;
+    exec_ok(
+        executor,
+        "CREATE TABLE oj_right (aid INTEGER PRIMARY KEY, y INTEGER)",
+    )
+    .await;
+    exec_ok(executor, "INSERT INTO oj_left VALUES (1, 1), (2, 0)").await;
+    exec_ok(executor, "INSERT INTO oj_right VALUES (1, 100), (2, 200)").await;
+}
+
+#[tokio::test]
+async fn test_left_join_on_left_side_predicate_preserves_rows() {
+    let (executor, wal) = setup().await;
+    setup_outer_join_pushdown_tables(&executor).await;
+
+    // The ON predicate on the PRESERVED (left) side only gates matching:
+    // row (2,0) fails it but must still appear NULL-padded.
+    let (_, rows) = query(
+        &executor,
+        "SELECT oj_left.id, oj_left.x, oj_right.y FROM oj_left \
+         LEFT JOIN oj_right ON oj_left.id = oj_right.aid AND oj_left.x = 1 \
+         ORDER BY oj_left.id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1), Value::Integer(100)],
+            vec![Value::Integer(2), Value::Integer(0), Value::Null],
+        ]
+    );
+
+    // An ON predicate on the null (right) side stays pushdown-safe: rows it
+    // rejects simply never match, and the left side still NULL-pads.
+    let (_, rows) = query(
+        &executor,
+        "SELECT oj_left.id, oj_right.y FROM oj_left \
+         LEFT JOIN oj_right ON oj_left.id = oj_right.aid AND oj_right.y = 100 \
+         ORDER BY oj_left.id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(100)],
+            vec![Value::Integer(2), Value::Null],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_right_join_on_right_side_predicate_preserves_rows() {
+    let (executor, wal) = setup().await;
+    setup_outer_join_pushdown_tables(&executor).await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT oj_left.id, oj_right.aid, oj_right.y FROM oj_left \
+         RIGHT JOIN oj_right ON oj_left.id = oj_right.aid AND oj_right.y = 100 \
+         ORDER BY oj_right.aid",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1), Value::Integer(100)],
+            vec![Value::Null, Value::Integer(2), Value::Integer(200)],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_full_join_single_side_on_predicates_preserve_rows() {
+    let (executor, wal) = setup().await;
+    setup_outer_join_pushdown_tables(&executor).await;
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT oj_left.id, oj_right.aid FROM oj_left \
+         FULL OUTER JOIN oj_right ON oj_left.id = oj_right.aid AND oj_left.x = 1 \
+         ORDER BY oj_left.id, oj_right.aid",
+    )
+    .await;
+    // Row 1 matches; row 2 fails the ON predicate so both sides NULL-pad
+    // (ascending sort places NULLs first).
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Null, Value::Integer(2)],
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Null],
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_left_join_where_on_null_side_applies_after_join() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE wj_left (id INTEGER PRIMARY KEY, x INTEGER)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE wj_right (aid INTEGER PRIMARY KEY, y INTEGER)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO wj_left VALUES (1, 1), (2, 0)").await;
+    exec_ok(&executor, "INSERT INTO wj_right VALUES (1, 100)").await;
+
+    // WHERE on the null side filters AFTER the join: the NULL-padded row
+    // (2, NULL) fails y = 100 and must be dropped.
+    let (_, rows) = query(
+        &executor,
+        "SELECT wj_left.id, wj_right.y FROM wj_left \
+         LEFT JOIN wj_right ON wj_left.id = wj_right.aid WHERE wj_right.y = 100",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1), Value::Integer(100)]]);
+
+    // The IS NULL anti-join idiom keeps ONLY the NULL-padded row.
+    let (_, rows) = query(
+        &executor,
+        "SELECT wj_left.id, wj_right.y FROM wj_left \
+         LEFT JOIN wj_right ON wj_left.id = wj_right.aid WHERE wj_right.y IS NULL",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(2), Value::Null]]);
+
+    // WHERE on the preserved side is unaffected by the outer join.
+    let (_, rows) = query(
+        &executor,
+        "SELECT wj_left.id, wj_right.y FROM wj_left \
+         LEFT JOIN wj_right ON wj_left.id = wj_right.aid WHERE wj_left.x = 0",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(2), Value::Null]]);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_right_join_where_on_null_side_applies_after_join() {
+    let (executor, wal) = setup().await;
+    setup_outer_join_pushdown_tables(&executor).await;
+
+    // Left is the null side of a RIGHT JOIN: its WHERE conjunct must apply
+    // post-join, so the padded row (NULL, 2) fails x = 1 and is dropped.
+    let (_, rows) = query(
+        &executor,
+        "SELECT oj_left.id, oj_right.aid FROM oj_left \
+         RIGHT JOIN oj_right ON oj_left.id = oj_right.aid AND oj_left.x = 1 \
+         WHERE oj_left.x = 1",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Integer(1), Value::Integer(1)]]);
+
+    // And the IS NULL anti-join over the left side keeps only padded rows.
+    let (_, rows) = query(
+        &executor,
+        "SELECT oj_left.id, oj_right.aid FROM oj_left \
+         RIGHT JOIN oj_right ON oj_left.id = oj_right.aid AND oj_left.x = 1 \
+         WHERE oj_left.id IS NULL",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Value::Null, Value::Integer(2)]]);
+    cleanup(&wal);
+}

@@ -1533,6 +1533,7 @@ impl Executor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_join_step(
         &self,
         left_schema: TableSchema,
@@ -1543,6 +1544,7 @@ impl Executor {
         projection: &Option<Vec<String>>,
         stage_projection_hint: &Option<Vec<String>>,
         join_column_refs: &HashSet<String>,
+        allow_where_pushdown: bool,
         txn: &mut dyn Transaction,
         params: &[Value],
         limit: Option<usize>,
@@ -1556,8 +1558,33 @@ impl Executor {
                 Vec::new()
             };
 
-        if let Some(left_local) = self.take_schema_predicate(&mut join_predicates, &left_schema) {
-            left_rows = self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
+        let is_left_outer = matches!(
+            join_operator,
+            Some(
+                sqlparser::ast::JoinOperator::LeftOuter(_) | sqlparser::ast::JoinOperator::Left(_)
+            )
+        );
+        let is_right_outer = matches!(
+            join_operator,
+            Some(
+                sqlparser::ast::JoinOperator::RightOuter(_)
+                    | sqlparser::ast::JoinOperator::Right(_)
+            )
+        );
+        let is_full_outer = matches!(
+            join_operator,
+            Some(sqlparser::ast::JoinOperator::FullOuter(_))
+        );
+
+        // An ON conjunct on the PRESERVED side must not pre-filter that side's
+        // rows: a preserved row failing it is still emitted NULL-padded, so it
+        // has to stay in the join predicates and be evaluated per pair.
+        if !is_left_outer && !is_full_outer {
+            if let Some(left_local) = self.take_schema_predicate(&mut join_predicates, &left_schema)
+            {
+                left_rows =
+                    self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
+            }
         }
 
         if let Some(result) = self.apply_generate_subscripts_join(
@@ -1597,15 +1624,24 @@ impl Executor {
             })
             .transpose()?;
 
+        // WHERE conjuncts on a side that any outer step can NULL-pad must be
+        // applied AFTER the join (execute_join's trailing filter): consuming
+        // them as scan filters keeps NULL-padded rows a post-join WHERE would
+        // drop and breaks the IS NULL anti-join idiom. The caller disables
+        // WHERE pushdown for the whole chain when a RIGHT/FULL step exists.
         if let Some(right_schema) = &right_schema_for_predicates {
-            if let Some(left_local) =
-                self.take_exclusive_schema_predicate(pending_predicates, &left_schema, right_schema)
-            {
-                left_rows =
-                    self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
+            if allow_where_pushdown {
+                if let Some(left_local) = self.take_exclusive_schema_predicate(
+                    pending_predicates,
+                    &left_schema,
+                    right_schema,
+                ) {
+                    left_rows =
+                        self.filter_rows_with_expr(left_rows, &left_schema, &left_local, params)?;
+                }
             }
 
-            if join_operator.is_none() {
+            if allow_where_pushdown && join_operator.is_none() {
                 join_predicates.extend(self.take_schema_pair_predicates(
                     pending_predicates,
                     &left_schema,
@@ -1614,33 +1650,36 @@ impl Executor {
             }
         }
 
-        let where_right = self.take_relation_predicate(pending_predicates, &right_relation_names);
-        let where_right_schema = right_schema_for_predicates
-            .as_ref()
-            .and_then(|right_schema| {
-                self.take_exclusive_schema_predicate(pending_predicates, right_schema, &left_schema)
-            });
-        let join_right = self.take_relation_predicate(&mut join_predicates, &right_relation_names);
+        // The right side is NULL-padded by LEFT/FULL steps: its WHERE
+        // conjuncts stay pending; its ON conjuncts stay in the join
+        // predicates when RIGHT/FULL preserves it.
+        let where_pushdown_right = allow_where_pushdown && !is_left_outer && !is_full_outer;
+        let where_right = if where_pushdown_right {
+            self.take_relation_predicate(pending_predicates, &right_relation_names)
+        } else {
+            None
+        };
+        let where_right_schema = if where_pushdown_right {
+            right_schema_for_predicates
+                .as_ref()
+                .and_then(|right_schema| {
+                    self.take_exclusive_schema_predicate(
+                        pending_predicates,
+                        right_schema,
+                        &left_schema,
+                    )
+                })
+        } else {
+            None
+        };
+        let join_right = if !is_right_outer && !is_full_outer {
+            self.take_relation_predicate(&mut join_predicates, &right_relation_names)
+        } else {
+            None
+        };
         let right_selection =
             Self::combine_optional_predicates(vec![where_right, where_right_schema, join_right]);
 
-        let is_left_outer = matches!(
-            join_operator,
-            Some(
-                sqlparser::ast::JoinOperator::LeftOuter(_) | sqlparser::ast::JoinOperator::Left(_)
-            )
-        );
-        let is_right_outer = matches!(
-            join_operator,
-            Some(
-                sqlparser::ast::JoinOperator::RightOuter(_)
-                    | sqlparser::ast::JoinOperator::Right(_)
-            )
-        );
-        let is_full_outer = matches!(
-            join_operator,
-            Some(sqlparser::ast::JoinOperator::FullOuter(_))
-        );
         let supports_left_driven_probe = matches!(
             join_operator,
             None | Some(
@@ -2400,9 +2439,27 @@ impl Executor {
             Vec::new()
         };
 
+        // A RIGHT/FULL step anywhere in the chain can NULL-pad any earlier
+        // relation's columns, so WHERE pushdown is disabled for the whole
+        // chain; the trailing post-join filter applies the predicates instead.
+        let allow_where_pushdown = !planned_from
+            .iter()
+            .flat_map(|table| table.joins.iter())
+            .any(|join| {
+                matches!(
+                    join.join_operator,
+                    sqlparser::ast::JoinOperator::RightOuter(_)
+                        | sqlparser::ast::JoinOperator::Right(_)
+                        | sqlparser::ast::JoinOperator::FullOuter(_)
+                )
+            });
+
         let first_relation_names = self.relation_names(&first.relation);
-        let first_selection =
-            self.take_relation_predicate(&mut pending_predicates, &first_relation_names);
+        let first_selection = if allow_where_pushdown {
+            self.take_relation_predicate(&mut pending_predicates, &first_relation_names)
+        } else {
+            None
+        };
         let first_projection = if first_selection.is_some() {
             if let TableFactor::Table { name, .. } = &first.relation {
                 let table_name = name.to_string();
@@ -2477,6 +2534,7 @@ impl Executor {
                     &None,
                     projection,
                     &join_column_refs,
+                    allow_where_pushdown,
                     txn,
                     params,
                     if completed_join_steps + 1 == total_join_steps {
@@ -2507,6 +2565,7 @@ impl Executor {
                     &None,
                     projection,
                     &join_column_refs,
+                    allow_where_pushdown,
                     txn,
                     params,
                     if completed_join_steps + 1 == total_join_steps {
@@ -2536,6 +2595,7 @@ impl Executor {
                         &None,
                         projection,
                         &join_column_refs,
+                        allow_where_pushdown,
                         txn,
                         params,
                         if completed_join_steps + 1 == total_join_steps {
