@@ -1,6 +1,7 @@
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use sqlparser::ast::{BinaryOperator, Expr, TableFactor};
+use std::collections::{HashMap, HashSet};
 
 use super::Executor;
 
@@ -55,12 +56,209 @@ fn unique_sentinel_hash_string(value: &Value) -> Option<String> {
     Some(format!("h64:{hash:016x}"))
 }
 
+/// Unique values are compared with SQL equality but hashed by bit pattern,
+/// so -0.0 == 0.0 would land in different hash buckets; normalize float
+/// zeros (also inside VECTOR/ARRAY/OBJECT) so set membership agrees with
+/// value equality.
+fn normalized_unique_set_value(value: &Value) -> Value {
+    match value {
+        Value::Float(f) if *f == 0.0 => Value::Float(0.0),
+        Value::Vector(items) => Value::Vector(
+            items
+                .iter()
+                .map(|f| if *f == 0.0 { 0.0 } else { *f })
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(normalized_unique_set_value).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), normalized_unique_set_value(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn unique_column_indexes(schema: &TableSchema) -> impl Iterator<Item = usize> + '_ {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| col.is_unique && !col.is_primary)
+        .map(|(idx, _)| idx)
+}
+
+/// Per-statement cache of the values currently held by every non-PK UNIQUE
+/// column: one table scan on first use instead of one scan per row and
+/// column, kept in sync as the statement writes rows. The scan check covers
+/// already-committed duplicates; concurrent same-value writers still collide
+/// through the unique sentinels (BENCHPROD-464).
+pub(crate) struct UniqueColumnValueSets {
+    sets: Option<HashMap<usize, HashSet<Value>>>,
+}
+
+impl UniqueColumnValueSets {
+    pub(crate) fn new() -> Self {
+        Self { sets: None }
+    }
+
+    /// True when the row carries a non-NULL value in some non-PK UNIQUE
+    /// column, i.e. a duplicate check is required at all.
+    fn row_needs_check(schema: &TableSchema, row_values: &[Value]) -> bool {
+        unique_column_indexes(schema).any(|idx| {
+            row_values
+                .get(idx)
+                .is_some_and(|value| *value != Value::Null)
+        })
+    }
+
+    /// Error if the row duplicates a tracked value in any non-PK UNIQUE
+    /// column. Fails closed when the sets were never loaded.
+    fn assert_row_absent(&self, schema: &TableSchema, row_values: &[Value]) -> Result<()> {
+        let Some(sets) = self.sets.as_ref() else {
+            return Err(FusionError::Execution(
+                "unique column value sets consulted before load".to_string(),
+            ));
+        };
+        for idx in unique_column_indexes(schema) {
+            let Some(value) = row_values.get(idx) else {
+                continue;
+            };
+            if *value == Value::Null {
+                continue;
+            }
+            let is_duplicate = sets
+                .get(&idx)
+                .is_some_and(|values| values.contains(&normalized_unique_set_value(value)));
+            if is_duplicate {
+                return Err(FusionError::Execution(format!(
+                    "UNIQUE constraint violated for column '{}': duplicate value '{}'",
+                    schema.columns[idx].name,
+                    crate::common::encoding::encode_key(value)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Track a freshly inserted row. No-op when the sets were never loaded:
+    /// a later load scans the post-write state through the transaction.
+    pub(crate) fn track_insert(&mut self, schema: &TableSchema, row_values: &[Value]) {
+        let Some(sets) = self.sets.as_mut() else {
+            return;
+        };
+        for idx in unique_column_indexes(schema) {
+            let Some(value) = row_values.get(idx) else {
+                continue;
+            };
+            if *value == Value::Null {
+                continue;
+            }
+            if let Some(values) = sets.get_mut(&idx) {
+                values.insert(normalized_unique_set_value(value));
+            }
+        }
+    }
+
+    /// Track an UPSERT DO UPDATE that rewrote an existing row in place.
+    pub(crate) fn track_update(
+        &mut self,
+        schema: &TableSchema,
+        old_row: &[Value],
+        new_row: &[Value],
+    ) {
+        let Some(sets) = self.sets.as_mut() else {
+            return;
+        };
+        for idx in unique_column_indexes(schema) {
+            if old_row.get(idx) == new_row.get(idx) {
+                continue;
+            }
+            let Some(values) = sets.get_mut(&idx) else {
+                continue;
+            };
+            if let Some(old_value) = old_row.get(idx) {
+                if *old_value != Value::Null {
+                    values.remove(&normalized_unique_set_value(old_value));
+                }
+            }
+            if let Some(new_value) = new_row.get(idx) {
+                if *new_value != Value::Null {
+                    values.insert(normalized_unique_set_value(new_value));
+                }
+            }
+        }
+    }
+}
+
 impl Executor {
     /// Sentinel key component for a unique value: the normal index string
     /// when available, else a stable hash so every value type is covered.
     fn unique_sentinel_value_string(&self, value: &Value) -> Option<String> {
         self.value_to_index_string(value)
             .or_else(|| unique_sentinel_hash_string(value))
+    }
+
+    /// INSERT-side duplicate check for the row's non-PK UNIQUE columns
+    /// against the per-statement value sets, loading them with a single
+    /// table scan on first use.
+    pub(crate) async fn check_unique_columns_for_insert(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        row_values: &[Value],
+        unique_sets: &mut UniqueColumnValueSets,
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        if !UniqueColumnValueSets::row_needs_check(schema, row_values) {
+            return Ok(());
+        }
+        self.ensure_unique_column_value_sets(table_name, schema, unique_sets, txn)
+            .await?;
+        unique_sets.assert_row_absent(schema, row_values)
+    }
+
+    /// Build the per-statement unique-value sets with one table scan that
+    /// serves every non-PK UNIQUE column at once. No-op when already loaded.
+    async fn ensure_unique_column_value_sets(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        unique_sets: &mut UniqueColumnValueSets,
+        txn: &mut dyn crate::storage::Transaction,
+    ) -> Result<()> {
+        if unique_sets.sets.is_some() {
+            return Ok(());
+        }
+        let mut sets: HashMap<usize, HashSet<Value>> = unique_column_indexes(schema)
+            .map(|idx| (idx, HashSet::new()))
+            .collect();
+        if !sets.is_empty() {
+            let existing = self
+                .scan_routed_data_prefixes_for_table(table_name, txn, None)
+                .await?;
+            for (k, v) in &existing {
+                let cached_row = std::str::from_utf8(k)
+                    .ok()
+                    .and_then(|key_str| self.row_cache_lookup(key_str, v));
+                for (idx, values) in sets.iter_mut() {
+                    let existing_value = if let Some(row) = cached_row.as_ref() {
+                        row.get(*idx).cloned().unwrap_or(Value::Null)
+                    } else {
+                        crate::common::encoding::RowDecoder::decode_column(v, *idx)
+                            .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
+                            .unwrap_or(Value::Null)
+                    };
+                    if existing_value != Value::Null {
+                        values.insert(normalized_unique_set_value(&existing_value));
+                    }
+                }
+            }
+        }
+        unique_sets.sets = Some(sets);
+        Ok(())
     }
 
     /// Stage unique-constraint sentinel keys for every non-PK UNIQUE column

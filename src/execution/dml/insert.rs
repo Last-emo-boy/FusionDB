@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use super::super::composite_index::CompositeIndexMeta;
 use super::super::{Executor, ForeignKeyMeta, QueryResult};
+use super::UniqueColumnValueSets;
 
 struct InsertRowsContext {
     table_name: String,
@@ -393,9 +394,17 @@ impl Executor {
         };
 
         let mut count = 0usize;
+        let mut unique_sets = UniqueColumnValueSets::new();
         for raw_values in raw_rows {
             if let Some(row) = self
-                .insert_prepared_values_row(context, raw_values, on_conflict, txn, count)
+                .insert_prepared_values_row(
+                    context,
+                    raw_values,
+                    on_conflict,
+                    txn,
+                    count,
+                    &mut unique_sets,
+                )
                 .await?
             {
                 if returning.is_some() {
@@ -430,6 +439,7 @@ impl Executor {
         on_conflict: Option<&OnInsert>,
         txn: &mut dyn Transaction,
         row_index: usize,
+        unique_sets: &mut UniqueColumnValueSets,
     ) -> Result<Option<Vec<Value>>> {
         let (mut row_values, missing_serial_indexes) =
             self.map_raw_insert_values(context, raw_values)?;
@@ -481,37 +491,14 @@ impl Executor {
             }
         }
 
-        for (idx, col) in context.schema.columns.iter().enumerate() {
-            if col.is_unique && !col.is_primary && row_values[idx] != Value::Null {
-                let existing = self
-                    .scan_routed_data_prefixes_for_table(&context.table_name, txn, None)
-                    .await?;
-                for (k, v) in &existing {
-                    let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
-                        if let Some(row) = self.row_cache_lookup(key_str, v) {
-                            row.get(idx).cloned().unwrap_or(Value::Null)
-                        } else {
-                            crate::common::encoding::RowDecoder::decode_column(v, idx)
-                                .map_err(|e| {
-                                    FusionError::Execution(format!("Decode error: {}", e))
-                                })?
-                                .unwrap_or(Value::Null)
-                        }
-                    } else {
-                        crate::common::encoding::RowDecoder::decode_column(v, idx)
-                            .map_err(|e| FusionError::Execution(format!("Decode error: {}", e)))?
-                            .unwrap_or(Value::Null)
-                    };
-                    if existing_value == row_values[idx] {
-                        return Err(FusionError::Execution(format!(
-                            "UNIQUE constraint violated for column '{}': duplicate value '{}'",
-                            col.name,
-                            crate::common::encoding::encode_key(&row_values[idx])
-                        )));
-                    }
-                }
-            }
-        }
+        self.check_unique_columns_for_insert(
+            &context.table_name,
+            &context.schema,
+            &row_values,
+            unique_sets,
+            txn,
+        )
+        .await?;
 
         let row_id = self.row_id_for_insert(
             &context.schema,
@@ -600,6 +587,7 @@ impl Executor {
                             txn,
                         )
                         .await?;
+                        unique_sets.track_update(&context.schema, &old_existing_row, &existing_row);
                         self.update_trigram_index_for_update(
                             &context.table_name,
                             &context.schema,
@@ -679,6 +667,7 @@ impl Executor {
             txn,
         )
         .await?;
+        unique_sets.track_insert(&context.schema, &row_values);
 
         self.update_trigram_index_for_insert(
             &context.table_name,
@@ -834,6 +823,7 @@ impl Executor {
                     Vec::new()
                 };
                 let mut count = 0;
+                let mut unique_sets = UniqueColumnValueSets::new();
                 for row in &values.rows {
                     Self::insert_trace(format!(
                         "row start table={} row_index={} exprs={}",
@@ -931,42 +921,14 @@ impl Executor {
                     }
 
                     // Enforce UNIQUE constraints (non-PK unique columns)
-                    for (idx, col) in schema.columns.iter().enumerate() {
-                        if col.is_unique && !col.is_primary && row_values[idx] != Value::Null {
-                            // Scan existing rows for duplicate value
-                            let existing = self
-                                .scan_routed_data_prefixes_for_table(&table_name_str, txn, None)
-                                .await?;
-                            for (k, v) in &existing {
-                                let existing_value = if let Ok(key_str) = std::str::from_utf8(k) {
-                                    if let Some(row) = self.row_cache_lookup(key_str, v) {
-                                        row.get(idx).cloned().unwrap_or(Value::Null)
-                                    } else {
-                                        crate::common::encoding::RowDecoder::decode_column(v, idx)
-                                            .map_err(|e| {
-                                                FusionError::Execution(format!(
-                                                    "Decode error: {}",
-                                                    e
-                                                ))
-                                            })?
-                                            .unwrap_or(Value::Null)
-                                    }
-                                } else {
-                                    crate::common::encoding::RowDecoder::decode_column(v, idx)
-                                        .map_err(|e| {
-                                            FusionError::Execution(format!("Decode error: {}", e))
-                                        })?
-                                        .unwrap_or(Value::Null)
-                                };
-                                if existing_value == row_values[idx] {
-                                    return Err(FusionError::Execution(format!(
-                                        "UNIQUE constraint violated for column '{}': duplicate value '{}'",
-                                        col.name, crate::common::encoding::encode_key(&row_values[idx])
-                                    )));
-                                }
-                            }
-                        }
-                    }
+                    self.check_unique_columns_for_insert(
+                        &table_name_str,
+                        &schema,
+                        &row_values,
+                        &mut unique_sets,
+                        txn,
+                    )
+                    .await?;
 
                     let row_id =
                         self.row_id_for_insert(&schema, &row_values, &composite_unique_indexes);
@@ -1068,6 +1030,11 @@ impl Executor {
                                         txn,
                                     )
                                     .await?;
+                                    unique_sets.track_update(
+                                        &schema,
+                                        &old_existing_row,
+                                        &existing_row,
+                                    );
                                     self.update_trigram_index_for_update(
                                         &table_name_str,
                                         &schema,
@@ -1151,6 +1118,7 @@ impl Executor {
                         txn,
                     )
                     .await?;
+                    unique_sets.track_insert(&schema, &row_values);
 
                     self.update_trigram_index_for_insert(
                         &table_name_str,

@@ -1880,3 +1880,89 @@ async fn test_copy_from_text_coerces_timezone_offset_to_timestamptz() {
     let _ = std::fs::remove_file(csv_path);
     cleanup(&wal);
 }
+
+#[tokio::test]
+async fn test_unique_column_batch_insert_duplicates() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE uniq_batch (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_batch VALUES (1, 'a@x.com'), (2, 'b@x.com')",
+    )
+    .await;
+
+    // Duplicate of a committed value.
+    let stmts = executor
+        .prepare("INSERT INTO uniq_batch VALUES (3, 'a@x.com')")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("UNIQUE constraint violated"), "{err}");
+
+    // Duplicate within a single multi-row statement.
+    let stmts = executor
+        .prepare("INSERT INTO uniq_batch VALUES (4, 'c@x.com'), (5, 'c@x.com')")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("UNIQUE constraint violated"), "{err}");
+
+    // NULLS DISTINCT: any number of NULLs is allowed.
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_batch VALUES (6, NULL), (7, NULL)",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT id FROM uniq_batch WHERE email IS NULL").await;
+    assert_eq!(rows.len(), 2);
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_unique_column_upsert_keeps_statement_value_sets_in_sync() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE uniq_upsert (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO uniq_upsert VALUES (1, 'old@x.com')").await;
+
+    // Within one statement: row 1's DO UPDATE frees 'old@x.com', so the next
+    // row of the same statement may take the freed value.
+    exec_ok(
+        &executor,
+        "INSERT INTO uniq_upsert VALUES (1, 'new@x.com'), (2, 'old@x.com') \
+         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
+    )
+    .await;
+    let (_, rows) = query(&executor, "SELECT email FROM uniq_upsert ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::String("new@x.com".to_string())],
+            vec![Value::String("old@x.com".to_string())],
+        ]
+    );
+
+    // The value taken by the DO UPDATE is tracked: a later row of the same
+    // statement inserting it must fail.
+    let stmts = executor
+        .prepare(
+            "INSERT INTO uniq_upsert VALUES (1, 'x@x.com'), (4, 'x@x.com') \
+             ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
+        )
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("UNIQUE constraint violated"), "{err}");
+
+    // A committed duplicate of the updated value still fails across statements.
+    let stmts = executor
+        .prepare("INSERT INTO uniq_upsert VALUES (5, 'new@x.com')")
+        .unwrap();
+    let err = executor.execute(&stmts[0]).await.unwrap_err().to_string();
+    assert!(err.contains("UNIQUE constraint violated"), "{err}");
+    cleanup(&wal);
+}
