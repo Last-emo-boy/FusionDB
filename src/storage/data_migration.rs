@@ -18,6 +18,9 @@ use crate::storage::keyspace::{encode_identifier_key, KeyNamespace};
 pub(crate) const MIGRATION_PHASE_RECORD_LEN: usize = 18;
 pub(crate) const MIGRATION_PHASE_RECORD_VERSION: u8 = 1;
 const MIGRATION_PHASE_KEY_COMPONENT: &[u8] = b"data-v2-migration-phase";
+const BACKFILL_STATE_KEY_COMPONENT: &[u8] = b"data-v2-backfill-state";
+pub(crate) const BACKFILL_STATE_RECORD_VERSION: u8 = 1;
+const BACKFILL_STATE_HEADER_LEN: usize = 40;
 
 /// The migration ladder. `Legacy` (ordinal 0) is reserved and never
 /// materialized: even with the shadow flag off, delete-side v2 tombstones and
@@ -38,13 +41,12 @@ pub(crate) enum DataMigrationPhase {
 /// The highest phase whose full contract (write, read, and CDC behavior) this
 /// binary implements. Opening, applying, or installing state above this phase
 /// must be refused — running blind would diverge by node version.
-pub(crate) const MAX_SUPPORTED_PHASE: DataMigrationPhase = DataMigrationPhase::WriteDeleteShadow;
+pub(crate) const MAX_SUPPORTED_PHASE: DataMigrationPhase = DataMigrationPhase::Backfill;
 
 /// The highest phase `CALL fusiondb_data_migration_advance` may target.
 /// Kept separate from `MAX_SUPPORTED_PHASE` so later tickets can land phase
 /// implementations dark (raise SUPPORTED) before unlocking the advance gate.
-pub(crate) const MAX_ADVANCE_TARGET_PHASE: DataMigrationPhase =
-    DataMigrationPhase::WriteDeleteShadow;
+pub(crate) const MAX_ADVANCE_TARGET_PHASE: DataMigrationPhase = DataMigrationPhase::Backfill;
 
 impl DataMigrationPhase {
     pub(crate) fn from_byte(byte: u8) -> Option<Self> {
@@ -165,6 +167,141 @@ pub(crate) fn migration_phase_key() -> &'static [u8] {
     KEY.get_or_init(|| {
         encode_identifier_key(KeyNamespace::Catalog, &[MIGRATION_PHASE_KEY_COMPONENT])
             .expect("static migration phase key components are codec-valid")
+    })
+}
+
+/// The durable backfill cursor. One record for the whole store, rewritten by
+/// every chunk inside that chunk's own transaction, so progress and copied
+/// rows are always durable together.
+///
+/// It is also the DDL conflict point: DROP/TRUNCATE rewrite this key once the
+/// phase reaches `Backfill`, which forces a write-write conflict with any
+/// in-flight chunk. Without that, a cleanup and a chunk touch disjoint keys
+/// (the cleanup only tombstones what its own snapshot saw) and both commit,
+/// stranding v2 rows for a table that no longer exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DataBackfillState {
+    /// Shard count observed when the backfill started, or `None` when no
+    /// router was configured. A topology change invalidates every cursor, so
+    /// resuming across one is refused loudly.
+    pub(crate) shard_count_at_start: Option<u64>,
+    pub(crate) chunks_done: u64,
+    pub(crate) rows_done: u64,
+    pub(crate) updated_at_unix_ms: u64,
+    pub(crate) complete: bool,
+    /// The last legacy key copied. Resumption continues strictly after it, so
+    /// a chunk that crashed mid-flight is simply redone (chunks are
+    /// idempotent: a v2 put of an identical value is a no-op in effect).
+    pub(crate) cursor: Option<Vec<u8>>,
+}
+
+impl DataBackfillState {
+    /// The widest cursor the codec accepts. Comfortably above any key the
+    /// storage engine can hold, so a checkpoint never becomes impossible; the
+    /// bound exists to stop a corrupt record from allocating wildly.
+    pub(crate) const MAX_CURSOR_BYTES: usize = 4 * 1024 * 1024;
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        let cursor = self.cursor.as_deref().unwrap_or(&[]);
+        if cursor.len() > Self::MAX_CURSOR_BYTES {
+            return Err(FusionError::Storage(format!(
+                "Data V2 backfill cursor is too large to checkpoint: {} > {}",
+                cursor.len(),
+                Self::MAX_CURSOR_BYTES
+            )));
+        }
+        let mut out = Vec::with_capacity(BACKFILL_STATE_HEADER_LEN + cursor.len());
+        out.push(BACKFILL_STATE_RECORD_VERSION);
+        out.push(u8::from(self.complete));
+        // A presence flag, not an in-band sentinel: any u64 is a legal shard
+        // count and must round-trip distinctly from "no router".
+        out.push(u8::from(self.shard_count_at_start.is_some()));
+        out.extend_from_slice(&self.shard_count_at_start.unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(&self.chunks_done.to_be_bytes());
+        out.extend_from_slice(&self.rows_done.to_be_bytes());
+        out.extend_from_slice(&self.updated_at_unix_ms.to_be_bytes());
+        out.push(u8::from(self.cursor.is_some()));
+        out.extend_from_slice(&(cursor.len() as u32).to_be_bytes());
+        out.extend_from_slice(cursor);
+        Ok(out)
+    }
+
+    /// Strict decode: exact header, exact declared cursor length with no
+    /// trailing bytes, and a cursor bounded by the key codec's own limits so
+    /// a legally writable row can always be checkpointed.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        let malformed = |detail: &str| {
+            FusionError::Storage(format!(
+                "Data V2 backfill state record is malformed: {detail}"
+            ))
+        };
+        if bytes.len() < BACKFILL_STATE_HEADER_LEN {
+            return Err(malformed("shorter than the fixed header"));
+        }
+        if bytes[0] != BACKFILL_STATE_RECORD_VERSION {
+            return Err(malformed(&format!(
+                "unsupported version {} (expected {BACKFILL_STATE_RECORD_VERSION})",
+                bytes[0]
+            )));
+        }
+        let complete = match bytes[1] {
+            0 => false,
+            1 => true,
+            other => return Err(malformed(&format!("invalid completion flag {other}"))),
+        };
+        let has_shard_count = match bytes[2] {
+            0 => false,
+            1 => true,
+            other => return Err(malformed(&format!("invalid shard-count flag {other}"))),
+        };
+        let raw_shard_count = u64::from_be_bytes(bytes[3..11].try_into().expect("length checked"));
+        if !has_shard_count && raw_shard_count != 0 {
+            return Err(malformed(
+                "shard-count flag is unset but a count is present",
+            ));
+        }
+        let shard_count_at_start = has_shard_count.then_some(raw_shard_count);
+        let chunks_done = u64::from_be_bytes(bytes[11..19].try_into().expect("length checked"));
+        let rows_done = u64::from_be_bytes(bytes[19..27].try_into().expect("length checked"));
+        let updated_at_unix_ms =
+            u64::from_be_bytes(bytes[27..35].try_into().expect("length checked"));
+        let has_cursor = match bytes[35] {
+            0 => false,
+            1 => true,
+            other => return Err(malformed(&format!("invalid cursor flag {other}"))),
+        };
+        let cursor_len =
+            u32::from_be_bytes(bytes[36..40].try_into().expect("length checked")) as usize;
+        if cursor_len > Self::MAX_CURSOR_BYTES {
+            return Err(malformed(&format!(
+                "cursor is too large: {cursor_len} > {}",
+                Self::MAX_CURSOR_BYTES
+            )));
+        }
+        if bytes.len() != BACKFILL_STATE_HEADER_LEN + cursor_len {
+            return Err(malformed(
+                "declared cursor length does not match the record",
+            ));
+        }
+        if !has_cursor && cursor_len != 0 {
+            return Err(malformed("cursor flag is unset but a cursor is present"));
+        }
+        Ok(Self {
+            shard_count_at_start,
+            chunks_done,
+            rows_done,
+            updated_at_unix_ms,
+            complete,
+            cursor: has_cursor.then(|| bytes[BACKFILL_STATE_HEADER_LEN..].to_vec()),
+        })
+    }
+}
+
+pub(crate) fn backfill_state_key() -> &'static [u8] {
+    static KEY: OnceLock<Vec<u8>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        encode_identifier_key(KeyNamespace::Catalog, &[BACKFILL_STATE_KEY_COMPONENT])
+            .expect("static backfill state key components are codec-valid")
     })
 }
 
@@ -342,6 +479,104 @@ mod tests {
         let mut zero_seq = valid;
         zero_seq[2..10].copy_from_slice(&0u64.to_be_bytes());
         assert!(DataMigrationPhaseRecord::decode(&zero_seq).is_err());
+    }
+
+    fn backfill_state(cursor: Option<&[u8]>, shard_count: Option<u64>) -> DataBackfillState {
+        DataBackfillState {
+            shard_count_at_start: shard_count,
+            chunks_done: 7,
+            rows_done: 4096,
+            updated_at_unix_ms: 1_752_000_000_123,
+            complete: false,
+            cursor: cursor.map(<[u8]>::to_vec),
+        }
+    }
+
+    #[test]
+    fn backfill_state_round_trips_every_field() {
+        for state in [
+            backfill_state(None, None),
+            backfill_state(Some(b"data:orders:0001"), Some(16)),
+            // Every u64 is a legal shard count, including the value a
+            // sentinel-based encoding would have swallowed.
+            backfill_state(Some(b""), Some(u64::MAX)),
+            backfill_state(Some(&[0xff; 512]), Some(0)),
+            DataBackfillState {
+                complete: true,
+                ..backfill_state(Some(b"shard:9:data:t:1"), Some(4))
+            },
+        ] {
+            let encoded = state.encode().expect("encode");
+            assert_eq!(DataBackfillState::decode(&encoded).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn backfill_state_decode_rejects_malformed_shapes() {
+        let valid = backfill_state(Some(b"data:orders:1"), Some(8))
+            .encode()
+            .unwrap();
+
+        assert!(DataBackfillState::decode(&valid[..valid.len() - 1]).is_err());
+        let mut extra = valid.clone();
+        extra.push(0);
+        assert!(
+            DataBackfillState::decode(&extra).is_err(),
+            "trailing bytes must be rejected"
+        );
+
+        for (index, byte, reason) in [
+            (0usize, 2u8, "version"),
+            (1, 2, "completion flag"),
+            (2, 2, "shard-count flag"),
+            (35, 2, "cursor flag"),
+        ] {
+            let mut corrupt = valid.clone();
+            corrupt[index] = byte;
+            assert!(
+                DataBackfillState::decode(&corrupt).is_err(),
+                "{reason} must be validated"
+            );
+        }
+
+        // Cursor flag unset while a cursor is present.
+        let mut lying = valid.clone();
+        lying[35] = 0;
+        assert!(DataBackfillState::decode(&lying).is_err());
+
+        // Shard-count flag unset while a count is present.
+        let mut ghost_count = backfill_state(None, None).encode().unwrap();
+        ghost_count[3..11].copy_from_slice(&7u64.to_be_bytes());
+        assert!(DataBackfillState::decode(&ghost_count).is_err());
+    }
+
+    /// An over-long cursor must fail loudly at write time. Silently encoding
+    /// one would durably store a record this same binary then refuses to
+    /// decode, wedging every later chunk and every DROP/TRUNCATE.
+    #[test]
+    fn backfill_state_refuses_to_encode_an_undecodable_cursor() {
+        let oversized = vec![b'x'; DataBackfillState::MAX_CURSOR_BYTES + 1];
+        let error = backfill_state(Some(&oversized), None)
+            .encode()
+            .expect_err("an oversized cursor must not be encoded");
+        assert!(error.to_string().contains("too large to checkpoint"));
+
+        let at_limit = vec![b'x'; DataBackfillState::MAX_CURSOR_BYTES];
+        let encoded = backfill_state(Some(&at_limit), None)
+            .encode()
+            .expect("a cursor at the limit is encodable");
+        assert!(
+            DataBackfillState::decode(&encoded).is_ok(),
+            "anything encodable must be decodable"
+        );
+    }
+
+    #[test]
+    fn backfill_state_key_is_a_distinct_catalog_sibling() {
+        assert!(backfill_state_key().starts_with(b"\0FDBK"));
+        assert_eq!(backfill_state_key()[6], 6);
+        assert_ne!(backfill_state_key(), migration_phase_key());
+        assert_eq!(backfill_state_key(), backfill_state_key());
     }
 
     #[test]

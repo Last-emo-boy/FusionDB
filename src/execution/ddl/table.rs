@@ -608,6 +608,11 @@ impl Executor {
             }
             self.delete_structured_data_shadows_for_table(&table_name, txn)
                 .await?;
+            // Force a write-write conflict with any in-flight backfill chunk:
+            // the cleanup above only tombstones v2 keys its own snapshot saw,
+            // so a concurrent chunk's fresh puts would otherwise commit
+            // alongside this DDL and strand orphan shadow rows.
+            self.touch_backfill_state_for_ddl(txn).await?;
 
             let mut index_entries = self
                 .scan_routed_prefixes(self.routed_index_prefixes_for_table(&table_name), txn, None)
@@ -669,6 +674,11 @@ impl Executor {
             }
             self.delete_structured_data_shadows_for_table(&table_name, txn)
                 .await?;
+            // Force a write-write conflict with any in-flight backfill chunk:
+            // the cleanup above only tombstones v2 keys its own snapshot saw,
+            // so a concurrent chunk's fresh puts would otherwise commit
+            // alongside this DDL and strand orphan shadow rows.
+            self.touch_backfill_state_for_ddl(txn).await?;
             count += kv_pairs.len();
 
             let mut index_entries = self

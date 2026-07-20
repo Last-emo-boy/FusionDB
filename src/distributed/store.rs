@@ -22,7 +22,7 @@ use super::typ::{
 };
 use crate::execution::Executor;
 use crate::storage::data_migration::{
-    migration_phase_key, DataMigrationPhaseRecord, MAX_SUPPORTED_PHASE,
+    migration_phase_key, DataMigrationPhase, DataMigrationPhaseRecord, MAX_SUPPORTED_PHASE,
 };
 use crate::storage::fusion::{FusionTransaction, SideIndexDelta};
 use crate::storage::{FusionStorage, Storage};
@@ -360,6 +360,41 @@ impl FusionRaftStore {
                     new_record.phase_seq,
                     MAX_SUPPORTED_PHASE.name()
                 )));
+            }
+        }
+
+        // Once the store is at Backfill or beyond, every data-family write
+        // must have been fenced, which means its batch carries a phase
+        // precondition. A batch without one was produced by a binary that
+        // does not know about the fence; applying it would punch silent holes
+        // in the shadow set that no verifier could later explain. Reject
+        // deterministically so the node keeps serving and the operator sees a
+        // loud failure instead of quiet corruption.
+        if batch.mutations.iter().any(|mutation| {
+            let key = match mutation {
+                KvMutation::Put { key, .. } => key,
+                KvMutation::Delete { key } => key,
+            };
+            is_data_family_key(key)
+        }) {
+            let record = txn
+                .get(migration_phase_key())
+                .await
+                .map_err(state_machine_read_error)?
+                .as_deref()
+                .map(DataMigrationPhaseRecord::decode)
+                .transpose()
+                .map_err(state_machine_write_error)?;
+            let fenced = batch
+                .preconditions
+                .iter()
+                .any(|precondition| precondition.key.as_slice() == migration_phase_key());
+            if !fenced && record.is_some_and(|record| record.phase >= DataMigrationPhase::Backfill)
+            {
+                txn.rollback().await.map_err(state_machine_write_error)?;
+                return Ok(Response::error(
+                    "Raft batch writes data rows without a Data V2 migration phase precondition while the store is at 'backfill' or beyond; the proposing node must be upgraded",
+                ));
             }
         }
 
@@ -903,6 +938,31 @@ fn canonical_snapshot_entries(
         entries.insert(RAFT_APPLIED_WATERMARK_KEY.to_vec(), watermark);
     }
     Ok(entries)
+}
+
+/// True for every key that holds a base row, in all three physical shapes:
+/// legacy unsharded, legacy sharded, and the Data V2 namespace. Index, unique,
+/// fts and catalog keys are deliberately excluded — only base rows participate
+/// in the shadow-write contract the fence protects.
+fn is_data_family_key(key: &[u8]) -> bool {
+    if crate::storage::keyspace::parse_data_key_exact(key).is_ok() {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(key) else {
+        return false;
+    };
+    if text.starts_with("data:") {
+        return true;
+    }
+    let Some(rest) = text.strip_prefix("shard:") else {
+        return false;
+    };
+    let Some((shard, tail)) = rest.split_once(':') else {
+        return false;
+    };
+    !shard.is_empty()
+        && shard.bytes().all(|byte| byte.is_ascii_digit())
+        && tail.starts_with("data:")
 }
 
 fn normalize_snapshot_payload(
@@ -2273,27 +2333,38 @@ mod tests {
     #[tokio::test]
     async fn apply_halts_when_cluster_advances_beyond_binary_support() {
         let (mut store, storage, wal_path) = test_store("phase_guard_halt");
-        store
-            .apply_to_state_machine(&[phase_mutation_entry(
-                3,
-                1,
-                KvMutation::Put {
-                    key: migration_phase_key().to_vec(),
-                    value: phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 1),
-                },
-            )])
-            .await
-            .unwrap();
+        // Walk the ladder legitimately up to this binary's ceiling.
+        for (index, phase) in [
+            DataMigrationPhase::WriteDeleteShadow,
+            DataMigrationPhase::Backfill,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seq = index as u64 + 1;
+            let response = store
+                .apply_to_state_machine(&[phase_mutation_entry(
+                    3,
+                    seq,
+                    KvMutation::Put {
+                        key: migration_phase_key().to_vec(),
+                        value: phase_record_bytes(phase, seq),
+                    },
+                )])
+                .await
+                .unwrap();
+            assert!(response[0].success, "ladder step {phase:?} was rejected");
+        }
 
         // A legitimate next step past this binary's support must halt the
         // state machine, not apply blind.
         let error = store
             .apply_to_state_machine(&[phase_mutation_entry(
                 3,
-                2,
+                3,
                 KvMutation::Put {
                     key: migration_phase_key().to_vec(),
-                    value: phase_record_bytes(DataMigrationPhase::Backfill, 2),
+                    value: phase_record_bytes(DataMigrationPhase::Validated, 3),
                 },
             )])
             .await
@@ -2301,7 +2372,7 @@ mod tests {
         assert!(error.to_string().contains("halting"));
         assert_eq!(
             stored_phase_record(&storage).await,
-            Some(phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 1))
+            Some(phase_record_bytes(DataMigrationPhase::Backfill, 2))
         );
 
         let _ = std::fs::remove_file(wal_path);
@@ -2503,6 +2574,220 @@ mod tests {
         let _ = std::fs::remove_file(target_wal);
     }
 
+    /// The backfill step is single-node only this ticket: driving chunks
+    /// through Raft would record a precondition per copied key, so any
+    /// concurrent DML between evaluation and apply would halt the state
+    /// machine. It must therefore never reach a proposal.
+    #[tokio::test]
+    async fn raft_evaluation_refuses_the_backfill_step() {
+        let (_store, storage, wal_path) = test_store("phase_backfill_closed");
+        let executor = Executor::new(storage.clone());
+        executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+
+        let error = evaluate_sql_to_request(&executor, "CALL fusiondb_data_backfill_step()")
+            .await
+            .expect_err("the backfill step must fail closed on the Raft path");
+        assert!(
+            error.contains("backfill step"),
+            "the refusal must name the backfill step: {error}"
+        );
+
+        // The read-only status procedure is not a write at all, so it is
+        // rejected as "not a mutating statement" rather than proposed.
+        let error = evaluate_sql_to_request(&executor, "CALL fusiondb_data_backfill_status()")
+            .await
+            .expect_err("status is not a mutating statement");
+        assert!(error.contains("mutating"), "unexpected: {error}");
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// Once the store is at Backfill, a batch that writes base rows without a
+    /// phase precondition came from a binary that does not know about the
+    /// fence. It must be rejected deterministically — not applied, and not
+    /// halting.
+    #[tokio::test]
+    async fn apply_rejects_unfenced_data_writes_at_backfill_phase() {
+        let (mut store, storage, wal_path) = test_store("phase_unfenced_guard");
+        for (seq, phase) in [
+            DataMigrationPhase::WriteDeleteShadow,
+            DataMigrationPhase::Backfill,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seq = seq as u64 + 1;
+            store
+                .apply_to_state_machine(&[phase_mutation_entry(
+                    8,
+                    seq,
+                    KvMutation::Put {
+                        key: migration_phase_key().to_vec(),
+                        value: phase_record_bytes(phase, seq),
+                    },
+                )])
+                .await
+                .unwrap();
+        }
+
+        // All three physical base-row shapes must be caught.
+        for (index, key) in [
+            b"data:orders:1".to_vec(),
+            b"shard:3:data:orders:1".to_vec(),
+            crate::storage::keyspace::encode_data_key(
+                crate::storage::keyspace::DataRoute::Unsharded,
+                b"orders",
+                b"1",
+            )
+            .unwrap(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = store
+                .apply_to_state_machine(&[phase_mutation_entry(
+                    8,
+                    10 + index as u64,
+                    KvMutation::Put {
+                        key: key.clone(),
+                        value: b"unfenced".to_vec(),
+                    },
+                )])
+                .await
+                .unwrap();
+            assert!(
+                !response[0].success,
+                "an unfenced data write was accepted at phase backfill: {:?}",
+                String::from_utf8_lossy(&key)
+            );
+            assert!(response[0].message.contains("phase precondition"));
+            let txn = storage.begin_transaction().await.unwrap();
+            assert_eq!(
+                txn.get(&key).await.unwrap(),
+                None,
+                "the write must not land"
+            );
+        }
+
+        // A non-data key is unaffected, and a properly fenced data write applies.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                8,
+                20,
+                KvMutation::Put {
+                    key: b"schema:orders".to_vec(),
+                    value: b"not a base row".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(response[0].success);
+
+        let fenced = Entry {
+            log_id: test_log_id(8, 21),
+            payload: EntryPayload::Normal(Request::MutationBatch(MutationBatch {
+                version: MUTATION_BATCH_VERSION,
+                preconditions: vec![crate::distributed::typ::KvPrecondition {
+                    key: migration_phase_key().to_vec(),
+                    expected: Some(phase_record_bytes(DataMigrationPhase::Backfill, 2)),
+                }],
+                mutations: vec![KvMutation::Put {
+                    key: b"data:orders:2".to_vec(),
+                    value: b"fenced".to_vec(),
+                }],
+                side_index_mutations: Vec::new(),
+                response: Response::success("Inserted 1 rows"),
+            })),
+        };
+        let response = store.apply_to_state_machine(&[fenced]).await.unwrap();
+        assert!(response[0].success, "a fenced data write must still apply");
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// CTE materialization writes rows into the legacy `data:` namespace, so
+    /// its batches must carry a phase precondition too — otherwise the guard
+    /// above would reject ordinary `INSERT ... WITH ...` statements on a
+    /// cluster that has reached Backfill.
+    #[tokio::test]
+    async fn cte_batches_carry_a_phase_precondition_and_apply_at_backfill() {
+        let (mut store, storage, wal_path) = test_store("phase_cte_fenced");
+        let executor = Executor::new(storage.clone());
+        executor
+            .execute_sql("CREATE TABLE cte_src (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("CREATE TABLE cte_dst (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
+        for sql in [
+            "CALL fusiondb_data_migration_init()",
+            "CALL fusiondb_data_migration_advance('write-delete-shadow')",
+            "CALL fusiondb_data_migration_advance('backfill')",
+        ] {
+            executor.execute_sql(sql).await.unwrap();
+        }
+        // Mirror the phase onto the state machine's own storage.
+        for (seq, phase) in [
+            DataMigrationPhase::WriteDeleteShadow,
+            DataMigrationPhase::Backfill,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seq = seq as u64 + 1;
+            store
+                .apply_to_state_machine(&[phase_mutation_entry(
+                    9,
+                    seq,
+                    KvMutation::Put {
+                        key: migration_phase_key().to_vec(),
+                        value: phase_record_bytes(phase, seq),
+                    },
+                )])
+                .await
+                .unwrap();
+        }
+
+        // A CTE whose outer INSERT selects nothing: the only data-family
+        // mutations in the batch come from materializing the CTE.
+        let request = evaluate_sql_to_request(
+            &executor,
+            "INSERT INTO cte_dst WITH batch AS (SELECT id FROM cte_src) SELECT id FROM batch WHERE id > 999999",
+        )
+        .await
+        .expect("a CTE insert must evaluate");
+        let Request::MutationBatch(batch) = &request else {
+            panic!("expected a mutation batch");
+        };
+        assert!(
+            batch
+                .preconditions
+                .iter()
+                .any(|p| p.key == migration_phase_key()),
+            "a batch containing CTE data-family writes must be fenced"
+        );
+
+        let response = store
+            .apply_to_state_machine(&[Entry {
+                log_id: test_log_id(9, 30),
+                payload: EntryPayload::Normal(request),
+            }])
+            .await
+            .unwrap();
+        assert!(
+            response[0].success,
+            "an ordinary CTE insert must not be rejected at phase backfill: {}",
+            response[0].message
+        );
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
     /// The standalone rule must hold on the Raft evaluation path too, not
     /// only in `execute_sql`.
     #[tokio::test]
@@ -2542,7 +2827,7 @@ mod tests {
             version: SNAPSHOT_PAYLOAD_VERSION,
             entries: vec![(
                 migration_phase_key().to_vec(),
-                phase_record_bytes(DataMigrationPhase::Backfill, 3),
+                phase_record_bytes(DataMigrationPhase::Validated, 4),
             )],
         };
         let error = store

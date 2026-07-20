@@ -1,0 +1,50 @@
+{
+  "id": "P10-2.3",
+  "title": "Data V2 backfill engine: resumable chunks, DDL conflict point, advance->Backfill unlock",
+  "phase": "P10-2 Versioned Structured Keyspace (ticket 3 of 9)",
+  "status": "done",
+  "design": ".workflow/.csv-wave/20260720-design-p10-2-data-v2-migration-ladder/design.md",
+  "implementation": {
+    "state_record": "data-v2-backfill-state, a Catalog sibling of the phase record: 40-byte fixed header (version, complete, shard-count presence flag + value, chunks_done, rows_done, updated_at, cursor flag + length) plus a bounded cursor tail, strict decode. Shard count uses a presence flag rather than a u64::MAX sentinel because every u64 is a legal shard count.",
+    "chunking": "One transaction = N rows of v2 shadow writes + the cursor update, so progress and copied data are always durable together. Capped at 256 rows AND 1 MiB of values: every written key costs a latest_committed_timestamp probe under the global commit lock, so a bigger chunk stalls all other commits.",
+    "enumeration": "Walks the physical key order over [\"data:\",\"data;\") and [\"shard:\",\"shard;\") instead of asking ShardRouter (verified: the router enumerates only the current shard_count and, once enabled, omits the unsharded prefix entirely, so historical shards and pre-router rows would be silently skipped). Non-base-row keys in the shard region are skipped.",
+    "table_identity": "Schemas are loaded once per chunk; the {table}:{row_id} split is resolved against the known table set, with the row's own primary key breaking multi-candidate ties, and orphan rows of unknown tables are skipped. The primary key is NOT always column 0 (get_primary_key_index searches for is_primary) — an initial column-0 implementation was corrected before review.",
+    "ddl_conflict_point": "At phase >= Backfill, DROP/TRUNCATE unconditionally rewrite the state record, forcing a write-write conflict with any in-flight chunk. Unconditional matters: the first chunk is the one that creates the record, and a conditional rewrite would leave exactly that chunk unguarded.",
+    "operator_surface": "CALL fusiondb_data_backfill_step() / fusiondb_data_backfill_status(), reusing the whole P10-2.1 chain (statement-shaped superuser gate, standalone rule, raft routing classification); status is read-only and does not route to the Raft write path.",
+    "phase_gates": "MAX_SUPPORTED_PHASE and MAX_ADVANCE_TARGET_PHASE both raised to Backfill — raising only the latter bricks the store (all data writes refused, with_config refuses to open, apply halts)."
+  },
+  "deliberate_decision": {
+    "single_node_only": "The chunk step fails closed on the Raft path (added to statement_is_unsafe_to_stage). RecordingTransaction records a precondition per written key, so a chunk proposes hundreds of them; any concurrent DML touching one between leader evaluation and apply is a precondition mismatch, and that is fail-closed HALT, not a retry. A routine race would therefore halt a replica. Same precedent as pgwire writes failing closed in Raft mode. A distributed drive needs a proposal shape that does not amplify preconditions — its own ticket."
+  },
+  "adversarial_review": {
+    "mode": "READ-ONLY (Explore agents, prompt-level ban on writes and mutating git commands, tree snapshotted as 5db5a1e before launch)",
+    "scale": "5 dimensions, 28 agents, ~1.69M tokens",
+    "confirmed": 2,
+    "findings": [
+      "BLOCKER cursor poisoning: the cursor was taken from any visited key, and shard:N:index:/unique: keys embed unbounded column values, so it could exceed the decode bound while encode did NOT validate — writing a record this same binary cannot read back. Blast radius beyond the backfill: touch_backfill_state_for_ddl reads it, so every DROP/TRUNCATE on the store would fail permanently, with no SQL path to repair a Catalog key. The reviewer also noted that within shard:N: the families sort data < fts < index < unique, so an exhausting scan's terminal key is routinely a unique sentinel — poisoning is the normal terminal case. Fixed: cursor bound raised to 4 MiB (above any key the engine can hold) AND enforced on encode, so an over-long cursor is a loud write-time error instead of an unreadable record.",
+      "MAJOR CTE false positive: is_data_family_key matches data:{cte}:{row}, but CTE materialization writes without a fence, so at phase >= Backfill an ordinary INSERT ... WITH ... whose outer select returns nothing produces a batch with data-family mutations and no phase precondition, and the new guard rejects it cluster-wide with a misleading 'the proposing node must be upgraded'. The reviewer further showed the guard's intended adversary is unreachable — an old binary halts on the advance-to-Backfill entry before it could ever propose an unfenced write — so the false positive was reachable while the true positive was not. Fixed at the root: CTE materialization now observes the fence, since anything writing into the data: namespace is bound by the P10-2.1 invariant."
+    ]
+  },
+  "verification": {
+    "gate": "cargo test --locked --all-targets: 1216 passed (1200 after P10-2.2, +16), cargo fmt clean",
+    "engine": "cross-chunk resume; reopen resumes from the durable cursor rather than restarting; shadow values byte-equal their legacy rows; a step after completion is an idempotent no-op",
+    "convergence": "a chunk and a concurrent UPDATE collide on the same v2 key, the chunk aborts loudly, and the retry lands the newest value",
+    "ddl_race": "DROP commits first, the in-flight chunk aborts, and the dropped table leaves zero shadow rows behind",
+    "identity": "primary key in the second column, row ids containing ':', quoted table names, a synthetic genuinely colon-named table exercising the multi-candidate tie-break, and orphan rows skipped",
+    "routes": "unsharded and historical shard:7: rows both copied; a shard:7:index: key in the same range skipped",
+    "gates": "step refused below phase backfill, resume refused across a shard topology change, argument/standalone/superuser prefix spellings all refused",
+    "codec": "full-field round trip including Some(u64::MAX) shard count, four flag-corruption cases, trailing bytes, flag/value inconsistency, and an over-long cursor refused at encode with 'anything encodable is decodable' asserted",
+    "distributed": "raft path refuses the backfill step; unfenced data writes in all three physical shapes are gracefully rejected at Backfill while the node keeps serving; fenced writes still apply; CTE batches carry a phase precondition and apply normally at Backfill"
+  },
+  "open_observation": "One `cargo test --lib` run reported 672 passed / 2 failed, but the output was not captured and the test names are unknown. Seven subsequent runs (3 solo, 1 concurrent with --all-targets under deliberate load, 3 captured) were all 674 green; not reproducible. This repo has a documented load-sensitive flaky family (fusion.rs GLOBAL_METRICS exact-delta assertions, flagged since d44ccc2 as 'migrate like the sstable ones if they recur') and this is plausibly the same, but that is UNPROVEN. If it recurs, capture the names first.",
+  "benchmark": {
+    "claim": "none",
+    "reasoning": "Backfill is an operator-driven offline path on no benchmarked part; the only write-path addition is one fence observation in CTE materialization (a cached synchronous fast path). This harness's noise floor (per-query p90 |delta| 36.2%) dwarfs that."
+  },
+  "followups": [
+    "P10-2.4 (next): exact verifier + verify token, unlocking advance->Validated",
+    "Distributed backfill drive: needs a proposal shape that does not amplify preconditions (own ticket)",
+    "Known limit: a single legacy key above 4 MiB (only reachable via a huge indexed column value) makes the chunk stop loudly at that key — safe but needs operator intervention",
+    "RETRACTION: the P10-2.1/2.2 tickets noted 'backfill must exclude CTE keys'. CTE rows are put and cleared inside one transaction (handle_query clears unconditionally) and MVCC publishes only at commit, so a concurrent transaction can never observe live CTE rows — no enumeration-level exclusion is needed. This ticket did fence CTE writes, but for the Raft guard, not for enumeration."
+  ]
+}

@@ -1188,6 +1188,11 @@ impl Executor {
                 check_expr: None,
             });
         }
+        // CTE rows live in the legacy `data:` namespace, so they are
+        // data-family writes and must observe the Data V2 migration phase
+        // like any other. Without this their Raft batches carry no phase
+        // precondition and the apply-side guard rejects them at >= Backfill.
+        self.observe_data_migration_phase_and_fence(txn).await?;
         let schema = TableSchema::new(cte_name.to_string(), cols);
         let schema_key = query_schema_key_for_table(cte_name);
         let schema_bytes = bincode::serialize(&schema)
@@ -1204,7 +1209,12 @@ impl Executor {
         Ok(())
     }
 
-    async fn clear_materialized_cte(txn: &mut dyn Transaction, cte_name: &str) -> Result<()> {
+    async fn clear_materialized_cte(
+        &self,
+        txn: &mut dyn Transaction,
+        cte_name: &str,
+    ) -> Result<()> {
+        self.observe_data_migration_phase_and_fence(txn).await?;
         let schema_key = query_schema_key_for_table(cte_name);
         txn.delete(schema_key.as_bytes()).await?;
         let prefix = materialized_cte_data_prefix_for_name(cte_name);
@@ -1222,7 +1232,7 @@ impl Executor {
         columns: &[String],
         rows: &[Vec<Value>],
     ) -> Result<()> {
-        Self::clear_materialized_cte(txn, cte_name).await?;
+        self.clear_materialized_cte(txn, cte_name).await?;
         self.put_materialized_cte(txn, cte_name, columns, rows)
             .await
     }
@@ -2111,7 +2121,7 @@ impl Executor {
 
         // Cleanup CTE temporary tables
         for name in &cte_names {
-            let _ = Self::clear_materialized_cte(txn, name).await;
+            let _ = self.clear_materialized_cte(txn, name).await;
         }
 
         result

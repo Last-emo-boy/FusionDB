@@ -22,8 +22,9 @@ use crate::distributed::sharding::{ShardRoute, ShardRouter};
 use crate::monitor;
 use crate::parser::parse_sql;
 use crate::storage::data_migration::{
-    migration_phase_key, CachedFenceState, DataMigrationFence, DataMigrationPhase,
-    DataMigrationPhaseRecord, MAX_ADVANCE_TARGET_PHASE, MAX_SUPPORTED_PHASE,
+    backfill_state_key, migration_phase_key, CachedFenceState, DataBackfillState,
+    DataMigrationFence, DataMigrationPhase, DataMigrationPhaseRecord, MAX_ADVANCE_TARGET_PHASE,
+    MAX_SUPPORTED_PHASE,
 };
 use crate::storage::{
     vector_index::VectorIndex, FusionStorage, ScanVisitor, Storage, StorageScanOptions, Transaction,
@@ -3981,7 +3982,10 @@ impl Executor {
             // Migration procedures mutate the durable phase record; other
             // CALL names keep today's non-mutating classification and fail
             // loudly at execution.
-            Statement::Call(function) => Self::is_data_migration_call(function),
+            Statement::Call(function) => {
+                Self::is_data_migration_call(function)
+                    && !Self::is_data_backfill_status_call(function)
+            }
             Statement::Explain { statement, .. } => {
                 Self::statement_may_change_query_results(statement)
             }
@@ -4635,6 +4639,18 @@ impl Executor {
     pub(crate) fn is_data_migration_call(function: &Function) -> bool {
         execution_object_name_eq_ascii(&function.name, "fusiondb_data_migration_init")
             || execution_object_name_eq_ascii(&function.name, "fusiondb_data_migration_advance")
+            || execution_object_name_eq_ascii(&function.name, "fusiondb_data_backfill_step")
+            || Self::is_data_backfill_status_call(function)
+    }
+
+    pub(crate) fn is_data_backfill_step_call(function: &Function) -> bool {
+        execution_object_name_eq_ascii(&function.name, "fusiondb_data_backfill_step")
+    }
+
+    /// Read-only status is not a mutating procedure: it must not route to the
+    /// Raft write path, but it is still operator-only.
+    pub(crate) fn is_data_backfill_status_call(function: &Function) -> bool {
+        execution_object_name_eq_ascii(&function.name, "fusiondb_data_backfill_status")
     }
 
     pub(crate) fn statement_is_data_migration_call(stmt: &Statement) -> bool {
@@ -4680,6 +4696,22 @@ impl Executor {
                 ));
             }
             return self.handle_data_migration_init(txn).await;
+        }
+        if execution_object_name_eq_ascii(&function.name, "fusiondb_data_backfill_step") {
+            if !args.is_empty() {
+                return Err(FusionError::Execution(
+                    "CALL fusiondb_data_backfill_step() takes no arguments".to_string(),
+                ));
+            }
+            return self.run_backfill_chunk(txn).await;
+        }
+        if execution_object_name_eq_ascii(&function.name, "fusiondb_data_backfill_status") {
+            if !args.is_empty() {
+                return Err(FusionError::Execution(
+                    "CALL fusiondb_data_backfill_status() takes no arguments".to_string(),
+                ));
+            }
+            return self.handle_backfill_status(txn).await;
         }
         if execution_object_name_eq_ascii(&function.name, "fusiondb_data_migration_advance") {
             let [target] = args.as_slice() else {
@@ -4822,6 +4854,342 @@ impl Executor {
                     Value::Null,
                 ]],
             }),
+        }
+    }
+
+    // ---- Data V2 backfill engine (P10-2.3) ----
+
+    /// Rows copied per chunk. Every key in a chunk costs one
+    /// `latest_committed_timestamp` probe under the global commit lock, so a
+    /// larger chunk buys throughput by stalling every other commit for longer.
+    const BACKFILL_CHUNK_ROWS: usize = 256;
+    /// Byte ceiling for one chunk's copied values, so a table of large rows
+    /// cannot turn a chunk into an unbounded write buffer.
+    const BACKFILL_CHUNK_BYTES: usize = 1 << 20;
+
+    /// The legacy base-row key ranges, in byte order: unsharded rows first
+    /// (`data:`), then every shard route (`shard:{N}:data:`). Walking the
+    /// physical keyspace — rather than asking the router — is what makes the
+    /// backfill see historical shard ids and pre-router unsharded rows, which
+    /// `routed_data_prefixes_for_table` would silently skip.
+    fn legacy_backfill_ranges() -> [(Vec<u8>, Vec<u8>); 2] {
+        [
+            (b"data:".to_vec(), b"data;".to_vec()),
+            (b"shard:".to_vec(), b"shard;".to_vec()),
+        ]
+    }
+
+    /// Split a legacy base-row key into `(table, row_id)` using the set of
+    /// tables that actually exist.
+    ///
+    /// Both table names and row ids may contain `:`, so the split is resolved
+    /// against known table names first. When several known tables match (say
+    /// `orders` and `orders:archive`), the row's own primary key breaks the
+    /// tie. `Ok(None)` means the key belongs to no known table — an orphan
+    /// that must not be copied into a table's shadow set. A genuinely
+    /// ambiguous key is a loud error rather than a guess.
+    fn split_legacy_backfill_suffix(
+        suffix: &str,
+        value: &[u8],
+        schemas: &HashMap<String, TableSchema>,
+    ) -> Result<Option<(String, String)>> {
+        let mut candidates: Vec<(&str, &str)> = Vec::new();
+        for (index, _) in suffix.match_indices(':') {
+            let (table, row_id) = (&suffix[..index], &suffix[index + 1..]);
+            if table.is_empty() || row_id.is_empty() {
+                continue;
+            }
+            if schemas.contains_key(table) {
+                candidates.push((table, row_id));
+            }
+        }
+        match candidates.as_slice() {
+            [] => Ok(None),
+            [(table, row_id)] => Ok(Some((table.to_string(), row_id.to_string()))),
+            many => {
+                for (table, row_id) in many {
+                    let Some(schema) = schemas.get(*table) else {
+                        continue;
+                    };
+                    let Some(pk_index) = schema.get_primary_key_index() else {
+                        continue;
+                    };
+                    if let Ok(Some(pk_value)) =
+                        crate::common::encoding::RowDecoder::decode_column(value, pk_index)
+                    {
+                        if Self::value_to_primary_row_id(&pk_value).as_deref() == Some(*row_id) {
+                            return Ok(Some((table.to_string(), row_id.to_string())));
+                        }
+                    }
+                }
+                Err(FusionError::Execution(format!(
+                    "Data V2 backfill cannot resolve the table/row split of legacy key suffix '{suffix}': it matches several tables and no primary key confirms one"
+                )))
+            }
+        }
+    }
+
+    /// Classify a key found in the legacy ranges. `Ok(None)` means the key is
+    /// not a base row of a known table (a sharded index key, or an orphan) and
+    /// is skipped.
+    fn legacy_backfill_row_identity(
+        key: &[u8],
+        value: &[u8],
+        schemas: &HashMap<String, TableSchema>,
+    ) -> Result<Option<(String, String)>> {
+        let Ok(text) = std::str::from_utf8(key) else {
+            return Ok(None);
+        };
+        let suffix = if let Some(rest) = text.strip_prefix("data:") {
+            rest
+        } else if let Some(rest) = text.strip_prefix("shard:") {
+            // shard:{N}:data:{table}:{row_id} — anything else in the shard
+            // region belongs to another key family.
+            let Some((shard, tail)) = rest.split_once(':') else {
+                return Ok(None);
+            };
+            if shard.is_empty() || !shard.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Ok(None);
+            }
+            let Some(tail) = tail.strip_prefix("data:") else {
+                return Ok(None);
+            };
+            tail
+        } else {
+            return Ok(None);
+        };
+        if suffix.is_empty() {
+            return Ok(None);
+        }
+        Self::split_legacy_backfill_suffix(suffix, value, schemas)
+    }
+
+    /// Every table schema, loaded once per chunk so the scan visitor (which is
+    /// synchronous) can resolve table names without further storage reads.
+    async fn load_all_table_schemas(
+        txn: &mut dyn Transaction,
+    ) -> Result<HashMap<String, TableSchema>> {
+        let mut schemas = HashMap::new();
+        for (key, value) in txn.scan_prefix(b"schema:", None).await? {
+            let Some(name) = key
+                .strip_prefix(b"schema:".as_slice())
+                .and_then(|name| std::str::from_utf8(name).ok())
+            else {
+                continue;
+            };
+            if let Ok(schema) = bincode::deserialize::<TableSchema>(&value) {
+                schemas.insert(name.to_string(), schema);
+            }
+        }
+        Ok(schemas)
+    }
+
+    async fn read_backfill_state(txn: &mut dyn Transaction) -> Result<Option<DataBackfillState>> {
+        txn.get(backfill_state_key())
+            .await?
+            .as_deref()
+            .map(DataBackfillState::decode)
+            .transpose()
+    }
+
+    /// Rewrite the backfill state record so this transaction collides with any
+    /// in-flight chunk. Called by DROP/TRUNCATE once the phase reaches
+    /// `Backfill`: their v2 cleanup only tombstones keys their own snapshot
+    /// saw, so without a shared key a concurrent chunk's fresh puts would
+    /// commit alongside the drop and strand orphan shadow rows.
+    ///
+    /// The write is unconditional — including when no record exists yet —
+    /// because the very first chunk is the one that creates the record, and a
+    /// conditional rewrite would leave exactly that chunk unguarded.
+    pub(crate) async fn touch_backfill_state_for_ddl(
+        &self,
+        txn: &mut dyn Transaction,
+    ) -> Result<()> {
+        let phase = self.observe_data_migration_phase_and_fence(txn).await?;
+        if phase < DataMigrationPhase::Backfill {
+            return Ok(());
+        }
+        let mut state =
+            Self::read_backfill_state(txn)
+                .await?
+                .unwrap_or_else(|| DataBackfillState {
+                    shard_count_at_start: self
+                        .shard_router
+                        .as_ref()
+                        .map(|router| router.shard_count()),
+                    chunks_done: 0,
+                    rows_done: 0,
+                    updated_at_unix_ms: 0,
+                    complete: false,
+                    cursor: None,
+                });
+        state.updated_at_unix_ms = u64::try_from(Self::current_epoch_ms()).unwrap_or(u64::MAX);
+        txn.put(backfill_state_key(), &state.encode()?).await?;
+        Ok(())
+    }
+
+    /// Copy one chunk of legacy base rows into the Data V2 keyspace and
+    /// advance the durable cursor, all in the caller's single transaction.
+    ///
+    /// Idempotent: a redone chunk rewrites identical shadow values. Converges
+    /// with concurrent DML by construction — OCC validates the write set, and
+    /// a row write and this chunk both target the same v2 key, so one of them
+    /// aborts and retries against fresh state.
+    async fn run_backfill_chunk(&self, txn: &mut dyn Transaction) -> Result<QueryResult> {
+        let phase = self.observe_data_migration_phase_and_fence(txn).await?;
+        if phase < DataMigrationPhase::Backfill {
+            return Err(FusionError::Execution(format!(
+                "Data V2 backfill requires migration phase '{}'; current phase is '{}'",
+                DataMigrationPhase::Backfill.name(),
+                phase.name()
+            )));
+        }
+
+        let current_shard_count = self
+            .shard_router
+            .as_ref()
+            .map(|router| router.shard_count());
+        let mut state =
+            Self::read_backfill_state(txn)
+                .await?
+                .unwrap_or_else(|| DataBackfillState {
+                    shard_count_at_start: current_shard_count,
+                    chunks_done: 0,
+                    rows_done: 0,
+                    updated_at_unix_ms: 0,
+                    complete: false,
+                    cursor: None,
+                });
+        if state.shard_count_at_start != current_shard_count {
+            return Err(FusionError::Execution(format!(
+                "Data V2 backfill cannot resume across a shard topology change (started with {:?}, now {:?}); the cursor is invalid",
+                state.shard_count_at_start, current_shard_count
+            )));
+        }
+        if state.complete {
+            return Ok(Self::backfill_status_result(&state, "complete"));
+        }
+
+        // Resume from the last copied key, inclusive, and skip that one key
+        // while visiting. Appending a `\0` to build an exclusive bound does
+        // NOT work here: FusionStorage range bounds are compared against
+        // internal keys (`user_key + inverted commit ts`), and the timestamp
+        // bytes sort above `\0`, so the cursor row would slip back in.
+        let schemas = Self::load_all_table_schemas(txn).await?;
+        let mut resume_from = state.cursor.clone();
+        let resume_boundary = state.cursor.clone();
+        let mut copied = 0usize;
+        let mut copied_bytes = 0usize;
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        'ranges: for (range_start, range_end) in Self::legacy_backfill_ranges() {
+            let start = match &resume_from {
+                Some(cursor) if cursor.as_slice() >= range_end.as_slice() => continue,
+                Some(cursor) if cursor.as_slice() > range_start.as_slice() => cursor.clone(),
+                _ => range_start.clone(),
+            };
+            let mut batch_error = None;
+            let mut visit = |key: &[u8], value: &[u8]| {
+                if resume_boundary.as_deref() == Some(key) {
+                    return true;
+                }
+                match Self::legacy_backfill_row_identity(key, value, &schemas) {
+                    Ok(Some((table, row_id))) => {
+                        match self.routed_structured_data_key_for_row_id(&table, &row_id) {
+                            Ok(shadow_key) => {
+                                copied_bytes += value.len();
+                                pending.push((shadow_key, value.to_vec()));
+                                copied += 1;
+                            }
+                            Err(error) => {
+                                batch_error = Some(error);
+                                return false;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        batch_error = Some(error);
+                        return false;
+                    }
+                }
+                last_key = Some(key.to_vec());
+                copied < Self::BACKFILL_CHUNK_ROWS && copied_bytes < Self::BACKFILL_CHUNK_BYTES
+            };
+            txn.scan_range_for_each(&start, &range_end, None, &mut visit)
+                .await?;
+            if let Some(error) = batch_error {
+                return Err(error);
+            }
+            resume_from = None;
+            if copied >= Self::BACKFILL_CHUNK_ROWS || copied_bytes >= Self::BACKFILL_CHUNK_BYTES {
+                break 'ranges;
+            }
+        }
+
+        for (shadow_key, value) in pending {
+            txn.put(&shadow_key, &value).await?;
+        }
+
+        let exhausted =
+            copied < Self::BACKFILL_CHUNK_ROWS && copied_bytes < Self::BACKFILL_CHUNK_BYTES;
+        if let Some(key) = last_key {
+            state.cursor = Some(key);
+        }
+        state.rows_done = state.rows_done.saturating_add(copied as u64);
+        state.chunks_done = state.chunks_done.saturating_add(1);
+        state.updated_at_unix_ms = u64::try_from(Self::current_epoch_ms()).unwrap_or(u64::MAX);
+        state.complete = exhausted;
+        txn.put(backfill_state_key(), &state.encode()?).await?;
+
+        Ok(Self::backfill_status_result(
+            &state,
+            if exhausted { "complete" } else { "in-progress" },
+        ))
+    }
+
+    fn backfill_status_result(state: &DataBackfillState, status: &str) -> QueryResult {
+        QueryResult::Select {
+            columns: vec![
+                "status".to_string(),
+                "rows_done".to_string(),
+                "chunks_done".to_string(),
+                "cursor".to_string(),
+            ],
+            rows: vec![vec![
+                Value::String(status.to_string()),
+                Value::Integer(state.rows_done as i64),
+                Value::Integer(state.chunks_done as i64),
+                match &state.cursor {
+                    Some(cursor) => Value::String(String::from_utf8_lossy(cursor).into_owned()),
+                    None => Value::Null,
+                },
+            ]],
+        }
+    }
+
+    async fn handle_backfill_status(&self, txn: &mut dyn Transaction) -> Result<QueryResult> {
+        match Self::read_backfill_state(txn).await? {
+            Some(state) => Ok(Self::backfill_status_result(
+                &state,
+                if state.complete {
+                    "complete"
+                } else {
+                    "in-progress"
+                },
+            )),
+            None => Ok(Self::backfill_status_result(
+                &DataBackfillState {
+                    shard_count_at_start: None,
+                    chunks_done: 0,
+                    rows_done: 0,
+                    updated_at_unix_ms: 0,
+                    complete: false,
+                    cursor: None,
+                },
+                "not-started",
+            )),
         }
     }
 
@@ -7944,11 +8312,18 @@ mod tests {
             ("write-delete-shadow".to_string(), 2)
         );
 
-        // The next rung exists but is beyond this build's advance gate.
-        let error = executor
+        // Backfill is reachable as of P10-2.3.
+        let advanced = executor
             .execute_sql("CALL fusiondb_data_migration_advance('backfill')")
             .await
-            .expect_err("backfill is beyond the T1 advance gate");
+            .unwrap();
+        assert_eq!(phase_row(&advanced[0]), ("backfill".to_string(), 3));
+
+        // The next rung exists but is beyond this build's advance gate.
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('validated')")
+            .await
+            .expect_err("validated is beyond this build's advance gate");
         assert!(error.to_string().contains("not supported by this build"));
 
         // Downgrade and rung-skipping are single-step violations.
@@ -7958,7 +8333,7 @@ mod tests {
             .expect_err("downgrade must fail");
         assert!(error.to_string().contains("only advance one step"));
         let error = executor
-            .execute_sql("CALL fusiondb_data_migration_advance('validated')")
+            .execute_sql("CALL fusiondb_data_migration_advance('v2-readable')")
             .await
             .expect_err("skipping rungs must fail");
         assert!(error.to_string().contains("only advance one step"));
@@ -7998,7 +8373,7 @@ mod tests {
             .execute_sql("SHOW DATA MIGRATION PHASE")
             .await
             .unwrap();
-        assert_eq!(phase_row(&shown[0]), ("write-delete-shadow".to_string(), 2));
+        assert_eq!(phase_row(&shown[0]), ("backfill".to_string(), 3));
 
         let _ = std::fs::remove_file(wal_path);
     }
@@ -8376,6 +8751,586 @@ mod tests {
         assert_eq!(
             phase_row(&retried[0]),
             ("write-delete-shadow".to_string(), 2)
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ---- Data V2 backfill engine (P10-2.3) ----
+
+    /// Walk the ladder to `backfill` so chunk steps are legal.
+    async fn advance_to_backfill(executor: &Executor) {
+        for sql in [
+            "CALL fusiondb_data_migration_init()",
+            "CALL fusiondb_data_migration_advance('write-delete-shadow')",
+            "CALL fusiondb_data_migration_advance('backfill')",
+        ] {
+            executor.execute_sql(sql).await.expect(sql);
+        }
+    }
+
+    fn backfill_status_row(result: &QueryResult) -> (String, i64) {
+        let QueryResult::Select { columns, rows } = result else {
+            panic!("backfill procedures return a row, got {result:?}");
+        };
+        assert_eq!(columns[0], "status");
+        assert_eq!(columns[1], "rows_done");
+        let (Value::String(status), Value::Integer(rows_done)) = (&rows[0][0], &rows[0][1]) else {
+            panic!("unexpected status row shape: {:?}", rows[0]);
+        };
+        (status.clone(), *rows_done)
+    }
+
+    /// Drive chunks to completion and report how many steps it took.
+    async fn drain_backfill(executor: &Executor) -> (usize, i64) {
+        for step in 1..=200 {
+            let result = executor
+                .execute_sql("CALL fusiondb_data_backfill_step()")
+                .await
+                .expect("backfill step");
+            let (status, rows_done) = backfill_status_row(&result[0]);
+            if status == "complete" {
+                return (step, rows_done);
+            }
+        }
+        panic!("backfill did not converge within 200 chunks");
+    }
+
+    async fn shadow_exists(
+        executor: &Executor,
+        storage: &Arc<dyn Storage>,
+        table: &str,
+        row: &str,
+    ) -> bool {
+        let key = executor
+            .routed_structured_data_key_for_row_id(table, row)
+            .unwrap();
+        let txn = storage.begin_transaction().await.unwrap();
+        txn.get(&key).await.unwrap().is_some()
+    }
+
+    #[tokio::test]
+    async fn backfill_copies_every_legacy_row_and_resumes_across_chunks() {
+        let (executor, storage, data_dir) = fusion_executor("backfill_basic").await;
+        executor
+            .execute_sql("CREATE TABLE b_rows (id INT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        // More rows than one chunk holds, so resumption is exercised.
+        let rows = Executor::BACKFILL_CHUNK_ROWS + 37;
+        for id in 0..rows {
+            executor
+                .execute_sql(&format!("INSERT INTO b_rows VALUES ({id}, 'payload-{id}')"))
+                .await
+                .unwrap();
+        }
+
+        // Written before the phase reached write-delete-shadow, so no shadows exist yet.
+        assert!(!shadow_exists(&executor, &storage, "b_rows", "0").await);
+
+        advance_to_backfill(&executor).await;
+        let (steps, rows_done) = drain_backfill(&executor).await;
+        assert!(steps >= 2, "expected multiple chunks, took {steps}");
+        assert_eq!(rows_done as usize, rows);
+
+        for id in 0..rows {
+            let row_id = crate::common::encoding::encode_i64_comparable(id as i64);
+            assert!(
+                shadow_exists(&executor, &storage, "b_rows", &row_id).await,
+                "row {id} was not backfilled"
+            );
+        }
+
+        // Idempotent: another step on a complete backfill is a no-op.
+        let result = executor
+            .execute_sql("CALL fusiondb_data_backfill_step()")
+            .await
+            .unwrap();
+        assert_eq!(backfill_status_row(&result[0]).0, "complete");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Progress and copied rows are written by the same transaction, so a
+    /// crash between chunks can lose both or neither — never a cursor that
+    /// claims rows it did not copy.
+    #[tokio::test]
+    async fn backfill_cursor_survives_reopen_and_resumes() {
+        let data_dir =
+            std::env::temp_dir().join(format!("fusiondb_backfill_resume_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = crate::config::StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let rows = Executor::BACKFILL_CHUNK_ROWS + 11;
+
+        let rows_after_first_chunk = {
+            let fusion =
+                crate::storage::FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                    .await
+                    .unwrap();
+            let storage: Arc<dyn Storage> = Arc::new(fusion);
+            let executor = Executor::with_config(storage.clone(), &config);
+            executor
+                .execute_sql("CREATE TABLE b_resume (id INT PRIMARY KEY, payload TEXT)")
+                .await
+                .unwrap();
+            for id in 0..rows {
+                executor
+                    .execute_sql(&format!("INSERT INTO b_resume VALUES ({id}, 'p{id}')"))
+                    .await
+                    .unwrap();
+            }
+            advance_to_backfill(&executor).await;
+            let result = executor
+                .execute_sql("CALL fusiondb_data_backfill_step()")
+                .await
+                .unwrap();
+            let (status, rows_done) = backfill_status_row(&result[0]);
+            assert_eq!(status, "in-progress");
+            rows_done
+        };
+        assert!(rows_after_first_chunk > 0);
+
+        // Reopen: the cursor must be durable and the backfill must resume,
+        // not restart.
+        let fusion =
+            crate::storage::FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                .await
+                .expect("reopen mid-backfill");
+        let storage: Arc<dyn Storage> = Arc::new(fusion);
+        let executor = Executor::with_config(storage.clone(), &config);
+        let status = executor
+            .execute_sql("CALL fusiondb_data_backfill_status()")
+            .await
+            .unwrap();
+        assert_eq!(
+            backfill_status_row(&status[0]),
+            ("in-progress".to_string(), rows_after_first_chunk)
+        );
+
+        let (_steps, total) = drain_backfill(&executor).await;
+        assert_eq!(total as usize, rows);
+        for id in 0..rows {
+            let row_id = crate::common::encoding::encode_i64_comparable(id as i64);
+            assert!(shadow_exists(&executor, &storage, "b_resume", &row_id).await);
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A chunk and a concurrent row write target the same v2 key, so
+    /// write-set-only OCC forces one of them to abort — the backfill can
+    /// never overwrite a newer row with a stale copy.
+    #[tokio::test]
+    async fn backfill_chunk_conflicts_with_concurrent_row_write() {
+        let (executor, storage, data_dir) = fusion_executor("backfill_occ").await;
+        executor
+            .execute_sql("CREATE TABLE b_race (id INT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO b_race VALUES (1, 'original')")
+            .await
+            .unwrap();
+        advance_to_backfill(&executor).await;
+
+        // Stage a chunk without committing it.
+        let step = executor
+            .prepare("CALL fusiondb_data_backfill_step()")
+            .unwrap()
+            .remove(0);
+        let mut chunk_txn = storage.begin_transaction().await.unwrap();
+        executor
+            .execute_in_transaction(&step, &mut *chunk_txn)
+            .await
+            .unwrap();
+
+        // A concurrent UPDATE commits first, writing the same shadow key.
+        executor
+            .execute_sql("UPDATE b_race SET payload = 'newer' WHERE id = 1")
+            .await
+            .unwrap();
+
+        let error = chunk_txn
+            .commit()
+            .await
+            .expect_err("a chunk racing a row write must abort, not overwrite");
+        assert!(
+            error.to_string().contains("Write conflict"),
+            "unexpected: {error}"
+        );
+
+        // Retrying converges on the newer value.
+        drain_backfill(&executor).await;
+        let shadow_key = executor
+            .routed_structured_data_key_for_row_id(
+                "b_race",
+                &crate::common::encoding::encode_i64_comparable(1),
+            )
+            .unwrap();
+        let legacy_key = executor.routed_data_key_for_row_id(
+            "b_race",
+            &crate::common::encoding::encode_i64_comparable(1),
+        );
+        let txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(
+            txn.get(&shadow_key).await.unwrap(),
+            txn.get(legacy_key.as_bytes()).await.unwrap(),
+            "shadow must equal the newest legacy value"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The named blocker: a DROP's v2 cleanup only tombstones keys its own
+    /// snapshot saw, so without a shared write key a concurrent chunk would
+    /// commit fresh shadow rows for a table that no longer exists.
+    #[tokio::test]
+    async fn drop_table_conflicts_with_an_in_flight_backfill_chunk() {
+        let (executor, storage, data_dir) = fusion_executor("backfill_drop_race").await;
+        executor
+            .execute_sql("CREATE TABLE b_drop (id INT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        for id in 0..5 {
+            executor
+                .execute_sql(&format!("INSERT INTO b_drop VALUES ({id}, 'p{id}')"))
+                .await
+                .unwrap();
+        }
+        advance_to_backfill(&executor).await;
+
+        let step = executor
+            .prepare("CALL fusiondb_data_backfill_step()")
+            .unwrap()
+            .remove(0);
+        let mut chunk_txn = storage.begin_transaction().await.unwrap();
+        executor
+            .execute_in_transaction(&step, &mut *chunk_txn)
+            .await
+            .unwrap();
+
+        // DROP commits first and touches the shared backfill-state record.
+        executor.execute_sql("DROP TABLE b_drop").await.unwrap();
+
+        let error = chunk_txn
+            .commit()
+            .await
+            .expect_err("a chunk racing DROP must abort instead of stranding orphan shadows");
+        assert!(
+            error.to_string().contains("Write conflict"),
+            "unexpected: {error}"
+        );
+
+        // No orphan shadow rows survive for the dropped table.
+        for id in 0..5 {
+            let row_id = crate::common::encoding::encode_i64_comparable(id);
+            assert!(
+                !shadow_exists(&executor, &storage, "b_drop", &row_id).await,
+                "row {id} of the dropped table was stranded in the v2 namespace"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn backfill_gates_phase_arguments_and_topology() {
+        let (executor, _storage, data_dir) = fusion_executor("backfill_gates").await;
+        executor
+            .execute_sql("CREATE TABLE b_gate (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
+
+        // Steps before the phase reaches backfill are refused.
+        let error = executor
+            .execute_sql("CALL fusiondb_data_backfill_step()")
+            .await
+            .expect_err("a step below phase backfill must be refused");
+        assert!(error.to_string().contains("requires migration phase"));
+
+        // Status is readable at any phase and reports not-started.
+        let status = executor
+            .execute_sql("CALL fusiondb_data_backfill_status()")
+            .await
+            .unwrap();
+        assert_eq!(backfill_status_row(&status[0]).0, "not-started");
+
+        advance_to_backfill(&executor).await;
+        let error = executor
+            .execute_sql("CALL fusiondb_data_backfill_step('x')")
+            .await
+            .expect_err("step takes no arguments");
+        assert!(error.to_string().contains("takes no arguments"));
+
+        // Migration procedures stay standalone and superuser-only.
+        let error = executor
+            .execute_sql("CALL fusiondb_data_backfill_step(); SELECT 1")
+            .await
+            .expect_err("backfill step must be standalone");
+        assert!(error.to_string().contains("standalone"));
+        executor
+            .execute_sql("CREATE USER bob WITH PASSWORD 'pw'")
+            .await
+            .unwrap();
+        for sql in [
+            "CALL fusiondb_data_backfill_step()",
+            "/* sneak */ CALL fusiondb_data_backfill_status()",
+        ] {
+            let error = executor
+                .authorize_sql("bob", sql)
+                .await
+                .expect_err("non-superuser must be refused");
+            assert!(error.to_string().to_lowercase().contains("superuser"));
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The cursor is only meaningful under the topology it was recorded on.
+    /// A shard-count change invalidates it, so resuming across one must be
+    /// refused instead of silently copying rows at the wrong routes.
+    #[tokio::test]
+    async fn backfill_refuses_to_resume_across_a_topology_change() {
+        let (executor, storage, data_dir) = fusion_executor("backfill_topology").await;
+        executor
+            .execute_sql("CREATE TABLE b_topo (id INT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO b_topo VALUES (1, 'one')")
+            .await
+            .unwrap();
+        advance_to_backfill(&executor).await;
+
+        // Record a state that claims a different starting topology than the
+        // executor's current one (which is None — no router configured).
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let planted = crate::storage::data_migration::DataBackfillState {
+            shard_count_at_start: Some(16),
+            chunks_done: 1,
+            rows_done: 0,
+            updated_at_unix_ms: 1,
+            complete: false,
+            cursor: None,
+        };
+        txn.put(
+            crate::storage::data_migration::backfill_state_key(),
+            &planted.encode().unwrap(),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let error = executor
+            .execute_sql("CALL fusiondb_data_backfill_step()")
+            .await
+            .expect_err("resuming across a topology change must be refused");
+        assert!(
+            error.to_string().contains("shard topology change"),
+            "unexpected: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Copying must preserve the row bytes, not merely create a key.
+    #[tokio::test]
+    async fn backfill_shadow_values_equal_their_legacy_rows() {
+        let (executor, storage, data_dir) = fusion_executor("backfill_values").await;
+        executor
+            .execute_sql("CREATE TABLE b_val (id INT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        for id in 0..5 {
+            executor
+                .execute_sql(&format!(
+                    "INSERT INTO b_val VALUES ({id}, 'payload number {id}')"
+                ))
+                .await
+                .unwrap();
+        }
+        advance_to_backfill(&executor).await;
+        drain_backfill(&executor).await;
+
+        let txn = storage.begin_transaction().await.unwrap();
+        for id in 0..5 {
+            let row_id = crate::common::encoding::encode_i64_comparable(id);
+            let legacy = txn
+                .get(
+                    executor
+                        .routed_data_key_for_row_id("b_val", &row_id)
+                        .as_bytes(),
+                )
+                .await
+                .unwrap()
+                .expect("legacy row");
+            let shadow = txn
+                .get(
+                    &executor
+                        .routed_structured_data_key_for_row_id("b_val", &row_id)
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("shadow row");
+            assert_eq!(shadow, legacy, "row {id} shadow bytes differ from legacy");
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Table identity comes from the schema catalog, not from a positional
+    /// guess: primary keys are not always the first column, and both table
+    /// names and row ids may contain ':'. Orphan rows of no known table are
+    /// skipped rather than copied into some table's shadow set.
+    #[tokio::test]
+    async fn backfill_resolves_table_identity_for_colon_names_and_late_primary_keys() {
+        let (executor, storage, data_dir) = fusion_executor("backfill_identity").await;
+        // Primary key is the SECOND column, and row ids contain ':'.
+        executor
+            .execute_sql("CREATE TABLE b_ident (payload TEXT, id TEXT PRIMARY KEY)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO b_ident VALUES ('one', 'row:1')")
+            .await
+            .unwrap();
+        // A quoted identifier keeps its quotes in the stored name, so it does
+        // not actually collide; exercise it anyway as the end-to-end shape.
+        executor
+            .execute_sql("CREATE TABLE \"b_ident quoted\" (payload TEXT, id TEXT PRIMARY KEY)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO \"b_ident quoted\" VALUES ('q', 'row:8')")
+            .await
+            .unwrap();
+
+        // A genuinely colon-named table (only reachable for synthetic or
+        // historical data) whose rows collide with `b_ident`'s split points.
+        // Registering it in the catalog forces the multi-candidate tie-break.
+        let archive_schema = crate::catalog::TableSchema::new(
+            "b_ident:archive".to_string(),
+            vec![
+                crate::catalog::Column {
+                    name: "payload".to_string(),
+                    data_type: "TEXT".to_string(),
+                    is_primary: false,
+                    is_indexed: false,
+                    index_type: crate::catalog::IndexType::None,
+                    default_value: None,
+                    is_nullable: true,
+                    is_unique: false,
+                    check_expr: None,
+                },
+                crate::catalog::Column {
+                    name: "id".to_string(),
+                    data_type: "TEXT".to_string(),
+                    is_primary: true,
+                    is_indexed: false,
+                    index_type: crate::catalog::IndexType::None,
+                    default_value: None,
+                    is_nullable: false,
+                    is_unique: true,
+                    check_expr: None,
+                },
+            ],
+        );
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(
+            b"schema:b_ident:archive",
+            &bincode::serialize(&archive_schema).unwrap(),
+        )
+        .await
+        .unwrap();
+        txn.put(
+            b"data:b_ident:archive:row:9",
+            &crate::common::encoding::RowEncoder::encode(&[
+                Value::String("arch".to_string()),
+                Value::String("row:9".to_string()),
+            ]),
+        )
+        .await
+        .unwrap();
+        // An orphan row of a table that does not exist.
+        txn.put(
+            b"data:b_ghost:row:1",
+            &crate::common::encoding::RowEncoder::encode(&[Value::String("ghost".to_string())]),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        advance_to_backfill(&executor).await;
+        let (_steps, rows_done) = drain_backfill(&executor).await;
+        assert_eq!(rows_done, 3, "only the three real rows may be copied");
+
+        assert!(shadow_exists(&executor, &storage, "b_ident", "row:1").await);
+        assert!(shadow_exists(&executor, &storage, "\"b_ident quoted\"", "row:8").await);
+        assert!(
+            shadow_exists(&executor, &storage, "b_ident:archive", "row:9").await,
+            "the colon-named table's row was attributed to the wrong table"
+        );
+        assert!(
+            !shadow_exists(&executor, &storage, "b_ghost", "row:1").await,
+            "an orphan row was copied into the v2 namespace"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Legacy rows live under several physical routes; the backfill walks the
+    /// keyspace rather than asking the router, so historical shard routes are
+    /// copied too, and non-base-row keys in the shard region are skipped.
+    #[tokio::test]
+    async fn backfill_covers_historical_routes_and_skips_other_key_families() {
+        let (executor, storage, data_dir) = fusion_executor("backfill_routes").await;
+        executor
+            .execute_sql("CREATE TABLE b_hist (id INT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO b_hist VALUES (1, 'unsharded')")
+            .await
+            .unwrap();
+
+        // A row left behind by a historical shard topology, plus a sharded
+        // index key that must NOT be treated as a base row.
+        let historical_value = crate::common::encoding::RowEncoder::encode(&[
+            Value::Integer(2),
+            Value::String("historical".to_string()),
+        ]);
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let historical_row_id = crate::common::encoding::encode_i64_comparable(2);
+        txn.put(
+            format!("shard:7:data:b_hist:{historical_row_id}").as_bytes(),
+            &historical_value,
+        )
+        .await
+        .unwrap();
+        txn.put(b"shard:7:index:b_hist:payload:x:1", b"index entry")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        advance_to_backfill(&executor).await;
+        let (_steps, rows_done) = drain_backfill(&executor).await;
+        assert_eq!(rows_done, 2, "both routes' rows must be copied");
+
+        assert!(
+            shadow_exists(
+                &executor,
+                &storage,
+                "b_hist",
+                &crate::common::encoding::encode_i64_comparable(1)
+            )
+            .await
+        );
+        assert!(
+            shadow_exists(&executor, &storage, "b_hist", &historical_row_id).await,
+            "a row on a historical shard route was skipped"
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);

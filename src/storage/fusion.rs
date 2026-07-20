@@ -8874,9 +8874,12 @@ mod tests {
             // Plant a decode-valid record above this binary's support (the
             // SQL surface cannot reach it; this simulates a store touched by
             // a newer binary).
-            commit_migration_record(&storage, &migration_record(DataMigrationPhase::Backfill, 3))
-                .await
-                .unwrap();
+            commit_migration_record(
+                &storage,
+                &migration_record(DataMigrationPhase::Validated, 4),
+            )
+            .await
+            .unwrap();
         }
 
         let error = match FusionStorage::with_config(&wal_path.to_string_lossy(), &config).await {

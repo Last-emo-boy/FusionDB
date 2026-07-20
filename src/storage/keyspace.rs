@@ -6,9 +6,9 @@ const DATA_ROUTE_UNSHARDED: u8 = 0;
 const DATA_ROUTE_SHARD: u8 = 1;
 const ORDERED_VALUE_TYPE_INTEGER: u8 = 0x11;
 const ORDERED_VALUE_TYPE_BYTES: u8 = 0x12;
-const MAX_IDENTIFIER_COMPONENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_IDENTIFIER_COMPONENT_BYTES: usize = 64 * 1024;
 const MAX_IDENTIFIER_COMPONENTS: usize = 32;
-const MAX_DATA_ROW_ID_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_DATA_ROW_ID_BYTES: usize = 256 * 1024;
 const MAX_STRUCTURED_KEY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

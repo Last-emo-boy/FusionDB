@@ -491,6 +491,14 @@ fn statement_is_unsafe_to_stage(statement: &sqlparser::ast::Statement) -> bool {
 
     match statement {
         Statement::Vacuum(_) | Statement::Copy { to: true, .. } => true,
+        // The backfill step writes hundreds of shadow keys per chunk, and
+        // RecordingTransaction records a precondition for every one of them.
+        // Any concurrent DML touching one of those keys between leader
+        // evaluation and apply turns a routine race into a precondition
+        // mismatch, which halts the state machine. Fail closed here until the
+        // chunk gets a proposal shape that tolerates that race (own ticket),
+        // mirroring how pgwire writes fail closed in Raft mode today.
+        Statement::Call(function) => Executor::is_data_backfill_step_call(function),
         Statement::CreateIndex(create_index) => create_index.index_options.iter().any(|option| {
             matches!(
                 option,
@@ -523,7 +531,7 @@ pub(crate) async fn evaluate_sql_to_request(
     }
     if statements.iter().any(statement_is_unsafe_to_stage) {
         return Err(
-            "Raft deterministic writes do not support VACUUM, COPY TO, or CREATE INDEX USING HNSW"
+            "Raft deterministic writes do not support VACUUM, COPY TO, CREATE INDEX USING HNSW, or the Data V2 backfill step"
                 .to_string(),
         );
     }
