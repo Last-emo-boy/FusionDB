@@ -1066,3 +1066,14 @@ CREATE TABLE and ALTER TABLE column identity now use sqlparser Ident.value via a
 自本票起,trigram/HNSW 在事务上下文中禁止直接修改:必须经 dml/mod.rs 的 update_trigram_index_for_* 与 defer_or_apply_vector_{insert,delete}(Fusion 后端缓冲 SideIndexDelta,commit 在 commit_lock 内 OCC+WAL+memtable 后、current_ts 前统一应用;rollback 丢弃)。向量插入在 defer 时必须过 validate_insert_dimensions(错维提交前报错)。多行调用形态用结构化搜索防漏检(单行 grep 曾漏 rustfmt 断行站点)。已知设计代价:事务内 RYOW 收窄(LIKE/向量搜索见不到本事务未提交写)。VECTOR 字面量摄入禁止随手加 coercion——线格式/OID/迁移影响面已实测,走 467 设计票。
 
 </spec-entry>
+<spec-entry category="coding" keywords="scan,limit,pushdown,visitor,zero-copy" date="2026-07-20" title="限量扫描必须下推,无限量扫描必须走物化路径(64afb98)" description="事后截断不算下推;visitor API 交出切片,收集必二次拷贝,故全扫不能走 for-each" source="main@64afb98">
+
+### 限量扫描必须下推,无限量扫描必须走物化路径(64afb98)
+
+**契约**:`scan_routed_data_prefixes_for_table_with_options` 分两条路。有 `limit` 时委托 `scan_routed_data_prefixes_for_each_with_options`(`ExactTableDataScanVisitor` 施加归属过滤、跨前缀全局计已接受行数、返回 false 停掉存储扫描);`limit=None` 时保留原并行物化路径。
+
+**两个方向都是硬约束,别"统一"成一条**:①给存储层传 `None` 再对已物化结果截断**不是下推**——这正是 ORDER BY PK LIMIT 读遍全表的直接原因(65ms/962 块 → 9.1ms/7 块);②`ScanVisitor::visit` 交出的是 `&[u8]`,经它收集必须 `to_vec()` **二次分配**,而并行物化路径是把每分区 Vec **移动**进结果 —— 把无限量全扫改走 for-each 会让 CREATE INDEX / ANALYZE / 表重建 / 无条件 DELETE·UPDATE / FK 校验 / INSERT 查重等 13 个 `limit=None` 调用点每行多付一次键值拷贝(只读评审 major,已在提交前修正)。
+
+**测试注意**:MemoryStorage 不实现任何 `scan_prefix_parallel_*`,且 `PARALLEL_SCAN_MIN_ROWS=8192`——低于该行数或用 MemoryStorage 的用例**只覆盖串行路径**,不要在断言里宣称覆盖了并行分支。计数替身若不转发 `scan_prefix_parallel_for_each_with_options` / `scan_prefix_for_each_with_options`,会退化成默认物化链,把流式行为**误报成全读**(本票中一度造成假红)。
+
+</spec-entry>
