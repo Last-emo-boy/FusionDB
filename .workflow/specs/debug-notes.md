@@ -268,3 +268,17 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 **由此必须修正此前的结论**:"同机中位慢 3.04x"这个数字里,凡涉及写入的项都在拿持久 vs 非持久对比,不能计入回归。真正需要继续追的只剩**纯读路径**的差距。方法学教训:跨版本基准对比前,必须先确认两侧的**持久化语义相同**;语义变了就不是同一个可比对象(与 tmpfs 陷阱同源——那次是介质免除 fsync,这次是代码根本不调用 fsync)。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="regression,parallel-scan,integer_pk_range_splits,reverse-scan,small-table" date="2026-07-20" title="小查询固定开销定位:并行切分探测对每次扫描做一次完整反向扫描" description="integer_pk_range_splits 调 last() 触发反向迭代器+前沿探测,小表上该探测即全部耗时,且结果因低于阈值被丢弃" source="main@c2c5f71">
+
+### 小查询固定开销定位:并行切分探测对每次扫描做一次完整反向扫描
+
+追纯读路径剩余回归(按写入拆分后:纯读 84 条中位 2.53x、35 条 >3x;含写 19 条中位 6.46x 已证实为持久化代价)。500 行 `accounts` 表上 `COUNT(*)` 与 `SUM(balance)` 的存储计数器**逐项完全相同**(含 `fusion_reverse_scan_count=1`、`sstable_reverse_block_span_scan_entry_count=35`),块缓存 21 命中 0 未命中却耗时 2.1-2.7ms——不同查询给出相同计数器 ⇒ 该工作不属于查询本身。空对照(两次 /metrics 间不跑查询)计数器全零,排除探针自身。
+
+在 `fusion.rs` 反向扫描入口打 backtrace,调用链坐实:
+`count_routed_data_prefixes_for_table → scan_prefix_parallel_for_each_with_options → scan_range_parallel_for_each_with_options → integer_pk_range_splits → txn.last() → merge_visible_range_reverse`。
+
+**即:每次可并行扫描都先做一次完整反向扫描探最大键(开全部 SSTable 反向迭代器 + 前沿探测/收紧 + 物化 35 条 block span)来计算并行切分,随后因表行数低于 `PARALLEL_SCAN_MIN_ROWS=8192` 把切分丢弃。** 探测成本在大表被摊薄,在小表即全部耗时——正是"亚毫秒查询变 10-40ms"的固定开销来源。
+
+**候选修法(未实施,择一或组合)**:①用 manifest 里已有的 SSTable first/last key 描述符估算键区间,避免实时反向扫描(启动期已加载,零 I/O);②把 (表前缀 → min/max) 的探测结果按事务或按扫描缓存,避免同查询多前缀重复探;③先用便宜信号(如 count summary / 统计器行数估计)判定是否值得并行,不值得就跳过探测。注意 ①最彻底但需确认描述符在 memtable 有新写入时的正确性(区间只需覆盖,不需精确)。
+
