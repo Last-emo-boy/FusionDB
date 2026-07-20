@@ -245,3 +245,14 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 **附带发现**:`src/server/pg_server.rs:9216` 在 pgwire 热路径对每条查询 `eprintln!` 完整 SQL(一次 Part 1 运行写 7.6MB,批量 INSERT 的 500 行 VALUES 被整条打印)。自 2026-01-06 初始提交即存在,**非本次回归主因**(新旧二进制都有),但应单独清理。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="order-by,topk,early-stop,pk,regression,scan-limit" date="2026-07-20" title="ORDER BY PK LIMIT 回归二次收窄:主键这个最优情形反而丢了早停" description="逐形态实测锁定只有 PK 有序回归;streaming top-K 的 limit.is_none() 门是诱因但放开它更慢;真正的洞在 scan_limit 未兑现" source="main@d58c488">
+
+### ORDER BY PK LIMIT 回归二次收窄:主键这个最优情形反而丢了早停
+
+同数据集逐形态实测(HEAD):`SELECT * ORDER BY id LIMIT n`(主键)65ms/962 块未命中/1.26MB;`ORDER BY val LIMIT n`(非主键)150ms/**0 块**;`SELECT id ORDER BY id LIMIT n`(仅键)12ms/**0 块**;`SELECT * LIMIT n`(无 ORDER BY)21ms/**0 块**。**即:普通限量扫描的早停是好的,非主键 ORDER BY 的流式 top-K 早停也是好的,唯独主键这个本该最快的情形回归**。
+
+诱因定位:`src/execution/scan/mod.rs` 约 2276 行,流式 top-K 入口条件含 **`limit.is_none()`**;而主键 ORDER BY 恰恰让 `primary_key_order_scan_limit` 把 `limit` 置为 `Some(n)`,于是该路径被跳过。控制流随后到达普通路径,那里 `scan_limit = effective_limit` 本应为 `Some(n)`,但实测仍读 962 块 —— **limit 在 `effective_limit` 到存储扫描之间丢失或未被兑现**,这是下一步要插桩的确切位置。
+
+**已验证的错误修法(勿重复)**:直接去掉 `limit.is_none()` 门 —— 排序回退确实消失、结果正确(升序 0-4/降序 49999-49995),但**更慢**(65→144ms),因为 top-K visitor 为给任意列排名必须扫全表。主键升序下数据本已按键有序,正解是让既有的 `scan_limit` 路径真正早停(取够 n 行即止),而非改走 top-K。已回退,工作区干净。
+
