@@ -1,4 +1,8 @@
 use super::columnar::ColumnarVectorStore;
+use super::data_migration::{
+    migration_phase_key, DataMigrationFence, DataMigrationPhase, DataMigrationPhaseRecord,
+    FenceSnapshot, MAX_SUPPORTED_PHASE,
+};
 use super::manifest_edit::{
     ManifestEdit, ManifestSstableEntry as ManifestV2SstableEntry,
     ManifestSstableFingerprint as ManifestV2SstableFingerprint,
@@ -1298,6 +1302,7 @@ pub struct FusionStorage {
     commit_lock: Arc<AsyncMutex<()>>,
     flush_lock: Arc<AsyncMutex<()>>,
     compaction_lock: Arc<AsyncMutex<()>>,
+    data_migration_fence: Arc<DataMigrationFence>,
     paths: Arc<FusionStoragePaths>,
 }
 
@@ -1488,6 +1493,9 @@ impl FusionStorage {
             commit_lock: Arc::new(AsyncMutex::new(())),
             flush_lock: Arc::new(AsyncMutex::new(())),
             compaction_lock: Arc::new(AsyncMutex::new(())),
+            data_migration_fence: Arc::new(DataMigrationFence::new(
+                config.structured_data_shadow_v2,
+            )),
             paths,
         };
 
@@ -1553,6 +1561,10 @@ impl FusionStorage {
         );
         let restored_ts = max_sstable_ts.max(max_replay_ts);
         storage.current_ts.store(restored_ts, Ordering::SeqCst);
+
+        storage
+            .load_and_gate_data_migration_phase(config.structured_data_shadow_v2)
+            .await?;
 
         storage.rebuild_side_indexes().await?;
 
@@ -2089,6 +2101,7 @@ impl FusionStorage {
             read_ts_registered: false,
             capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
+            fenced_migration_phase: None,
         };
         let existing = snapshot_txn.scan_range(start, end, None).await?;
         let mut future_entries = if start.is_empty() && end == [0xff] {
@@ -2147,6 +2160,13 @@ impl FusionStorage {
         self.vector_index.replace_with(rebuilt_vector);
         *self.trigram_index.write().unwrap() = rebuilt_trigram;
         self.current_ts.store(publish_ts, Ordering::SeqCst);
+
+        // A snapshot install rewrites the whole visible keyspace, including
+        // the migration phase record. Drop the cached fence inside this same
+        // critical section: publishing the new keyspace and invalidating the
+        // fence must be one step, or a commit landing in between would
+        // revalidate its pin against a pre-install phase and pass.
+        self.data_migration_fence.invalidate();
 
         if needs_rotate {
             self.rotate_memtable().await;
@@ -2332,6 +2352,66 @@ impl FusionStorage {
             }
         }
         Ok(())
+    }
+
+    /// Read the durable Data V2 migration phase record and prime the fence.
+    /// Called once during `with_config`, after WAL replay restored the MVCC
+    /// clock, so the read sees crash-consistent state. A malformed record or
+    /// a phase above what this binary implements refuses the open outright —
+    /// running blind past the fence would corrupt the migration invariants.
+    async fn load_and_gate_data_migration_phase(
+        &self,
+        structured_data_shadow_v2: bool,
+    ) -> Result<()> {
+        let txn = self.begin_transaction().await?;
+        let raw = txn.get(migration_phase_key()).await?;
+        drop(txn);
+
+        let Some(raw) = raw else {
+            self.data_migration_fence.resolve_with(None);
+            return Ok(());
+        };
+        let record = DataMigrationPhaseRecord::decode(&raw).map_err(|error| {
+            FusionError::Storage(format!(
+                "Refusing to open: the Data V2 migration phase record is malformed ({error})"
+            ))
+        })?;
+        if record.phase > MAX_SUPPORTED_PHASE {
+            return Err(FusionError::Storage(format!(
+                "Refusing to open: the store is at Data V2 migration phase '{}' (seq {}), but this binary only supports up to '{}'; upgrade the binary",
+                record.phase.name(),
+                record.phase_seq,
+                MAX_SUPPORTED_PHASE.name()
+            )));
+        }
+        if record.phase.shadow_writes_enabled() != structured_data_shadow_v2 {
+            eprintln!(
+                "[data-v2] the durable migration phase record ('{}', seq {}) overrides the structured_data_shadow_v2 config flag ({}); the record is authoritative",
+                record.phase.name(),
+                record.phase_seq,
+                structured_data_shadow_v2
+            );
+        }
+        self.data_migration_fence.resolve_with(Some(&record));
+        Ok(())
+    }
+
+    /// Re-read the durable phase record and refresh the fence cache. Used when
+    /// the fence was invalidated (Raft apply / snapshot install) and a commit
+    /// or observer needs the current value.
+    pub(crate) async fn reload_data_migration_fence(&self) -> Result<FenceSnapshot> {
+        let txn = self.begin_transaction().await?;
+        let raw = txn.get(migration_phase_key()).await?;
+        drop(txn);
+        let record = raw
+            .as_deref()
+            .map(DataMigrationPhaseRecord::decode)
+            .transpose()?;
+        Ok(self.data_migration_fence.resolve_with(record.as_ref()))
+    }
+
+    pub(crate) fn data_migration_fence(&self) -> Arc<DataMigrationFence> {
+        self.data_migration_fence.clone()
     }
 
     async fn rebuild_side_indexes(&self) -> Result<()> {
@@ -2905,6 +2985,7 @@ pub struct FusionTransaction {
     read_ts_registered: bool,
     capture_cdc: AtomicBool,
     side_index_deltas: std::sync::Mutex<Vec<SideIndexDelta>>,
+    fenced_migration_phase: Option<FenceSnapshot>,
 }
 
 impl FusionTransaction {
@@ -2912,6 +2993,62 @@ impl FusionTransaction {
     /// commits (after OCC validation and WAL durability). See SideIndexDelta.
     pub fn defer_side_index_delta(&self, delta: SideIndexDelta) {
         self.side_index_deltas.lock().unwrap().push(delta);
+    }
+
+    /// Revalidate the migration-phase pin. Called inside the commit critical
+    /// section, where every phase advance also publishes its fence, so a
+    /// commit serialized after an advance either carries the new pin or
+    /// aborts here — write skew across a phase change is impossible.
+    async fn revalidate_migration_fence(&self) -> Result<()> {
+        let Some(pin) = self.fenced_migration_phase else {
+            return Ok(());
+        };
+        let current = match self.storage.data_migration_fence.cached() {
+            Some(current) => current,
+            None => self.storage.reload_data_migration_fence().await?,
+        };
+        if current != pin {
+            return Err(FusionError::Storage(format!(
+                "Data V2 migration phase advanced during transaction (fenced '{}' seq {}, now '{}' seq {}); retry",
+                pin.phase.name(),
+                pin.phase_seq,
+                current.phase.name(),
+                current.phase_seq
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate any staged phase-record write and return it for publication.
+    ///
+    /// Three rules, all enforced before the write can become durable: the
+    /// record must decode, it must never be deleted (a missing record silently
+    /// reverts the cluster to per-process config-flag behavior), and it must
+    /// not share a transaction with fenced data writes. The last one is the
+    /// atomicity rule: those writes acted on the *old* phase, so committing
+    /// them together with the advance would publish rows that silently violate
+    /// the new phase's contract (for example unshadowed rows under
+    /// `write-delete-shadow`).
+    fn staged_migration_phase_record(&self) -> Result<Option<DataMigrationPhaseRecord>> {
+        let mut staged = None;
+        for (user_key, value) in &self.write_buffer {
+            if user_key.as_slice() != migration_phase_key() {
+                continue;
+            }
+            let Some(bytes) = value else {
+                return Err(FusionError::Storage(
+                    "the Data V2 migration phase record must never be deleted".to_string(),
+                ));
+            };
+            staged = Some(DataMigrationPhaseRecord::decode(bytes)?);
+        }
+        if staged.is_some() && self.fenced_migration_phase.is_some() {
+            return Err(FusionError::Storage(
+                "a Data V2 migration phase advance must not share a transaction with data writes; run it as its own transaction"
+                    .to_string(),
+            ));
+        }
+        Ok(staged)
     }
 
     /// Raft replicates the exact logical mutation batch. Per-node CDC records
@@ -4340,6 +4477,34 @@ impl Transaction for FusionTransaction {
         }
     }
 
+    async fn fence_data_migration_phase(&mut self, phase: u8, phase_seq: u64) -> Result<()> {
+        let phase = DataMigrationPhase::from_byte(phase).ok_or_else(|| {
+            FusionError::Storage(format!(
+                "cannot fence on invalid Data V2 migration phase ordinal {phase}"
+            ))
+        })?;
+        let pin = FenceSnapshot { phase, phase_seq };
+        match self.fenced_migration_phase {
+            None => {
+                self.fenced_migration_phase = Some(pin);
+                Ok(())
+            }
+            Some(existing) if existing == pin => Ok(()),
+            Some(existing) => Err(FusionError::Storage(format!(
+                "Data V2 migration phase changed within transaction (fenced '{}' seq {}, now '{}' seq {}); abort and retry",
+                existing.phase.name(),
+                existing.phase_seq,
+                pin.phase.name(),
+                pin.phase_seq
+            ))),
+        }
+    }
+
+    fn data_migration_phase_pin(&self) -> Option<(u8, u64)> {
+        self.fenced_migration_phase
+            .map(|pin| (pin.phase.as_byte(), pin.phase_seq))
+    }
+
     async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.write_buffer.push((key.to_vec(), Some(value.to_vec())));
         Ok(())
@@ -4692,6 +4857,7 @@ impl Transaction for FusionTransaction {
                 .write_owned()
                 .await;
             let _commit_guard = self.storage.commit_lock.lock().await;
+            self.revalidate_migration_fence().await?;
             self.validate_side_index_deltas()?;
             self.apply_side_index_deltas()?;
             return Ok(());
@@ -4718,6 +4884,9 @@ impl Transaction for FusionTransaction {
             }
         }
         self.validate_side_index_deltas()?;
+
+        self.revalidate_migration_fence().await?;
+        let pending_fence_publish = self.staged_migration_phase_record()?;
 
         let commit_ts = self
             .storage
@@ -4792,6 +4961,15 @@ impl Transaction for FusionTransaction {
         // and complete source publication, otherwise a new reader can observe a partial commit.
         self.storage.current_ts.store(commit_ts, Ordering::SeqCst);
 
+        // Publish the new fence while still inside the commit critical
+        // section, so the advance and its fence visibility are one atomic
+        // step in the commit total order. This also covers Raft followers:
+        // their apply path commits the replicated record through this same
+        // code.
+        if let Some(record) = &pending_fence_publish {
+            self.storage.data_migration_fence.publish_committed(record);
+        }
+
         // Rotation comes after the visibility watermark. Otherwise a newly
         // committed version can reach an SSTable (and therefore compaction)
         // while begin_transaction still selects the previous read_ts.
@@ -4822,6 +5000,7 @@ impl Storage for FusionStorage {
             read_ts_registered: true,
             capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
+            fenced_migration_phase: None,
         }))
     }
 
@@ -5625,6 +5804,7 @@ mod tests {
             read_ts_registered: false,
             capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
+            fenced_migration_phase: None,
         };
         txn.put(b"data:rev:009", b"wb9").await.unwrap();
         txn.delete(b"data:rev:007").await.unwrap();
@@ -5682,6 +5862,7 @@ mod tests {
             read_ts_registered: false,
             capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
+            fenced_migration_phase: None,
         };
 
         {
@@ -8259,6 +8440,7 @@ mod tests {
             read_ts_registered: false,
             capture_cdc: AtomicBool::new(true),
             side_index_deltas: std::sync::Mutex::new(Vec::new()),
+            fenced_migration_phase: None,
         };
         assert_eq!(
             stale_txn.get(b"data:compact_snapshot:001").await.unwrap(),
@@ -8546,5 +8728,282 @@ mod tests {
     fn obsolete_sstable_buffer_preallocates_first_compaction_output() {
         let sstables = obsolete_sstable_buffer();
         assert!(sstables.capacity() >= 1);
+    }
+
+    // ---- Data V2 migration phase: crash matrix + commit fence (P10-2.1) ----
+
+    fn migration_record(phase: DataMigrationPhase, phase_seq: u64) -> DataMigrationPhaseRecord {
+        DataMigrationPhaseRecord {
+            phase,
+            phase_seq,
+            updated_at_unix_ms: 42,
+        }
+    }
+
+    async fn commit_migration_record(
+        storage: &FusionStorage,
+        record: &DataMigrationPhaseRecord,
+    ) -> Result<()> {
+        let mut txn = storage.begin_transaction().await?;
+        txn.put(migration_phase_key(), &record.encode()).await?;
+        txn.commit().await
+    }
+
+    async fn read_migration_record(storage: &FusionStorage) -> Option<DataMigrationPhaseRecord> {
+        let txn = storage.begin_transaction().await.unwrap();
+        let raw = txn.get(migration_phase_key()).await.unwrap();
+        raw.map(|raw| DataMigrationPhaseRecord::decode(&raw).unwrap())
+    }
+
+    #[tokio::test]
+    async fn migration_phase_commit_rolls_back_on_wal_failure_and_reopens_clean() {
+        let data_dir = unique_storage_dir("migration_phase_wal_fault");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+
+        {
+            let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                .await
+                .unwrap();
+            storage
+                .wal
+                .inject_faults(&[crate::storage::wal::WalFaultPoint::AfterWrite]);
+            let error = commit_migration_record(
+                &storage,
+                &migration_record(DataMigrationPhase::DeleteOnly, 1),
+            )
+            .await
+            .expect_err("WAL append failure must abort the phase-record commit");
+            assert!(error.to_string().contains("WAL"), "unexpected: {error}");
+            assert_eq!(read_migration_record(&storage).await, None);
+            // The fence must not observe an aborted advance: it stays at the
+            // startup-primed no-record default (seq 0), never seq 1.
+            assert_eq!(
+                storage.data_migration_fence().cached(),
+                Some(FenceSnapshot {
+                    phase: DataMigrationPhase::DeleteOnly,
+                    phase_seq: 0
+                })
+            );
+        }
+
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .expect("reopen after aborted phase commit");
+        assert_eq!(read_migration_record(&storage).await, None);
+        commit_migration_record(
+            &storage,
+            &migration_record(DataMigrationPhase::DeleteOnly, 1),
+        )
+        .await
+        .expect("clean retry after rollback");
+        assert_eq!(
+            read_migration_record(&storage).await,
+            Some(migration_record(DataMigrationPhase::DeleteOnly, 1))
+        );
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_phase_torn_tail_replay_recovers_prior_phase() {
+        let data_dir = unique_storage_dir("migration_phase_torn_tail");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+
+        let size_after_first;
+        let size_after_second;
+        {
+            let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                .await
+                .unwrap();
+            commit_migration_record(
+                &storage,
+                &migration_record(DataMigrationPhase::DeleteOnly, 1),
+            )
+            .await
+            .unwrap();
+            size_after_first = std::fs::metadata(&wal_path).unwrap().len();
+            commit_migration_record(
+                &storage,
+                &migration_record(DataMigrationPhase::WriteDeleteShadow, 2),
+            )
+            .await
+            .unwrap();
+            size_after_second = std::fs::metadata(&wal_path).unwrap().len();
+        }
+        assert!(size_after_second > size_after_first);
+
+        // Cut into the middle of the second (advance) batch record: a torn
+        // tail, exactly what a crash mid-append leaves behind.
+        let torn_len = size_after_first + (size_after_second - size_after_first) / 2;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        file.set_len(torn_len).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .expect("reopen with torn advance tail");
+        assert_eq!(
+            read_migration_record(&storage).await,
+            Some(migration_record(DataMigrationPhase::DeleteOnly, 1)),
+            "the torn advance must be dropped; the prior durable phase survives"
+        );
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn reopen_refuses_phase_record_beyond_binary_support() {
+        let data_dir = unique_storage_dir("migration_phase_unsupported");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+
+        {
+            let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                .await
+                .unwrap();
+            // Plant a decode-valid record above this binary's support (the
+            // SQL surface cannot reach it; this simulates a store touched by
+            // a newer binary).
+            commit_migration_record(&storage, &migration_record(DataMigrationPhase::Backfill, 3))
+                .await
+                .unwrap();
+        }
+
+        let error = match FusionStorage::with_config(&wal_path.to_string_lossy(), &config).await {
+            Ok(_) => panic!("open must refuse a phase beyond this binary's support"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("only supports"),
+            "unexpected: {error}"
+        );
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_malformed_phase_record_and_deletion() {
+        let (storage, data_dir) = test_fusion_storage("migration_phase_malformed").await;
+
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(migration_phase_key(), b"junk").await.unwrap();
+        let error = txn
+            .commit()
+            .await
+            .expect_err("malformed phase record must not become durable");
+        assert!(
+            error.to_string().contains("invalid length"),
+            "unexpected: {error}"
+        );
+
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.delete(migration_phase_key()).await.unwrap();
+        let error = txn
+            .commit()
+            .await
+            .expect_err("phase record deletion must be rejected");
+        assert!(
+            error.to_string().contains("never be deleted"),
+            "unexpected: {error}"
+        );
+
+        assert_eq!(read_migration_record(&storage).await, None);
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn commit_fence_aborts_stale_pin_after_advance() {
+        let (storage, data_dir) = test_fusion_storage("migration_phase_fence_race").await;
+
+        // In-flight transaction pins the no-record fence (seq 0).
+        let mut stale = storage.begin_transaction().await.unwrap();
+        stale
+            .fence_data_migration_phase(DataMigrationPhase::DeleteOnly.as_byte(), 0)
+            .await
+            .unwrap();
+        stale.put(b"data:fence_race:1", b"stale").await.unwrap();
+
+        // A concurrent INIT commits and publishes the new fence.
+        commit_migration_record(
+            &storage,
+            &migration_record(DataMigrationPhase::DeleteOnly, 1),
+        )
+        .await
+        .unwrap();
+
+        let error = stale
+            .commit()
+            .await
+            .expect_err("a commit serialized after an advance must abort on its stale pin");
+        assert!(
+            error.to_string().contains("migration phase advanced"),
+            "unexpected: {error}"
+        );
+
+        // The retry (new fence) succeeds.
+        let mut retry = storage.begin_transaction().await.unwrap();
+        retry
+            .fence_data_migration_phase(DataMigrationPhase::DeleteOnly.as_byte(), 1)
+            .await
+            .unwrap();
+        retry.put(b"data:fence_race:1", b"fresh").await.unwrap();
+        retry.commit().await.unwrap();
+
+        // A second fence with a different value inside one transaction is an
+        // immediate loud error (multi-statement transaction crossing an
+        // advance).
+        let mut crossing = storage.begin_transaction().await.unwrap();
+        crossing
+            .fence_data_migration_phase(DataMigrationPhase::DeleteOnly.as_byte(), 1)
+            .await
+            .unwrap();
+        let error = crossing
+            .fence_data_migration_phase(DataMigrationPhase::WriteDeleteShadow.as_byte(), 2)
+            .await
+            .expect_err("a changed fence within one transaction must error immediately");
+        assert!(
+            error.to_string().contains("changed within transaction"),
+            "unexpected: {error}"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fence_reload_after_invalidate_reads_durable_record() {
+        let (storage, data_dir) = test_fusion_storage("migration_phase_reload").await;
+        commit_migration_record(
+            &storage,
+            &migration_record(DataMigrationPhase::WriteDeleteShadow, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.data_migration_fence().cached(),
+            Some(FenceSnapshot {
+                phase: DataMigrationPhase::WriteDeleteShadow,
+                phase_seq: 1
+            })
+        );
+
+        storage.data_migration_fence().invalidate();
+        assert_eq!(storage.data_migration_fence().cached(), None);
+        assert_eq!(
+            storage.reload_data_migration_fence().await.unwrap(),
+            FenceSnapshot {
+                phase: DataMigrationPhase::WriteDeleteShadow,
+                phase_seq: 1
+            }
+        );
+        cleanup_storage_dir(&data_dir);
     }
 }

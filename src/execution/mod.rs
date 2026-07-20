@@ -21,15 +21,19 @@ use crate::config::StorageConfig;
 use crate::distributed::sharding::{ShardRoute, ShardRouter};
 use crate::monitor;
 use crate::parser::parse_sql;
+use crate::storage::data_migration::{
+    migration_phase_key, CachedFenceState, DataMigrationFence, DataMigrationPhase,
+    DataMigrationPhaseRecord, MAX_ADVANCE_TARGET_PHASE, MAX_SUPPORTED_PHASE,
+};
 use crate::storage::{
     vector_index::VectorIndex, FusionStorage, ScanVisitor, Storage, StorageScanOptions, Transaction,
 };
 use moka::sync::Cache;
 use parking_lot::RwLock;
 use sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByKind, Query, SelectItem, SetExpr,
-    Statement, TableFactor,
+    BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByKind, Query,
+    SelectItem, SetExpr, Statement, TableFactor,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
@@ -462,6 +466,7 @@ pub struct Executor {
     pub(crate) row_cache: Cache<String, CachedRow>,
     pub(crate) sql_bulk_scan_no_fill: bool,
     structured_data_shadow_v2: bool,
+    data_migration_fence: Option<Arc<DataMigrationFence>>,
     pub(crate) vector_index: Arc<VectorIndex>,
     pub(crate) embedding_registry: Arc<EmbeddingRegistry>,
 }
@@ -548,6 +553,10 @@ impl Executor {
             .downcast_ref::<FusionStorage>()
             .map(|fusion| fusion.vector_index.clone())
             .unwrap_or_else(|| Arc::new(VectorIndex::new()));
+        let data_migration_fence = storage
+            .as_any()
+            .downcast_ref::<FusionStorage>()
+            .map(|fusion| fusion.data_migration_fence());
 
         Self {
             storage,
@@ -560,6 +569,7 @@ impl Executor {
             row_cache: Cache::new(config.row_cache_capacity),
             sql_bulk_scan_no_fill: config.sql_bulk_scan_no_fill,
             structured_data_shadow_v2: config.structured_data_shadow_v2,
+            data_migration_fence,
             vector_index: shared_vector_index,
             embedding_registry: Arc::new(EmbeddingRegistry::new()),
         }
@@ -810,6 +820,71 @@ impl Executor {
         })
     }
 
+    /// The phase this executor acts on when no durable record exists. It is
+    /// the executor's own config flag — the pre-record contract — never the
+    /// storage-baked one, so a store opened with a different StorageConfig
+    /// cannot silently change shadow behavior.
+    fn config_default_migration_phase(&self) -> DataMigrationPhase {
+        if self.structured_data_shadow_v2 {
+            DataMigrationPhase::WriteDeleteShadow
+        } else {
+            DataMigrationPhase::DeleteOnly
+        }
+    }
+
+    /// Resolve the Data V2 migration phase this write acts on and pin it on
+    /// the transaction. The pin is revalidated at commit (FusionTransaction)
+    /// and recorded as a replicated precondition (RecordingTransaction), so a
+    /// write can never commit under a phase other than the one it observed.
+    pub(crate) async fn observe_data_migration_phase_and_fence(
+        &self,
+        txn: &mut dyn Transaction,
+    ) -> Result<DataMigrationPhase> {
+        // Row writers call this once per row. After the first row of a
+        // statement the transaction already holds its pin, so the shared
+        // fence lock and the boxed async fence call are both skipped.
+        if let Some((phase, _)) = txn.data_migration_phase_pin() {
+            return DataMigrationPhase::from_byte(phase).ok_or_else(|| {
+                FusionError::Execution(format!(
+                    "transaction holds an invalid Data V2 migration phase pin {phase}"
+                ))
+            });
+        }
+
+        let (phase, phase_seq) = match self.data_migration_fence.as_ref().map(|f| f.cached_state())
+        {
+            Some(CachedFenceState::Record(snapshot)) => (snapshot.phase, snapshot.phase_seq),
+            Some(CachedFenceState::NoRecord) => (self.config_default_migration_phase(), 0),
+            // Unknown (first touch or invalidated), or a non-Fusion engine
+            // with no shared cache: read the record through this transaction.
+            _ => {
+                let record = txn
+                    .get(migration_phase_key())
+                    .await?
+                    .as_deref()
+                    .map(DataMigrationPhaseRecord::decode)
+                    .transpose()?;
+                if let Some(fence) = &self.data_migration_fence {
+                    fence.resolve_with(record.as_ref());
+                }
+                match record {
+                    Some(record) => (record.phase, record.phase_seq),
+                    None => (self.config_default_migration_phase(), 0),
+                }
+            }
+        };
+        if phase > MAX_SUPPORTED_PHASE {
+            return Err(FusionError::Execution(format!(
+                "the store is at Data V2 migration phase '{}' which this binary does not support (max '{}')",
+                phase.name(),
+                MAX_SUPPORTED_PHASE.name()
+            )));
+        }
+        txn.fence_data_migration_phase(phase.as_byte(), phase_seq)
+            .await?;
+        Ok(phase)
+    }
+
     pub(crate) async fn write_routed_data_row(
         &self,
         table_name: &str,
@@ -817,9 +892,10 @@ impl Executor {
         value: &[u8],
         txn: &mut dyn Transaction,
     ) -> Result<()> {
+        let phase = self.observe_data_migration_phase_and_fence(txn).await?;
         let legacy_key = self.routed_data_key_for_row_id(table_name, row_id);
-        let shadow_key = self
-            .structured_data_shadow_v2
+        let shadow_key = phase
+            .shadow_writes_enabled()
             .then(|| self.routed_structured_data_key_for_row_id(table_name, row_id))
             .transpose()?;
 
@@ -836,6 +912,11 @@ impl Executor {
         row_id: &str,
         txn: &mut dyn Transaction,
     ) -> Result<()> {
+        // Deletes behave identically in every T1 phase (blind v2 tombstone),
+        // but still fence: delete-only batches must carry the same phase
+        // precondition so the later no-precondition apply guard (P10-2.3)
+        // does not reject this binary's own deletes.
+        self.observe_data_migration_phase_and_fence(txn).await?;
         let legacy_key = self.routed_data_key_for_row_id(table_name, row_id);
         let shadow_key = self.routed_structured_data_key_for_row_id(table_name, row_id)?;
         txn.delete(legacy_key.as_bytes()).await?;
@@ -848,6 +929,7 @@ impl Executor {
         table_name: &str,
         txn: &mut dyn Transaction,
     ) -> Result<()> {
+        self.observe_data_migration_phase_and_fence(txn).await?;
         let namespace_prefix = crate::storage::keyspace::data_namespace_prefix();
         for (key, _) in txn.scan_prefix(&namespace_prefix, None).await? {
             let parsed = crate::storage::keyspace::parse_data_key_exact(&key).map_err(|error| {
@@ -3783,6 +3865,11 @@ impl Executor {
         self.invalidate_query_result_cache();
         self.invalidate_update_fast_path_cache();
         self.row_cache.invalidate_all();
+        // Covers both existing callers: Raft apply and snapshot install. The
+        // fence re-reads the durable phase record on the next observation.
+        if let Some(fence) = &self.data_migration_fence {
+            fence.invalidate();
+        }
     }
 
     fn invalidate_update_fast_path_cache(&self) {
@@ -3808,6 +3895,10 @@ impl Executor {
             | Statement::Analyze(_)
             | Statement::Drop { .. } => true,
             Statement::Copy { to, .. } => !*to,
+            // Migration procedures mutate the durable phase record; other
+            // CALL names keep today's non-mutating classification and fail
+            // loudly at execution.
+            Statement::Call(function) => Self::is_data_migration_call(function),
             Statement::Explain { statement, .. } => {
                 Self::statement_may_change_query_results(statement)
             }
@@ -4445,9 +4536,209 @@ impl Executor {
                 self.handle_create_view(&cv.name, &cv.query, cv.or_replace, txn)
                     .await
             }
+            Statement::Call(function) => self.handle_call(function, txn).await,
+            stmt if Self::is_show_data_migration_phase(stmt) => {
+                self.handle_show_data_migration_phase(txn).await
+            }
             _ => Err(FusionError::Execution(format!(
                 "Unsupported SQL statement: {stmt}"
             ))),
+        }
+    }
+
+    /// True for the two Data V2 migration procedures. Only these CALL names
+    /// mutate state; they must route through the Raft write path in
+    /// distributed mode exactly like DML, and require superuser.
+    pub(crate) fn is_data_migration_call(function: &Function) -> bool {
+        execution_object_name_eq_ascii(&function.name, "fusiondb_data_migration_init")
+            || execution_object_name_eq_ascii(&function.name, "fusiondb_data_migration_advance")
+    }
+
+    pub(crate) fn statement_is_data_migration_call(stmt: &Statement) -> bool {
+        matches!(stmt, Statement::Call(function) if Self::is_data_migration_call(function))
+    }
+
+    fn call_string_arguments(function: &Function) -> Result<Vec<String>> {
+        match &function.args {
+            FunctionArguments::None => Ok(vec![]),
+            FunctionArguments::List(list) => list
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => {
+                        match &value.value {
+                            sqlparser::ast::Value::SingleQuotedString(text) => Ok(text.clone()),
+                            other => Err(FusionError::Execution(format!(
+                                "CALL arguments must be string literals, got {other}"
+                            ))),
+                        }
+                    }
+                    other => Err(FusionError::Execution(format!(
+                        "CALL arguments must be string literals, got {other}"
+                    ))),
+                })
+                .collect(),
+            FunctionArguments::Subquery(_) => Err(FusionError::Execution(
+                "CALL does not accept a subquery argument".to_string(),
+            )),
+        }
+    }
+
+    async fn handle_call(
+        &self,
+        function: &Function,
+        txn: &mut dyn Transaction,
+    ) -> Result<QueryResult> {
+        let args = Self::call_string_arguments(function)?;
+        if execution_object_name_eq_ascii(&function.name, "fusiondb_data_migration_init") {
+            if !args.is_empty() {
+                return Err(FusionError::Execution(
+                    "CALL fusiondb_data_migration_init() takes no arguments".to_string(),
+                ));
+            }
+            return self.handle_data_migration_init(txn).await;
+        }
+        if execution_object_name_eq_ascii(&function.name, "fusiondb_data_migration_advance") {
+            let [target] = args.as_slice() else {
+                return Err(FusionError::Execution(
+                    "CALL fusiondb_data_migration_advance('<phase>') takes exactly one phase-name argument"
+                        .to_string(),
+                ));
+            };
+            return self.handle_data_migration_advance(target, txn).await;
+        }
+        Err(FusionError::Execution(format!(
+            "Unsupported SQL statement: CALL {}",
+            function.name
+        )))
+    }
+
+    fn data_migration_phase_result(record: &DataMigrationPhaseRecord) -> QueryResult {
+        QueryResult::Select {
+            columns: vec![
+                "phase".to_string(),
+                "phase_seq".to_string(),
+                "updated_at_unix_ms".to_string(),
+            ],
+            rows: vec![vec![
+                Value::String(record.phase.name().to_string()),
+                Value::Integer(record.phase_seq as i64),
+                Value::Integer(record.updated_at_unix_ms as i64),
+            ]],
+        }
+    }
+
+    /// `CALL fusiondb_data_migration_init()`: create the durable phase record
+    /// from the config-flag default. Idempotent — an existing record is
+    /// returned unchanged with zero writes, so operator/crash retries are
+    /// safe. A record is never created implicitly: initialization is an
+    /// explicit operator decision.
+    async fn handle_data_migration_init(&self, txn: &mut dyn Transaction) -> Result<QueryResult> {
+        if let Some(raw) = txn.get(migration_phase_key()).await? {
+            let record = DataMigrationPhaseRecord::decode(&raw)?;
+            return Ok(Self::data_migration_phase_result(&record));
+        }
+        let record = DataMigrationPhaseRecord {
+            phase: self.config_default_migration_phase(),
+            phase_seq: 1,
+            updated_at_unix_ms: u64::try_from(Self::current_epoch_ms()).unwrap_or(u64::MAX),
+        };
+        txn.put(migration_phase_key(), &record.encode()).await?;
+        Ok(Self::data_migration_phase_result(&record))
+    }
+
+    /// `CALL fusiondb_data_migration_advance('<phase>')`: move the record
+    /// exactly one phase up the ladder. Re-targeting the current phase is an
+    /// idempotent no-op (retry safety); anything else — downgrade, skip,
+    /// unknown name, or a target beyond this binary's advance gate — fails
+    /// loudly with zero writes.
+    async fn handle_data_migration_advance(
+        &self,
+        target_name: &str,
+        txn: &mut dyn Transaction,
+    ) -> Result<QueryResult> {
+        let Some(target) = DataMigrationPhase::parse_name(target_name) else {
+            return Err(FusionError::Execution(format!(
+                "unknown Data V2 migration phase '{target_name}' (valid: delete-only, write-delete-shadow, backfill, validated, v2-readable, v2-only, legacy-gc)"
+            )));
+        };
+        let Some(raw) = txn.get(migration_phase_key()).await? else {
+            return Err(FusionError::Execution(
+                "no Data V2 migration phase record exists; run CALL fusiondb_data_migration_init() first"
+                    .to_string(),
+            ));
+        };
+        let current = DataMigrationPhaseRecord::decode(&raw)?;
+        if target == current.phase {
+            return Ok(Self::data_migration_phase_result(&current));
+        }
+        if Some(target) != current.phase.next() {
+            return Err(FusionError::Execution(format!(
+                "Data V2 migration phase can only advance one step: current '{}', next '{}', requested '{}'",
+                current.phase.name(),
+                current
+                    .phase
+                    .next()
+                    .map(DataMigrationPhase::name)
+                    .unwrap_or("<none: ladder complete>"),
+                target.name()
+            )));
+        }
+        if target > MAX_ADVANCE_TARGET_PHASE {
+            return Err(FusionError::Execution(format!(
+                "Data V2 migration phase '{}' is not supported by this build (advance gate: '{}')",
+                target.name(),
+                MAX_ADVANCE_TARGET_PHASE.name()
+            )));
+        }
+        let record = DataMigrationPhaseRecord {
+            phase: target,
+            phase_seq: current.phase_seq + 1,
+            updated_at_unix_ms: u64::try_from(Self::current_epoch_ms()).unwrap_or(u64::MAX),
+        };
+        txn.put(migration_phase_key(), &record.encode()).await?;
+        Ok(Self::data_migration_phase_result(&record))
+    }
+
+    /// True for `SHOW DATA MIGRATION PHASE` in its parsed form. pgwire parses
+    /// the text before `execute_sql` can intercept it, so the diagnostic must
+    /// also be reachable as a statement.
+    fn is_show_data_migration_phase(stmt: &Statement) -> bool {
+        let Statement::ShowVariable { variable } = stmt else {
+            return false;
+        };
+        let parts: Vec<String> = variable
+            .iter()
+            .map(|ident| ident.value.to_ascii_uppercase())
+            .collect();
+        parts == ["DATA", "MIGRATION", "PHASE"]
+    }
+
+    /// `SHOW DATA MIGRATION PHASE`: local read-only diagnostic.
+    async fn handle_show_data_migration_phase(
+        &self,
+        txn: &mut dyn Transaction,
+    ) -> Result<QueryResult> {
+        match txn.get(migration_phase_key()).await? {
+            Some(raw) => {
+                let record = DataMigrationPhaseRecord::decode(&raw)?;
+                Ok(Self::data_migration_phase_result(&record))
+            }
+            None => Ok(QueryResult::Select {
+                columns: vec![
+                    "phase".to_string(),
+                    "phase_seq".to_string(),
+                    "updated_at_unix_ms".to_string(),
+                ],
+                rows: vec![vec![
+                    Value::String(format!(
+                        "no record (config-derived: {})",
+                        self.config_default_migration_phase().name()
+                    )),
+                    Value::Null,
+                    Value::Null,
+                ]],
+            }),
         }
     }
 
@@ -4480,6 +4771,9 @@ impl Executor {
             return self.require_superuser(username).await;
         }
 
+        // CALL is deliberately not string-matched here: a leading comment or
+        // tab defeats a prefix test. authorize_statement gates it on the
+        // parsed statement instead.
         let statements = self.prepare(sql)?;
         for statement in &statements {
             self.authorize_statement(username, statement).await?;
@@ -4513,6 +4807,13 @@ impl Executor {
         }
 
         if matches!(stmt, Statement::Vacuum(_)) {
+            return self.require_superuser(username).await;
+        }
+
+        // Statement-shaped, not string-prefix-shaped: a leading comment or
+        // an extended-protocol bind must not slip a migration procedure past
+        // the superuser gate.
+        if Self::statement_is_data_migration_call(stmt) {
             return self.require_superuser(username).await;
         }
 
@@ -4759,6 +5060,12 @@ impl Executor {
         {
             return Err(FusionError::Execution(
                 "VACUUM must be executed as a standalone statement".to_string(),
+            ));
+        }
+        if stmts.len() > 1 && stmts.iter().any(Self::statement_is_data_migration_call) {
+            return Err(FusionError::Execution(
+                "Data V2 migration CALL procedures must be executed as standalone statements"
+                    .to_string(),
             ));
         }
 
@@ -7078,6 +7385,535 @@ mod tests {
             .await
             .expect_err("second same-float insert must abort at OCC validation");
         assert!(err.to_string().to_lowercase().contains("conflict"));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ---- Data V2 migration phase: CALL surface + fencing races (P10-2.1) ----
+
+    fn phase_row(result: &QueryResult) -> (String, i64) {
+        let QueryResult::Select { columns, rows } = result else {
+            panic!("migration procedures return a row, got {result:?}");
+        };
+        assert_eq!(columns[0], "phase");
+        assert_eq!(columns[1], "phase_seq");
+        let Value::String(phase) = &rows[0][0] else {
+            panic!("phase column must be a string, got {:?}", rows[0][0]);
+        };
+        let Value::Integer(seq) = &rows[0][1] else {
+            panic!("phase_seq column must be an integer, got {:?}", rows[0][1]);
+        };
+        (phase.clone(), *seq)
+    }
+
+    async fn fusion_executor(test_name: &str) -> (Executor, Arc<dyn Storage>, std::path::PathBuf) {
+        let data_dir =
+            std::env::temp_dir().join(format!("fusiondb_{}_{}", test_name, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = crate::config::StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let fusion =
+            crate::storage::FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                .await
+                .unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(fusion);
+        let executor = Executor::with_config(storage.clone(), &config);
+        (executor, storage, data_dir)
+    }
+
+    #[tokio::test]
+    async fn data_migration_call_lifecycle_and_gates() {
+        let wal_path = format!("test_migration_call_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+
+        let shown = executor
+            .execute_sql("SHOW DATA MIGRATION PHASE")
+            .await
+            .unwrap();
+        let QueryResult::Select { rows, .. } = &shown[0] else {
+            panic!("SHOW returns a row");
+        };
+        assert!(
+            matches!(&rows[0][0], Value::String(s) if s.contains("no record")
+            && s.contains("delete-only"))
+        );
+
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .await
+            .expect_err("advance before init must fail loudly");
+        assert!(error
+            .to_string()
+            .contains("run CALL fusiondb_data_migration_init() first"));
+
+        let inited = executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+        assert_eq!(phase_row(&inited[0]), ("delete-only".to_string(), 1));
+
+        // INIT retry is idempotent with zero writes.
+        let inited = executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+        assert_eq!(phase_row(&inited[0]), ("delete-only".to_string(), 1));
+
+        let advanced = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .await
+            .unwrap();
+        assert_eq!(
+            phase_row(&advanced[0]),
+            ("write-delete-shadow".to_string(), 2)
+        );
+
+        // Advance retry to the current phase is an idempotent no-op.
+        let advanced = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .await
+            .unwrap();
+        assert_eq!(
+            phase_row(&advanced[0]),
+            ("write-delete-shadow".to_string(), 2)
+        );
+
+        // The next rung exists but is beyond this build's advance gate.
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('backfill')")
+            .await
+            .expect_err("backfill is beyond the T1 advance gate");
+        assert!(error.to_string().contains("not supported by this build"));
+
+        // Downgrade and rung-skipping are single-step violations.
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('delete-only')")
+            .await
+            .expect_err("downgrade must fail");
+        assert!(error.to_string().contains("only advance one step"));
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('validated')")
+            .await
+            .expect_err("skipping rungs must fail");
+        assert!(error.to_string().contains("only advance one step"));
+
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('nonsense')")
+            .await
+            .expect_err("unknown phase name must fail");
+        assert!(error
+            .to_string()
+            .contains("unknown Data V2 migration phase"));
+
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_init('x')")
+            .await
+            .expect_err("init takes no arguments");
+        assert!(error.to_string().contains("takes no arguments"));
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_advance()")
+            .await
+            .expect_err("advance takes one argument");
+        assert!(error.to_string().contains("exactly one"));
+        let error = executor
+            .execute_sql("CALL some_other_procedure()")
+            .await
+            .expect_err("unknown CALL names stay unsupported");
+        assert!(error.to_string().contains("Unsupported SQL statement"));
+
+        // Migration procedures are standalone statements, like VACUUM.
+        let error = executor
+            .execute_sql("CALL fusiondb_data_migration_init(); SELECT 1")
+            .await
+            .expect_err("migration CALL must be standalone");
+        assert!(error.to_string().contains("standalone"));
+
+        let shown = executor
+            .execute_sql("SHOW DATA MIGRATION PHASE")
+            .await
+            .unwrap();
+        assert_eq!(phase_row(&shown[0]), ("write-delete-shadow".to_string(), 2));
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// pgwire parses the text before `execute_sql` can intercept the raw
+    /// string, so the diagnostic must also work as a parsed statement.
+    #[tokio::test]
+    async fn show_data_migration_phase_works_as_a_parsed_statement() {
+        let wal_path = format!("test_migration_show_stmt_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+        executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+
+        let stmt = crate::parser::parse_sql("SHOW DATA MIGRATION PHASE")
+            .unwrap()
+            .remove(0);
+        assert!(!Executor::statement_may_change_query_results(&stmt));
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let result = executor
+            .execute_in_transaction(&stmt, &mut *txn)
+            .await
+            .expect("the parsed form must resolve, not error as unsupported");
+        assert_eq!(phase_row(&result), ("delete-only".to_string(), 1));
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// The superuser gate is statement-shaped: a leading comment or a tab
+    /// separator must not slip a migration procedure past it.
+    #[tokio::test]
+    async fn migration_call_superuser_gate_resists_prefix_tricks() {
+        let wal_path = format!("test_migration_authz_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+        executor
+            .execute_sql("CREATE USER alice WITH PASSWORD 'pw'")
+            .await
+            .unwrap();
+
+        for sql in [
+            "CALL fusiondb_data_migration_init()",
+            "/* sneak */ CALL fusiondb_data_migration_init()",
+            "CALL\tfusiondb_data_migration_advance('write-delete-shadow')",
+            "  \n CALL fusiondb_data_migration_init()",
+        ] {
+            let error = executor
+                .authorize_sql("alice", sql)
+                .await
+                .expect_err(&format!("non-superuser must be refused for: {sql}"));
+            assert!(
+                error.to_string().to_lowercase().contains("superuser"),
+                "unexpected error for {sql}: {error}"
+            );
+        }
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn data_migration_record_overrides_the_config_flag() {
+        // Flag OFF, record advanced to write-delete-shadow: shadows appear.
+        let wal_path = format!("test_migration_flag_off_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+        executor
+            .execute_sql("CREATE TABLE flagless (id TEXT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO flagless VALUES ('row:1', 'one')")
+            .await
+            .unwrap();
+        let shadow_key = executor
+            .routed_structured_data_key_for_row_id("flagless", "row:1")
+            .unwrap();
+        {
+            let txn = storage.begin_transaction().await.unwrap();
+            assert!(
+                txn.get(&shadow_key).await.unwrap().is_some(),
+                "record=write-delete-shadow must shadow-write even with the flag off"
+            );
+        }
+        let _ = std::fs::remove_file(wal_path);
+
+        // Flag ON, record still delete-only: no shadows.
+        let wal_path = format!("test_migration_flag_on_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let mut config = crate::config::StorageConfig::default();
+        config.structured_data_shadow_v2 = true;
+        let executor = Executor::with_config(storage.clone(), &config);
+        executor
+            .execute_sql("CREATE TABLE flagged (id TEXT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        {
+            // Plant a delete-only record directly (flag-on INIT would start
+            // at write-delete-shadow).
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.put(
+                migration_phase_key(),
+                &DataMigrationPhaseRecord {
+                    phase: DataMigrationPhase::DeleteOnly,
+                    phase_seq: 1,
+                    updated_at_unix_ms: 42,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+            txn.commit().await.unwrap();
+        }
+        executor
+            .execute_sql("INSERT INTO flagged VALUES ('row:1', 'one')")
+            .await
+            .unwrap();
+        let shadow_key = executor
+            .routed_structured_data_key_for_row_id("flagged", "row:1")
+            .unwrap();
+        {
+            let txn = storage.begin_transaction().await.unwrap();
+            assert!(
+                txn.get(&shadow_key).await.unwrap().is_none(),
+                "record=delete-only must suppress shadows even with the flag on"
+            );
+        }
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// On FusionStorage the shadow decision runs through the cached fence,
+    /// a different branch from the MemoryStorage fallback above, and it must
+    /// survive a reopen (the record is read back by `load_and_gate`).
+    #[tokio::test]
+    async fn fusion_cached_fence_drives_shadow_writes_across_reopen() {
+        let (executor, storage, data_dir) = fusion_executor("migration_fusion_fence").await;
+        executor
+            .execute_sql("CREATE TABLE fenced_rows (id TEXT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("INSERT INTO fenced_rows VALUES ('row:1', 'one')")
+            .await
+            .unwrap();
+        let shadow_key = executor
+            .routed_structured_data_key_for_row_id("fenced_rows", "row:1")
+            .unwrap();
+        {
+            let txn = storage.begin_transaction().await.unwrap();
+            assert!(txn.get(&shadow_key).await.unwrap().is_some());
+        }
+        drop(executor);
+        drop(storage);
+
+        // Reopen: the record must be re-read and still drive shadow writes,
+        // even though the config flag is off.
+        let mut config = crate::config::StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let fusion =
+            crate::storage::FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+                .await
+                .expect("reopen with a write-delete-shadow record");
+        let storage: Arc<dyn Storage> = Arc::new(fusion);
+        let executor = Executor::with_config(storage.clone(), &config);
+        assert!(!executor.structured_data_shadow_v2);
+        executor
+            .execute_sql("INSERT INTO fenced_rows VALUES ('row:2', 'two')")
+            .await
+            .unwrap();
+        let shadow_key = executor
+            .routed_structured_data_key_for_row_id("fenced_rows", "row:2")
+            .unwrap();
+        let txn = storage.begin_transaction().await.unwrap();
+        assert!(
+            txn.get(&shadow_key).await.unwrap().is_some(),
+            "the reopened fence must keep shadow writes on"
+        );
+        drop(txn);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn fenced_write_aborts_when_phase_advances_mid_transaction() {
+        let (executor, storage, data_dir) = fusion_executor("migration_fence_race").await;
+        executor
+            .execute_sql("CREATE TABLE fence_race (id TEXT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+
+        // An interactive transaction (the pg session shape: BEGIN .. write
+        // .. COMMIT commits this same FusionTransaction) writes under the
+        // pre-INIT fence.
+        let insert = executor
+            .prepare("INSERT INTO fence_race VALUES ('row:1', 'stale')")
+            .unwrap()
+            .remove(0);
+        let mut in_flight = storage.begin_transaction().await.unwrap();
+        executor
+            .execute_in_transaction(&insert, &mut *in_flight)
+            .await
+            .unwrap();
+
+        // A concurrent operator INIT commits first.
+        executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+
+        let error = in_flight
+            .commit()
+            .await
+            .expect_err("COMMIT after a concurrent phase change must abort");
+        assert!(
+            error.to_string().contains("migration phase advanced"),
+            "unexpected: {error}"
+        );
+
+        // The retry succeeds under the new fence.
+        let insert = executor
+            .prepare("INSERT INTO fence_race VALUES ('row:1', 'fresh')")
+            .unwrap()
+            .remove(0);
+        let mut retry = storage.begin_transaction().await.unwrap();
+        executor
+            .execute_in_transaction(&insert, &mut *retry)
+            .await
+            .unwrap();
+        retry.commit().await.unwrap();
+
+        let rows = executor
+            .execute_sql("SELECT payload FROM fence_race WHERE id = 'row:1'")
+            .await
+            .unwrap();
+        let QueryResult::Select { rows, .. } = &rows[0] else {
+            panic!("select returns rows");
+        };
+        assert_eq!(rows[0][0], Value::String("fresh".to_string()));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The atomicity rule: a session transaction that mixes data writes with
+    /// an advance must abort at COMMIT. Committing both would publish rows
+    /// evaluated under the old phase together with the new phase contract.
+    #[tokio::test]
+    async fn session_transaction_mixing_data_write_and_advance_aborts() {
+        let (executor, storage, data_dir) = fusion_executor("migration_mixed_txn").await;
+        executor
+            .execute_sql("CREATE TABLE mixed_txn (id TEXT PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+
+        let insert = executor
+            .prepare("INSERT INTO mixed_txn VALUES ('row:1', 'one')")
+            .unwrap()
+            .remove(0);
+        let advance = executor
+            .prepare("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .unwrap()
+            .remove(0);
+
+        // BEGIN; INSERT; CALL advance; COMMIT
+        let mut session = storage.begin_transaction().await.unwrap();
+        executor
+            .execute_in_transaction(&insert, &mut *session)
+            .await
+            .unwrap();
+        executor
+            .execute_in_transaction(&advance, &mut *session)
+            .await
+            .unwrap();
+        let error = session
+            .commit()
+            .await
+            .expect_err("mixing data writes with an advance must abort at COMMIT");
+        assert!(
+            error.to_string().contains("must not share a transaction"),
+            "unexpected: {error}"
+        );
+
+        // Neither effect landed: the row is absent and the phase is unchanged.
+        let rows = executor
+            .execute_sql("SELECT payload FROM mixed_txn WHERE id = 'row:1'")
+            .await
+            .unwrap();
+        let QueryResult::Select { rows, .. } = &rows[0] else {
+            panic!("select returns rows");
+        };
+        assert!(rows.is_empty());
+        let shown = executor
+            .execute_sql("SHOW DATA MIGRATION PHASE")
+            .await
+            .unwrap();
+        assert_eq!(phase_row(&shown[0]), ("delete-only".to_string(), 1));
+
+        // The same statements in their own transactions both succeed.
+        executor
+            .execute_sql("INSERT INTO mixed_txn VALUES ('row:1', 'one')")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_double_advance_exactly_one_wins() {
+        let (executor, storage, data_dir) = fusion_executor("migration_double_advance").await;
+        executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+
+        let advance = executor
+            .prepare("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .unwrap()
+            .remove(0);
+        let mut first = storage.begin_transaction().await.unwrap();
+        let mut second = storage.begin_transaction().await.unwrap();
+        executor
+            .execute_in_transaction(&advance, &mut *first)
+            .await
+            .unwrap();
+        executor
+            .execute_in_transaction(&advance, &mut *second)
+            .await
+            .unwrap();
+
+        first.commit().await.expect("first advance wins");
+        let error = second
+            .commit()
+            .await
+            .expect_err("second concurrent advance must lose OCC validation");
+        assert!(
+            error.to_string().contains("Write conflict"),
+            "unexpected: {error}"
+        );
+
+        // The loser's retry lands on the idempotent branch: same phase, same
+        // sequence, zero writes.
+        let retried = executor
+            .execute_sql("CALL fusiondb_data_migration_advance('write-delete-shadow')")
+            .await
+            .unwrap();
+        assert_eq!(
+            phase_row(&retried[0]),
+            ("write-delete-shadow".to_string(), 2)
+        );
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

@@ -21,6 +21,9 @@ use super::typ::{
     MUTATION_BATCH_VERSION,
 };
 use crate::execution::Executor;
+use crate::storage::data_migration::{
+    migration_phase_key, DataMigrationPhaseRecord, MAX_SUPPORTED_PHASE,
+};
 use crate::storage::fusion::{FusionTransaction, SideIndexDelta};
 use crate::storage::{FusionStorage, Storage};
 
@@ -287,6 +290,76 @@ impl FusionRaftStore {
             if watermark >= *log_id {
                 txn.rollback().await.map_err(state_machine_write_error)?;
                 return Ok(batch.response.clone());
+            }
+        }
+
+        // Monotonic guard for the Data V2 migration phase record. Violations
+        // are deterministic across replicas (same log order, same prior
+        // state), so they use the graceful rejection channel — state
+        // unchanged, replay reaches the same verdict, the node keeps
+        // running. Only a legitimate advance beyond this binary's support
+        // halts the state machine: applying past the fence would diverge.
+        for mutation in &batch.mutations {
+            let (key, new_value) = match mutation {
+                KvMutation::Put { key, value } => (key, Some(value)),
+                KvMutation::Delete { key } => (key, None),
+            };
+            if key.as_slice() != migration_phase_key() {
+                continue;
+            }
+            let Some(new_value) = new_value else {
+                txn.rollback().await.map_err(state_machine_write_error)?;
+                return Ok(Response::error(
+                    "the Data V2 migration phase record must never be deleted",
+                ));
+            };
+            let new_record = match DataMigrationPhaseRecord::decode(new_value) {
+                Ok(record) => record,
+                Err(error) => {
+                    txn.rollback().await.map_err(state_machine_write_error)?;
+                    return Ok(Response::error(format!(
+                        "malformed Data V2 migration phase record in Raft mutation batch: {error}"
+                    )));
+                }
+            };
+            let existing = txn
+                .get(migration_phase_key())
+                .await
+                .map_err(state_machine_read_error)?;
+            let step_is_valid = match &existing {
+                None => {
+                    new_record.phase_seq == 1
+                        && matches!(
+                        new_record.phase,
+                        crate::storage::data_migration::DataMigrationPhase::DeleteOnly
+                            | crate::storage::data_migration::DataMigrationPhase::WriteDeleteShadow
+                    )
+                }
+                Some(existing) => {
+                    // A malformed record already in storage is local
+                    // corruption, not a batch defect: halt loudly.
+                    let existing = DataMigrationPhaseRecord::decode(existing)
+                        .map_err(state_machine_write_error)?;
+                    new_record.phase_seq == existing.phase_seq + 1
+                        && Some(new_record.phase) == existing.phase.next()
+                }
+            };
+            if !step_is_valid {
+                txn.rollback().await.map_err(state_machine_write_error)?;
+                return Ok(Response::error(format!(
+                    "Data V2 migration phase mutation is not a valid monotonic step (proposed '{}' seq {})",
+                    new_record.phase.name(),
+                    new_record.phase_seq
+                )));
+            }
+            if new_record.phase > MAX_SUPPORTED_PHASE {
+                txn.rollback().await.map_err(state_machine_write_error)?;
+                return Err(state_machine_write_error(format!(
+                    "the cluster advanced to Data V2 migration phase '{}' (seq {}), but this binary only supports up to '{}'; halting instead of diverging — upgrade this node",
+                    new_record.phase.name(),
+                    new_record.phase_seq,
+                    MAX_SUPPORTED_PHASE.name()
+                )));
             }
         }
 
@@ -836,9 +909,29 @@ fn normalize_snapshot_payload(
     payload: &FusionSnapshotPayload,
     last_log_id: Option<LogId<NodeId>>,
 ) -> Result<FusionSnapshotPayload, StorageError<NodeId>> {
-    let entries = canonical_snapshot_entries(payload, last_log_id)?
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = canonical_snapshot_entries(payload, last_log_id)?
         .into_iter()
         .collect();
+    // Refuse to install state from a migration phase this binary does not
+    // implement. Installing blind would leave this node reading and writing
+    // under stale phase semantics — divergence, not availability.
+    for (key, value) in &entries {
+        if key.as_slice() == migration_phase_key() {
+            let record = DataMigrationPhaseRecord::decode(value).map_err(|error| {
+                snapshot_read_error(format!(
+                    "Raft snapshot payload carries a malformed Data V2 migration phase record: {error}"
+                ))
+            })?;
+            if record.phase > MAX_SUPPORTED_PHASE {
+                return Err(snapshot_read_error(format!(
+                    "Raft snapshot payload is at Data V2 migration phase '{}' (seq {}), but this binary only supports up to '{}'; upgrade before installing",
+                    record.phase.name(),
+                    record.phase_seq,
+                    MAX_SUPPORTED_PHASE.name()
+                )));
+            }
+        }
+    }
     Ok(FusionSnapshotPayload {
         version: SNAPSHOT_PAYLOAD_VERSION,
         entries,
@@ -2015,5 +2108,473 @@ mod tests {
 
         let _ = std::fs::remove_file(wal_path);
         cleanup_dir(&raft_dir);
+    }
+
+    // ---- Data V2 migration phase: apply guard + install gate (P10-2.1) ----
+
+    use crate::storage::data_migration::DataMigrationPhase;
+
+    fn phase_record_bytes(phase: DataMigrationPhase, phase_seq: u64) -> Vec<u8> {
+        DataMigrationPhaseRecord {
+            phase,
+            phase_seq,
+            updated_at_unix_ms: 42,
+        }
+        .encode()
+        .to_vec()
+    }
+
+    fn phase_mutation_entry(term: u64, index: u64, mutation: KvMutation) -> Entry<TypeConfig> {
+        Entry {
+            log_id: test_log_id(term, index),
+            payload: EntryPayload::Normal(Request::MutationBatch(MutationBatch {
+                version: MUTATION_BATCH_VERSION,
+                preconditions: Vec::new(),
+                mutations: vec![mutation],
+                side_index_mutations: Vec::new(),
+                response: Response::success("phase step"),
+            })),
+        }
+    }
+
+    async fn stored_phase_record(storage: &Arc<dyn Storage>) -> Option<Vec<u8>> {
+        let txn = storage.begin_transaction().await.unwrap();
+        txn.get(migration_phase_key()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_guard_rejects_invalid_phase_steps_gracefully_and_node_continues() {
+        let (mut store, storage, wal_path) = test_store("phase_guard_matrix");
+
+        // (a) Deleting the phase record is always rejected.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                2,
+                1,
+                KvMutation::Delete {
+                    key: migration_phase_key().to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(!response[0].success);
+        assert!(response[0].message.contains("never be deleted"));
+
+        // (b) A malformed record value is rejected deterministically.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                2,
+                2,
+                KvMutation::Put {
+                    key: migration_phase_key().to_vec(),
+                    value: b"junk".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(!response[0].success);
+        assert!(response[0].message.contains("malformed"));
+
+        // (c) First build must start at seq 1.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                2,
+                3,
+                KvMutation::Put {
+                    key: migration_phase_key().to_vec(),
+                    value: phase_record_bytes(DataMigrationPhase::DeleteOnly, 5),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(!response[0].success);
+        assert!(response[0].message.contains("monotonic"));
+        assert_eq!(stored_phase_record(&storage).await, None);
+
+        // Valid INIT applies.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                2,
+                4,
+                KvMutation::Put {
+                    key: migration_phase_key().to_vec(),
+                    value: phase_record_bytes(DataMigrationPhase::DeleteOnly, 1),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(response[0].success);
+
+        // (d) Skipping a rung is rejected.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                2,
+                5,
+                KvMutation::Put {
+                    key: migration_phase_key().to_vec(),
+                    value: phase_record_bytes(DataMigrationPhase::Backfill, 2),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(!response[0].success);
+        assert!(response[0].message.contains("monotonic"));
+
+        // Valid advance applies.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                2,
+                6,
+                KvMutation::Put {
+                    key: migration_phase_key().to_vec(),
+                    value: phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 2),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(response[0].success);
+
+        // (e) Downgrade is rejected.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                2,
+                7,
+                KvMutation::Put {
+                    key: migration_phase_key().to_vec(),
+                    value: phase_record_bytes(DataMigrationPhase::DeleteOnly, 3),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(!response[0].success);
+
+        // The node keeps applying ordinary writes after every rejection, and
+        // the record is exactly the last valid step.
+        let response = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                2,
+                8,
+                KvMutation::Put {
+                    key: b"data:orders:1".to_vec(),
+                    value: b"alive".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(response[0].success);
+        assert_eq!(
+            stored_phase_record(&storage).await,
+            Some(phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 2))
+        );
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn apply_halts_when_cluster_advances_beyond_binary_support() {
+        let (mut store, storage, wal_path) = test_store("phase_guard_halt");
+        store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                3,
+                1,
+                KvMutation::Put {
+                    key: migration_phase_key().to_vec(),
+                    value: phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 1),
+                },
+            )])
+            .await
+            .unwrap();
+
+        // A legitimate next step past this binary's support must halt the
+        // state machine, not apply blind.
+        let error = store
+            .apply_to_state_machine(&[phase_mutation_entry(
+                3,
+                2,
+                KvMutation::Put {
+                    key: migration_phase_key().to_vec(),
+                    value: phase_record_bytes(DataMigrationPhase::Backfill, 2),
+                },
+            )])
+            .await
+            .expect_err("advance beyond MAX_SUPPORTED_PHASE must halt");
+        assert!(error.to_string().contains("halting"));
+        assert_eq!(
+            stored_phase_record(&storage).await,
+            Some(phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 1))
+        );
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn evaluated_migration_calls_carry_phase_preconditions_and_replicate() {
+        let (mut store, storage, wal_path) = test_store("phase_eval_replicate");
+
+        let request =
+            evaluate_sql_to_request(&store.executor, "CALL fusiondb_data_migration_init()")
+                .await
+                .unwrap();
+        let Request::MutationBatch(batch) = &request else {
+            panic!("migration CALL must evaluate to a mutation batch");
+        };
+        assert!(
+            batch
+                .preconditions
+                .iter()
+                .any(|p| p.key == migration_phase_key() && p.expected.is_none()),
+            "INIT must pin the absent phase record as a precondition"
+        );
+        assert!(batch
+            .mutations
+            .iter()
+            .any(|m| matches!(m, KvMutation::Put { key, .. } if key == migration_phase_key())));
+
+        let init_entry = Entry {
+            log_id: test_log_id(4, 1),
+            payload: EntryPayload::Normal(request),
+        };
+        let response = store
+            .apply_to_state_machine(std::slice::from_ref(&init_entry))
+            .await
+            .unwrap();
+        assert!(response[0].success);
+        let init_record = stored_phase_record(&storage).await.expect("record exists");
+        assert_eq!(
+            DataMigrationPhaseRecord::decode(&init_record)
+                .unwrap()
+                .phase,
+            DataMigrationPhase::DeleteOnly
+        );
+
+        // Idempotent replay of the same log entry is skipped by the applied
+        // watermark and must not bump the sequence.
+        let replay = store
+            .apply_to_state_machine(std::slice::from_ref(&init_entry))
+            .await
+            .unwrap();
+        assert!(replay[0].success);
+        assert_eq!(
+            stored_phase_record(&storage).await,
+            Some(init_record.clone())
+        );
+
+        // The advance pins the current record bytes and replicates.
+        let request = evaluate_sql_to_request(
+            &store.executor,
+            "CALL fusiondb_data_migration_advance('write-delete-shadow')",
+        )
+        .await
+        .unwrap();
+        let Request::MutationBatch(batch) = &request else {
+            panic!("advance must evaluate to a mutation batch");
+        };
+        assert!(batch
+            .preconditions
+            .iter()
+            .any(|p| p.key == migration_phase_key()
+                && p.expected.as_deref() == Some(&init_record[..])));
+
+        let response = store
+            .apply_to_state_machine(&[Entry {
+                log_id: test_log_id(4, 2),
+                payload: EntryPayload::Normal(request),
+            }])
+            .await
+            .unwrap();
+        assert!(response[0].success);
+        let advanced = stored_phase_record(&storage).await.expect("record exists");
+        let advanced = DataMigrationPhaseRecord::decode(&advanced).unwrap();
+        assert_eq!(advanced.phase, DataMigrationPhase::WriteDeleteShadow);
+        assert_eq!(advanced.phase_seq, 2);
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn evaluated_dml_batches_carry_the_phase_precondition() {
+        let (_store, storage, wal_path) = test_store("phase_dml_precondition");
+        let executor = Executor::new(storage.clone());
+        executor
+            .execute_sql("CREATE TABLE phase_orders (id INT PRIMARY KEY, note TEXT)")
+            .await
+            .unwrap();
+
+        let request =
+            evaluate_sql_to_request(&executor, "INSERT INTO phase_orders VALUES (1, 'fenced')")
+                .await
+                .unwrap();
+        let Request::MutationBatch(batch) = &request else {
+            panic!("INSERT must evaluate to a mutation batch");
+        };
+        assert!(
+            batch
+                .preconditions
+                .iter()
+                .any(|p| p.key == migration_phase_key()),
+            "every data-family batch must pin the phase record"
+        );
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn phase_precondition_mismatch_fails_closed() {
+        let (mut store, storage, wal_path) = test_store("phase_precondition_mismatch");
+        put_entry(
+            &storage,
+            migration_phase_key(),
+            &phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 2),
+        )
+        .await;
+
+        // A stale cross-leader proposal pinned the older record.
+        let entry = Entry {
+            log_id: test_log_id(5, 1),
+            payload: EntryPayload::Normal(Request::MutationBatch(MutationBatch {
+                version: MUTATION_BATCH_VERSION,
+                preconditions: vec![crate::distributed::typ::KvPrecondition {
+                    key: migration_phase_key().to_vec(),
+                    expected: Some(phase_record_bytes(DataMigrationPhase::DeleteOnly, 1)),
+                }],
+                mutations: vec![KvMutation::Put {
+                    key: b"data:orders:1".to_vec(),
+                    value: b"stale-phase-write".to_vec(),
+                }],
+                side_index_mutations: Vec::new(),
+                response: Response::success("Updated 1 rows"),
+            })),
+        };
+
+        let error = store
+            .apply_to_state_machine(&[entry])
+            .await
+            .expect_err("stale phase precondition must fail closed");
+        assert!(error.to_string().contains("precondition failed"));
+        let txn = storage.begin_transaction().await.unwrap();
+        assert_eq!(txn.get(b"data:orders:1").await.unwrap(), None);
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// The leader-built snapshot must actually carry the phase record: if a
+    /// range narrowing or a `retain` ever excluded the `\0FDBK` Catalog key,
+    /// installs would silently revert a node to config-flag behavior.
+    #[tokio::test]
+    async fn built_snapshot_payload_round_trips_the_phase_record() {
+        let (mut source, source_storage, source_wal) = test_store("phase_snapshot_build");
+        put_entry(
+            &source_storage,
+            migration_phase_key(),
+            &phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 2),
+        )
+        .await;
+
+        let payload = source.build_snapshot_payload().await.unwrap();
+        assert!(
+            payload
+                .entries
+                .iter()
+                .any(|(key, value)| key.as_slice() == migration_phase_key()
+                    && value.as_slice()
+                        == phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 2)),
+            "the built snapshot payload must carry the phase record"
+        );
+
+        let (mut target, target_storage, target_wal) = test_store("phase_snapshot_install");
+        target
+            .install_snapshot(
+                &SnapshotMeta {
+                    last_log_id: Some(test_log_id(7, 4)),
+                    last_membership: StoredMembership::default(),
+                    snapshot_id: "7-1-4".to_string(),
+                },
+                Box::new(Cursor::new(encode_snapshot_payload(&payload).unwrap())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_phase_record(&target_storage).await,
+            Some(phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 2)),
+            "the installed node must land on the source's phase"
+        );
+
+        let _ = std::fs::remove_file(source_wal);
+        let _ = std::fs::remove_file(target_wal);
+    }
+
+    /// The standalone rule must hold on the Raft evaluation path too, not
+    /// only in `execute_sql`.
+    #[tokio::test]
+    async fn raft_evaluation_rejects_migration_call_batched_with_dml() {
+        let (_store, storage, wal_path) = test_store("phase_raft_standalone");
+        let executor = Executor::new(storage.clone());
+        executor
+            .execute_sql("CREATE TABLE batched (id INT PRIMARY KEY, note TEXT)")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("CALL fusiondb_data_migration_init()")
+            .await
+            .unwrap();
+
+        let error = evaluate_sql_to_request(
+            &executor,
+            "INSERT INTO batched VALUES (1, 'x'); CALL fusiondb_data_migration_advance('write-delete-shadow')",
+        )
+        .await
+        .expect_err("an advance batched with DML must be rejected before proposal");
+        assert!(error.contains("standalone"), "unexpected: {error}");
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_refuses_payload_beyond_binary_support() {
+        let (mut store, storage, wal_path) = test_store("phase_snapshot_gate");
+        let meta = SnapshotMeta {
+            last_log_id: Some(test_log_id(6, 3)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "6-1-3".to_string(),
+        };
+
+        let unsupported = FusionSnapshotPayload {
+            version: SNAPSHOT_PAYLOAD_VERSION,
+            entries: vec![(
+                migration_phase_key().to_vec(),
+                phase_record_bytes(DataMigrationPhase::Backfill, 3),
+            )],
+        };
+        let error = store
+            .install_snapshot(
+                &meta,
+                Box::new(Cursor::new(encode_snapshot_payload(&unsupported).unwrap())),
+            )
+            .await
+            .expect_err("snapshot beyond MAX_SUPPORTED_PHASE must refuse install");
+        assert!(error.to_string().contains("upgrade before installing"));
+        assert_eq!(stored_phase_record(&storage).await, None);
+
+        // A supported-phase payload installs and the record becomes visible.
+        let supported = FusionSnapshotPayload {
+            version: SNAPSHOT_PAYLOAD_VERSION,
+            entries: vec![(
+                migration_phase_key().to_vec(),
+                phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 2),
+            )],
+        };
+        store
+            .install_snapshot(
+                &meta,
+                Box::new(Cursor::new(encode_snapshot_payload(&supported).unwrap())),
+            )
+            .await
+            .expect("supported-phase snapshot installs");
+        assert_eq!(
+            stored_phase_record(&storage).await,
+            Some(phase_record_bytes(DataMigrationPhase::WriteDeleteShadow, 2))
+        );
+
+        let _ = std::fs::remove_file(wal_path);
     }
 }

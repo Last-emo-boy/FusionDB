@@ -158,6 +158,23 @@ impl Transaction for RecordingTransaction {
         self.inner.get(key).await
     }
 
+    fn data_migration_phase_pin(&self) -> Option<(u8, u64)> {
+        self.inner.data_migration_phase_pin()
+    }
+
+    async fn fence_data_migration_phase(&mut self, phase: u8, phase_seq: u64) -> FusionResult<()> {
+        // Pin the phase record into the replicated preconditions. The
+        // expected value comes from the leader's applied state through
+        // `record_precondition` (never a cache), so a batch can only apply
+        // where the durable phase still matches what evaluation observed —
+        // a stale cross-leader proposal is deterministically stopped.
+        self.record_precondition(crate::storage::data_migration::migration_phase_key())
+            .await?;
+        self.inner
+            .fence_data_migration_phase(phase, phase_seq)
+            .await
+    }
+
     async fn put(&mut self, key: &[u8], value: &[u8]) -> FusionResult<()> {
         self.record_precondition(key).await?;
         self.inner.put(key, value).await?;
@@ -507,6 +524,19 @@ pub(crate) async fn evaluate_sql_to_request(
     if statements.iter().any(statement_is_unsafe_to_stage) {
         return Err(
             "Raft deterministic writes do not support VACUUM, COPY TO, or CREATE INDEX USING HNSW"
+                .to_string(),
+        );
+    }
+    // The standalone rule must hold on this path too: a batch mixing an
+    // advance with data writes would replicate rows evaluated under the old
+    // phase and the new phase record as one atomic apply.
+    if statements.len() > 1
+        && statements
+            .iter()
+            .any(Executor::statement_is_data_migration_call)
+    {
+        return Err(
+            "Data V2 migration CALL procedures must be executed as standalone statements"
                 .to_string(),
         );
     }

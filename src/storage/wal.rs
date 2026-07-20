@@ -57,7 +57,7 @@ struct WalDurablePosition {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalFaultPoint {
+pub(crate) enum WalFaultPoint {
     AfterWrite,
     AfterFlush,
     AfterSync,
@@ -420,7 +420,7 @@ impl WalManager {
     }
 
     #[cfg(test)]
-    fn inject_faults(&self, faults: &[WalFaultPoint]) {
+    pub(crate) fn inject_faults(&self, faults: &[WalFaultPoint]) {
         self.state
             .lock()
             .expect("WAL state lock should be available for fault injection")

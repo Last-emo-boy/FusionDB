@@ -52,6 +52,9 @@ pub struct StorageConfig {
     pub sql_bulk_scan_no_fill: bool,
     /// Mirror base-row writes into the versioned Data V2 shadow keyspace.
     /// Legacy keys remain authoritative until a fenced migration cutover.
+    /// Once `CALL fusiondb_data_migration_init()` persists a durable phase
+    /// record, that record permanently overrides this flag; the flag then
+    /// only supplies the INIT default.
     pub structured_data_shadow_v2: bool,
     /// Slow query threshold in milliseconds
     pub slow_query_threshold_ms: u64,

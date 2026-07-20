@@ -7,6 +7,7 @@ use std::sync::Arc;
 pub mod backend;
 pub mod columnar;
 pub mod columnar_analytics;
+pub(crate) mod data_migration;
 pub mod fbtree;
 pub mod fusion;
 pub mod inverted_index;
@@ -387,6 +388,23 @@ where
 pub trait Transaction: Send + Sync {
     /// Get a value by key (from write buffer or storage)
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    /// Pin the Data V2 migration phase this transaction's data-family writes
+    /// act on. FusionTransaction re-validates the pin at commit inside the
+    /// commit critical section; RecordingTransaction additionally records a
+    /// replicated precondition. Engines without migration state ignore it.
+    async fn fence_data_migration_phase(&mut self, _phase: u8, _phase_seq: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// The pin already established by [`fence_data_migration_phase`], if any.
+    ///
+    /// Synchronous and allocation-free on purpose: row writers call this once
+    /// per row, and after the first row of a statement it lets them skip the
+    /// shared fence lock and the boxed async fence call entirely.
+    fn data_migration_phase_pin(&self) -> Option<(u8, u64)> {
+        None
+    }
 
     /// Put a key-value pair (into write buffer)
     async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
