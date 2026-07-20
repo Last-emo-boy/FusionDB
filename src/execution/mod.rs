@@ -1450,12 +1450,41 @@ impl Executor {
         limit: Option<usize>,
         options: StorageScanOptions,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // A limited scan must stop the storage scan itself, not read the whole
+        // table and slice the result: passing `None` down and truncating
+        // afterwards is exactly what an `ORDER BY <pk> LIMIT n` plan pushes a
+        // limit down to avoid. `scan_routed_data_prefixes_for_each_with_options`
+        // already counts *accepted* rows (post table-ownership filter) and stops
+        // the scan, so the row-count semantics are unchanged.
+        //
+        // Unlimited scans deliberately keep the older materializing path. The
+        // visitor API hands out `&[u8]`, so collecting through it would copy
+        // every key and value a second time, whereas the parallel materializing
+        // scan moves its per-partition Vec into the result. Full scans (CREATE
+        // INDEX, ANALYZE, table rebuilds, unqualified DELETE/UPDATE, FK checks)
+        // are the hottest path here and must not pay that.
+        if let Some(limit) = limit {
+            let mut pairs = Vec::with_capacity(limit.min(4096));
+            let mut collect = |key: &[u8], value: &[u8]| {
+                pairs.push((key.to_vec(), value.to_vec()));
+                true
+            };
+            self.scan_routed_data_prefixes_for_each_with_options(
+                table_name,
+                txn,
+                Some(limit),
+                &mut collect,
+                options,
+            )
+            .await?;
+            return Ok(pairs);
+        }
+
         let prefixes = self.routed_data_prefixes_for_table(table_name);
         let schema = self
             .load_schema_for_data_prefix_filter(table_name, txn)
             .await?;
         let mut pairs = Vec::new();
-
         for prefix in &prefixes {
             let shard_pairs = txn
                 .scan_prefix_parallel_with_options(prefix.as_bytes(), None, options.clone())
@@ -1471,12 +1500,8 @@ impl Executor {
                     continue;
                 }
                 pairs.push((key, value));
-                if limit.is_some_and(|limit| pairs.len() >= limit) {
-                    return Ok(pairs);
-                }
             }
         }
-
         Ok(pairs)
     }
 
@@ -7911,6 +7936,42 @@ mod tests {
                 .fetch_add(visited as u64, AtomicOrdering::Relaxed);
             Ok(visited)
         }
+        // Forward the parallel streaming variants instead of inheriting the
+        // trait defaults: the defaults materialize, which would make this
+        // double report a streaming scan as a full read and mask exactly the
+        // early-stop behaviour it exists to measure.
+        async fn scan_prefix_parallel_for_each_with_options(
+            &self,
+            prefix: &[u8],
+            limit: Option<usize>,
+            visitor: &mut dyn ScanVisitor,
+            options: StorageScanOptions,
+        ) -> Result<Option<usize>> {
+            let visited = self
+                .inner
+                .scan_prefix_parallel_for_each_with_options(prefix, limit, visitor, options)
+                .await?;
+            if let Some(visited) = visited {
+                self.keys_seen
+                    .fetch_add(visited as u64, AtomicOrdering::Relaxed);
+            }
+            Ok(visited)
+        }
+        async fn scan_prefix_for_each_with_options(
+            &self,
+            prefix: &[u8],
+            limit: Option<usize>,
+            visitor: &mut dyn ScanVisitor,
+            options: StorageScanOptions,
+        ) -> Result<usize> {
+            let visited = self
+                .inner
+                .scan_prefix_for_each_with_options(prefix, limit, visitor, options)
+                .await?;
+            self.keys_seen
+                .fetch_add(visited as u64, AtomicOrdering::Relaxed);
+            Ok(visited)
+        }
         async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
             self.inner.count_prefix(prefix).await
         }
@@ -8027,6 +8088,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(survivors.len(), namespace_rows - 2);
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// A limited table scan must stop the storage scan itself, not read the
+    /// whole table and slice the result. Passing `None` down and truncating
+    /// afterwards made `ORDER BY <pk> LIMIT n` read every block of the table.
+    ///
+    /// Covers the serial streaming path: MemoryStorage implements no parallel
+    /// scan, and 400 rows is below `PARALLEL_SCAN_MIN_ROWS` anyway. The
+    /// parallel branch's own stop-early and ordering behaviour is pinned by
+    /// `scan_range_parallel_for_each_*` tests in `storage::fusion`.
+    #[tokio::test]
+    async fn limited_table_scan_stops_the_storage_scan_early() {
+        let wal_path = format!("test_limited_scan_early_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+        executor
+            .execute_sql("CREATE TABLE lim_rows (id INTEGER PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        const ROWS: usize = 400;
+        for id in 0..ROWS {
+            executor
+                .execute_sql(&format!("INSERT INTO lim_rows VALUES ({id}, 'p{id}')"))
+                .await
+                .unwrap();
+        }
+
+        let keys_seen = Arc::new(AtomicU64::new(0));
+        let mut counting: Box<dyn Transaction> = Box::new(CountingTransaction {
+            inner: storage.begin_transaction().await.unwrap(),
+            keys_seen: keys_seen.clone(),
+        });
+        let rows = executor
+            .scan_routed_data_prefixes_for_table_with_options(
+                "lim_rows",
+                &mut *counting,
+                Some(10),
+                StorageScanOptions::fill_cache(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 10, "the limit must still bound the result");
+        let seen = keys_seen.load(AtomicOrdering::Relaxed);
+        assert!(
+            seen < 50,
+            "storage handed back {seen} keys for a LIMIT 10 scan over {ROWS} rows; \
+             the limit is not reaching the scan"
+        );
+
+        // Unlimited scans must still see everything.
+        let keys_seen_all = Arc::new(AtomicU64::new(0));
+        let mut counting_all: Box<dyn Transaction> = Box::new(CountingTransaction {
+            inner: storage.begin_transaction().await.unwrap(),
+            keys_seen: keys_seen_all.clone(),
+        });
+        let all = executor
+            .scan_routed_data_prefixes_for_table_with_options(
+                "lim_rows",
+                &mut *counting_all,
+                None,
+                StorageScanOptions::fill_cache(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(all.len(), ROWS);
 
         let _ = std::fs::remove_file(wal_path);
     }
