@@ -705,3 +705,34 @@ Revenue by category(order_items JOIN products GROUP BY)warm 17.6s 画像:10k 产
 对抗评审合并设计入库 .csv-wave/20260720-design-p10-2-data-v2-migration-ladder/design.md。阶梯:2.1 持久 phase record(Catalog identifier key "data-v2-migration-phase",18B 定长 {version,phase,phase_seq,updated_at})+ 全 data-writer commit-fence(commit_lock 内等值校验,pg 交互事务天然覆盖,P5-4 绕 raft 路径同样兜住)+ CALL init/advance 操作面;2.2 DROP/TRUNCATE 清理有界化(route skip-scan,backfill 前置);2.3 幂等 chunk backfill + DDL 冲突点(DROP×chunk 零键重叠双提交→已删表 v2 永久孤儿,靠 backfill-state record 强制 write-write 冲突堵死)+ 无 precondition data-batch 拒绝守卫;2.4 verifier + verify-token 盖 phase_seq;2.5 v2 读 dark launch;2.6 读切换+CDC 同相翻转;2.7 v2-only(不可回退);2.8 legacy-gc+flag 退役;2.9 剩余 families(unique namespace 无保留位,补位优先)。承重实证:precondition 失配=fail-closed 停机(store.rs:1561),优雅确定性拒绝须走 Ok(Response::error)(store.rs:263-267);仅 apply 侧刷新 fence 会在 snapshot install 后永久陈旧(store.rs:384 的 invalidate 一行同时覆盖两处);MAX_SUPPORTED 与 MAX_ADVANCE_TARGET 双常量分离;backfill 枚举禁走 ShardRouter(不含 unsharded 前缀且只见当前 shard_count)。T1 基准门:BENCH_PROTO=pg Parts 1/2/3/5,medium+xlarge,同盘 ext4。
 
 </spec-entry>
+
+<spec-entry category="arch" keywords="goal,performance,commercial-parity,roadmap,parallel-scan" date="2026-07-20" title="性能目标线:向商业级看齐的当前待办栈(2026-07-20)" description="纯读中位 2.53x 差距的已定位根因与修法选型;写侧已证实为持久化代价不必追" source="main@8629218">
+
+### 性能目标线:向商业级看齐的当前待办栈(2026-07-20)
+
+**目标**:持续迭代,性能对标商业数据库;必要时检索业界实践与论文佐证选型;进度走 maestro。
+
+**当前基线认知(同机同盘 large+pg,对照 6/29 二进制 5be78c9)**:
+- 含写 19 条中位 6.46x —— **已证实为持久化代价**(基线 wal.rs 零 fsync),不计入回归,不必追。
+- 纯读 84 条中位 2.53x、35 条 >3x —— 真正待修。形态两极:重扫描已快 2-5x(P9-6/P9-7 + 469/470),
+  亚毫秒小查询慢 13-40x。
+- 已修一处(`64afb98`):限量扫描把 LIMIT 真正下推(整体中位 3.75x→3.04x,PK 点查 4.2x)。
+
+**下一刀(已定位,未实施)**:`integer_pk_range_splits`(fusion.rs:4310)为算并行切分调 `first()`+`last()`,
+其中 `last()` 触发完整反向扫描(开全部 SSTable 反向迭代器 + 前沿探测/收紧 + 物化 block span),
+随后常因表行数 < `PARALLEL_SCAN_MIN_ROWS=8192` 丢弃切分。**探测本身即小查询的全部耗时。**
+
+修法选型(按风险从低到高):
+1. **便宜前置门**:用内存中已有信号(memtable size / SSTable 数量或条目数)先算行数上界,
+   低于阈值直接返回 None,不做任何探测。改动最小、最安全。
+2. **元数据替代 `last()`**:`sstable.meta.first_key/last_key` 已在内存(fusion.rs:1965 已这样用于点查跳过),
+   可据此取 max 键上界。**坑**:SSTable 区间常跨表,meta.last_key 可能落在 [start,end) 之外,
+   截断到 `end` 后无法通过既有的"等长 + 同前缀 + 全 hex"解析;需要先解决这个表示问题。
+3. **按事务缓存 (表前缀 → min/max)**:避免同查询多前缀重复探测,但不解决单次探测成本。
+
+**正确性要点**:切分边界只需**覆盖** [start,end),不需精确;偏保守(区间估大)只影响分区均衡,
+不影响结果。故用上界估计是安全的——这是选 ① 或 ② 的前提。
+
+**再下一步(尚未开工)**:纯读 2.53x 中,除本项外仍有未解释成分;`src/server/pg_server.rs:9216`
+在 pgwire 热路径对每条查询 `eprintln!` 完整 SQL(一次 Part 1 写 7.6MB),自项目初始即存在,应清理。
+
