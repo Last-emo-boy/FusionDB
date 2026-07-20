@@ -215,3 +215,19 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 `delete_structured_data_shadows_for_table` 原为 `scan_prefix(data_namespace_prefix())` 物化整个 v2 namespace 的 (k,v) 后逐键 parse —— backfill(2.3)灌满 namespace 后每次 DROP/TRUNCATE 退化 O(全部影子行),故为 2.3 前置。改 route 区跳扫:`scan_range(cursor, ns_end, Some(1))` 取探针键(FusionStorage visitor 首行 false 早停)→ `parse_data_key_exact().route()` → 只扫 `(route,表)` 自己区间(收键不收值)→ 游标 `prefix_end(encode_data_route_prefix(route))` 跳过整个 route 区。**前缀安全性根因**:表名 4 字节 BE 长度前缀编码 ⇒ `orders` 与 `orders:archive`/`orders_2` 区间天然不嵌套,冒号邻表不可能误删(这也是原实现能安全按表名匹配的同一性质)。**终止性**:探针键 ≥ 游标且以 route 前缀开头 ⇒ `prefix_end(route_prefix) > probe ≥ cursor` 严格递增;`Shard(u64::MAX)` 进位落到 route tag(0x01→0x02)仍在 namespace 内,下轮扫空即止。**语义差(设计稿有意裁定)**:malformed-key loud 检测范围由"整个 namespace"收窄为"本次触碰范围"。**有界性证明方法**:`CountingTransaction` 装饰器计数扫描交还的键,2002 行 namespace → 触碰 4 键(2 探针 + 2 目标行);关键是该断言对旧实现会失败(旧实现 2002),否则测试空过——**证明有界性要用对旧实现会红的计数断言,不要用时延**(本 harness 噪声 p90 36% 根本测不出)。**只读评审机制生效**:agentType=Explore + 提示词禁写 + 评审前 `git stash create` 快照,17 findings 全驳回且工作区完好(对照 2.1 的评审 agent `git checkout` 删档事故)。仍采纳四条质量改进:测试替身静默丢弃 fence(3 agent 独立提出,替身必须委托 inner 而非继承 trait 默认)、`prefix_end` None 分支静默跳过改 loud、文档不再宣称干净 O(routes+rows)(FusionStorage 每次扫描合并写缓冲,按 route 数付费)、补 FusionStorage 真引擎与"只存在于写缓冲的 route"测试。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="data-v2,backfill,cursor,cte,fence,p10-2-3" date="2026-07-20" title="P10-2.3 backfill 引擎落地(3e81baa):游标毒化 blocker + CTE 守卫误伤" description="分块续跑 backfill;评审抓到游标可写成读不回来的记录(波及全库 DROP)与 apply 守卫误伤 CTE" source="main@3e81baa">
+
+### P10-2.3 backfill 引擎落地(3e81baa):游标毒化 blocker + CTE 守卫误伤
+
+分块 backfill:一事务 = 若干行 v2 影子写 + 游标更新(同生共死),256 行/1 MiB 双封顶(每键在 commit_lock 内一次 latest_committed_timestamp 探测)。**枚举必须走物理键序两段区间而非 ShardRouter**(router 只枚举当前 shard_count 且启用后不含 unsharded 前缀)。**表身份识别**:预加载 schema 目录用已知表名切分,多候选用该行主键消歧,孤儿跳过——注意 `get_primary_key_index` 按 `is_primary` 搜索,**主键不一定在第 0 列**,按第 0 列硬解是错的(自查改掉)。**DDL 冲突点必须无条件写**状态记录:首个 chunk 才是创建者,条件式重写恰好漏掉它。**相位闸门 MAX_SUPPORTED 与 MAX_ADVANCE_TARGET 必须同时升**,只升后者会砸库(数据写全拒/拒开/apply 停机)。
+
+**blocker 游标毒化**:游标取自任意访问过的键,而 `shard:N:index:`/`unique:` 键嵌入无上限列值,可超过 decode 上界;当时 `encode` **无**校验 ⇒ durable 写出一条自己读不回来的记录。**波及面远超 backfill**:`touch_backfill_state_for_ddl` 也读它,于是全库每次 DROP/TRUNCATE 永久失败,且 Catalog 键无 SQL 途径修复。评审补充:shard 区内族序 `data<fts<index<unique`,扫尽时末键**通常**就是 unique 哨兵 ⇒ 毒化是常规终态而非奇葩路径。**规则:任何 durable 记录的 encode 与 decode 必须校验同一组约束,"可编码必可解码"要有测试钉死**;修复=上界 4 MiB + encode 侧同样校验(超界写时 loud,绝不产出不可读记录)。
+
+**major CTE 误伤 + 守卫假想敌不可达**:`is_data_family_key` 匹配 `data:{cte}:{row}`,而 CTE 材料化不打 fence ⇒ 集群到 Backfill 后,外层选出 0 行的 `INSERT ... WITH ...` 批次里只有 CTE 写、无 phase precondition,被新守卫拒绝并附赠误导性"提议节点需升级"。评审进一步证明该守卫的**假想敌不可达**:旧二进制在 advance→Backfill 那条 entry 上就先停机,不可能之后当 leader 提议未 fence 的写 ⇒ **假阳性可达、真阳性不可达**。修复取根因:**凡写 `data:` 命名空间者都必须遵守 P10-2.1 fence 不变量**,给 CTE 材料化补 fence,守卫随之健全。
+
+**撤回**:2.1/2.2 工单曾写"backfill 必须排除 CTE 键"——CTE 行在同一事务内 put 后即 clear(`handle_query` 尾部无条件清理),MVCC 只在提交时发布,并发事务永远看不到活的 CTE 行,枚举层面无需排除(本票给 CTE 补 fence 是为 raft 守卫,与枚举无关)。
+
+**未结**:曾有一次 `--lib` 报 672/2 failed 但未捕获测试名,此后 7 次运行(含与 --all-targets 并发压测)全绿无法复现;疑为既有 GLOBAL_METRICS 高负载 flaky 家族但**未经证实**,再现须第一时间捕获名字。
+
+</spec-entry>
