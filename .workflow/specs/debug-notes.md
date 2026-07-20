@@ -282,3 +282,14 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 
 **候选修法(未实施,择一或组合)**:①用 manifest 里已有的 SSTable first/last key 描述符估算键区间,避免实时反向扫描(启动期已加载,零 I/O);②把 (表前缀 → min/max) 的探测结果按事务或按扫描缓存,避免同查询多前缀重复探;③先用便宜信号(如 count summary / 统计器行数估计)判定是否值得并行,不值得就跳过探测。注意 ①最彻底但需确认描述符在 memtable 有新写入时的正确性(区间只需覆盖,不需精确)。
 
+
+<spec-entry category="debug" keywords="parallel-scan,gate,reverse-scan,fixed-cost,query_total_us" date="2026-07-20" title="并行切分探测门落地(2657029);剩余固定耗时转向执行层" description="小表反向扫描归零(计数器证据);墙钟收益噪声内不可分辨;下一线索=存储计数器近零仍 1.5ms 的服务端内耗时" source="main@2657029">
+
+### 并行切分探测门落地(2657029);剩余固定耗时转向执行层
+
+`range_entry_upper_bound_capped`:先累加重叠 SSTable 块条目数(预载元数据,大表几块即超阈值早停),不足再对 memtable 做封顶区间走查;上界 < `PARALLEL_SCAN_MIN_ROWS` 直接跳过 first()+last() 探测。**顺序要点**:SSTable 块元数据在前(近零成本),memtable 走查在后 —— 反过来会让大表每次扫描白走 8192 次 skip-map 跳(初版犯过,提交前已正)。**门是纯启发式**:切分边界仍由真实键计算,估偏大=照旧探测,估偏小=该查询少并行,两向都不碰正确性 —— 这也是它不需要 verifier 级验证的原因。块属性未载入按 cap 处理(照旧探测),不丢并行。
+
+**验证**:小表连续查询 `fusion_reverse_scan_count` 归零(修复前每查询 1);大表保留(=1)。1217 全绿。**诚实披露**:pgwire 墙钟收益在单轮噪声内不可分辨,收益证据以计数器为准 —— 该探测 I/O 全部命中块缓存时本就只占墙钟的小头,SSTable 多/缓存冷时才是大头。
+
+**下一线索(比本项更大)**:小查询仍有 ~1.5ms **服务端内**固定耗时(`query_total_us=1511` 对 500 行 SUM),而其存储计数器近零(21 次缓存命中,无 miss,现无反向扫描)——即耗时在执行层 CPU/分配,不在存储。更极端的先例:`SELECT * FROM bench LIMIT 82` 曾测得 21.5ms 且存储计数器全零。**候查方向**:聚合路径的逐行 Value 物化/装箱、HTTP/pg 结果序列化计入 query_total_us 的范围、schema/统计加载、tokio 调度。工具:在 execute_in_transaction_with_params 关键段加 FDB_TRACE 分段计时,或 perf record 采样对比同查询在 6/29 二进制的火焰图。
+
