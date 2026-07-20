@@ -304,3 +304,12 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 
 **剩余待查**:裸聚合(SUM/COUNT over 小表)不经该 scan 位点仍有 ~1.6ms 执行层耗时(无 scan= 输出证实走了别的分支)——下一轮先找聚合分支的实际路径再插桩;并行分区"无背压先跑满"问题对无限量扫描仍存在,属独立优化票。
 
+
+<spec-entry category="debug" keywords="aggregate,sstable,read-path,per-entry,memtable,floor" date="2026-07-21" title="裸聚合剩余耗时定性:SSTable 读路径逐条目成本,非版本垃圾非文件数" description="三判定:memtable 驻留 150-250µs vs SSTable 驻留 1.2-4ms;仅 2 文件;VACUUM 无效 —— 读路径地板,接 472 族批量解码" source="main@d8b4d2e">
+
+### 裸聚合剩余耗时定性:SSTable 读路径逐条目成本,非版本垃圾非文件数
+
+三个判定实验(FDB_PHASE_TRACE 插桩 agg_scan,已移除):①同一二进制 + 全新目录(500 行仅在 memtable):**150-250µs**;②基准目录(数据落 SSTable):**1.2-4ms**;③磁盘仅 2 个 SSTable(72MB)排除文件数,**VACUUM 后仍 2-4ms 排除 MVCC 版本垃圾**。⇒ 剩余耗时是 **SSTable 前缀扫描的逐条目读路径成本**(块内逐条目 offset 迭代 + 内部键解码 + 前缀比较,~2-4µs/行),属引擎地板,与 6/29 差距的读侧残余同源。**接架构票 472 族**:批量列式块解码(CRDB 同构证明 70x micro)是正解;短线可查块内条目迭代的逐条开销(每条目 CRC/解码重复工作)。
+
+**环境教训(两次踩坑)**:server 从仓库根启动会打开仓库根 ./data(698MB 历史数据集,spec debug-notes-001 早有警告);cd 失败后 `cat server_port.txt` 读到残留文件连错服务端(sum 值对不上才发现)。**规则:每次测量前必须校验连接目标 —— 用只有该目录才有的数据特征(如行数/求和值)做身份断言,别只看端口通不通。**
+
