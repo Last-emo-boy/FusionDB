@@ -293,3 +293,14 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 
 **下一线索(比本项更大)**:小查询仍有 ~1.5ms **服务端内**固定耗时(`query_total_us=1511` 对 500 行 SUM),而其存储计数器近零(21 次缓存命中,无 miss,现无反向扫描)——即耗时在执行层 CPU/分配,不在存储。更极端的先例:`SELECT * FROM bench LIMIT 82` 曾测得 21.5ms 且存储计数器全零。**候查方向**:聚合路径的逐行 Value 物化/装箱、HTTP/pg 结果序列化计入 query_total_us 的范围、schema/统计加载、tokio 调度。工具:在 execute_in_transaction_with_params 关键段加 FDB_TRACE 分段计时,或 perf record 采样对比同查询在 6/29 二进制的火焰图。
 
+
+<spec-entry category="debug" keywords="bounded-scan,serial,parallel,limit,phase-trace" date="2026-07-21" title="有界扫描误入并行机器修复(445f7fa):回归因果链补全" description="limit=Some 时并行分区全表扫全部白跑;串行早停恰好只读所需;ORDER BY PK LIMIT 回归=两刀之和" source="main@445f7fa">
+
+### 有界扫描误入并行机器修复(445f7fa):回归因果链补全
+
+分段计时(FDB_PHASE_TRACE 临时插桩)定位:`ORDER BY id LIMIT 60` 的 scan 占 exec 95%(6-7.8ms)却只读 9 块 —— 耗时在 CPU 不在 I/O。根因:`64afb98` 让限量扫描经 `scan_prefix_parallel_for_each_with_options` 走流式,但 **driver 层 limit=None(靠 visitor 自停)⇒ 并行门照过、first/last 探测照做(last=反向扫描)、8 分区全表扫描照生成**,消费端取够行数后兄弟分区已白跑(只读评审当时的"分区无背压"警告在此兑现)。修复:`scan_routed_data_prefixes_for_each_with_options` 在 `limit.is_some()` 时直接走串行 for-each。**规则:有界扫描的正解是串行早停(只读所需);并行分区只配无限量扫描 —— visitor 自停不能替代 driver 级 limit 判定。**实测 scan 6-7.8ms → 0.4-0.9ms(~10x),1217 全绿。
+
+**回归因果链就此补全**:`ORDER BY id LIMIT 50` 基线 0.26ms → 22ms = ①limit 未达存储层(64afb98)+ ②有界扫描误入并行机器(本票)。**诊断方法沉淀**:计数器差值找 I/O 形态异常,分段计时找 CPU 形态异常;"块读少但耗时高"= CPU 侧,直接上 PHASE 插桩比猜快。
+
+**剩余待查**:裸聚合(SUM/COUNT over 小表)不经该 scan 位点仍有 ~1.6ms 执行层耗时(无 scan= 输出证实走了别的分支)——下一轮先找聚合分支的实际路径再插桩;并行分区"无背压先跑满"问题对无限量扫描仍存在,属独立优化票。
+
