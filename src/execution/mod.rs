@@ -1551,15 +1551,23 @@ impl Executor {
                 stopped: false,
             };
             let prefix_bytes = prefix.as_bytes();
-            match txn
-                .scan_prefix_parallel_for_each_with_options(
+            // A bounded scan must stay serial: the visitor self-stops after
+            // `limit` accepted rows, and the serial path reads exactly that.
+            // The parallel path spawns full-range partition scans first (plus
+            // a first()/last() split probe whose last() is a reverse scan) —
+            // all of it wasted work once the consumer stops early.
+            let parallel_visited = if limit.is_some() {
+                None
+            } else {
+                txn.scan_prefix_parallel_for_each_with_options(
                     prefix_bytes,
                     None,
                     &mut filter_visitor,
                     options.clone(),
                 )
                 .await?
-            {
+            };
+            match parallel_visited {
                 Some(_) => {}
                 None => {
                     txn.scan_prefix_for_each_with_options(
