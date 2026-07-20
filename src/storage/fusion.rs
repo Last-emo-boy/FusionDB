@@ -4307,6 +4307,70 @@ impl FusionTransaction {
     /// sub-ranges (keys shaped `<table prefix> ++ <16 ASCII hex>`, the `encode_i64_comparable`
     /// encoding). Returns `None` — so the caller stays serial — when the range is empty, not that
     /// encoding, or estimated to hold fewer than `PARALLEL_SCAN_MIN_ROWS` rows.
+    /// Cheap, in-memory upper bound on how many entries `[start, end)` can
+    /// hold, counting at most `cap`. Memtable entries come from a bounded
+    /// skip-map range walk; SSTable entries from the preloaded per-block
+    /// properties (blocks whose key span overlaps the range).
+    ///
+    /// This is a performance heuristic only: the parallel-split boundaries
+    /// are still computed from real keys, so an estimate that is off in
+    /// either direction changes whether the probe runs, never the results.
+    /// It deliberately over-counts (MVCC versions, partial block overlap,
+    /// unloaded properties count as `cap`) so a table worth parallelizing
+    /// never loses its probe.
+    fn range_entry_upper_bound_capped(&self, start: &[u8], end: &[u8], cap: u64) -> u64 {
+        let start_ik = FusionStorage::encode_key(start, u64::MAX);
+        let end_ik = FusionStorage::encode_key(end, u64::MAX);
+        let mut total = 0u64;
+
+        // SSTable block metadata first: for a table already worth
+        // parallelizing, a handful of block entry counts reaches `cap`
+        // without touching a single entry. The bounded memtable walk (up to
+        // `cap` skip-map hops) only runs when blocks alone were not enough.
+        let sstables = self.storage.sstables.read().unwrap().clone();
+        for sst in &sstables {
+            let properties = sst.current_block_properties();
+            if properties.is_empty() {
+                // Properties not preloaded yet: assume the worst so the
+                // probe still runs — same behavior as before this gate.
+                return cap;
+            }
+            for property in properties.iter() {
+                let (block_first, _) = FusionStorage::decode_key(&property.first_key);
+                let (block_last, _) = FusionStorage::decode_key(&property.last_key);
+                if block_last < start || block_first >= end {
+                    continue;
+                }
+                total = total.saturating_add(u64::from(property.entry_count));
+                if total >= cap {
+                    return total;
+                }
+            }
+        }
+
+        let mem_tables = {
+            let mut tables = vec![self.storage.active_memtable.read().unwrap().clone()];
+            tables.extend(
+                self.storage
+                    .immutable_memtables
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+            tables
+        };
+        for mem in &mem_tables {
+            for _ in mem.map.range(start_ik.clone()..end_ik.clone()) {
+                total += 1;
+                if total >= cap {
+                    return total;
+                }
+            }
+        }
+        total
+    }
+
     async fn integer_pk_range_splits(
         &self,
         start: &[u8],
@@ -4320,6 +4384,16 @@ impl FusionTransaction {
             .unwrap_or(1)
             .min(PARALLEL_SCAN_SHARDS_CAP);
         if shards <= 1 {
+            return Ok(None);
+        }
+        // Ranges that cannot possibly hold enough rows skip the key-span
+        // probe entirely. The probe's `last()` opens a reverse iterator over
+        // every overlapping SSTable, which on a small table costs more than
+        // the query itself — and its result would be discarded against
+        // PARALLEL_SCAN_MIN_ROWS anyway.
+        if self.range_entry_upper_bound_capped(start, end, PARALLEL_SCAN_MIN_ROWS)
+            < PARALLEL_SCAN_MIN_ROWS
+        {
             return Ok(None);
         }
         let (Some((min_key, _)), Some((max_key, _))) =
