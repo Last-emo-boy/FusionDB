@@ -698,3 +698,10 @@ part1 三阶段对照(原始快照→470 后):Range LIMIT 12,076→5.0ms(2438×)
 Revenue by category(order_items JOIN products GROUP BY)warm 17.6s 画像:10k 产品探测已 probe_cache 记忆化(row_read 恰 10,000,无重复探测);order_items 34MB bulk 扫描正常;主体=JOIN 引擎逐行开销 ~30µs/行 × ~50 万行。结论:非误选型/误分类病灶,归入调研 backlog P1『批量列式扫描 kernel』(CRDB 同构证明 70x micro/4x TPC-H)——即 472 候选的架构性工作。剩余热点分类:Subquery IN 24s/Never-ordered 8.5s(子查询物化形态,待画像,可能仍有快刀);并发超时(需查询超时护栏)。471 后 Analytics 家族快刀已尽,进入架构性优化区间。
 
 </spec-entry>
+<spec-entry category="arch" keywords="data-v2,migration,phase,fence,p10-2" date="2026-07-20" title="P10-2 Data V2 迁移阶梯设计定稿(9 票,下一执行票=P10-2.1)" source="main@22314ab">
+
+### P10-2 Data V2 迁移阶梯设计定稿(9 票,下一执行票=P10-2.1)
+
+对抗评审合并设计入库 .csv-wave/20260720-design-p10-2-data-v2-migration-ladder/design.md。阶梯:2.1 持久 phase record(Catalog identifier key "data-v2-migration-phase",18B 定长 {version,phase,phase_seq,updated_at})+ 全 data-writer commit-fence(commit_lock 内等值校验,pg 交互事务天然覆盖,P5-4 绕 raft 路径同样兜住)+ CALL init/advance 操作面;2.2 DROP/TRUNCATE 清理有界化(route skip-scan,backfill 前置);2.3 幂等 chunk backfill + DDL 冲突点(DROP×chunk 零键重叠双提交→已删表 v2 永久孤儿,靠 backfill-state record 强制 write-write 冲突堵死)+ 无 precondition data-batch 拒绝守卫;2.4 verifier + verify-token 盖 phase_seq;2.5 v2 读 dark launch;2.6 读切换+CDC 同相翻转;2.7 v2-only(不可回退);2.8 legacy-gc+flag 退役;2.9 剩余 families(unique namespace 无保留位,补位优先)。承重实证:precondition 失配=fail-closed 停机(store.rs:1561),优雅确定性拒绝须走 Ok(Response::error)(store.rs:263-267);仅 apply 侧刷新 fence 会在 snapshot install 后永久陈旧(store.rs:384 的 invalidate 一行同时覆盖两处);MAX_SUPPORTED 与 MAX_ADVANCE_TARGET 双常量分离;backfill 枚举禁走 ShardRouter(不含 unsharded 前缀且只见当前 shard_count)。T1 基准门:BENCH_PROTO=pg Parts 1/2/3/5,medium+xlarge,同盘 ext4。
+
+</spec-entry>
