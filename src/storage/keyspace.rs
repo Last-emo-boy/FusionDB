@@ -160,7 +160,6 @@ pub(crate) struct ParsedDataKey<'a> {
 }
 
 impl<'a> ParsedDataKey<'a> {
-    #[cfg(test)]
     pub(crate) fn route(&self) -> DataRoute {
         self.route
     }
@@ -367,6 +366,24 @@ fn data_prefix_capacity(route: DataRoute, table_len: usize) -> Result<usize, Key
     Ok(capacity)
 }
 
+/// The prefix shared by every Data key of one route, table-independent.
+///
+/// Used to seek past a whole route region when enumerating which routes are
+/// physically present, so a per-table cleanup costs O(routes) seeks instead
+/// of a scan over the entire Data namespace.
+pub(crate) fn encode_data_route_prefix(route: DataRoute) -> Vec<u8> {
+    let capacity = STRUCTURED_KEY_MAGIC.len() + 2 + 1 + 8;
+    let mut key = encoded_header(KeyNamespace::Data, capacity);
+    match route {
+        DataRoute::Unsharded => key.push(DATA_ROUTE_UNSHARDED),
+        DataRoute::Shard(shard_id) => {
+            key.push(DATA_ROUTE_SHARD);
+            key.extend_from_slice(&shard_id.to_be_bytes());
+        }
+    }
+    key
+}
+
 pub(crate) fn encode_data_prefix(route: DataRoute, table: &[u8]) -> Result<Vec<u8>, KeyCodecError> {
     if table.is_empty() {
         return Err(KeyCodecError::EmptyTable);
@@ -488,7 +505,10 @@ pub(crate) fn parse_data_key_exact(input: &[u8]) -> Result<ParsedDataKey<'_>, Ke
     })
 }
 
-#[cfg(test)]
+/// The exclusive upper bound of the key range covered by `prefix`.
+///
+/// `None` means the prefix is all-`0xff` and therefore has no finite bound;
+/// callers scan to the end of the keyspace instead.
 pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     for idx in (0..end.len()).rev() {

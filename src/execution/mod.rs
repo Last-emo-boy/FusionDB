@@ -924,6 +924,20 @@ impl Executor {
         Ok(())
     }
 
+    /// Remove this table's Data V2 shadow rows from every route that is
+    /// physically present, including historical or removed shard routes the
+    /// current router would not enumerate.
+    ///
+    /// Cost is one probe seek per route physically present plus a scan of
+    /// only `(route, table)`'s own key range; the doomed keys (keys alone, no
+    /// values) are buffered and deleted after the walk. A full scan of the
+    /// Data namespace would make every DROP/TRUNCATE O(all shadow rows) once
+    /// backfill (P10-2.3) fills that namespace. Note that on FusionStorage
+    /// each scan also merges the transaction's write buffer, so a DROP that
+    /// has already staged many deletes pays that merge once per route.
+    ///
+    /// Table identifiers are length-prefixed, so a table's range can never
+    /// contain a differently named table — `t` and `t:archive` do not nest.
     pub(crate) async fn delete_structured_data_shadows_for_table(
         &self,
         table_name: &str,
@@ -931,15 +945,84 @@ impl Executor {
     ) -> Result<()> {
         self.observe_data_migration_phase_and_fence(txn).await?;
         let namespace_prefix = crate::storage::keyspace::data_namespace_prefix();
-        for (key, _) in txn.scan_prefix(&namespace_prefix, None).await? {
-            let parsed = crate::storage::keyspace::parse_data_key_exact(&key).map_err(|error| {
-                FusionError::Execution(format!(
-                    "Malformed key in the structured Data V2 namespace: {error}"
-                ))
-            })?;
-            if parsed.table() == table_name.as_bytes() {
-                txn.delete(&key).await?;
+        let Some(namespace_end) = crate::storage::keyspace::prefix_end(&namespace_prefix) else {
+            return Ok(());
+        };
+
+        let mut cursor = namespace_prefix;
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
+        while cursor < namespace_end {
+            // One row: the first key at or after the cursor tells us which
+            // route region we are standing in, without reading the region.
+            let Some((probe_key, _)) = txn
+                .scan_range(&cursor, &namespace_end, Some(1))
+                .await?
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
+            let route = crate::storage::keyspace::parse_data_key_exact(&probe_key)
+                .map_err(|error| {
+                    FusionError::Execution(format!(
+                        "Malformed key in the structured Data V2 namespace: {error}"
+                    ))
+                })?
+                .route();
+
+            let table_prefix =
+                crate::storage::keyspace::encode_data_prefix(route, table_name.as_bytes())
+                    .map_err(|error| {
+                        FusionError::Execution(format!(
+                            "Structured data prefix encoding failed: {error}"
+                        ))
+                    })?;
+            // Structured keys start with a `\0` magic, so a table prefix is
+            // never all-`0xff` and always has a finite bound. Fail loudly
+            // rather than silently skipping a route's rows if that ever
+            // changes.
+            let table_end =
+                crate::storage::keyspace::prefix_end(&table_prefix).ok_or_else(|| {
+                    FusionError::Execution(
+                    "Structured data table prefix has no upper bound; refusing to skip its rows"
+                        .to_string(),
+                )
+                })?;
+            {
+                let mut malformed = None;
+                let mut collect = |key: &[u8], _value: &[u8]| {
+                    match crate::storage::keyspace::parse_data_key_exact(key) {
+                        Ok(parsed) if parsed.table() == table_name.as_bytes() => {
+                            doomed.push(key.to_vec());
+                            true
+                        }
+                        Ok(_) => true,
+                        Err(error) => {
+                            malformed = Some(error);
+                            false
+                        }
+                    }
+                };
+                txn.scan_range_for_each(&table_prefix, &table_end, None, &mut collect)
+                    .await?;
+                if let Some(error) = malformed {
+                    return Err(FusionError::Execution(format!(
+                        "Malformed key in the structured Data V2 namespace: {error}"
+                    )));
+                }
             }
+
+            // Skip the rest of this route's region: other tables there are
+            // none of this cleanup's business.
+            let route_prefix = crate::storage::keyspace::encode_data_route_prefix(route);
+            let Some(next_cursor) = crate::storage::keyspace::prefix_end(&route_prefix) else {
+                break;
+            };
+            cursor = next_cursor;
+        }
+
+        for key in doomed {
+            txn.delete(&key).await?;
         }
         Ok(())
     }
@@ -7385,6 +7468,386 @@ mod tests {
             .await
             .expect_err("second same-float insert must abort at OCC validation");
         assert!(err.to_string().to_lowercase().contains("conflict"));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // ---- Data V2 shadow cleanup: bounded route skip-scan (P10-2.2) ----
+
+    /// Counts the keys a scan actually hands back, so a test can assert that
+    /// per-table cleanup cost tracks the table's own rows and the number of
+    /// routes present — not the size of the whole Data V2 namespace.
+    struct CountingTransaction {
+        inner: Box<dyn Transaction>,
+        keys_seen: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transaction for CountingTransaction {
+        async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+        async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+            self.inner.put(key, value).await
+        }
+        async fn delete(&mut self, key: &[u8]) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn scan_prefix(
+            &self,
+            prefix: &[u8],
+            limit: Option<usize>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            let rows = self.inner.scan_prefix(prefix, limit).await?;
+            self.keys_seen
+                .fetch_add(rows.len() as u64, AtomicOrdering::Relaxed);
+            Ok(rows)
+        }
+        async fn scan_prefix_for_each(
+            &self,
+            prefix: &[u8],
+            limit: Option<usize>,
+            visitor: &mut dyn ScanVisitor,
+        ) -> Result<usize> {
+            let visited = self
+                .inner
+                .scan_prefix_for_each(prefix, limit, visitor)
+                .await?;
+            self.keys_seen
+                .fetch_add(visited as u64, AtomicOrdering::Relaxed);
+            Ok(visited)
+        }
+        async fn scan_range(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: Option<usize>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            let rows = self.inner.scan_range(start, end, limit).await?;
+            self.keys_seen
+                .fetch_add(rows.len() as u64, AtomicOrdering::Relaxed);
+            Ok(rows)
+        }
+        async fn scan_range_for_each(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: Option<usize>,
+            visitor: &mut dyn ScanVisitor,
+        ) -> Result<usize> {
+            let visited = self
+                .inner
+                .scan_range_for_each(start, end, limit, visitor)
+                .await?;
+            self.keys_seen
+                .fetch_add(visited as u64, AtomicOrdering::Relaxed);
+            Ok(visited)
+        }
+        async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
+            self.inner.count_prefix(prefix).await
+        }
+        async fn first(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+            self.inner.first(start, end).await
+        }
+        async fn last(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+            self.inner.last(start, end).await
+        }
+        async fn commit(self: Box<Self>) -> Result<()> {
+            self.inner.commit().await
+        }
+        async fn rollback(self: Box<Self>) -> Result<()> {
+            self.inner.rollback().await
+        }
+        // Delegate rather than inherit the trait defaults: a test double that
+        // silently drops the P10-2.1 migration fence would let this test pass
+        // while exercising a path the production code never takes.
+        async fn fence_data_migration_phase(&mut self, phase: u8, phase_seq: u64) -> Result<()> {
+            self.inner
+                .fence_data_migration_phase(phase, phase_seq)
+                .await
+        }
+        fn data_migration_phase_pin(&self) -> Option<(u8, u64)> {
+            self.inner.data_migration_phase_pin()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self.inner.as_any()
+        }
+    }
+
+    /// The cleanup must scale with the target table and the number of routes
+    /// present, not with the size of the Data V2 namespace. Once backfill
+    /// (P10-2.3) fills that namespace, a full scan would make every
+    /// DROP/TRUNCATE O(all shadow rows).
+    #[tokio::test]
+    async fn structured_shadow_cleanup_cost_is_bounded_by_table_not_namespace() {
+        let wal_path = format!("test_shadow_cleanup_bounded_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+
+        // Two routes present, one target row each; the namespace is otherwise
+        // filled with unrelated tables' shadows.
+        const NOISE_TABLES: usize = 40;
+        const NOISE_ROWS_PER_TABLE: usize = 25;
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for route in [
+            crate::storage::keyspace::DataRoute::Unsharded,
+            crate::storage::keyspace::DataRoute::Shard(99),
+        ] {
+            txn.put(
+                &crate::storage::keyspace::encode_data_key(route, b"target", b"row:1").unwrap(),
+                b"target row",
+            )
+            .await
+            .unwrap();
+            for table in 0..NOISE_TABLES {
+                let name = format!("noise_table_{table:03}");
+                for row in 0..NOISE_ROWS_PER_TABLE {
+                    txn.put(
+                        &crate::storage::keyspace::encode_data_key(
+                            route,
+                            name.as_bytes(),
+                            format!("row:{row:03}").as_bytes(),
+                        )
+                        .unwrap(),
+                        b"noise",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+        txn.commit().await.unwrap();
+        let namespace_rows = 2 * (1 + NOISE_TABLES * NOISE_ROWS_PER_TABLE);
+
+        let keys_seen = Arc::new(AtomicU64::new(0));
+        let mut counting: Box<dyn Transaction> = Box::new(CountingTransaction {
+            inner: storage.begin_transaction().await.unwrap(),
+            keys_seen: keys_seen.clone(),
+        });
+        executor
+            .delete_structured_data_shadows_for_table("target", &mut *counting)
+            .await
+            .unwrap();
+        counting.commit().await.unwrap();
+
+        // Two route probes (1 key each) plus the two target rows. The bound
+        // that matters: nowhere near the namespace size.
+        let seen = keys_seen.load(AtomicOrdering::Relaxed);
+        assert!(
+            seen <= 8,
+            "cleanup visited {seen} keys with {namespace_rows} rows in the namespace; \
+             it must scale with routes + target rows, not namespace size"
+        );
+
+        // Correctness is unchanged: both target rows gone, all noise intact.
+        let txn = storage.begin_transaction().await.unwrap();
+        for route in [
+            crate::storage::keyspace::DataRoute::Unsharded,
+            crate::storage::keyspace::DataRoute::Shard(99),
+        ] {
+            assert!(txn
+                .get(
+                    &crate::storage::keyspace::encode_data_key(route, b"target", b"row:1").unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let survivors = txn
+            .scan_prefix(&crate::storage::keyspace::data_namespace_prefix(), None)
+            .await
+            .unwrap();
+        assert_eq!(survivors.len(), namespace_rows - 2);
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// Route discovery must find every route physically present — including
+    /// shard ids the current router would never enumerate — and must not
+    /// touch a table whose name merely shares a prefix.
+    #[tokio::test]
+    async fn structured_shadow_cleanup_finds_all_historical_routes() {
+        let wal_path = format!("test_shadow_cleanup_routes_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage.clone());
+
+        let routes = [
+            crate::storage::keyspace::DataRoute::Unsharded,
+            crate::storage::keyspace::DataRoute::Shard(0),
+            crate::storage::keyspace::DataRoute::Shard(7),
+            crate::storage::keyspace::DataRoute::Shard(u64::MAX),
+        ];
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for (index, route) in routes.iter().enumerate() {
+            txn.put(
+                &crate::storage::keyspace::encode_data_key(
+                    *route,
+                    b"orders",
+                    format!("row:{index}").as_bytes(),
+                )
+                .unwrap(),
+                b"target",
+            )
+            .await
+            .unwrap();
+            // Prefix-sharing neighbors that must survive.
+            for neighbor in [b"orders:archive".as_slice(), b"orders_2".as_slice()] {
+                txn.put(
+                    &crate::storage::keyspace::encode_data_key(*route, neighbor, b"row:n").unwrap(),
+                    b"neighbor",
+                )
+                .await
+                .unwrap();
+            }
+        }
+        txn.commit().await.unwrap();
+
+        let mut txn = storage.begin_transaction().await.unwrap();
+        executor
+            .delete_structured_data_shadows_for_table("orders", &mut *txn)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let txn = storage.begin_transaction().await.unwrap();
+        for (index, route) in routes.iter().enumerate() {
+            assert!(
+                txn.get(
+                    &crate::storage::keyspace::encode_data_key(
+                        *route,
+                        b"orders",
+                        format!("row:{index}").as_bytes()
+                    )
+                    .unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "route {route:?} target row survived cleanup"
+            );
+            for neighbor in [b"orders:archive".as_slice(), b"orders_2".as_slice()] {
+                assert!(
+                    txn.get(
+                        &crate::storage::keyspace::encode_data_key(*route, neighbor, b"row:n")
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                    "prefix-sharing neighbor was wrongly deleted in route {route:?}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// The route walk on the real engine: FusionStorage resolves scans
+    /// through the MVCC merge, and a DROP legitimately sees routes whose rows
+    /// exist only in its own uncommitted write buffer.
+    #[tokio::test]
+    async fn structured_shadow_cleanup_walks_routes_on_fusion_storage() {
+        let (executor, storage, data_dir) = fusion_executor("shadow_cleanup_fusion_routes").await;
+
+        let committed_routes = [
+            crate::storage::keyspace::DataRoute::Unsharded,
+            crate::storage::keyspace::DataRoute::Shard(3),
+            crate::storage::keyspace::DataRoute::Shard(u64::MAX),
+        ];
+        let mut txn = storage.begin_transaction().await.unwrap();
+        for route in committed_routes {
+            txn.put(
+                &crate::storage::keyspace::encode_data_key(route, b"orders", b"row:c").unwrap(),
+                b"committed",
+            )
+            .await
+            .unwrap();
+            txn.put(
+                &crate::storage::keyspace::encode_data_key(route, b"orders_2", b"row:n").unwrap(),
+                b"neighbor",
+            )
+            .await
+            .unwrap();
+        }
+        txn.commit().await.unwrap();
+
+        // One route exists only in this transaction's write buffer, plus an
+        // extra row in an already-committed route.
+        let buffer_only_route = crate::storage::keyspace::DataRoute::Shard(42);
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(
+            &crate::storage::keyspace::encode_data_key(buffer_only_route, b"orders", b"row:b")
+                .unwrap(),
+            b"write-buffer only",
+        )
+        .await
+        .unwrap();
+        txn.put(
+            &crate::storage::keyspace::encode_data_key(
+                crate::storage::keyspace::DataRoute::Shard(3),
+                b"orders",
+                b"row:b2",
+            )
+            .unwrap(),
+            b"staged in committed route",
+        )
+        .await
+        .unwrap();
+        executor
+            .delete_structured_data_shadows_for_table("orders", &mut *txn)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let txn = storage.begin_transaction().await.unwrap();
+        for route in committed_routes {
+            assert!(
+                txn.get(
+                    &crate::storage::keyspace::encode_data_key(route, b"orders", b"row:c").unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "committed target row survived in route {route:?}"
+            );
+            assert!(
+                txn.get(
+                    &crate::storage::keyspace::encode_data_key(route, b"orders_2", b"row:n")
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .is_some(),
+                "prefix-sharing neighbor was deleted in route {route:?}"
+            );
+        }
+        assert!(
+            txn.get(
+                &crate::storage::keyspace::encode_data_key(buffer_only_route, b"orders", b"row:b")
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a route present only in the write buffer was missed by route discovery"
+        );
+        assert!(
+            txn.get(
+                &crate::storage::keyspace::encode_data_key(
+                    crate::storage::keyspace::DataRoute::Shard(3),
+                    b"orders",
+                    b"row:b2"
+                )
+                .unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a staged row in an already-committed route was missed"
+        );
+        drop(txn);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
