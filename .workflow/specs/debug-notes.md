@@ -199,3 +199,11 @@ reverse_iterator_uses_persisted_reverse_seek_sidecar flaky 根因确认并修复
 memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双族:①apply_join_step 把 ON 中仅引用保留侧的合取项无条件下推为扫描过滤(LEFT/FULL 左、RIGHT/FULL 右被丢行);②NULL 侧 WHERE 合取项被 take_* 提取吞掉后不再后置应用(NULL 填充行错误存活,IS NULL 反连接错乱)。修复原则:ON 保留侧合取项留在 join 谓词走 residual_expr 逐对求值(probe/expr-hash/hash/nested-loop 全路径已支持);链含 RIGHT/FULL 则整链禁 WHERE 下推(含首表与 comma 对谓词,后续步可 NULL 填充任何早先关系列),本步 LEFT/FULL 则右侧 WHERE 不提取——execute_join 尾部后置过滤兜底。教训:下推安全性 = f(谓词来源 ON/WHERE, 侧别, 本步与后续步的保留性),四维都要判;纯 INNER 链不受影响。遗留权衡:comma+RIGHT/FULL 混链的对谓词不再提取会退化为笛卡尔物化后过滤(极罕见,正确性优先);FULL JOIN ORDER BY 的 NULL 排序为 NULLS FIRST(asc)。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="data-v2,phase,fence,p10-2-1,评审事故" date="2026-07-20" title="P10-2.1 落地:phase record + commit fence,评审抓 1 blocker + 6 项(df21565)" description="持久相位取代 flag;评审抓到同事务混排/superuser 门绕过/fence 非单调等;评审 agent 误删未提交工作" source="main@df21565">
+
+### P10-2.1 落地:phase record + commit fence,评审抓 1 blocker + 6 项(df21565)
+
+持久相位 record(Catalog identifier key,18B 定长严格 decode)取代进程本地 flag,fence 三层:启动灌好并随 invalidate_storage_caches 失效(一行同覆盖 raft apply 与 snapshot install 两调用点)、单机 commit_lock 内等值校验且 advance 同临界区发布、分布式转 precondition + apply 单调守卫。**对抗评审 19 findings 修 7 项**:①blocker 同事务混排——`BEGIN;INSERT;CALL advance;COMMIT` 会把按旧相求值的行与新相 record 原子共提交(commit 的 pin 校验只看已发布 fence,本事务 staged 的 record 尚未发布,二者互不感知;standalone 规则只拦单字符串多语句),修复=staged record 与 fence pin 并存即 loud abort;②superuser 门 `starts_with("CALL ")` 裸前缀被 `/*注释*/`、TAB 绕过且 statement_permissions(Call) 为空 ⇒ 非 superuser 可改相位,门移到 authorize_statement 按解析语句判定;③resolve_with 无单调性,陈旧 MVCC 快照覆盖已发布新 fence 后写以旧相干净提交;④raft evaluate 路径缺 standalone;⑤install 在 commit_lock 内改 record 但 invalidate 延迟到上层的陈旧窗口;⑥空 write_buffer 早退跳过 pin 校验;⑦无 record 时 flag 来源从 Executor 漂到 FusionStorage。**契约**:data-family 写只能经 write_routed_data_row/delete_routed_data_row/delete_structured_data_shadows_for_table 三个 helper(它们打 fence);相位推进必须独占事务。**基准方法论教训**:medium harness 噪声底噪极大(baseline-vs-baseline 逐查询 p90 |delta| 36.2%、装载基线跨时段自漂移 +14%),首轮 n=4 的"装载 +9.5% 回归"假设**已撤回**(n=8 合并基线 +2.4%/t=0.63);判噪内部对照=只读扫描也"可复现变慢",而写路径改动不可能影响纯 SELECT。**过程事故**:评审 subagent 写 in-tree probe 测试后用 `git checkout src/execution/mod.rs` 清理,抹掉该文件约 600 行未提交改动(其余 6 文件完好),靠 cargo check 报"刚写的函数找不到"发现并重做——**规则:评审 agent 必须只读,多 agent 评审未提交工作前先 git stash create 快照**。
+
+</spec-entry>

@@ -1,0 +1,47 @@
+{
+  "id": "P10-2.1",
+  "title": "Durable Data V2 migration phase record + commit-time fence on every data-family writer",
+  "phase": "P10-2 Versioned Structured Keyspace (ticket 1 of 9)",
+  "status": "done",
+  "design": ".workflow/.csv-wave/20260720-design-p10-2-data-v2-migration-ladder/design.md",
+  "problem": "Data V2 shadow writes were decided solely by the process-local config flag structured_data_shadow_v2: storage state could not attest shadow completeness, cluster nodes could diverge by local config, and there was no fence, phase, or rollback semantics. Every later P10-2 ticket (backfill, verifier, read cutover, legacy GC) must stand on a durable, monotonic phase that all writers enforce.",
+  "implementation": {
+    "record": "New src/storage/data_migration.rs. Key = encode_identifier_key(Catalog, [\"data-v2-migration-phase\"]) — the \\0FDBK magic keeps it invisible to legacy string-prefix scans and out of the Data-namespace cleanup scan. Value = 18-byte fixed v1 [version:u8][phase:u8][phase_seq:u64BE][updated_at_unix_ms:u64BE] with strict decode (exact length, exact version, phase in 1..=7, seq>0). Ladder: delete-only(1) -> write-delete-shadow(2) -> backfill -> validated -> v2-readable -> v2-only -> legacy-gc(7); ordinal 0 (legacy) reserved, never materialized because blind v2 tombstones run even with the flag off. MAX_SUPPORTED_PHASE and MAX_ADVANCE_TARGET_PHASE both = write-delete-shadow in T1.",
+    "fence": "Three layers. (1) DataMigrationFence on FusionStorage, primed during with_config after WAL replay and before side-index rebuild; invalidate_storage_caches gained one line that covers both existing call sites (Raft apply, snapshot install). (2) Single node: the three data-writer helpers pin the phase; FusionTransaction::commit revalidates inside commit_lock, and an advance publishes its fence in that same critical section (same point as current_ts) — so any commit serialized after an advance either carries the new pin or aborts loudly. pg session transactions commit a real FusionTransaction at COMMIT, so they are covered; so are the P5-4 local write paths that bypass Raft. (3) Distributed: RecordingTransaction turns the fence into a phase-key precondition whose expected value comes from the leader's applied state (never a cache); the apply-side monotonic guard rejects delete / malformed / non-seq-1 first build / rung skip / downgrade via Ok(Response::error) (deterministic, state unchanged, replay agrees, node keeps serving), and only a legitimate advance beyond MAX_SUPPORTED halts the state machine; normalize_snapshot_payload refuses to install a payload above MAX_SUPPORTED.",
+    "surface": "CALL fusiondb_data_migration_init() / fusiondb_data_migration_advance('<phase>') (single step, idempotent retry, loud on skip/downgrade/unknown/beyond-gate), SHOW DATA MIGRATION PHASE in both raw-string and parsed (ShowVariable) forms so pgwire works. Both CALLs route to the Raft write path through statement_may_change_query_results and get leader forwarding for free; the superuser gate is statement-shaped, not string-prefix-shaped."
+  },
+  "adversarial_review": {
+    "findings_total": 19,
+    "fixed": [
+      "BLOCKER same-transaction mixing: BEGIN; INSERT; CALL advance; COMMIT committed rows evaluated under the OLD phase atomically with the NEW phase record — the commit-time pin check compares against the published fence, and the transaction's own staged record is not published yet, so neither sees the other; the standalone rule only screens multi-statement single strings. Fixed in staged_migration_phase_record: a staged record plus a fence pin in the same transaction aborts loudly.",
+      "MAJOR superuser gate bypass: upper.starts_with(\"CALL \") is defeated by a leading comment or a tab, and statement_permissions(Call) is empty, so a non-superuser could mutate the durable phase. Gate moved to authorize_statement on the parsed statement.",
+      "MAJOR resolve_with had no monotonicity: a stale MVCC snapshot could overwrite a newly published fence, after which writes commit cleanly under old-phase behavior. A lower phase_seq now never overwrites a higher one.",
+      "MAJOR the Raft evaluation path lacked the standalone rule: an advance could be batched and replicated atomically with DML.",
+      "MAJOR snapshot install rewrote the durable record inside commit_lock but deferred fence invalidation to the caller, leaving a window where a commit revalidates against the pre-install phase. Invalidation moved into the same critical section.",
+      "MINOR empty-write-buffer early return skipped pin revalidation.",
+      "MINOR SHOW DATA MIGRATION PHASE worked only over HTTP (pgwire parses first and hit Unsupported).",
+      "MINOR the no-record default drifted from the Executor's flag to FusionStorage's, changing behavior when the two configs differ; CachedFenceState now exposes the no-record case so the Executor supplies its own default."
+    ],
+    "incident": "A review subagent wrote an in-tree probe test to prove a finding and cleaned up with git checkout src/execution/mod.rs, destroying ~600 lines of uncommitted work in that file (the other six files were intact). Detected when cargo check reported a just-written function as missing; the file was redone. RULE: review agents must be read-only, and uncommitted work must be snapshotted (git stash create) before any multi-agent review."
+  },
+  "verification": {
+    "gate": "cargo test --locked --all-targets: 1197 passed (baseline 1153, +44 new), cargo fmt clean",
+    "backward_compat": "the 4 pre-existing shadow tests pass unmodified; with no record, behavior follows the config flag exactly as before",
+    "crash_matrix": "WAL AfterWrite fault rolls the advance back (record absent, fence not advanced); torn tail replays to the prior phase; a record above MAX_SUPPORTED refuses the open; malformed values and record deletion are rejected at commit",
+    "fencing_races": "in-flight write x concurrent INIT aborts at COMMIT then succeeds on retry; same-transaction mixing aborts with neither effect landing; concurrent double advance leaves exactly one winner and the loser's retry hits the idempotent branch; the superuser gate refuses all four prefix spellings",
+    "distributed": "apply-guard matrix (delete / malformed / non-first-build / rung skip / downgrade all rejected gracefully with the node still serving; beyond MAX_SUPPORTED halts), precondition mismatch fails closed, snapshot build->install round-trips the record, over-supported install refused, idempotent replay does not double-bump seq, DML batches carry the phase precondition, Raft evaluation rejects advance batched with DML"
+  },
+  "benchmark": {
+    "setup": "same-disk ext4, BENCH_PROTO=pg, Parts 1/2/3/5, medium; baseline is an independent binary built from worktree@7de8634",
+    "verdict": "no write-path regression detected; every per-query delta sits inside this harness's noise floor and bulk load is indistinguishable from baseline",
+    "noise_floor": "baseline-vs-baseline per-query p90 |delta| = 36.2% (max 86%); bulk-load baseline self-drifted +14% between measurement sessions (2591ms -> 2950ms)",
+    "retracted_hypothesis": "an initial n=4 comparison showed bulk load +9.5% (t~2.7) and was treated as a suspected regression; extending to n=8 pooled baseline gave v1 (per-row fence) +2.4% (t=0.63) and v2 (pinned) -0.3% (t=-0.05), proving the earlier signal was baseline drift",
+    "internal_control": "several READ-ONLY scans also 'regressed reproducibly' (Full scan narrow +25%/+23%, BETWEEN +22%/+39%); a write-path-only change cannot affect pure SELECTs, which confirms noise dominance",
+    "optimization_kept": "adopted the review's minor finding (fence observed per-ROW, not per-statement): new synchronous allocation-free Transaction::data_migration_phase_pin lets row writers skip the shared lock and the boxed async fence call after the first row"
+  },
+  "followups": [
+    "P10-2.2 (next): bound the DROP/TRUNCATE v2 cleanup scan via route skip-scan — must land before backfill fills the namespace",
+    "P10-2.3 scope note: materialized CTEs write data:{cte}:{row} keys directly (pre-existing behavior, not a regression here); backfill enumeration over data: prefixes must exclude them or temp tables get migrated into v2",
+    "open (from the design doc): a pre-T1 binary cannot be stopped from downgrading at the storage layer — investigate a manifest feature-bit; decide before 2.6 whether CDC should keep emitting the phase-record put as a binary-key event"
+  ]
+}
