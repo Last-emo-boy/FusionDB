@@ -1,0 +1,42 @@
+{
+  "id": "P10-2.2",
+  "title": "Bound the DROP/TRUNCATE Data V2 shadow cleanup with a route skip-scan",
+  "phase": "P10-2 Versioned Structured Keyspace (ticket 2 of 9)",
+  "status": "done",
+  "design": ".workflow/.csv-wave/20260720-design-p10-2-data-v2-migration-ladder/design.md",
+  "problem": "delete_structured_data_shadows_for_table did txn.scan_prefix(data_namespace_prefix(), None) — materializing every key AND value in the Data V2 namespace — then parsed each key and deleted the table's matches. Harmless while the namespace is near-empty (shadow writes default off), but a hard blocker for P10-2.3: once backfill fills that namespace, every DROP/TRUNCATE becomes O(all shadow rows) and reads all their values into memory.",
+  "implementation": {
+    "walk": "Route-region skip-scan between data_namespace_prefix() and its prefix_end. Per iteration: (1) scan_range(cursor, namespace_end, Some(1)) — one seek, one row; FusionStorage's visitor returns false after the first row so it early-stops (verified). (2) parse_data_key_exact(probe).route() identifies the route region. (3) stream-scan [encode_data_prefix(route, table), prefix_end(...)) collecting keys only, no values. (4) cursor = prefix_end(encode_data_route_prefix(route)) skips the whole route region. Deletes are applied after the walk, still inside the caller's single transaction.",
+    "keyspace": "prefix_end and ParsedDataKey::route() promoted from #[cfg(test)] to production; new encode_data_route_prefix (header + route tag [+ shard id], table-independent).",
+    "prefix_safety": "Table identifiers are length-prefixed (4-byte BE), so `orders` and `orders:archive` / `orders_2` carry different length headers and their ranges cannot nest — a prefix-sharing neighbor can never be swept.",
+    "termination": "The probe key is >= cursor and starts with the route prefix, so prefix_end(route_prefix) > probe >= cursor: the cursor strictly increases. For Shard(u64::MAX) the carry lands on the route tag (0x01 -> 0x02), still inside the namespace; the next scan is empty and the loop breaks (covered by test)."
+  },
+  "semantic_change": "Malformed-key loud detection narrows to the ranges this cleanup touches (each route's probe key plus the target table's own range) instead of the whole namespace. This is the deliberate, design-doc-sanctioned cost of not scanning the whole namespace.",
+  "verification": {
+    "gate": "cargo test --locked --all-targets: 1200 passed (1197 after P10-2.1, +3 here), cargo fmt clean",
+    "backward_compat": "the 4 pre-existing shadow tests pass unmodified, including the Shard(99) historical orphan and the shadow_cleanup:archive colon-neighbor trap",
+    "boundedness": "new CountingTransaction decorator counts the keys scans actually hand back. With 2002 rows in the namespace (2 routes x (1 target row + 40 tables x 25 rows)) the cleanup touches 4 keys (2 route probes + 2 target rows), asserted <= 8. The old implementation would have scanned all 2002, so the assertion has real discriminating power; the test also asserts all 2000 noise rows survive and both target rows are gone.",
+    "route_discovery": "Unsharded / Shard(0) / Shard(7) / Shard(u64::MAX) with two prefix-sharing neighbor tables per route",
+    "real_engine": "FusionStorage test: three committed routes plus a route existing ONLY in the transaction's own write buffer (Shard(42)) plus a staged row in an already-committed route — all found and deleted, proving route discovery sees uncommitted routes through the MVCC merge"
+  },
+  "benchmark": {
+    "claim": "none",
+    "reasoning": "The only callers are DROP TABLE and TRUNCATE (verified exhaustively); the function is on no benchmarked hot path. This harness's measured noise floor (per-query p90 |delta| 36.2%, see P10-2.1) exceeds any signal the change could produce, so running the standard parts would yield noise. Boundedness is proven by the in-tree counting test (2002 rows -> 4 keys), which is both more direct and regression-protected."
+  },
+  "adversarial_review": {
+    "mode": "READ-ONLY — agentType Explore, prompt-level ban on all write tools and mutating git commands, working tree snapshotted (git stash create 715e480) before launch; git status confirmed the tree intact afterwards. This is the corrective for the P10-2.1 incident where a review agent's git checkout destroyed uncommitted work.",
+    "findings_total": 17,
+    "confirmed": 0,
+    "adopted_as_quality_fixes": [
+      "CountingTransaction inherited the trait defaults for fence_data_migration_phase / data_migration_phase_pin / as_any, silently dropping the P10-2.1 fence in the test double (raised independently by 3 agents). Harmless to this test's conclusion today, but it would silently stop covering the fence once a later ticket makes it load-bearing — now delegates to inner.",
+      "The prefix_end None branch silently skipped a route's rows. Structured keys start with a \\0 magic so a table prefix is never all-0xff and the branch is unreachable, but 'unreachable therefore silent' violates the loud-over-silent doctrine — now a loud error.",
+      "The docstring claimed a 'streaming scan' while accumulating keys into a Vec. Rewritten to state exactly what happens (keys only, no values; deletes applied after the walk) and to disclose that FusionStorage merges the write buffer on every scan, so a DROP that already staged many deletes pays that merge once per route — no longer claiming a clean O(routes + rows).",
+      "Tests covered only MemoryStorage and no write-buffer-only route — added the FusionStorage test described under verification.remaining"
+    ]
+  },
+  "followups": [
+    "P10-2.3 (next, now unblocked): backfill engine — idempotent chunks, durable checkpoint, DDL conflict point, unlock advance->Backfill",
+    "P10-2.3 scope note (carried from 2.1): materialized CTEs write data:{cte}:{row} keys; backfill enumeration over legacy data: prefixes must exclude them",
+    "P10-2.3 hazard (from the design doc): DROP/TRUNCATE v2 cleanup only removes keys present in its snapshot and shares zero keys with a concurrent chunk's fresh puts, so the backfill-state record must be written by DROP/TRUNCATE too, to force a write-write conflict point"
+  ]
+}
