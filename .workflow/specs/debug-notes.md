@@ -231,3 +231,17 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 **未结**:曾有一次 `--lib` 报 672/2 failed 但未捕获测试名,此后 7 次运行(含与 --all-targets 并发压测)全绿无法复现;疑为既有 GLOBAL_METRICS 高负载 flaky 家族但**未经证实**,再现须第一时间捕获名字。
 
 </spec-entry>
+
+<spec-entry category="debug" keywords="regression,order-by,topk,early-stop,benchmark,port" date="2026-07-20" title="性能回归实证:ORDER BY PK LIMIT 丢失早停(b0bd059 起),伴随基准装置端口缺陷" description="同机新旧二进制对照证实中位 3.75x 回归;根因定位到有序 top-K 早停失效;基准脚本不校验端口归属曾污染多轮测量" source="main@3d08f0a">
+
+### 性能回归实证:ORDER BY PK LIMIT 丢失早停(b0bd059 起),伴随基准装置端口缺陷
+
+**测量装置缺陷(先修这个,否则一切数据不可信)**:基准脚本只用 `curl 8091/health` 判就绪,且**从不校验自己启动的服务端是否真的持有客户端要连的 8092**。本机 8091 被 docker-proxy 常驻占用,且残留旧会话的 fusiondb 进程会占 8092/8093;端口被占时 FusionDB 的 pgwire 监听线程 panic 但**进程继续运行**(HTTP 自增到 8096),于是 benchmark 一路连到别的服务端(不同构建/不同数据集),表现为大量 "Table X not found" 与最终 Connection refused。**规则:基准脚本必须在启动前检查端口空闲、启动后用 `ss -ltnp` 确认本进程 pid 持有该端口、日志含 panicked 一律 loud 退出**。今日多轮 A/B(含 P10-2.1 记录的"噪声底噪 p90 36%")均受此污染,该噪声数字作废。
+
+**回归实证(同机同盘、同一份 benchmark.py、large+pg)**:6/29 二进制(5be78c9)vs HEAD 中位 **3.75x 慢**,103 条中 60 条 >3x。机器因子仅 **1.25x**(旧二进制本机 vs 6/29 归档),故非硬件。既有表行数完全相同(多出 4 万行来自新增 join_reorder part)。`sql_bulk_scan_no_fill`(6/29 配置中不存在,今默认 true)仅解释约 10%(开 fill 后中位 0.91x)。**方向是分化的**:重扫描真实变快(LIKE 330→85ms、IN list 310→85、Full scan 314→126,来自 P9-6 并行归并 + P9-7 jemalloc + 469/470),但毫秒级快路径与写入慢 10–100x(ORDER BY id LIMIT 50 0.26→22ms、Total bank balance 0.18→9.7、AND filter 1.28→25、单行写 0.2→1.4-2.7、装载 9.8→14.6s)。
+
+**根因定位(计数器差值,绕开结果缓存用唯一查询文本)**:`SELECT * FROM bench ORDER BY id LIMIT n`——6/29 二进制 0.4-1.8ms 且**存储计数器全零**(有序 PK 扫描取够即停);HEAD 13-54ms、`block_cache_miss=1263`、`sstable_block_read_bytes=1.66MB`、**`query_sort_fallback_count=1`**(物化后显式排序)。回归在 `b0bd059`(7/10 大检查点,4.4 万行)时已完整存在。入口条件 `order_by_allows_streaming_topk`(order.rs:349,该提交引入)对 `ORDER BY id` 应返回 true、`streaming_order_limit` 应为 Some(50),**即入口满足但流式 top-K 实际未生效**——修复票应从 `scan_single_table` 是否兑现 streaming_order_limit 查起。这是 memory 已记载的 **"预计算 vs 早停" PATTERN** 的新实例(469 修过 PK 区间扫描同类问题,并明确留有未审计挂载点)。
+
+**附带发现**:`src/server/pg_server.rs:9216` 在 pgwire 热路径对每条查询 `eprintln!` 完整 SQL(一次 Part 1 运行写 7.6MB,批量 INSERT 的 500 行 VALUES 被整条打印)。自 2026-01-06 初始提交即存在,**非本次回归主因**(新旧二进制都有),但应单独清理。
+
+</spec-entry>
