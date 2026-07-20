@@ -256,3 +256,15 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 
 **已验证的错误修法(勿重复)**:直接去掉 `limit.is_none()` 门 —— 排序回退确实消失、结果正确(升序 0-4/降序 49999-49995),但**更慢**(65→144ms),因为 top-K visitor 为给任意列排名必须扫全表。主键升序下数据本已按键有序,正解是让既有的 `scan_limit` 路径真正早停(取够 n 行即止),而非改走 top-K。已回退,工作区干净。
 
+
+<spec-entry category="debug" keywords="regression,write-path,fsync,durability,baseline" date="2026-07-20" title="写路径"回归"实为持久化代价:6/29 基线的 WAL 根本不 fsync" description="旧 wal.rs 零个 sync_data/sync_all;单行写 0.21ms 是无持久化的假快;写侧对比基线无效" source="main@5945031">
+
+### 写路径"回归"实为持久化代价:6/29 基线的 WAL 根本不 fsync
+
+追剩余回归时对写路径做计数器差值:HEAD 单行 INSERT 只有 5 次点探 + 1 次块读 + 796B WAL 写入,**CPU 侧没有异常工作量**,3.5ms 的量级只能是 fsync 绑定。而基线的 0.21ms 对 ext4 上一次 fsync 而言**物理上太快**。核实:`git show 5be78c9:src/storage/wal.rs`(781 行)中 `sync_data|sync_all|fsync|durab` 命中数 **= 0**,只有 `BufWriter::flush()`;当前 wal.rs(2160 行)有完整同步纪律,929 行由 `b0bd059` 一次性加入(即 ROADMAP 的 P1-3"分段 WAL/同步文件与目录持久化"落地)。
+
+**结论:单行写慢 6-13x、批量装载慢 1.5x 不是缺陷,是把"提交后掉电会丢数据"换成了真正的持久化。** 拿 6/29 二进制做写侧基线是无效对照——那是一个不 fsync 的数据库。
+
+**由此必须修正此前的结论**:"同机中位慢 3.04x"这个数字里,凡涉及写入的项都在拿持久 vs 非持久对比,不能计入回归。真正需要继续追的只剩**纯读路径**的差距。方法学教训:跨版本基准对比前,必须先确认两侧的**持久化语义相同**;语义变了就不是同一个可比对象(与 tmpfs 陷阱同源——那次是介质免除 fsync,这次是代码根本不调用 fsync)。
+
+</spec-entry>
