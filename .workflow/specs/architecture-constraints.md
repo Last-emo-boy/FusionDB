@@ -736,3 +736,16 @@ Revenue by category(order_items JOIN products GROUP BY)warm 17.6s 画像:10k 产
 **再下一步(尚未开工)**:纯读 2.53x 中,除本项外仍有未解释成分;`src/server/pg_server.rs:9216`
 在 pgwire 热路径对每条查询 `eprintln!` 完整 SQL(一次 Part 1 写 7.6MB),自项目初始即存在,应清理。
 
+
+<spec-entry category="arch" keywords="sstable,iterator,zero-copy,472,per-entry,allocation" date="2026-07-21" title="472 切入点确定:SSTable 迭代器逐条目双分配 + 整块物化(审计实证)" description="sstable.rs:3356-3359 每条目 key/value 各一次 to_vec 且整块物化;零拷贝块视图迭代器为正解;含改动波及面评估" source="main@bb999dd">
+
+### 472 切入点确定:SSTable 迭代器逐条目双分配 + 整块物化(审计实证)
+
+裸聚合地板(memtable 驻留 150-250µs vs SSTable 驻留 1.2-4ms,~2-4µs/行)的逐条目审计结论:
+
+**双分配**:`SsTableIterator::next`(sstable.rs:3276)把块内每条目 `key.to_vec() + value.to_vec()` 装进 `VecDeque<(Vec<u8>,Vec<u8>)>`(:3356-3359)——每条目两次堆分配,即便块数据已在 Arc 缓存中。**整块物化**:装填不看消费端进度,LIMIT/早停只取前几条时整块条目已全部拷贝。反向迭代器同构(`SsTableReverseIterator` 同样 VecDeque owned)。
+
+**正解(472 族第一刀)**:迭代器持有块 `Arc<[u8]>` + spans,`next` 返回借用视图或 (Arc, Range) 轻句柄;可见性归并层的堆比较用借用键;仅在真正交付给 visitor/物化时才拷贝。RocksDB 迭代器即此模型(slice into block)。**波及面**:`next() -> Option<(Vec<u8>,Vec<u8>)>` 签名、for_each_visible_range 的多源归并(候选比较/所有权)、reverse 侧同构改造;预估中等规模重构,须整轮专票 + 只读评审 + 同机 A/B(受益面=一切 SSTable 读)。
+
+**排序依据**:此点同时是裸聚合地板与 JOIN 逐行 30µs(Revenue 画像)的公共成分;比"批量列式 kernel"更小更先行——先消分配,再谈列式批处理。
+
