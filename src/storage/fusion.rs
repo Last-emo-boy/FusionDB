@@ -920,15 +920,24 @@ fn scan_sstable_files(sst_dir: &Path) -> Vec<SstableLiveFile> {
     files
 }
 
+/// Heap item for the compaction merge. All compaction sources are SSTables,
+/// so entries stay as borrowed views into their block (one `Arc` bump per
+/// entry instead of two heap copies); bytes are copied only when the builder
+/// writes its own block buffer. Ordering is the canonical merge order:
+/// reverse key compare for a min-heap, no source tie-break.
+///
+/// Memory boundedness: the heap holds at most one view per source and each
+/// iterator holds its current block, so at most 2 block `Arc`s are alive per
+/// input SSTable (<= 2 x COMPACTION_FANIN in total); advancing a source
+/// drops its previous view's block reference.
 struct MergeItem {
-    key: Vec<u8>,
-    val: Vec<u8>,
+    entry: crate::storage::sstable::SsTableEntryView,
     iter_idx: usize,
 }
 
 impl PartialEq for MergeItem {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.entry.key() == other.entry.key()
     }
 }
 
@@ -943,7 +952,7 @@ impl PartialOrd for MergeItem {
 impl Ord for MergeItem {
     fn cmp(&self, other: &Self) -> CmpOrdering {
         // Reverse order for Min-Heap: we want smallest key to pop first
-        other.key.cmp(&self.key)
+        other.entry.key().cmp(self.entry.key())
     }
 }
 
@@ -2629,10 +2638,9 @@ impl FusionStorage {
 
         // Init heap
         for (idx, it) in iterators.iter_mut().enumerate() {
-            if let Some((k, v)) = it.next().await? {
+            if let Some(entry) = it.next_entry().await? {
                 heap.push(MergeItem {
-                    key: k,
-                    val: v,
+                    entry,
                     iter_idx: idx,
                 });
             }
@@ -2648,15 +2656,14 @@ impl FusionStorage {
         let mut max_output_ts = 0;
 
         while let Some(item) = heap.pop() {
-            let k = item.key;
-            let v = item.val;
+            let k = item.entry.key();
+            let v = item.entry.value();
             let idx = item.iter_idx;
 
             if k.len() < TS_SIZE {
-                if let Some((next_k, next_v)) = iterators[idx].next().await? {
+                if let Some(entry) = iterators[idx].next_entry().await? {
                     heap.push(MergeItem {
-                        key: next_k,
-                        val: next_v,
+                        entry,
                         iter_idx: idx,
                     });
                 }
@@ -2666,13 +2673,13 @@ impl FusionStorage {
             // Keep exactly the versions needed by current and future snapshots. Without active
             // readers, only the latest version is needed. With active readers, keep all versions
             // newer than the oldest reader plus the first floor version visible to that reader.
-            let base_key = k[..k.len() - TS_SIZE].to_vec();
-            let is_new_base_key = last_base_key.as_ref() != Some(&base_key);
+            let base_key = &k[..k.len() - TS_SIZE];
+            let is_new_base_key = last_base_key.as_deref() != Some(base_key);
             if is_new_base_key {
-                last_base_key = Some(base_key);
+                last_base_key = Some(base_key.to_vec());
                 kept_floor_version_for_base = false;
             }
-            let (_, ts) = FusionStorage::decode_key(&k);
+            let (_, ts) = FusionStorage::decode_key(k);
             let keep_version = match oldest_active_read_ts {
                 None => is_new_base_key,
                 Some(oldest_read_ts) => {
@@ -2688,10 +2695,9 @@ impl FusionStorage {
             };
             if !keep_version {
                 dropped_version_count += 1;
-                if let Some((next_k, next_v)) = iterators[idx].next().await? {
+                if let Some(entry) = iterators[idx].next_entry().await? {
                     heap.push(MergeItem {
-                        key: next_k,
-                        val: next_v,
+                        entry,
                         iter_idx: idx,
                     });
                 }
@@ -2703,14 +2709,14 @@ impl FusionStorage {
             max_output_ts = max_output_ts.max(ts);
 
             if first_key.is_none() {
-                first_key = Some(k.clone());
+                first_key = Some(k.to_vec());
             }
 
-            builder.add_key(&k);
+            builder.add_key(k);
             block_buffer.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            block_buffer.extend_from_slice(&k);
+            block_buffer.extend_from_slice(k);
             block_buffer.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            block_buffer.extend_from_slice(&v);
+            block_buffer.extend_from_slice(v);
             block_count += 1;
 
             if block_buffer.len() >= SSTABLE_BLOCK_BUFFER_CAPACITY {
@@ -2728,10 +2734,9 @@ impl FusionStorage {
             }
 
             // Advance iterator
-            if let Some((next_k, next_v)) = iterators[idx].next().await? {
+            if let Some(entry) = iterators[idx].next_entry().await? {
                 heap.push(MergeItem {
-                    key: next_k,
-                    val: next_v,
+                    entry,
                     iter_idx: idx,
                 });
             }
