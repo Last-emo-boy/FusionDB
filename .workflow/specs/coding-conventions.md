@@ -1088,3 +1088,14 @@ CREATE TABLE and ALTER TABLE column identity now use sqlparser Ident.value via a
 
 **本步价值边界(诚实)**:全量消费扫描无可见收益;受益 = 早停/带界扫描的免整块物化 + 结构铺路。1217 门全绿,时延与正确性经 probe_head 身份断言验证。
 
+
+<spec-entry category="coding" keywords="zero-copy,view,merge,mvcc,visible-range,472" date="2026-07-21" title="前向可见性归并零拷贝契约(f92763a);剩余物化面清单" description="VisibleMergeItem 二态(Owned/Sst 视图);比较器复刻 MergeItem;内存有界论证;并行路径与反向/compaction 仍物化" source="main@f92763a">
+
+### 前向可见性归并零拷贝契约(f92763a);剩余物化面清单
+
+**契约**:前向 `merge_visible_range` 用 `VisibleMergeItem { entry: VisibleEntry, iter_idx }`,`VisibleEntry::Owned`(write-buffer/memtable)/`::Sst(SsTableEntryView)`(块 Arc + spans)。比较器必须逐字复刻 `MergeItem`(仅键逆序 min-heap,无源 tiebreak——源优先级由 current_visible 的 idx==0 逻辑承担,别在比较器里加)。visitor 拿借用;**visitor 若保留数据必须自拷**(现有 visitor 均如此)。内存有界:堆内每源 ≤1 视图 + 迭代器持当前块 ⇒ 每 SSTable 源 ≤2 块 Arc;块缓存驱逐只降引用计数。
+
+**剩余物化面(按热度排序,后续片)**:①并行分区扫描(scan_range_parallel_* 经 channel 传 owned,消费端再拷——大表全扫/并行聚合的地板);②反向归并(ReverseMergeItem owned);③compaction 归并(MergeItem owned——但 compaction 本就要写盘,物化非浪费,优先级最低)。
+
+**评审纪录**:3 维只读评审,语义等价与生命周期零发现;时延主张软化为方向性证据(HTTP 探针含 ~1ms 传输),幅度以同协议基准为准。
+
