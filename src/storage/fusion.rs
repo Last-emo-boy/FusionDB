@@ -3665,11 +3665,10 @@ impl FusionTransaction {
         (!skip_offsets.is_empty()).then(|| Arc::new(skip_offsets))
     }
 
-    /// Core N-way MVCC merge over an owned snapshot (memtables + sstables + write buffer) for the
-    /// range `[start, end)`. It takes borrowed snapshot pieces (not `&self`) so a single consistent
-    /// snapshot can be shared across several sub-range merges running on spawned tasks (see
-    /// `scan_range_parallel`). Invokes `visit(user_key, value)` for each latest visible PUT in key
-    /// order and stops early when `visit` returns false.
+    /// Borrowed-slice facade over `merge_visible_range_entries`: decodes each yielded entry and
+    /// invokes `visit(user_key, value)` for each latest visible PUT in key order, stopping early
+    /// when `visit` returns false. Decoding is pure slicing (split off the timestamp suffix and
+    /// the put flag byte), so the facade adds no allocation over the entry-yielding core.
     async fn merge_visible_range(
         mem_tables: &[MemTable],
         sstables: &[Arc<SsTable>],
@@ -3679,6 +3678,40 @@ impl FusionTransaction {
         end: &[u8],
         scan_options: StorageScanOptions,
         visit: &mut (dyn FnMut(&[u8], &[u8]) -> bool + Send),
+    ) -> Result<()> {
+        Self::merge_visible_range_entries(
+            mem_tables,
+            sstables,
+            write_buffer,
+            read_ts,
+            start,
+            end,
+            scan_options,
+            &mut |entry: VisibleEntry| {
+                let (user_k, _ts) = FusionStorage::decode_key(entry.key());
+                let (_is_put, val) = FusionStorage::decode_value(entry.val());
+                visit(user_k, val)
+            },
+        )
+        .await
+    }
+
+    /// Core N-way MVCC merge over an owned snapshot (memtables + sstables + write buffer) for the
+    /// range `[start, end)`. It takes borrowed snapshot pieces (not `&self`) so a single consistent
+    /// snapshot can be shared across several sub-range merges running on spawned tasks (see
+    /// `scan_range_parallel`). Invokes `visit(entry)` with the moved `VisibleEntry` (still encoded:
+    /// internal key + flagged value) for each latest visible PUT in key order and stops early when
+    /// `visit` returns false. SSTable entries stay block views end to end, so a sink that ships
+    /// them elsewhere (e.g. over a channel to another task) pays an Arc bump, not a copy.
+    async fn merge_visible_range_entries(
+        mem_tables: &[MemTable],
+        sstables: &[Arc<SsTable>],
+        write_buffer: &[(Vec<u8>, Option<Vec<u8>>)],
+        read_ts: u64,
+        start: &[u8],
+        end: &[u8],
+        scan_options: StorageScanOptions,
+        visit: &mut (dyn FnMut(VisibleEntry) -> bool + Send),
     ) -> Result<()> {
         let start_ik = FusionStorage::encode_key(start, u64::MAX);
         let read_options = sstable_read_options(&scan_options);
@@ -3930,8 +3963,8 @@ impl FusionTransaction {
 
             if current_visible {
                 last_user_key = Some(user_k.to_vec());
-                let (is_put, val) = FusionStorage::decode_value(entry.val());
-                if is_put && !visit(user_k, val) {
+                let (is_put, _val) = FusionStorage::decode_value(entry.val());
+                if is_put && !visit(entry) {
                     break;
                 }
             }
@@ -4313,16 +4346,32 @@ impl FusionTransaction {
             let write_buffer = write_buffer.clone();
             let stop = stop.clone();
             let scan_options = scan_options.clone();
+            // Zero-copy channel protocol: partitions send the merge's `VisibleEntry` as-is.
+            // Memtable/write-buffer rows stay `Owned` (same bytes as before); SSTable rows are
+            // block views, so queueing one costs an `Arc<[u8]>` bump instead of a key+value copy.
+            //
+            // Bounded-memory argument (honest): the channel is unbounded and producers run their
+            // whole sub-range without backpressure — exactly as before, when a fully produced but
+            // not yet consumed partition held one owned copy of every row (≈ total row bytes).
+            // Now a queued `Sst` view pins its whole block Arc. Queued views from the same block
+            // share one Arc, so a fully queued partition pins at most its distinct overlapping
+            // blocks — ≈ the partition's block bytes, normally *less* than the old per-row copies
+            // (rows counted once per block, no per-row alloc). The worst case inverts that: a
+            // block contributing a single visible row (heavily deleted / mostly-shadowed data)
+            // pins block_size bytes where the old code copied only that row — a
+            // block_size / visible_bytes_per_block regression, still capped by the total block
+            // bytes overlapping the scanned range. Block-cache eviction only drops a refcount,
+            // so pinned blocks stay alive until their queued views are consumed.
             let (sender, receiver) = mpsc::unbounded_channel();
 
             let handle = tokio::spawn(async move {
-                let mut visit = |user_k: &[u8], val: &[u8]| {
+                let mut visit = |entry: VisibleEntry| {
                     if stop.load(Ordering::Relaxed) {
                         return false;
                     }
-                    sender.send((user_k.to_vec(), val.to_vec())).is_ok()
+                    sender.send(entry).is_ok()
                 };
-                FusionTransaction::merge_visible_range(
+                FusionTransaction::merge_visible_range_entries(
                     mem_tables.as_slice(),
                     sstables.as_slice(),
                     write_buffer.as_slice(),
@@ -4341,9 +4390,14 @@ impl FusionTransaction {
         let mut stopped_early = false;
         let mut partitions = partitions.into_iter();
         while let Some((mut receiver, handle)) = partitions.next() {
-            while let Some((key, value)) = receiver.recv().await {
+            while let Some(entry) = receiver.recv().await {
                 visited += 1;
-                if !visitor.visit(&key, &value) || visited >= safe_limit {
+                // The merge only yields visible PUTs; decode borrows straight from the received
+                // entry (block view or owned buffer) — the visitor copies at its own boundary if
+                // it retains data.
+                let (user_k, _ts) = FusionStorage::decode_key(entry.key());
+                let (_is_put, val) = FusionStorage::decode_value(entry.val());
+                if !visitor.visit(user_k, val) || visited >= safe_limit {
                     stop.store(true, Ordering::Relaxed);
                     stopped_early = true;
                     break;
