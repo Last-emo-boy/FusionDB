@@ -4,7 +4,7 @@ use crate::monitor;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use moka::sync::Cache;
 use serde::de::{MapAccess, Visitor};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -92,10 +92,6 @@ impl Default for SsTableReadOptions {
     fn default() -> Self {
         Self::fill_cache()
     }
-}
-
-fn block_entry_buffer() -> VecDeque<(Vec<u8>, Vec<u8>)> {
-    VecDeque::with_capacity(1)
 }
 
 fn block_entry_reserve_count(count: u32, block_len: usize) -> usize {
@@ -1697,14 +1693,18 @@ impl SsTable {
         key_user_part(key, suffix_len) < bound
     }
 
-    fn append_reverse_block_entries_in_bounds(
+    /// Compute the in-bounds window of entry spans for one block via a
+    /// span scan; the reverse iterator yields the window backward, lazily.
+    /// Stats count the whole window at block-decode time — the same values
+    /// the historical eager materialization produced — because the actual
+    /// byte copies are now deferred to the consumer's own boundary.
+    fn reverse_block_spans_in_bounds(
         block_data: &[u8],
         user_key_lower_bound: Option<&[u8]>,
         user_key_upper_bound: Option<&[u8]>,
         suffix_len: usize,
-        out: &mut VecDeque<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<ReverseBlockScanStats> {
-        let spans = Self::decoded_block_entry_spans(block_data)?;
+    ) -> Result<(Vec<BlockEntrySpan>, ReverseBlockScanStats)> {
+        let mut spans = Self::decoded_block_entry_spans(block_data)?;
         let mut stats = ReverseBlockScanStats {
             span_scan_blocks: 1,
             span_scan_entries: spans.len() as u64,
@@ -1726,32 +1726,35 @@ impl SsTable {
             .unwrap_or(spans.len());
 
         if lower_idx >= upper_idx {
-            return Ok(stats);
+            return Ok((Vec::new(), stats));
         }
 
-        let bounded_spans = &spans[lower_idx..upper_idx];
-        out.reserve(bounded_spans.len());
-        for span in bounded_spans.iter().rev() {
-            let key = block_data[span.key_start..span.key_end].to_vec();
-            let value = block_data[span.value_start..span.value_end].to_vec();
-            stats.decoded_entries += 1;
-            stats.yielded_entries += 1;
-            stats.span_materialized_entries += 1;
-            out.push_back((key, value));
-        }
-        Ok(stats)
+        spans.truncate(upper_idx);
+        spans.drain(..lower_idx);
+        let window_len = spans.len() as u64;
+        stats.decoded_entries = window_len;
+        stats.yielded_entries = window_len;
+        stats.span_materialized_entries = window_len;
+        Ok((spans, stats))
     }
 
-    fn entry_at_offset(block_data: &[u8], offset: u32) -> Option<(&[u8], &[u8])> {
+    fn span_at_offset(block_data: &[u8], offset: u32) -> Option<BlockEntrySpan> {
         let mut cursor = offset as usize;
         let key_len = Self::read_block_u32_at(block_data, &mut cursor)? as usize;
+        let key_start = cursor;
         let key_end = cursor.checked_add(key_len)?;
-        let key = block_data.get(cursor..key_end)?;
+        block_data.get(key_start..key_end)?;
         cursor = key_end;
         let value_len = Self::read_block_u32_at(block_data, &mut cursor)? as usize;
+        let value_start = cursor;
         let value_end = cursor.checked_add(value_len)?;
-        let value = block_data.get(cursor..value_end)?;
-        Some((key, value))
+        block_data.get(value_start..value_end)?;
+        Some(BlockEntrySpan {
+            key_start,
+            key_end,
+            value_start,
+            value_end,
+        })
     }
 
     fn sidecar_offset_before_bound(
@@ -1760,20 +1763,25 @@ impl SsTable {
         suffix_len: usize,
         bound: &[u8],
     ) -> bool {
-        let Some((key, _)) = Self::entry_at_offset(block_data, offset) else {
+        let Some(span) = Self::span_at_offset(block_data, offset) else {
             return false;
         };
+        let key = &block_data[span.key_start..span.key_end];
         key_user_part(key, suffix_len) < bound
     }
 
-    fn append_reverse_block_entries_with_seek_index(
+    /// Sidecar-indexed variant of `reverse_block_spans_in_bounds`: resolves
+    /// the in-bounds window through the persisted offset index (O(log n)
+    /// probes) and decodes only the window's spans, never the whole block.
+    /// Returns `None` to fail open to the span scan — always before any
+    /// span is handed out, so the fallback can never duplicate entries.
+    fn reverse_block_spans_with_seek_index(
         block_data: &[u8],
         seek_block: &SsTableReverseSeekBlockIndex,
         user_key_lower_bound: Option<&[u8]>,
         user_key_upper_bound: Option<&[u8]>,
         suffix_len: usize,
-        out: &mut VecDeque<(Vec<u8>, Vec<u8>)>,
-    ) -> Option<ReverseBlockScanStats> {
+    ) -> Option<(Vec<BlockEntrySpan>, ReverseBlockScanStats)> {
         if seek_block.decoded_len as usize != block_data.len()
             || seek_block.entry_count as usize != seek_block.entry_offsets.len()
             || seek_block.decoded_crc32 != Self::crc32(block_data)
@@ -1804,19 +1812,21 @@ impl SsTable {
             ..Default::default()
         };
         if lower_idx >= upper_idx {
-            return Some(stats);
+            return Some((Vec::new(), stats));
         }
 
         let offsets = &seek_block.entry_offsets[lower_idx..upper_idx];
-        out.reserve(offsets.len());
-        for offset in offsets.iter().rev() {
-            let (key, value) = Self::entry_at_offset(block_data, *offset)?;
-            stats.decoded_entries += 1;
-            stats.yielded_entries += 1;
-            stats.sidecar_materialized_entries += 1;
-            out.push_back((key.to_vec(), value.to_vec()));
+        let mut spans = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            // A CRC-matched sidecar whose offset does not decode is corrupt;
+            // fail open before yielding anything.
+            spans.push(Self::span_at_offset(block_data, *offset)?);
         }
-        Some(stats)
+        let window_len = spans.len() as u64;
+        stats.decoded_entries = window_len;
+        stats.yielded_entries = window_len;
+        stats.sidecar_materialized_entries = window_len;
+        Some((spans, stats))
     }
 
     async fn reverse_seek_sidecar_for_iterator(
@@ -2992,7 +3002,7 @@ impl SsTable {
             reverse_seek_sidecar: self.reverse_seek_sidecar.clone(),
             file_len: self.file_len,
             current_block_idx,
-            current_block_entries: block_entry_buffer(),
+            current_block: None,
             user_key_lower_bound: user_key_lower_bound.map(|key| key.to_vec()),
             user_key_upper_bound: user_key_upper_bound.map(|key| key.to_vec()),
             suffix_len,
@@ -3418,7 +3428,13 @@ pub struct SsTableReverseIterator {
     reverse_seek_sidecar: Arc<OnceLock<Option<Arc<SsTableReverseSeekSidecar>>>>,
     file_len: u64,
     current_block_idx: Option<usize>,
-    current_block_entries: VecDeque<(Vec<u8>, Vec<u8>)>,
+    // Lazily yielded view of the current block's in-bounds span window:
+    // bounds are resolved once per block (binary search over spans or the
+    // sidecar offset index), then the cursor walks the window BACKWARD and
+    // `next_entry` hands out one borrowed view at a time — no entry bytes
+    // are copied until a consumer materializes at its own boundary. The
+    // cursor is the number of spans not yet yielded (next = spans[cursor-1]).
+    current_block: Option<(BlockCacheValue, Vec<BlockEntrySpan>, usize)>,
     user_key_lower_bound: Option<Vec<u8>>,
     user_key_upper_bound: Option<Vec<u8>>,
     suffix_len: usize,
@@ -3528,9 +3544,34 @@ impl SsTableReverseIterator {
     }
 
     pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .next_entry()
+            .await?
+            .map(|entry| (entry.key().to_vec(), entry.value().to_vec())))
+    }
+
+    /// Yield the next in-range entry (descending key order) as a borrowed
+    /// view into the cached block, mirroring `SsTableIterator::next_entry`.
+    /// Memory boundedness: the iterator itself keeps exactly one block Arc
+    /// (`current_block`); every view yielded from it bumps that same Arc,
+    /// so a consumer that retains at most one view per source holds at most
+    /// two block Arcs per SSTable source alive at any time.
+    pub async fn next_entry(&mut self) -> Result<Option<SsTableEntryView>> {
         loop {
-            if let Some(entry) = self.current_block_entries.pop_front() {
-                return Ok(Some(entry));
+            if let Some((block_data, spans, mut cursor)) = self.current_block.take() {
+                if cursor > 0 {
+                    cursor -= 1;
+                    let span = spans[cursor];
+                    let view = SsTableEntryView {
+                        block: block_data.clone(),
+                        key_start: span.key_start,
+                        key_end: span.key_end,
+                        value_start: span.value_start,
+                        value_end: span.value_end,
+                    };
+                    self.current_block = Some((block_data, spans, cursor));
+                    return Ok(Some(view));
+                }
             }
 
             let Some(block_idx) = self.current_block_idx else {
@@ -3599,45 +3640,41 @@ impl SsTableReverseIterator {
                 &self.reverse_seek_sidecar,
             )
             .await;
-            let stats = if let Some(sidecar) = sidecar {
+            let (spans, stats) = if let Some(sidecar) = sidecar {
                 if let Some(seek_block) = sidecar.block_for_offset(offset) {
-                    if let Some(stats) = SsTable::append_reverse_block_entries_with_seek_index(
+                    if let Some(result) = SsTable::reverse_block_spans_with_seek_index(
                         block_data.as_ref(),
                         seek_block,
                         self.user_key_lower_bound.as_deref(),
                         self.user_key_upper_bound.as_deref(),
                         self.suffix_len,
-                        &mut self.current_block_entries,
                     ) {
                         monitor::inc_sstable_reverse_seek_sidecar_use();
-                        stats
+                        result
                     } else {
                         monitor::inc_sstable_reverse_seek_sidecar_fail_open();
-                        SsTable::append_reverse_block_entries_in_bounds(
+                        SsTable::reverse_block_spans_in_bounds(
                             block_data.as_ref(),
                             self.user_key_lower_bound.as_deref(),
                             self.user_key_upper_bound.as_deref(),
                             self.suffix_len,
-                            &mut self.current_block_entries,
                         )?
                     }
                 } else {
                     monitor::inc_sstable_reverse_seek_sidecar_fail_open();
-                    SsTable::append_reverse_block_entries_in_bounds(
+                    SsTable::reverse_block_spans_in_bounds(
                         block_data.as_ref(),
                         self.user_key_lower_bound.as_deref(),
                         self.user_key_upper_bound.as_deref(),
                         self.suffix_len,
-                        &mut self.current_block_entries,
                     )?
                 }
             } else {
-                SsTable::append_reverse_block_entries_in_bounds(
+                SsTable::reverse_block_spans_in_bounds(
                     block_data.as_ref(),
                     self.user_key_lower_bound.as_deref(),
                     self.user_key_upper_bound.as_deref(),
                     self.suffix_len,
-                    &mut self.current_block_entries,
                 )?
             };
             monitor::add_sstable_reverse_block_entry_decodes(stats.decoded_entries);
@@ -3653,6 +3690,8 @@ impl SsTableReverseIterator {
             );
             monitor::add_sstable_reverse_seek_sidecar_offset_probes(stats.sidecar_offset_probes);
             self.scan_stats.accumulate(stats);
+            let cursor = spans.len();
+            self.current_block = Some((block_data, spans, cursor));
         }
     }
 
@@ -3712,7 +3751,7 @@ mod tests {
     use crate::storage::{SQL_BLOCK_ZONE_MAP_TYPE_BOOLEAN, SQL_BLOCK_ZONE_MAP_TYPE_TIMESTAMP};
 
     use super::{
-        block_entry_buffer, block_entry_reserve_count, block_table_prefix_ranges, prefix_end,
+        block_entry_reserve_count, block_table_prefix_ranges, prefix_end,
         BlockSqlIndexPrefixesSsTableBlockPropertiesV4, BlockSqlIndexPrefixesSsTableMetaV4,
         BlockSqlZoneMapV5, BlockSqlZoneMapsSsTableBlockPropertiesV5, BlockSqlZoneMapsSsTableMetaV5,
         BlockTablePrefixesSsTableBlockProperties, BlockTablePrefixesSsTableMetaV3, Crc32Hasher,
@@ -3730,11 +3769,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
-
-    #[test]
-    fn block_entry_buffer_preallocates_first_entry() {
-        assert!(block_entry_buffer().capacity() >= 1);
-    }
 
     #[test]
     fn block_entry_reserve_count_is_bounded_by_block_length() {
@@ -3800,15 +3834,9 @@ mod tests {
             append_block_entry(&mut block, key.as_bytes(), value.as_bytes());
         }
 
-        let mut out = std::collections::VecDeque::new();
-        let stats = SsTable::append_reverse_block_entries_in_bounds(
-            &block,
-            Some(b"k090"),
-            Some(b"k095"),
-            0,
-            &mut out,
-        )
-        .unwrap();
+        let (spans, stats) =
+            SsTable::reverse_block_spans_in_bounds(&block, Some(b"k090"), Some(b"k095"), 0)
+                .unwrap();
 
         assert_eq!(stats.decoded_entries, 5);
         assert_eq!(stats.yielded_entries, 5);
@@ -3818,7 +3846,12 @@ mod tests {
         assert_eq!(stats.sidecar_index_entries, 0);
         assert_eq!(stats.sidecar_materialized_entries, 0);
         assert_eq!(stats.sidecar_offset_probes, 0);
-        let keys: Vec<Vec<u8>> = out.into_iter().map(|(key, _)| key).collect();
+        // The iterator walks the window backward: descending key order.
+        let keys: Vec<Vec<u8>> = spans
+            .iter()
+            .rev()
+            .map(|span| block[span.key_start..span.key_end].to_vec())
+            .collect();
         assert_eq!(
             keys,
             vec![

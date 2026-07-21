@@ -1039,16 +1039,55 @@ impl Ord for ReverseMergeItem {
     }
 }
 
+/// Raw entry flowing out of a reverse merge source. SSTable entries stay
+/// as borrowed views into their cached blocks (one Arc bump per entry);
+/// buffered (write-buffer / memtable) entries are already owned. Accessors
+/// return the encoded internal key and encoded value either way.
+enum ReverseRawEntry {
+    Owned(Vec<u8>, Vec<u8>),
+    Sst(crate::storage::sstable::SsTableEntryView),
+}
+
+impl ReverseRawEntry {
+    fn key(&self) -> &[u8] {
+        match self {
+            Self::Owned(key, _) => key,
+            Self::Sst(view) => view.key(),
+        }
+    }
+
+    fn value(&self) -> &[u8] {
+        match self {
+            Self::Owned(_, value) => value,
+            Self::Sst(view) => view.value(),
+        }
+    }
+}
+
+/// One visible version for a source's current user-key group. Holds the
+/// raw entry (SSTable versions stay as block views) and decodes user_key /
+/// value on demand; `wins_over` needs only the metadata, and the visitor
+/// receives borrows, so winner bytes are never copied inside the merge.
+/// Memory boundedness: the merge keeps at most one candidate (`current`)
+/// plus one stashed raw entry per source, so with the iterator's own
+/// current block each SSTable source pins at most three block Arcs.
 struct ReverseCandidate {
-    user_key: Vec<u8>,
+    raw: ReverseRawEntry,
     ts: u64,
     is_put: bool,
-    value: Vec<u8>,
     is_write_buffer: bool,
     source_order: usize,
 }
 
 impl ReverseCandidate {
+    fn user_key(&self) -> &[u8] {
+        FusionStorage::decode_key(self.raw.key()).0
+    }
+
+    fn value(&self) -> &[u8] {
+        FusionStorage::decode_value(self.raw.value()).1
+    }
+
     fn wins_over(&self, other: &Self) -> bool {
         if self.is_write_buffer != other.is_write_buffer {
             return self.is_write_buffer;
@@ -1060,19 +1099,19 @@ impl ReverseCandidate {
 enum ReverseSource<'a> {
     Buffered {
         entries: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send + 'a>,
-        pending: Option<(Vec<u8>, Vec<u8>)>,
+        pending: Option<ReverseRawEntry>,
         is_write_buffer: bool,
         source_order: usize,
     },
     SsTable {
         iter: SsTableReverseIterator,
-        pending: Option<(Vec<u8>, Vec<u8>)>,
+        pending: Option<ReverseRawEntry>,
         source_order: usize,
     },
 }
 
 impl<'a> ReverseSource<'a> {
-    async fn next_raw(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    async fn next_raw(&mut self) -> Result<Option<ReverseRawEntry>> {
         match self {
             ReverseSource::Buffered {
                 entries, pending, ..
@@ -1084,24 +1123,24 @@ impl<'a> ReverseSource<'a> {
                     if next.is_some() {
                         crate::monitor::inc_fusion_reverse_raw_entry_read();
                     }
-                    Ok(next)
+                    Ok(next.map(|(key, value)| ReverseRawEntry::Owned(key, value)))
                 }
             }
             ReverseSource::SsTable { iter, pending, .. } => {
                 if pending.is_some() {
                     Ok(pending.take())
                 } else {
-                    let next = iter.next().await?;
+                    let next = iter.next_entry().await?;
                     if next.is_some() {
                         crate::monitor::inc_fusion_reverse_raw_entry_read();
                     }
-                    Ok(next)
+                    Ok(next.map(ReverseRawEntry::Sst))
                 }
             }
         }
     }
 
-    fn stash_raw(&mut self, raw: (Vec<u8>, Vec<u8>)) {
+    fn stash_raw(&mut self, raw: ReverseRawEntry) {
         match self {
             ReverseSource::Buffered { pending, .. } | ReverseSource::SsTable { pending, .. } => {
                 debug_assert!(pending.is_none());
@@ -1129,36 +1168,36 @@ impl<'a> ReverseSource<'a> {
 
     async fn next_candidate(&mut self, read_ts: u64) -> Result<Option<ReverseCandidate>> {
         loop {
-            let Some((first_key, first_value)) = self.next_raw().await? else {
+            let Some(first_raw) = self.next_raw().await? else {
                 return Ok(None);
             };
-            let (first_user_key, first_ts) = FusionStorage::decode_key(&first_key);
+            let (first_user_key, first_ts) = FusionStorage::decode_key(first_raw.key());
+            // One owned copy per user-key group anchors the group boundary
+            // while the raw entries themselves move into candidates.
             let group_user_key = first_user_key.to_vec();
             let is_write_buffer = self.is_write_buffer();
             let source_order = self.source_order();
             let mut best = visible_reverse_candidate(
-                &group_user_key,
+                first_raw,
                 first_ts,
-                &first_value,
                 is_write_buffer,
                 source_order,
                 read_ts,
             );
 
             loop {
-                let Some((next_key, next_value)) = self.next_raw().await? else {
+                let Some(next_raw) = self.next_raw().await? else {
                     break;
                 };
-                let (next_user_key, next_ts) = FusionStorage::decode_key(&next_key);
+                let (next_user_key, next_ts) = FusionStorage::decode_key(next_raw.key());
                 if next_user_key != group_user_key.as_slice() {
-                    self.stash_raw((next_key, next_value));
+                    self.stash_raw(next_raw);
                     break;
                 }
 
                 if let Some(candidate) = visible_reverse_candidate(
-                    &group_user_key,
+                    next_raw,
                     next_ts,
-                    &next_value,
                     is_write_buffer,
                     source_order,
                     read_ts,
@@ -1181,9 +1220,8 @@ impl<'a> ReverseSource<'a> {
 }
 
 fn visible_reverse_candidate(
-    user_key: &[u8],
+    raw: ReverseRawEntry,
     ts: u64,
-    encoded_value: &[u8],
     is_write_buffer: bool,
     source_order: usize,
     read_ts: u64,
@@ -1191,12 +1229,11 @@ fn visible_reverse_candidate(
     if !is_write_buffer && ts > read_ts {
         return None;
     }
-    let (is_put, value) = FusionStorage::decode_value(encoded_value);
+    let (is_put, _) = FusionStorage::decode_value(raw.value());
     Some(ReverseCandidate {
-        user_key: user_key.to_vec(),
+        raw,
         ts,
         is_put,
-        value: value.to_vec(),
         is_write_buffer,
         source_order,
     })
@@ -1217,7 +1254,7 @@ async fn add_reverse_source<'a>(
     sources.push(source);
     if let Some(candidate) = candidate {
         heap.push(ReverseMergeItem {
-            user_key: candidate.user_key.clone(),
+            user_key: candidate.user_key().to_vec(),
             source_idx,
         });
         current.push(Some(candidate));
@@ -4116,7 +4153,7 @@ impl FusionTransaction {
             for source_idx in source_indices {
                 if let Some(candidate) = sources[source_idx].next_candidate(read_ts).await? {
                     heap.push(ReverseMergeItem {
-                        user_key: candidate.user_key.clone(),
+                        user_key: candidate.user_key().to_vec(),
                         source_idx,
                     });
                     current[source_idx] = Some(candidate);
@@ -4126,7 +4163,10 @@ impl FusionTransaction {
             if let Some(winner) = winner {
                 if winner.is_put {
                     crate::monitor::inc_fusion_reverse_visible_put();
-                    if !visit(&winner.user_key, &winner.value) {
+                    // Winner bytes are borrowed straight from the candidate
+                    // (for SSTable sources: from the cached block); the
+                    // visitor copies at its own boundary if it retains.
+                    if !visit(winner.user_key(), winner.value()) {
                         break;
                     }
                 }
