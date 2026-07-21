@@ -749,3 +749,11 @@ Revenue by category(order_items JOIN products GROUP BY)warm 17.6s 画像:10k 产
 
 **排序依据**:此点同时是裸聚合地板与 JOIN 逐行 30µs(Revenue 画像)的公共成分;比"批量列式 kernel"更小更先行——先消分配,再谈列式批处理。
 
+
+<spec-entry category="arch" keywords="472,columnar,block-aggregate,mvcc-guard,design" date="2026-07-21" title="472 主体设计定稿:块级列式聚合解码(8 票,首增量 T1)" description="行值 O(1) 偏移表使批量抽列可行;MVCC 守卫前四条复用 zone-map skip helper;COUNT/MIN/MAX 已在元数据;收益诚实=有意义非数量级" source="main@77dc563">
+
+### 472 主体设计定稿:块级列式聚合解码(8 票,首增量 T1)
+
+对抗合并设计入库 .csv-wave/20260721-design-block-columnar-aggregate/design.md。**核心事实**:行值 = `[flag][count:u16][off×count][span...]`,O(1) 列偏移表 ⇒ 块级"列式解码"= 跨块每行抽第 idx 列 span 喂 decode_scalar_span,不需 Arrow/物理转置。**MVCC 守卫**:块整段能列式整折 iff 恰一 SSTable 覆盖 + 无 WB/memtable 重叠(G1-G3,已有 sql_zone_map_skip_offsets_for_sstable 反向 helper,fusion.rs:3550)+ 逐条 ts<=read_ts(G5)+ 仅 PUT(G6)+ 单版本(G7,prev_user_key 跨块串连——Design A 漏此致过计数,归并本靠去重兜住)。**两派共同修正**:SsTableSqlZoneMap(sstable.rs:671)已存 row_count/put_count/tombstone_count/min/max_scalar per 块 per 前缀 ⇒ COUNT/MIN/MAX 可元数据直答(T4)。**T1 首增量**:attach 在 simple_column_aggregate_scan(column_scan.rs:1206)谓词分支后,纯前置 Ok(None) 回退,零风险碰不到归并;**成员过滤守卫 routed_data_entry_belongs_to_table 必须保留**(省=过计数 bug)。**浮点序**:全局升序用户键=现状,快路径单源单版本块内序==键序,逐位同;严禁逐块偏和结合(重排)。**收益诚实**:T1 削执行层(去堆/channel/spawn/一层 dyn),逐列 decode 与成员守卫保留 ⇒ 有意义非数量级;数量级要 T3(SoA 批量)+T4(元数据)。
+
+</spec-entry>
