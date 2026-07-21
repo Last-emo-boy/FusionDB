@@ -7980,6 +7980,24 @@ mod tests {
                 .fetch_add(visited as u64, AtomicOrdering::Relaxed);
             Ok(visited)
         }
+        async fn scan_range_reverse_for_each(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: Option<usize>,
+            visitor: &mut dyn ScanVisitor,
+        ) -> Result<usize> {
+            let visited = self
+                .inner
+                .scan_range_reverse_for_each(start, end, limit, visitor)
+                .await?;
+            self.keys_seen
+                .fetch_add(visited as u64, AtomicOrdering::Relaxed);
+            Ok(visited)
+        }
+        fn supports_bounded_scan_range_reverse(&self) -> bool {
+            self.inner.supports_bounded_scan_range_reverse()
+        }
         async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
             self.inner.count_prefix(prefix).await
         }
@@ -8166,6 +8184,53 @@ mod tests {
         assert_eq!(all.len(), ROWS);
 
         let _ = std::fs::remove_file(wal_path);
+    }
+
+    /// `ORDER BY <pk> DESC LIMIT n` must walk the key order backward and
+    /// stop after n accepted rows — not feed the whole table through the
+    /// top-K heap.
+    #[tokio::test]
+    async fn pk_desc_limit_uses_a_bounded_reverse_scan() {
+        let (executor, storage, data_dir) = fusion_executor("pk_desc_limit").await;
+        executor
+            .execute_sql("CREATE TABLE d_rows (id INTEGER PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        for id in 0..400 {
+            executor
+                .execute_sql(&format!("INSERT INTO d_rows VALUES ({id}, 'p{id}')"))
+                .await
+                .unwrap();
+        }
+
+        let keys_seen = Arc::new(AtomicU64::new(0));
+        let mut counting: Box<dyn Transaction> = Box::new(CountingTransaction {
+            inner: storage.begin_transaction().await.unwrap(),
+            keys_seen: keys_seen.clone(),
+        });
+        let stmt = executor
+            .prepare("SELECT id FROM d_rows ORDER BY id DESC LIMIT 10")
+            .unwrap()
+            .remove(0);
+        let result = executor
+            .execute_in_transaction(&stmt, &mut *counting)
+            .await
+            .unwrap();
+        let QueryResult::Select { rows, .. } = result else {
+            panic!("select returns rows");
+        };
+        assert_eq!(
+            rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+            (390..400).rev().map(Value::Integer).collect::<Vec<_>>(),
+            "descending PK order with the correct window"
+        );
+        let seen = keys_seen.load(AtomicOrdering::Relaxed);
+        assert!(
+            seen < 50,
+            "storage handed back {seen} keys for a DESC LIMIT 10 over 400 rows;              the reverse scan is not early-stopping"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// Route discovery must find every route physically present — including

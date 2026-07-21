@@ -1355,6 +1355,28 @@ impl Executor {
         Ok(Some(row))
     }
 
+    /// True when the ORDER BY is exactly one expression, descending, on the
+    /// table's primary key column. The physical key order then satisfies the
+    /// requested order when walked backward.
+    fn order_by_is_single_pk_desc(
+        order_by: &sqlparser::ast::OrderBy,
+        schema: &TableSchema,
+        executor: &Executor,
+    ) -> bool {
+        let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return false;
+        };
+        let [expr] = exprs.as_slice() else {
+            return false;
+        };
+        if expr.options.asc.unwrap_or(true) {
+            return false;
+        }
+        executor
+            .resolve_schema_column_index(&expr.expr, schema)
+            .is_some_and(|idx| schema.columns[idx].is_primary)
+    }
+
     pub(crate) async fn scan_single_table(
         &self,
         table: &TableFactor,
@@ -2271,6 +2293,70 @@ impl Executor {
                     if let (Some(order_by), Some(window)) = (order_by, streaming_order_limit) {
                         if window == 0 {
                             return Ok((schema, Vec::new(), true));
+                        }
+                        // ORDER BY <pk> DESC LIMIT n: the primary key IS the
+                        // physical key order, so a bounded reverse scan reads
+                        // exactly offset+n accepted rows instead of feeding
+                        // the whole table through the top-K heap. Guarded to
+                        // the unsharded case (one prefix = global PK order;
+                        // shard routing would interleave) and selection-free
+                        // scans (a WHERE keeps the top-K/filter paths).
+                        if selection.is_none()
+                            && self.shard_router.is_none()
+                            && txn.supports_bounded_scan_range_reverse()
+                            && Self::order_by_is_single_pk_desc(order_by, &schema, self)
+                        {
+                            let prefix = Self::legacy_data_prefix_for_table(&table_name);
+                            let range_end = crate::storage::keyspace::prefix_end(prefix.as_bytes())
+                                .ok_or_else(|| {
+                                    FusionError::Execution(
+                                        "data prefix has no upper bound".to_string(),
+                                    )
+                                })?;
+                            let prefixes = vec![prefix.clone()];
+                            let mut pairs: Vec<(Vec<u8>, Vec<u8>)> =
+                                Vec::with_capacity(window.min(4096));
+                            let mut collect = |key: &[u8], value: &[u8]| {
+                                if self.routed_data_entry_belongs_to_table(
+                                    &table_name,
+                                    Some(&schema),
+                                    &prefixes,
+                                    key,
+                                    value,
+                                ) {
+                                    pairs.push((key.to_vec(), value.to_vec()));
+                                }
+                                pairs.len() < window
+                            };
+                            txn.scan_range_reverse_for_each(
+                                prefix.as_bytes(),
+                                &range_end,
+                                None,
+                                &mut collect,
+                            )
+                            .await?;
+                            let mut desc_rows = Vec::with_capacity(pairs.len());
+                            for (k, v) in pairs {
+                                let row = if key_only_scan {
+                                    let pk_str =
+                                        self.legacy_row_id_from_routed_data_key(&schema.name, &k)?;
+                                    Some(Executor::primary_key_row_from_id(
+                                        &schema, pk_index, pk_str,
+                                    ))
+                                } else if zero_column_projection {
+                                    Some(Vec::new())
+                                } else {
+                                    Executor::decode_row_for_projection(
+                                        &v,
+                                        projection_indices.as_deref(),
+                                    )
+                                    .ok()
+                                };
+                                if let Some(row) = row {
+                                    desc_rows.push(row);
+                                }
+                            }
+                            return Ok((schema, desc_rows, true));
                         }
                         if limit.is_none()
                             && OrderTopKScanVisitor::supports_order_by(order_by, &schema, self)
