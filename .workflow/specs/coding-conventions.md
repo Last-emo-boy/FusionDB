@@ -1099,3 +1099,12 @@ CREATE TABLE and ALTER TABLE column identity now use sqlparser Ident.value via a
 
 **评审纪录**:3 维只读评审,语义等价与生命周期零发现;时延主张软化为方向性证据(HTTP 探针含 ~1ms 传输),幅度以同协议基准为准。
 
+
+<spec-entry category="coding" keywords="decode,scalar-span,bincode,fast-path,fallback,472" date="2026-07-21" title="标量列 span 快解码契约(66a4300);等价性靠字节形态门控+回退" description="decode_column 手工快解单列,非精确形态回退 bincode 保逐位一致;bincode 版本/Value 序漂移由 encoding.rs 等价单测绊线" source="main@66a4300">
+
+### 标量列 span 快解码契约(66a4300);等价性靠字节形态门控+回退
+
+`RowDecoder::decode_scalar_span`:按 bincode 1.x fixint-LE(u32 tag + payload,String/Decimal 带 u64 长度前缀)手工快解单列,tag 0..8 覆盖全部标量 Value;**任何非精确形态一律 `None` → 回退 bincode::deserialize**。等价性是结构性的:快路径只接受"bincode 会解成同一 Value"的字节,回退兜住其余,故结果与 loud-error 行为逐位一致。惠及所有 decode_column 调用点(裸聚合 + 谓词优先过滤扫描),blast radius 比单个 visitor 宽——命中严格更少工作,门控回退不改语义。
+
+**硬约束**:(a) 若 bincode 版本/配置(fixint/LE/allow-trailing)或 Value 变体序变更,`encoding.rs` 的等价单测(每变体含 NaN/-0.0/i64 极值/空串/UTF-8/malformed)是唯一绊线,勿删勿弱化;(b) 聚合仍按访问序(块序=键序)折入 ColumnAggregateState,**浮点求和序不可变**——别用 typed scratch vector fold 替(同样顺序加法却多每行 push)。GROUP BY 三 visitor 的 ColumnScanBatch 未动,是下一增量。**根本地板仍在存储侧**(SSTable 逐条目读),块级列式解码才是 472 主体。
+
