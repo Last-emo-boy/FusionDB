@@ -329,3 +329,14 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 
 三片在隔离 worktree 并发实现(compaction 视图直通 builder / 反向迭代器+归并视图化 / 并行分区 channel 传视图),同基 ca88745,各自 lib 全绿后按风险从低到高串行 cherry-pick 集成,每片过独立全量门(1217/1216/1216,-1 为随 VecDeque 装填删除的预分配测试)。合并 diff 只读评审(compaction 内存钉扎与出错路径/反向逐位等价与统计精确/并行 channel 协议)3 findings 全驳回。**流程要点**:worktree 基点可能陈旧(本次三个 worktree 均基于过期 032e052,agent 各自 ff 到 main tip 才动工)——启动 worktree 批实现前应显式给定基提交;集成用 cherry-pick -n + 自写提交信息,保留战役风格。**至此 SSTable 读/写路径的逐条目物化全部消除**(前向串行/并行/反向/compaction 四路),剩余拷贝仅在必要边界(visitor 保留数据自拷/builder 落盘缓冲/堆键小拷贝换比较器不变)。基准:SUM/COUNT/全扫不劣;DESC LIMIT ~115-155ms 经同目录旧二进制对照证实为既有病灶,已另案(77060dd)。
 
+
+<spec-entry category="debug" keywords="backpressure,parallel,lookahead,negative-result,staged-spawn" date="2026-07-21" title="已验证的错误修法:并行分区滑动窗口 spawn(lookahead=2)全扫慢 2x,已回退" description="背压问题在有界扫描串行化后已基本消解;砍并发生产者=砍真实并行度;正确设计需批量有界 channel 或异步 visitor" source="main@313a2db">
+
+### 已验证的错误修法:并行分区滑动窗口 spawn(lookahead=2)全扫慢 2x,已回退
+
+尝试给并行分区扫描加背压:消费端按分区序消费,把"一次性 spawn 全部分区"改为滑动窗口(lookahead=2)。**实测全扫中位 52-59ms → 120ms(2x 回归)**——并发生产者 8→3,归并/解码的真实并行度被砍。已回退,勿重试同型方案。
+
+**重新定性(为何背压优先级应降)**:reviewer 当初担心的"早停后兄弟分区超跑"在 445f7fa(有界扫描全走串行)与 313a2db(PK DESC 反向早停)后已基本不可达——并行路径只剩全量消费场景,队列深度被表大小天然封顶,与旧 owned-copy 行为同量级(视图钉块字节 ≈ 表块字节)。剩余风险仅"消费端 visitor 极慢"的病态场景。
+
+**若未来真要做**:正解是(a)生产端按批(如 256 条/批)发送 + 有界批 channel(减少 send 次数使 blocking 语义可行),或(b)把 merge 的 visitor 契约改异步以支持有界 send.await —— 两者都别用"砍并发生产者"凑数。
+
