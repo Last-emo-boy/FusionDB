@@ -1077,3 +1077,14 @@ CREATE TABLE and ALTER TABLE column identity now use sqlparser Ident.value via a
 **测试注意**:MemoryStorage 不实现任何 `scan_prefix_parallel_*`,且 `PARALLEL_SCAN_MIN_ROWS=8192`——低于该行数或用 MemoryStorage 的用例**只覆盖串行路径**,不要在断言里宣称覆盖了并行分支。计数替身若不转发 `scan_prefix_parallel_for_each_with_options` / `scan_prefix_for_each_with_options`,会退化成默认物化链,把流式行为**误报成全读**(本票中一度造成假红)。
 
 </spec-entry>
+
+<spec-entry category="coding" keywords="sstable,iterator,lazy,zero-copy,block-view" date="2026-07-21" title="SSTable 前向迭代器惰性交付契约(b69ab17);第二步=视图穿透归并" description="迭代器持块 Arc+spans,交付时才拷贝;上界命中即整体耗尽;反向迭代器未改;第二步改 yield 边界为视图" source="main@b69ab17">
+
+### SSTable 前向迭代器惰性交付契约(b69ab17);第二步=视图穿透归并
+
+**契约**:`SsTableIterator` 持有 `(BlockCacheValue, Vec<BlockEntrySpan>, cursor)`,`next()` 逐条判界、命中才 `to_vec` 交付;上界命中把 `current_block_idx` 置为 len(键块内与跨块有序 ⇒ 整体耗尽);下界不命中 continue(零分配跳过)。借用要点:块元组 `take()` 出来迭代、交付前放回 —— 直接 `&mut self.current_block` 里调 `&self` 方法过不了借用检查。**语义锚**:上/下界判定必须沿用 `key_at_or_after_upper_bound` 与 `key >= lower`,勿在新路径重写比较(UserKey 上界带 suffix_len 截断,自写必错)。
+
+**第二步(待做)**:`next_entry()` 返回 `(Arc<[u8]>, key_span, value_span)` 轻句柄穿透 `for_each_visible_range` 归并堆,归并比较用借用键,仅对 visitor 交付点物化 —— 这才消除全量消费型扫描(裸聚合/JOIN 探测)的逐行双分配。改动波及:归并堆条目类型(memtable owned / sstable view 二态)、visitor 边界。反向迭代器同构改造独立票。
+
+**本步价值边界(诚实)**:全量消费扫描无可见收益;受益 = 早停/带界扫描的免整块物化 + 结构铺路。1217 门全绿,时延与正确性经 probe_head 身份断言验证。
+
