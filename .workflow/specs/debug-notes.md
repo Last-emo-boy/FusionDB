@@ -322,3 +322,10 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 
 疑点:反向候选机器(merge_visible_range_reverse)对 LIMIT 查询似乎在整段范围上做逐键候选解析而非取够 n 键即停 —— 对照正向路径的教训(445f7fa:有界扫描早停),反向可能同样需要"visitor 取够即整体停"的贯通;也可能是 DESC 计划根本没把 limit 传给反向扫描(对照 64afb98 的 limit 丢失模式)。**下一步**:对 DESC LIMIT 查询插桩反向归并的 per-key 候选计数,确认是"全范围候选"还是"limit 未下传";两个先例模式(限量下传/早停贯通)都有现成修法。
 
+
+<spec-entry category="debug" keywords="zero-copy,472,integration,worktree,slices" date="2026-07-21" title="零拷贝三刀并行实现+串行集成闭环(b36c344/7bae904/ef8af5d)" description="worktree 三片并发实现,按风险串行集成各过全量门;合并评审 0 confirmed;DESC 病灶另案" source="main@ef8af5d">
+
+### 零拷贝三刀并行实现+串行集成闭环(b36c344/7bae904/ef8af5d)
+
+三片在隔离 worktree 并发实现(compaction 视图直通 builder / 反向迭代器+归并视图化 / 并行分区 channel 传视图),同基 ca88745,各自 lib 全绿后按风险从低到高串行 cherry-pick 集成,每片过独立全量门(1217/1216/1216,-1 为随 VecDeque 装填删除的预分配测试)。合并 diff 只读评审(compaction 内存钉扎与出错路径/反向逐位等价与统计精确/并行 channel 协议)3 findings 全驳回。**流程要点**:worktree 基点可能陈旧(本次三个 worktree 均基于过期 032e052,agent 各自 ff 到 main tip 才动工)——启动 worktree 批实现前应显式给定基提交;集成用 cherry-pick -n + 自写提交信息,保留战役风格。**至此 SSTable 读/写路径的逐条目物化全部消除**(前向串行/并行/反向/compaction 四路),剩余拷贝仅在必要边界(visitor 保留数据自拷/builder 落盘缓冲/堆键小拷贝换比较器不变)。基准:SUM/COUNT/全扫不劣;DESC LIMIT ~115-155ms 经同目录旧二进制对照证实为既有病灶,已另案(77060dd)。
+
