@@ -3036,7 +3036,7 @@ impl SsTable {
             block_properties,
             file_len: self.file_len,
             current_block_idx: start_idx,
-            current_block_entries: block_entry_buffer(),
+            current_block: None,
             lower_bound: start_key.map(|key| key.to_vec()),
             upper_bound,
             block_table_prefix_filter,
@@ -3158,7 +3158,11 @@ pub struct SsTableIterator {
     block_properties: Arc<Vec<SsTableBlockProperties>>,
     file_len: u64,
     current_block_idx: usize,
-    current_block_entries: VecDeque<(Vec<u8>, Vec<u8>)>,
+    // Lazily yielded view of the current block: entries are copied out
+    // one at a time in `next`, so bounds-skipped rows and early-stopped
+    // consumers never pay an allocation, and a whole block is never
+    // materialized up front.
+    current_block: Option<(BlockCacheValue, Vec<BlockEntrySpan>, usize)>,
     lower_bound: Option<Vec<u8>>,
     upper_bound: Option<SsTableIteratorUpperBound>,
     block_table_prefix_filter: Option<Vec<u8>>,
@@ -3275,8 +3279,33 @@ impl SsTableIterator {
 
     pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
-            if let Some(entry) = self.current_block_entries.pop_front() {
-                return Ok(Some(entry));
+            if let Some((block_data, spans, mut cursor)) = self.current_block.take() {
+                while cursor < spans.len() {
+                    let span = spans[cursor];
+                    cursor += 1;
+                    let key = &block_data[span.key_start..span.key_end];
+                    if self.key_at_or_after_upper_bound(key) {
+                        // Keys are sorted within and across blocks: nothing
+                        // later can be in range. Exhaust the iterator.
+                        self.current_block_idx = self.index_offsets.len();
+                        return Ok(None);
+                    }
+                    if self
+                        .lower_bound
+                        .as_ref()
+                        .is_some_and(|lower| key < lower.as_slice())
+                    {
+                        continue;
+                    }
+                    // Copy exactly one entry, only now that it is actually
+                    // being yielded.
+                    let owned = (
+                        key.to_vec(),
+                        block_data[span.value_start..span.value_end].to_vec(),
+                    );
+                    self.current_block = Some((block_data, spans, cursor));
+                    return Ok(Some(owned));
+                }
             }
 
             // Load next block
@@ -3339,26 +3368,7 @@ impl SsTableIterator {
             .await?;
 
             let spans = SsTable::decoded_block_entry_spans(block_data.as_ref())?;
-            self.current_block_entries.reserve(spans.len());
-
-            for span in spans {
-                let key = &block_data[span.key_start..span.key_end];
-
-                if self.key_at_or_after_upper_bound(key) {
-                    break;
-                }
-
-                if self
-                    .lower_bound
-                    .as_ref()
-                    .map_or(true, |lower_bound| key >= lower_bound.as_slice())
-                {
-                    self.current_block_entries.push_back((
-                        key.to_vec(),
-                        block_data[span.value_start..span.value_end].to_vec(),
-                    ));
-                }
-            }
+            self.current_block = Some((block_data, spans, 0));
         }
     }
 }
