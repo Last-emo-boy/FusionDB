@@ -420,7 +420,6 @@ struct ColumnAggregateScanVisitor<'a> {
     predicate: Option<&'a ColumnPredicateScanPlan>,
     states: &'a mut [ColumnAggregateState],
     predicate_values: Vec<Value>,
-    batch: Option<ColumnScanBatch>,
     error: Option<FusionError>,
 }
 
@@ -441,37 +440,15 @@ impl ColumnAggregateScanVisitor<'_> {
             data,
         )
     }
-
-    fn flush_batch(&mut self) -> Result<()> {
-        if let Some(batch) = self.batch.as_mut() {
-            let plans = self.plans;
-            let predicate = self.predicate;
-            let states = &mut *self.states;
-            batch.flush_with(predicate, |data, predicate_values| {
-                apply_column_aggregate_matched_row(plans, predicate, states, predicate_values, data)
-            })?;
-        }
-
-        Ok(())
-    }
 }
 
 impl ScanVisitor for ColumnAggregateScanVisitor<'_> {
+    // Bare aggregates decode the referenced columns straight off the borrowed
+    // entry and fold into the accumulator: the scan hands out zero-copy views,
+    // so a copy-and-defer batch (`ColumnScanBatch`) only added a full-row
+    // `to_vec` plus batch bookkeeping per row on top of the same per-row
+    // decode work at flush time.
     fn visit(&mut self, _key: &[u8], value: &[u8]) -> bool {
-        let should_flush = match self.batch.as_mut() {
-            Some(batch) => batch.push(value),
-            None => false,
-        };
-        if self.batch.is_some() {
-            if should_flush {
-                if let Err(error) = self.flush_batch() {
-                    self.error = Some(error);
-                    return false;
-                }
-            }
-            return true;
-        }
-
         if let Err(error) = self.visit_row(value) {
             self.error = Some(error);
             return false;
@@ -1074,23 +1051,6 @@ impl Executor {
             || Self::is_decimal_type_name(data_type)
     }
 
-    fn column_aggregate_batch_supported(
-        plans: &[ColumnAggregateScanPlan],
-        schema: &TableSchema,
-    ) -> bool {
-        plans.iter().all(|plan| match plan.kind {
-            ColumnAggregateKind::CountStar | ColumnAggregateKind::CountColumn => true,
-            ColumnAggregateKind::Sum
-            | ColumnAggregateKind::Avg
-            | ColumnAggregateKind::Min
-            | ColumnAggregateKind::Max => plan
-                .column_index
-                .and_then(|index| schema.columns.get(index))
-                .is_some_and(|column| Self::column_scan_numeric_data_type(&column.data_type)),
-            ColumnAggregateKind::StringAgg => false,
-        })
-    }
-
     fn group_column_aggregate_batch_supported(
         aggregate_plans: &[GroupColumnAggregateScanPlan],
         schema: &TableSchema,
@@ -1268,18 +1228,10 @@ impl Executor {
                 predicate,
                 states: &mut states,
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
-                batch: schema
-                    .filter(|schema| Self::column_aggregate_batch_supported(plans, schema))
-                    .map(|_| ColumnScanBatch::new(predicate)),
                 error: None,
             };
             self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
                 .await?;
-            if visitor.error.is_none() {
-                if let Err(err) = visitor.flush_batch() {
-                    visitor.error = Some(err);
-                }
-            }
             visitor.error
         };
 
@@ -1340,7 +1292,6 @@ impl Executor {
             predicate: Some(predicate),
             states: &mut states,
             predicate_values: ColumnPredicateScanPlan::scratch_values(Some(predicate)),
-            batch: None,
             error: None,
         };
 

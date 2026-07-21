@@ -137,6 +137,87 @@ mod tests {
         let decoded = RowDecoder::decode(&encoded).expect("Decoding failed");
         assert_eq!(row, decoded);
     }
+
+    #[test]
+    fn test_decode_scalar_span_matches_bincode_for_every_variant() {
+        let mut float_nan_negative = f64::NAN;
+        if float_nan_negative.is_sign_positive() {
+            float_nan_negative = -float_nan_negative;
+        }
+        let values = vec![
+            Value::Null,
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Integer(0),
+            Value::Integer(-1),
+            Value::Integer(i64::MIN),
+            Value::Integer(i64::MAX),
+            Value::Float(0.0),
+            Value::Float(-0.0),
+            Value::Float(1.5e-300),
+            Value::Float(f64::NAN),
+            Value::Float(float_nan_negative),
+            Value::Float(f64::INFINITY),
+            Value::Decimal("12345.6789".to_string()),
+            Value::Decimal(String::new()),
+            Value::String("héllo, wörld".to_string()),
+            Value::String(String::new()),
+            Value::Date(0),
+            Value::Date(-719_162),
+            Value::Timestamp(i64::MAX),
+            Value::Interval(-42),
+            Value::Blob(vec![0, 1, 2, 255]),
+            Value::Vector(vec![1.0, -2.5]),
+            Value::Array(vec![Value::Integer(1), Value::Null]),
+        ];
+
+        for value in &values {
+            let span = bincode::serialize(value).expect("value serializes");
+            let via_bincode: Value = bincode::deserialize(&span).expect("value deserializes");
+            let row = RowEncoder::encode(std::slice::from_ref(value));
+            let via_column = RowDecoder::decode_column(&row, 0)
+                .expect("column decodes")
+                .expect("column exists");
+            match (value, &via_column) {
+                (Value::Float(expected), Value::Float(actual)) => {
+                    assert_eq!(expected.to_bits(), actual.to_bits(), "bits for {:?}", value);
+                }
+                _ => assert_eq!(&via_column, value, "decode_column for {:?}", value),
+            }
+            match (value, &via_bincode) {
+                (Value::Float(expected), Value::Float(actual)) => {
+                    assert_eq!(expected.to_bits(), actual.to_bits(), "bits for {:?}", value);
+                }
+                _ => assert_eq!(&via_bincode, value, "bincode roundtrip for {:?}", value),
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_scalar_span_rejects_malformed_spans() {
+        // Every rejection must fall back to bincode so malformed data stays a
+        // loud error (or, for trailing bytes, keeps bincode's tolerance).
+        assert_eq!(RowDecoder::decode_scalar_span(&[]), None);
+        assert_eq!(RowDecoder::decode_scalar_span(&[2, 0, 0]), None);
+        // Boolean with an out-of-range payload byte.
+        assert_eq!(RowDecoder::decode_scalar_span(&[1, 0, 0, 0, 2]), None);
+        // Integer with a truncated payload.
+        assert_eq!(RowDecoder::decode_scalar_span(&[2, 0, 0, 0, 1, 2, 3]), None);
+        // Null with trailing bytes: bincode would tolerate, fast path defers.
+        assert_eq!(RowDecoder::decode_scalar_span(&[0, 0, 0, 0, 9]), None);
+        // String whose declared length disagrees with the span.
+        let mut bad_string = bincode::serialize(&Value::String("ab".to_string())).unwrap();
+        bad_string.pop();
+        assert_eq!(RowDecoder::decode_scalar_span(&bad_string), None);
+        // String with invalid UTF-8 payload.
+        let mut bad_utf8 = bincode::serialize(&Value::String("ab".to_string())).unwrap();
+        let last = bad_utf8.len() - 1;
+        bad_utf8[last] = 0xFF;
+        assert_eq!(RowDecoder::decode_scalar_span(&bad_utf8), None);
+        // Non-scalar variants defer to bincode.
+        let blob = bincode::serialize(&Value::Blob(vec![1, 2])).unwrap();
+        assert_eq!(RowDecoder::decode_scalar_span(&blob), None);
+    }
 }
 
 /// Decodes a comparable hex string back to i64.
@@ -272,6 +353,41 @@ impl RowDecoder {
         Ok(row)
     }
 
+    /// Manual decode of one bincode-encoded `Value` span, mirroring the
+    /// bincode 1.x fixint little-endian layout (u32 variant tag + payload) for
+    /// the scalar variants. Returns `None` for anything that is not an
+    /// exactly-sized well-formed scalar span; callers must then fall back to
+    /// `bincode::deserialize` so malformed data keeps the identical (loud)
+    /// error behavior and non-scalar variants decode as before.
+    fn decode_scalar_span(bytes: &[u8]) -> Option<Value> {
+        let (tag, body) = bytes.split_first_chunk::<4>()?;
+        match u32::from_le_bytes(*tag) {
+            0 if body.is_empty() => Some(Value::Null),
+            1 => match body {
+                [0] => Some(Value::Boolean(false)),
+                [1] => Some(Value::Boolean(true)),
+                _ => None,
+            },
+            2 => Some(Value::Integer(i64::from_le_bytes(body.try_into().ok()?))),
+            3 => Some(Value::Float(f64::from_le_bytes(body.try_into().ok()?))),
+            tag @ (4 | 5) => {
+                let (len, text) = body.split_first_chunk::<8>()?;
+                if u64::from_le_bytes(*len) != text.len() as u64 {
+                    return None;
+                }
+                let text = std::str::from_utf8(text).ok()?.to_string();
+                Some(match tag {
+                    4 => Value::Decimal(text),
+                    _ => Value::String(text),
+                })
+            }
+            6 => Some(Value::Date(i32::from_le_bytes(body.try_into().ok()?))),
+            7 => Some(Value::Timestamp(i64::from_le_bytes(body.try_into().ok()?))),
+            8 => Some(Value::Interval(i64::from_le_bytes(body.try_into().ok()?))),
+            _ => None,
+        }
+    }
+
     pub fn decode_column(data: &[u8], idx: usize) -> bincode::Result<Option<Value>> {
         if data.len() < 2 {
             let row: Vec<Value> = bincode::deserialize(data)?;
@@ -282,7 +398,11 @@ impl RowDecoder {
             return Ok(None);
         };
 
-        bincode::deserialize(&data[start..end]).map(Some)
+        let span = &data[start..end];
+        if let Some(value) = Self::decode_scalar_span(span) {
+            return Ok(Some(value));
+        }
+        bincode::deserialize(span).map(Some)
     }
 
     // Partially decode row, returning full Vec<Value> but with Nulls for skipped columns
