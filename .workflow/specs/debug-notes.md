@@ -313,3 +313,12 @@ memory 挂账已久的"outer-join predicate-pushdown caveat"重现属实且双�
 
 **环境教训(两次踩坑)**:server 从仓库根启动会打开仓库根 ./data(698MB 历史数据集,spec debug-notes-001 早有警告);cd 失败后 `cat server_port.txt` 读到残留文件连错服务端(sum 值对不上才发现)。**规则:每次测量前必须校验连接目标 —— 用只有该目录才有的数据特征(如行数/求和值)做身份断言,别只看端口通不通。**
 
+
+<spec-entry category="debug" keywords="reverse,desc,limit,early-stop,cpu,pre-existing" date="2026-07-21" title="新立案:DESC LIMIT 反向路径 ~100-160ms 纯 CPU(既有,非零拷贝回归)" description="同目录新旧二进制对照:pre-slice 同样 104-160ms;零 I/O 全 CPU;疑反向候选机器缺 LIMIT 早停" source="main@ef8af5d">
+
+### 新立案:DESC LIMIT 反向路径 ~100-160ms 纯 CPU(既有,非零拷贝回归)
+
+三刀集成后身份断言基准发现 `ORDER BY id DESC LIMIT n`(5 万行表)中位 ~115-155ms,计数器:`reverse_scan=1`、`block_miss=0`、`read_bytes=0`、`sort_fallback=0` —— **零 I/O 纯 CPU 在反向归并内**。同目录跑改动前二进制(ca88745):104-160ms 相同 ⇒ **既有病灶,与零拷贝四/五刀无关**(判定实验先于修复,遵守"先归因再动手")。
+
+疑点:反向候选机器(merge_visible_range_reverse)对 LIMIT 查询似乎在整段范围上做逐键候选解析而非取够 n 键即停 —— 对照正向路径的教训(445f7fa:有界扫描早停),反向可能同样需要"visitor 取够即整体停"的贯通;也可能是 DESC 计划根本没把 limit 传给反向扫描(对照 64afb98 的 limit 丢失模式)。**下一步**:对 DESC LIMIT 查询插桩反向归并的 per-key 候选计数,确认是"全范围候选"还是"limit 未下传";两个先例模式(限量下传/早停贯通)都有现成修法。
+
