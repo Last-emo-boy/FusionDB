@@ -3172,6 +3172,27 @@ pub struct SsTableIterator {
     file: Option<File>,
 }
 
+/// A borrowed view of one SSTable entry: the cached block plus key/value
+/// spans. Cloning bumps the block `Arc`; bytes are copied only when the
+/// consumer materializes them.
+pub struct SsTableEntryView {
+    block: BlockCacheValue,
+    key_start: usize,
+    key_end: usize,
+    value_start: usize,
+    value_end: usize,
+}
+
+impl SsTableEntryView {
+    pub fn key(&self) -> &[u8] {
+        &self.block[self.key_start..self.key_end]
+    }
+
+    pub fn value(&self) -> &[u8] {
+        &self.block[self.value_start..self.value_end]
+    }
+}
+
 enum SsTableIteratorUpperBound {
     Raw(Vec<u8>),
     UserKey { bound: Vec<u8>, suffix_len: usize },
@@ -3278,6 +3299,18 @@ impl SsTableIterator {
     }
 
     pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .next_entry()
+            .await?
+            .map(|entry| (entry.key().to_vec(), entry.value().to_vec())))
+    }
+
+    /// Yield the next in-range entry as a borrowed view into the cached
+    /// block: one `Arc` bump instead of two heap copies. Consumers that keep
+    /// the entry (merge heaps) hold the block alive through the view;
+    /// consumers that materialize call `key()`/`value()` and copy exactly
+    /// once at their own boundary.
+    pub async fn next_entry(&mut self) -> Result<Option<SsTableEntryView>> {
         loop {
             if let Some((block_data, spans, mut cursor)) = self.current_block.take() {
                 while cursor < spans.len() {
@@ -3297,14 +3330,15 @@ impl SsTableIterator {
                     {
                         continue;
                     }
-                    // Copy exactly one entry, only now that it is actually
-                    // being yielded.
-                    let owned = (
-                        key.to_vec(),
-                        block_data[span.value_start..span.value_end].to_vec(),
-                    );
+                    let view = SsTableEntryView {
+                        block: block_data.clone(),
+                        key_start: span.key_start,
+                        key_end: span.key_end,
+                        value_start: span.value_start,
+                        value_end: span.value_end,
+                    };
                     self.current_block = Some((block_data, spans, cursor));
-                    return Ok(Some(owned));
+                    return Ok(Some(view));
                 }
             }
 

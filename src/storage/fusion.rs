@@ -947,6 +947,58 @@ impl Ord for MergeItem {
     }
 }
 
+/// Heap item for the forward visible-range merge. SSTable entries stay as
+/// borrowed views into their cached blocks (one Arc bump per entry) and are
+/// materialized only at the visitor boundary; write-buffer and memtable
+/// entries are already owned. Ordering replicates `MergeItem` exactly:
+/// reverse key compare for a min-heap, no source tie-break.
+enum VisibleEntry {
+    Owned(Vec<u8>, Vec<u8>),
+    Sst(crate::storage::sstable::SsTableEntryView),
+}
+
+impl VisibleEntry {
+    fn key(&self) -> &[u8] {
+        match self {
+            Self::Owned(key, _) => key,
+            Self::Sst(view) => view.key(),
+        }
+    }
+
+    fn val(&self) -> &[u8] {
+        match self {
+            Self::Owned(_, val) => val,
+            Self::Sst(view) => view.value(),
+        }
+    }
+}
+
+struct VisibleMergeItem {
+    entry: VisibleEntry,
+    iter_idx: usize,
+}
+
+impl PartialEq for VisibleMergeItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry.key() == other.entry.key()
+    }
+}
+
+impl Eq for VisibleMergeItem {}
+
+impl PartialOrd for VisibleMergeItem {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VisibleMergeItem {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Reverse order for Min-Heap: we want smallest key to pop first
+        other.entry.key().cmp(self.entry.key())
+    }
+}
+
 fn merge_heap(capacity: usize) -> BinaryHeap<MergeItem> {
     BinaryHeap::with_capacity(capacity)
 }
@@ -3617,12 +3669,12 @@ impl FusionTransaction {
         });
 
         // 2. Initialize Heap
-        let mut heap = merge_heap(1 + mem_tables.len() + sstables.len());
+        let mut heap: BinaryHeap<VisibleMergeItem> =
+            BinaryHeap::with_capacity(1 + mem_tables.len() + sstables.len());
 
         if let Some((k, v)) = wb_iter.next() {
-            heap.push(MergeItem {
-                key: k,
-                val: v,
+            heap.push(VisibleMergeItem {
+                entry: VisibleEntry::Owned(k, v),
                 iter_idx: 0,
             });
         }
@@ -3645,9 +3697,8 @@ impl FusionTransaction {
             if let Some((k, v)) = iter.next() {
                 let (user_k, _) = FusionStorage::decode_key(&k);
                 if user_k < end {
-                    heap.push(MergeItem {
-                        key: k.clone(),
-                        val: v,
+                    heap.push(VisibleMergeItem {
+                        entry: VisibleEntry::Owned(k, v),
                         iter_idx: 1 + i,
                     });
                 }
@@ -3737,17 +3788,14 @@ impl FusionTransaction {
                 )
                 .await?;
             crate::monitor::inc_sstable_iterator_open();
-            if let Some((k, v)) = it.next().await? {
-                let current_k = k;
-                let current_v = v;
+            if let Some(view) = it.next_entry().await? {
                 // Check if the first key we found is already past end
                 // (This can happen if start_ik is not in SSTable and we landed on a key > end)
-                if current_k >= start_ik {
-                    let (uk, _) = FusionStorage::decode_key(&current_k);
+                if view.key() >= start_ik.as_slice() {
+                    let (uk, _) = FusionStorage::decode_key(view.key());
                     if uk < end {
-                        heap.push(MergeItem {
-                            key: current_k,
-                            val: current_v,
+                        heap.push(VisibleMergeItem {
+                            entry: VisibleEntry::Sst(view),
                             iter_idx: idx,
                         });
                     }
@@ -3760,11 +3808,10 @@ impl FusionTransaction {
         let mut last_user_key: Option<Vec<u8>> = None;
 
         while let Some(item) = heap.pop() {
-            let k = item.key;
-            let v = item.val;
+            let entry = item.entry;
             let idx = item.iter_idx;
 
-            let (user_k, ts) = FusionStorage::decode_key(&k);
+            let (user_k, ts) = FusionStorage::decode_key(entry.key());
             if user_k >= end {
                 break;
             }
@@ -3783,9 +3830,8 @@ impl FusionTransaction {
                     break;
                 }
                 if let Some((nk, nv)) = next_item {
-                    heap.push(MergeItem {
-                        key: nk,
-                        val: nv,
+                    heap.push(VisibleMergeItem {
+                        entry: VisibleEntry::Owned(nk, nv),
                         iter_idx: 0,
                     });
                 }
@@ -3804,31 +3850,29 @@ impl FusionTransaction {
                     break;
                 }
                 if let Some((nk, nv)) = next_item {
-                    heap.push(MergeItem {
-                        key: nk,
-                        val: nv,
+                    heap.push(VisibleMergeItem {
+                        entry: VisibleEntry::Owned(nk, nv),
                         iter_idx: idx,
                     });
                 }
             } else {
                 let sst_idx = idx - 1 - mem_tables.len();
                 if let Some(it) = &mut sst_iters[sst_idx] {
-                    while let Some((nk, nv)) = it.next().await? {
-                        let (nuk, _nts) = FusionStorage::decode_key(&nk);
+                    let mut next_view = None;
+                    while let Some(view) = it.next_entry().await? {
+                        let (nuk, _nts) = FusionStorage::decode_key(view.key());
                         if nuk >= end {
-                            next_item = None;
                             break;
                         }
                         if nuk == user_k && current_visible {
                             continue;
                         }
-                        next_item = Some((nk, nv));
+                        next_view = Some(view);
                         break;
                     }
-                    if let Some((nk, nv)) = next_item {
-                        heap.push(MergeItem {
-                            key: nk,
-                            val: nv,
+                    if let Some(view) = next_view {
+                        heap.push(VisibleMergeItem {
+                            entry: VisibleEntry::Sst(view),
                             iter_idx: idx,
                         });
                     }
@@ -3844,7 +3888,7 @@ impl FusionTransaction {
 
             if current_visible {
                 last_user_key = Some(user_k.to_vec());
-                let (is_put, val) = FusionStorage::decode_value(&v);
+                let (is_put, val) = FusionStorage::decode_value(entry.val());
                 if is_put && !visit(user_k, val) {
                     break;
                 }
