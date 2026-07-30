@@ -32,7 +32,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify, OwnedRwLockReadGuard, RwLoc
 // 2. LSM-Tree Structure (MemTable -> Flush -> SST)
 // 3. Columnar Vector Store (Integrated for Vector Search)
 
-const TS_SIZE: usize = 8;
+pub(crate) const TS_SIZE: usize = 8;
 const COMPACTION_FANIN: usize = 4;
 const SSTABLE_BLOCK_BUFFER_CAPACITY: usize = 4096;
 const CDC_KEY_PREFIX: &str = "__fusiondb_cdc:";
@@ -322,8 +322,8 @@ struct SideIndexRebuildPlan {
 
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::sstable::{
-    BlockCache, BlockCacheKey, BlockCacheValue, SsTable, SsTableBlockProperties, SsTableBuilder,
-    SsTableOpenDescriptor, SsTablePrefixFilterProbe, SsTableReadOptions,
+    BlockCache, BlockCacheKey, BlockCacheValue, BlockEntrySpan, SsTable, SsTableBlockProperties,
+    SsTableBuilder, SsTableOpenDescriptor, SsTablePrefixFilterProbe, SsTableReadOptions,
     SsTableReverseFrontierKind, SsTableReverseIterator,
 };
 use crate::storage::vector_index::VectorIndex;
@@ -3665,6 +3665,164 @@ impl FusionTransaction {
         (!skip_offsets.is_empty()).then(|| Arc::new(skip_offsets))
     }
 
+    /// Columnar single-source clean-window fast path (472 T1).
+    ///
+    /// Folds a bare (predicate-free) single-prefix aggregate directly off the
+    /// one SSTable that owns `[prefix, prefix_end)` — bypassing the N-way MVCC
+    /// merge — but ONLY when it can prove the merge would produce the exact same
+    /// ascending-user-key sequence of visible-PUT-sole-version rows. Any doubt
+    /// returns `Ok(None)` so the caller runs the untouched merge path; it never
+    /// returns a wrong answer.
+    ///
+    /// Storage owns ALL MVCC verification here (the four merge obligations the
+    /// per-entry dedup/visibility loop normally discharges):
+    /// - G1: exactly one SSTable overlaps the user-key range (else fall back);
+    /// - G2/G3: no write-buffer / memtable key in the range (they would shadow
+    ///   or add versions the block walk cannot see);
+    /// - G4: the candidate's block properties are offset-aligned (used only to
+    ///   enumerate block offsets + intervals, never for fold correctness);
+    /// - G5: every in-range entry is visible (`ts <= read_ts`);
+    /// - G6: every in-range entry is a PUT (put-flag byte == 1; a tombstone
+    ///   aborts);
+    /// - G7: no user key repeats (a duplicate = multiple versions; caught by
+    ///   threading `last_user_key` across blocks, which also subsumes the
+    ///   block-boundary split case).
+    ///
+    /// The snapshot (memtables + sstables + write_buffer + read_ts) is taken the
+    /// same way `for_each_visible_range` takes it, so the fast path and the merge
+    /// observe the identical storage state. Each fully-clean contiguous window of
+    /// in-range spans is handed to `sink(&block, &spans[lo..hi])`; the caller's
+    /// sink applies membership + fold (execution's responsibility).
+    pub(crate) async fn scan_single_source_clean_blocks<F>(
+        &self,
+        prefix: &[u8],
+        sink: &mut F,
+    ) -> Result<Option<()>>
+    where
+        F: FnMut(&[u8], &[BlockEntrySpan]) -> Result<()> + Send,
+    {
+        let start = prefix;
+        let Some(end_owned) = FusionStorage::prefix_end(prefix) else {
+            return Ok(None);
+        };
+        let end = end_owned.as_slice();
+        if start >= end {
+            return Ok(None);
+        }
+
+        // Same snapshot as the merge (cheap Arc clones).
+        let mem_tables = self.snapshot_memtables();
+        let sstables = self.storage.sstables.read().unwrap().clone();
+        let read_ts = self.read_ts;
+        let write_buffer = &self.write_buffer;
+
+        // G2 / G3: any staged write-buffer or memtable key inside the range
+        // could shadow an SSTable row or introduce another version, so the
+        // block walk alone can no longer prove single-version visibility. The
+        // helpers are inclusive `[start, end]`; the scan is half-open, so this
+        // only over-declines for a key exactly `== end` (the next prefix) —
+        // safe. (G1 comes after these two cheap checks.)
+        if Self::write_buffer_overlaps_user_key_interval(write_buffer, start, end) {
+            return Ok(None);
+        }
+        if Self::memtables_overlap_user_key_interval(&mem_tables, start, end) {
+            return Ok(None);
+        }
+
+        // G1: exactly one SSTable overlaps the user-key range. Zero (empty
+        // range, or data only in shadowed memtables) or more than one both fall
+        // back — the fast path only handles a single clean source.
+        let mut candidate: Option<&Arc<SsTable>> = None;
+        for sstable in &sstables {
+            if Self::sstable_overlaps_user_key_interval(sstable, start, end) {
+                if candidate.is_some() {
+                    return Ok(None);
+                }
+                candidate = Some(sstable);
+            }
+        }
+        let Some(sstable) = candidate else {
+            return Ok(None);
+        };
+
+        // G4: offset-aligned block properties give us the per-block user-key
+        // intervals + read offsets. Without them we cannot enumerate the blocks.
+        sstable.preload_block_properties().await;
+        let Some(block_properties) = sstable.validated_block_properties_for_zone_maps() else {
+            return Ok(None);
+        };
+
+        let read_options = SsTableReadOptions::fill_cache();
+        let mut last_user_key: Option<Vec<u8>> = None;
+
+        // Walk in-range blocks in offset (= key) order.
+        for property in block_properties.iter() {
+            let Some((block_first, block_last)) =
+                SsTable::block_property_user_key_interval(property, TS_SIZE)
+            else {
+                // A block overlapping our range with undecodable bounds cannot
+                // be trusted; decline the whole range.
+                return Ok(None);
+            };
+            // Blocks entirely outside [start, end) hold other tables' keys (or
+            // are out of range) — skip without reading.
+            if block_last.as_slice() < start || block_first.as_slice() >= end {
+                continue;
+            }
+
+            let block = sstable
+                .read_range_block(property.offset, read_options)
+                .await?;
+            let spans = SsTable::decoded_block_entry_spans(&block)?;
+
+            // In-range entries are contiguous (keys are sorted), so the clean
+            // window is a single [lo, hi) slice. Verify G5/G6/G7 for each.
+            let mut window_lo = 0usize;
+            let mut window_hi = 0usize;
+            let mut window_open = false;
+            for (idx, span) in spans.iter().enumerate() {
+                let key = &block[span.key_start()..span.key_end()];
+                let (user_key, ts) = FusionStorage::decode_key(key);
+                if user_key < start {
+                    continue; // boundary block: leading other-table keys
+                }
+                if user_key >= end {
+                    break; // past the range; remaining entries are sorted above
+                }
+
+                // G5: visibility. A newer-than-snapshot version means the merge
+                // would either hide this row or expose an older one we cannot
+                // see here — decline.
+                if ts > read_ts {
+                    return Ok(None);
+                }
+                // G6: PUT only. The put-flag is the first value byte.
+                if block.get(span.value_start()).copied() != Some(1) {
+                    return Ok(None);
+                }
+                // G7: single version. Two entries with the same user key (in this
+                // block or across the block boundary) mean the merge would dedup
+                // to one visible version — decline rather than double-fold.
+                if last_user_key.as_deref() == Some(user_key) {
+                    return Ok(None);
+                }
+                last_user_key = Some(user_key.to_vec());
+
+                if !window_open {
+                    window_lo = idx;
+                    window_open = true;
+                }
+                window_hi = idx + 1;
+            }
+
+            if window_open {
+                sink(&block, &spans[window_lo..window_hi])?;
+            }
+        }
+
+        Ok(Some(()))
+    }
+
     /// Borrowed-slice facade over `merge_visible_range_entries`: decodes each yielded entry and
     /// invokes `visit(user_key, value)` for each latest visible PUT in key order, stopping early
     /// when `visit` returns false. Decoding is pure slicing (split off the timestamp suffix and
@@ -5263,6 +5421,229 @@ mod tests {
         block.extend_from_slice(key);
         block.extend_from_slice(&(value.len() as u32).to_le_bytes());
         block.extend_from_slice(value);
+    }
+
+    // ---- 472 T1 scan_single_source_clean_blocks storage-level guard tests ----
+
+    /// A read-only `FusionTransaction` with a caller-chosen `read_ts` and
+    /// staged write buffer, for driving `scan_single_source_clean_blocks`
+    /// directly against a controlled snapshot.
+    fn clean_blocks_read_txn(
+        storage: &FusionStorage,
+        read_ts: u64,
+        write_buffer: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> FusionTransaction {
+        FusionTransaction {
+            storage: storage.clone(),
+            write_buffer,
+            read_ts,
+            read_ts_registered: false,
+            capture_cdc: AtomicBool::new(true),
+            side_index_deltas: StdMutex::new(Vec::new()),
+            fenced_migration_phase: None,
+        }
+    }
+
+    async fn put_committed(storage: &FusionStorage, key: &[u8], value: &[u8]) {
+        let mut txn = storage.begin_transaction().await.unwrap();
+        txn.put(key, value).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    /// Collect the clean windows a scan hands to the sink as (user_key, payload)
+    /// pairs, returning `None` when the scan declines.
+    async fn collect_clean_blocks(
+        txn: &FusionTransaction,
+        prefix: &[u8],
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut sink = |block: &[u8], spans: &[BlockEntrySpan]| -> Result<()> {
+            for span in spans {
+                let key = &block[span.key_start()..span.key_end()];
+                let (user_key, _ts) = FusionStorage::decode_key(key);
+                let payload = &block[span.value_start() + 1..span.value_end()];
+                seen.push((user_key.to_vec(), payload.to_vec()));
+            }
+            Ok(())
+        };
+        txn.scan_single_source_clean_blocks(prefix, &mut sink)
+            .await
+            .unwrap()
+            .map(|()| seen)
+    }
+
+    #[tokio::test]
+    async fn clean_blocks_folds_single_sstable_and_skips_other_prefixes() {
+        let (storage, data_dir) = test_fusion_storage("clean_blocks_clean").await;
+        // Keys outside [data:t:, data:t;) live in the same SSTable but must be
+        // skipped by the block walk.
+        put_committed(&storage, b"aaa:before", b"x").await;
+        put_committed(&storage, b"data:other:1", b"x").await;
+        for i in 1..=5u32 {
+            let key = format!("data:t:{i:03}");
+            put_committed(&storage, key.as_bytes(), format!("val{i:03}").as_bytes()).await;
+        }
+        put_committed(&storage, b"schema:t", b"x").await;
+        put_committed(&storage, b"zzz:after", b"x").await;
+        storage.create_snapshot_now().await.unwrap();
+
+        let read_ts = storage.current_ts.load(Ordering::SeqCst);
+        let txn = clean_blocks_read_txn(&storage, read_ts, Vec::new());
+        let seen = collect_clean_blocks(&txn, b"data:t:")
+            .await
+            .expect("clean single SSTable must fold");
+
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = (1..=5u32)
+            .map(|i| {
+                (
+                    format!("data:t:{i:03}").into_bytes(),
+                    format!("val{i:03}").into_bytes(),
+                )
+            })
+            .collect();
+        assert_eq!(seen, expected);
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn clean_blocks_declines_on_write_buffer_overlap_but_not_outside_range() {
+        let (storage, data_dir) = test_fusion_storage("clean_blocks_wb").await;
+        for i in 1..=5u32 {
+            let key = format!("data:t:{i:03}");
+            put_committed(&storage, key.as_bytes(), b"v").await;
+        }
+        storage.create_snapshot_now().await.unwrap();
+        let read_ts = storage.current_ts.load(Ordering::SeqCst);
+
+        // A staged write inside the range forces the fallback.
+        let inside = clean_blocks_read_txn(
+            &storage,
+            read_ts,
+            vec![(b"data:t:003".to_vec(), Some(b"staged".to_vec()))],
+        );
+        assert!(collect_clean_blocks(&inside, b"data:t:").await.is_none());
+
+        // A staged write exactly at the exclusive end (next prefix) over-declines
+        // by design (inclusive helper) — also fine, still a correct fallback.
+        let at_end = clean_blocks_read_txn(
+            &storage,
+            read_ts,
+            vec![(b"data:t;".to_vec(), Some(b"staged".to_vec()))],
+        );
+        assert!(collect_clean_blocks(&at_end, b"data:t:").await.is_none());
+
+        // A staged write well outside the range must NOT disturb the fast path.
+        let outside = clean_blocks_read_txn(
+            &storage,
+            read_ts,
+            vec![(b"data:u:001".to_vec(), Some(b"staged".to_vec()))],
+        );
+        assert!(collect_clean_blocks(&outside, b"data:t:").await.is_some());
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn clean_blocks_declines_on_multi_version_user_key() {
+        let (storage, data_dir) = test_fusion_storage("clean_blocks_multiversion").await;
+        // Pin a reader BEFORE the writes so flush cannot GC the older version.
+        let pin = storage.begin_transaction().await.unwrap();
+
+        put_committed(&storage, b"data:t:001", b"v1").await;
+        put_committed(&storage, b"data:t:002", b"v1").await;
+        // Second version of the same user key.
+        put_committed(&storage, b"data:t:001", b"v2").await;
+        storage.create_snapshot_now().await.unwrap();
+
+        let read_ts = storage.current_ts.load(Ordering::SeqCst);
+        let txn = clean_blocks_read_txn(&storage, read_ts, Vec::new());
+        assert!(
+            collect_clean_blocks(&txn, b"data:t:").await.is_none(),
+            "two versions of data:t:001 must trip the single-version guard"
+        );
+
+        drop(pin);
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn clean_blocks_declines_on_invisible_version() {
+        let (storage, data_dir) = test_fusion_storage("clean_blocks_invisible").await;
+        for i in 1..=3u32 {
+            let key = format!("data:t:{i:03}");
+            put_committed(&storage, key.as_bytes(), b"v").await;
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        // read_ts = 0 makes every committed version (ts >= 1) invisible, so the
+        // first in-range entry trips the visibility guard.
+        let txn = clean_blocks_read_txn(&storage, 0, Vec::new());
+        assert!(collect_clean_blocks(&txn, b"data:t:").await.is_none());
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn clean_blocks_declines_on_tombstone() {
+        let (storage, data_dir) = test_fusion_storage("clean_blocks_tombstone").await;
+        for i in 1..=5u32 {
+            let key = format!("data:t:{i:03}");
+            put_committed(&storage, key.as_bytes(), b"v").await;
+        }
+        // Delete one key BEFORE any snapshot: flush keeps the newest version,
+        // which is the tombstone, as the sole in-SSTable version of data:t:003.
+        {
+            let mut txn = storage.begin_transaction().await.unwrap();
+            txn.delete(b"data:t:003").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        storage.create_snapshot_now().await.unwrap();
+
+        let read_ts = storage.current_ts.load(Ordering::SeqCst);
+        let txn = clean_blocks_read_txn(&storage, read_ts, Vec::new());
+        assert!(
+            collect_clean_blocks(&txn, b"data:t:").await.is_none(),
+            "a lone tombstone in range must trip the PUT-only guard"
+        );
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn clean_blocks_declines_on_two_overlapping_sstables() {
+        let (storage, data_dir) = test_fusion_storage("clean_blocks_two_ssts").await;
+        put_committed(&storage, b"data:t:001", b"v").await;
+        put_committed(&storage, b"data:t:100", b"v").await;
+        storage.create_snapshot_now().await.unwrap();
+        // A second SSTable whose key sits inside the first's [001, 100] span, so
+        // both overlap [data:t:, data:t;).
+        put_committed(&storage, b"data:t:050", b"v").await;
+        storage.create_snapshot_now().await.unwrap();
+
+        let read_ts = storage.current_ts.load(Ordering::SeqCst);
+        let txn = clean_blocks_read_txn(&storage, read_ts, Vec::new());
+        assert!(collect_clean_blocks(&txn, b"data:t:").await.is_none());
+
+        cleanup_storage_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn clean_blocks_declines_on_memtable_overlap() {
+        let (storage, data_dir) = test_fusion_storage("clean_blocks_memtable").await;
+        for i in 1..=5u32 {
+            let key = format!("data:t:{i:03}");
+            put_committed(&storage, key.as_bytes(), b"v").await;
+        }
+        storage.create_snapshot_now().await.unwrap();
+        // A live memtable row in range (no snapshot) shadows the block walk.
+        put_committed(&storage, b"data:t:003", b"v2").await;
+
+        let read_ts = storage.current_ts.load(Ordering::SeqCst);
+        let txn = clean_blocks_read_txn(&storage, read_ts, Vec::new());
+        assert!(collect_clean_blocks(&txn, b"data:t:").await.is_none());
+
+        cleanup_storage_dir(&data_dir);
     }
 
     fn zone_map_test_schema() -> crate::catalog::TableSchema {

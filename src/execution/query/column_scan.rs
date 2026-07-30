@@ -2,6 +2,8 @@ use crate::catalog::IndexType;
 use crate::catalog::TableSchema;
 use crate::common::{FusionError, Result, Value};
 use crate::execution::analyze::TableStats;
+use crate::storage::fusion::{FusionTransaction, TS_SIZE};
+use crate::storage::sstable::{key_user_part, BlockEntrySpan};
 use crate::storage::{ScanVisitor, Transaction};
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
@@ -14,6 +16,20 @@ use super::Executor;
 
 const COLUMN_SCAN_BATCH_SIZE: usize = 1024;
 const GROUP_BY_COUNT_INDEX_STATS_MIN_ENTRIES: usize = 65_536;
+
+// Per-thread tally of columnar fast-path fires, used only by tests. The global
+// monitor counter is shared across cargo's parallel test threads, so it cannot
+// prove a *specific* query fired or declined; `#[tokio::test]` runs each test on
+// its own current-thread runtime, so a thread-local delta is race-free.
+#[cfg(test)]
+thread_local! {
+    static COLUMNAR_FAST_PATH_FIRE_LOCAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_columnar_fast_path_fire_for_test() {
+    COLUMNAR_FAST_PATH_FIRE_LOCAL.with(|cell| cell.set(cell.get() + 1));
+}
 
 #[derive(Clone, Copy)]
 enum ColumnAggregateKind {
@@ -1220,6 +1236,19 @@ impl Executor {
             }
         }
 
+        // 472 T1: block-level columnar fast path for bare (predicate-free)
+        // single-source aggregates. A pure pre-check that either folds the whole
+        // range and returns, or returns `None` so the untouched merge path below
+        // runs verbatim (zero risk).
+        if predicate.is_none() {
+            if let Some(values) = self
+                .try_columnar_single_source_aggregate(table_name, plans, txn)
+                .await?
+            {
+                return Ok(values);
+            }
+        }
+
         let mut states = column_aggregate_states(plans);
 
         let scan_error = {
@@ -1240,6 +1269,94 @@ impl Executor {
         }
 
         Ok(finalize_column_aggregate_states(&states))
+    }
+
+    /// 472 T1 fast path: fold a bare single-source aggregate straight off the
+    /// one clean SSTable window that owns the table's routed range, bypassing
+    /// the N-way MVCC merge.
+    ///
+    /// Storage (`scan_single_source_clean_blocks`) discharges every MVCC
+    /// obligation (single source, no write-buffer/memtable overlap, visible,
+    /// PUT-only, single-version) and hands back only clean ascending windows;
+    /// execution owns exactly two things here — the membership guard and the
+    /// fold — both bit-identical to the merge path:
+    /// - membership: `routed_data_entry_belongs_to_table` with the schema loaded
+    ///   the SAME way the fallback `ExactTableDataScanVisitor` loads it
+    ///   (`load_schema_for_data_prefix_filter`), so a colon-bearing non-PK
+    ///   row-id or a PK key that is not its own routed data key is excluded
+    ///   identically. Dropping this guard is the Design-A over-count bug.
+    /// - fold: the SAME `apply_column_aggregate_matched_row` /
+    ///   `ColumnAggregateState` accumulator, folding the identical value sequence
+    ///   in the identical (ascending user-key) order — so float sums accumulate
+    ///   bit-for-bit as the merge would (no per-block partial sums that would
+    ///   reorder), and NULL/tombstone/DECIMAL/membership all come out the same.
+    ///
+    /// Returns `Ok(None)` on any decline (fast path disabled, multi-prefix
+    /// table, non-Fusion transaction, or any storage guard failure) so the
+    /// caller runs the untouched merge path with fresh accumulators.
+    async fn try_columnar_single_source_aggregate(
+        &self,
+        table_name: &str,
+        plans: &[ColumnAggregateScanPlan],
+        txn: &mut dyn Transaction,
+    ) -> Result<Option<Vec<Value>>> {
+        if !self.columnar_single_source_aggregate_enabled() {
+            return Ok(None);
+        }
+
+        // T1 fires only for a single routed prefix (sharded single-table
+        // aggregates route to multiple prefixes and are deferred to T7).
+        let prefixes = self.routed_data_prefixes_for_table(table_name);
+        if prefixes.len() != 1 {
+            return Ok(None);
+        }
+
+        // Membership schema comes from the same source as the fallback path so
+        // the two are byte-identical (mut borrow of `txn` ends before downcast).
+        let schema = self
+            .load_schema_for_data_prefix_filter(table_name, txn)
+            .await?;
+
+        let Some(fusion) = txn.as_any().downcast_ref::<FusionTransaction>() else {
+            return Ok(None);
+        };
+
+        let mut states = column_aggregate_states(plans);
+        let folded = {
+            let schema_ref = schema.as_ref();
+            let prefixes_ref = &prefixes;
+            let states_ref = &mut states;
+            let mut sink = |block: &[u8], spans: &[BlockEntrySpan]| -> Result<()> {
+                for span in spans {
+                    let key = &block[span.key_start()..span.key_end()];
+                    let user_key = key_user_part(key, TS_SIZE);
+                    let payload = &block[span.value_start() + 1..span.value_end()];
+                    if self.routed_data_entry_belongs_to_table(
+                        table_name,
+                        schema_ref,
+                        prefixes_ref,
+                        user_key,
+                        payload,
+                    ) {
+                        apply_column_aggregate_matched_row(plans, None, states_ref, &[], payload)?;
+                    }
+                }
+                Ok(())
+            };
+            fusion
+                .scan_single_source_clean_blocks(prefixes[0].as_bytes(), &mut sink)
+                .await?
+        };
+
+        match folded {
+            Some(()) => {
+                crate::monitor::inc_columnar_single_source_aggregate_fast_path();
+                #[cfg(test)]
+                note_columnar_fast_path_fire_for_test();
+                Ok(Some(finalize_column_aggregate_states(&states)))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn simple_column_aggregate_index_scan(
@@ -2521,8 +2638,371 @@ impl Executor {
 mod tests {
     use super::*;
     use crate::catalog::Column;
+    use crate::common::encoding::RowEncoder;
+    use crate::config::StorageConfig;
     use crate::execution::analyze::{ColumnStats, DistinctCountKind, DistinctCountMethod};
+    use crate::execution::QueryResult;
+    use crate::storage::fusion::FusionStorage;
+    use crate::storage::Storage;
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+    use std::sync::Arc;
+
+    // ---- 472 T1 columnar single-source aggregate fast-path tests ----
+
+    async fn fusion_executor(name: &str) -> (Executor, FusionStorage, std::path::PathBuf) {
+        let data_dir =
+            std::env::temp_dir().join(format!("fusiondb_colagg_{}_{}", name, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let fusion = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(fusion.clone());
+        let executor = Executor::new(storage);
+        (executor, fusion, data_dir)
+    }
+
+    fn cleanup_dir(path: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn fast_path_fire_count() -> u64 {
+        // Thread-local so it is race-free under cargo's parallel test threads
+        // (each `#[tokio::test]` drives its own current-thread runtime).
+        super::COLUMNAR_FAST_PATH_FIRE_LOCAL.with(|cell| cell.get())
+    }
+
+    async fn exec_ok_sql(executor: &Executor, sql: &str) {
+        executor.execute_sql(sql).await.unwrap();
+    }
+
+    async fn agg_row_fast(executor: &Executor, sql: &str) -> Vec<Value> {
+        executor.invalidate_query_result_cache();
+        let results = executor.execute_sql(sql).await.unwrap();
+        single_agg_row(results)
+    }
+
+    async fn agg_row_fallback(executor: &Executor, sql: &str) -> Vec<Value> {
+        executor.invalidate_query_result_cache();
+        let results = executor
+            .execute_sql_with_columnar_single_source_aggregate(sql, false)
+            .await
+            .unwrap();
+        single_agg_row(results)
+    }
+
+    fn single_agg_row(results: Vec<QueryResult>) -> Vec<Value> {
+        match results.into_iter().next().unwrap() {
+            QueryResult::Select { rows, .. } => rows.into_iter().next().unwrap(),
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    fn values_bit_equal(a: &[Value], b: &[Value]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| match (x, y) {
+                // Lock float accumulation order: identical sums must have
+                // identical bit patterns, not merely compare `==`.
+                (Value::Float(fx), Value::Float(fy)) => fx.to_bits() == fy.to_bits(),
+                _ => x == y,
+            })
+    }
+
+    // Deterministic splitmix64 so the randomized differential harness is
+    // reproducible across runs.
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    const DIFFERENTIAL_AGGREGATES: &[&str] = &[
+        "COUNT(*)",
+        "COUNT(vn)",
+        "SUM(vi)",
+        "SUM(vf)",
+        "SUM(vd)",
+        "AVG(vi)",
+        "AVG(vf)",
+        "AVG(vd)",
+        "MIN(vi)",
+        "MAX(vi)",
+        "MIN(vs)",
+        "MAX(vs)",
+        "STRING_AGG(vs)",
+    ];
+
+    #[tokio::test]
+    async fn columnar_fast_path_differential_matches_merge_across_aggregates() {
+        let mut rng = SplitMix64(0x00C0_FFEE_1234_5678);
+        for iteration in 0..6u32 {
+            let (executor, fusion, data_dir) =
+                fusion_executor(&format!("differential_{iteration}")).await;
+            let table = format!("diff_{iteration}");
+            exec_ok_sql(
+                &executor,
+                &format!(
+                    "CREATE TABLE {table} (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL, \
+                     vf FLOAT NOT NULL, vs TEXT, vn INTEGER, vd DECIMAL(20, 4))"
+                ),
+            )
+            .await;
+
+            let row_count = 40 + rng.below(220) as u32;
+            let mut insert = format!("INSERT INTO {table} VALUES ");
+            for id in 1..=row_count {
+                if id > 1 {
+                    insert.push(',');
+                }
+                let vi = rng.below(2_000_000) as i64 - 1_000_000;
+                let vf = (rng.next_u64() as f64 / u64::MAX as f64) * 4000.0 - 2000.0;
+                let vd_cents = rng.below(50_000_000) as i64 - 25_000_000;
+                let vs = format!("s{:08}", rng.below(100_000_000));
+                // Sprinkle NULLs so COUNT(col)/aggregate NULL handling is exercised.
+                let vn = if rng.below(4) == 0 {
+                    "NULL".to_string()
+                } else {
+                    (rng.below(1_000_000) as i64).to_string()
+                };
+                let vs_lit = if rng.below(10) == 0 {
+                    "NULL".to_string()
+                } else {
+                    format!("'{vs}'")
+                };
+                let vd = format!(
+                    "CAST('{}.{:04}' AS DECIMAL(20,4))",
+                    vd_cents / 10_000,
+                    (vd_cents % 10_000).abs()
+                );
+                insert.push_str(&format!("({id}, {vi}, {vf:.6}, {vs_lit}, {vn}, {vd})"));
+            }
+            exec_ok_sql(&executor, &insert).await;
+            fusion.create_snapshot_now().await.unwrap();
+
+            for aggregate in DIFFERENTIAL_AGGREGATES {
+                let sql = format!("SELECT {aggregate} FROM {table}");
+                let before = fast_path_fire_count();
+                let fast = agg_row_fast(&executor, &sql).await;
+                let fired = fast_path_fire_count() > before;
+                let fallback = agg_row_fallback(&executor, &sql).await;
+                assert!(
+                    values_bit_equal(&fast, &fallback),
+                    "iteration {iteration} {aggregate}: fast {fast:?} != fallback {fallback:?}"
+                );
+                // `COUNT(*)` is answered by the earlier routed-prefix count path
+                // and never reaches the columnar fast path; every other aggregate
+                // in the matrix must fire it on a clean single SSTable.
+                if *aggregate != "COUNT(*)" {
+                    assert!(
+                        fired,
+                        "iteration {iteration} {aggregate}: fast path must fire on a clean single SSTable"
+                    );
+                }
+            }
+
+            cleanup_dir(&data_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_fast_path_declines_on_multiple_sstables_but_stays_correct() {
+        let (executor, fusion, data_dir) = fusion_executor("multi_sstable_e2e").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE m (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL)",
+        )
+        .await;
+        exec_ok_sql(&executor, "INSERT INTO m VALUES (1, 10), (100, 20)").await;
+        fusion.create_snapshot_now().await.unwrap();
+        // Second overlapping SSTable -> G1 declines, but the merge answer is
+        // still correct.
+        exec_ok_sql(&executor, "INSERT INTO m VALUES (50, 30)").await;
+        fusion.create_snapshot_now().await.unwrap();
+
+        let before = fast_path_fire_count();
+        let fast = agg_row_fast(&executor, "SELECT SUM(vi), COUNT(*) FROM m").await;
+        assert!(
+            fast_path_fire_count() == before,
+            "two overlapping SSTables must decline the fast path"
+        );
+        assert_eq!(fast, vec![Value::Integer(60), Value::Integer(3)]);
+
+        cleanup_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn columnar_fast_path_declines_on_memtable_overlap_but_stays_correct() {
+        let (executor, fusion, data_dir) = fusion_executor("memtable_e2e").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE mt (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL)",
+        )
+        .await;
+        exec_ok_sql(&executor, "INSERT INTO mt VALUES (1, 10), (2, 20), (3, 30)").await;
+        fusion.create_snapshot_now().await.unwrap();
+
+        // Clean: the fast path fires.
+        let before_clean = fast_path_fire_count();
+        let clean = agg_row_fast(&executor, "SELECT SUM(vi) FROM mt").await;
+        assert!(fast_path_fire_count() > before_clean);
+        assert_eq!(clean, vec![Value::Integer(60)]);
+
+        // A live memtable row -> G3 declines, answer still includes it.
+        exec_ok_sql(&executor, "INSERT INTO mt VALUES (4, 40)").await;
+        let before_dirty = fast_path_fire_count();
+        let dirty = agg_row_fast(&executor, "SELECT SUM(vi) FROM mt").await;
+        assert!(
+            fast_path_fire_count() == before_dirty,
+            "a live memtable row must decline the fast path"
+        );
+        assert_eq!(dirty, vec![Value::Integer(100)]);
+
+        cleanup_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn columnar_fast_path_excludes_non_member_rows() {
+        let (executor, fusion, data_dir) = fusion_executor("membership").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE mem (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL)",
+        )
+        .await;
+        // Legit rows: SUM(vi) = 10*(1..10) = 550, COUNT(*) = 10.
+        let mut insert = String::from("INSERT INTO mem VALUES ");
+        for id in 1..=10i64 {
+            if id > 1 {
+                insert.push(',');
+            }
+            insert.push_str(&format!("({id}, {})", id * 10));
+        }
+        exec_ok_sql(&executor, &insert).await;
+
+        // Plant non-member rows straight into the data keyspace:
+        //  (a) a colon-bearing key with no decodable PK -> excluded by the
+        //      "suffix contains ':'" rule;
+        //  (b) a key that is not its own routed data key (PK 777 != key)
+        //      -> excluded by the PK-identity rule.
+        // Both carry huge `vi` so any leak is obvious.
+        {
+            let mut txn = fusion.begin_transaction().await.unwrap();
+            let colon_key = b"data:mem:5:secondary";
+            let colon_val = RowEncoder::encode(&[Value::Null, Value::Integer(100_000)]);
+            txn.put(colon_key, &colon_val).await.unwrap();
+            let bogus_key = b"data:mem:zzz_bogus";
+            let bogus_val = RowEncoder::encode(&[Value::Integer(777), Value::Integer(200_000)]);
+            txn.put(bogus_key, &bogus_val).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        fusion.create_snapshot_now().await.unwrap();
+
+        let before = fast_path_fire_count();
+        let fast = agg_row_fast(&executor, "SELECT SUM(vi), COUNT(*) FROM mem").await;
+        assert!(
+            fast_path_fire_count() > before,
+            "membership planting must not stop the fast path from firing"
+        );
+        assert_eq!(
+            fast,
+            vec![Value::Integer(550), Value::Integer(10)],
+            "planted non-member rows must be excluded (removing the membership guard makes this fail)"
+        );
+        let fallback = agg_row_fallback(&executor, "SELECT SUM(vi), COUNT(*) FROM mem").await;
+        assert_eq!(fast, fallback);
+
+        cleanup_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn columnar_fast_path_skips_non_fusion_storage() {
+        let wal_path = format!("test_colagg_memory_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage);
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE nf (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL)",
+        )
+        .await;
+        exec_ok_sql(&executor, "INSERT INTO nf VALUES (1, 10), (2, 20), (3, 30)").await;
+
+        let before = fast_path_fire_count();
+        let row = agg_row_fast(&executor, "SELECT SUM(vi) FROM nf").await;
+        assert!(
+            fast_path_fire_count() == before,
+            "a non-Fusion transaction cannot downcast, so the fast path must not fire"
+        );
+        assert_eq!(row, vec![Value::Integer(60)]);
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn columnar_fast_path_decode_error_parity_with_fallback() {
+        let (executor, fusion, data_dir) = fusion_executor("decode_parity").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE de (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL)",
+        )
+        .await;
+        exec_ok_sql(&executor, "INSERT INTO de VALUES (1, 10), (2, 20)").await;
+
+        // Plant a member row (routed key == its own PK-derived key) whose `vi`
+        // column span is corrupt: membership passes, so both paths reach the
+        // same failing decode.
+        {
+            let mut row = RowEncoder::encode(&[Value::Integer(3), Value::Integer(30)]);
+            corrupt_encoded_column(&mut row, 1, 2);
+            let key = format!(
+                "data:de:{}",
+                crate::common::encoding::encode_i64_comparable(3)
+            );
+            let mut txn = fusion.begin_transaction().await.unwrap();
+            txn.put(key.as_bytes(), &row).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        fusion.create_snapshot_now().await.unwrap();
+
+        executor.invalidate_query_result_cache();
+        let fast = executor.execute_sql("SELECT SUM(vi) FROM de").await;
+        executor.invalidate_query_result_cache();
+        let fallback = executor
+            .execute_sql_with_columnar_single_source_aggregate("SELECT SUM(vi) FROM de", false)
+            .await;
+        assert!(fast.is_err(), "fast path must surface the decode error");
+        assert!(fallback.is_err(), "fallback must surface the decode error");
+        assert_eq!(
+            fast.unwrap_err().to_string(),
+            fallback.unwrap_err().to_string(),
+            "decode error must be identical across paths"
+        );
+
+        cleanup_dir(&data_dir);
+    }
+
+    fn corrupt_encoded_column(row: &mut [u8], column_index: usize, column_count: usize) {
+        let off_pos = 2 + column_index * 4;
+        let start = u32::from_le_bytes(row[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+        let end = if column_index + 1 < column_count {
+            let next_off_pos = off_pos + 4;
+            u32::from_le_bytes(row[next_off_pos..next_off_pos + 4].try_into().unwrap()) as usize
+        } else {
+            row.len()
+        };
+        for byte in &mut row[start..end] {
+            *byte = 0xff;
+        }
+    }
 
     #[test]
     fn column_aggregate_state_preallocates_string_agg_first_value() {

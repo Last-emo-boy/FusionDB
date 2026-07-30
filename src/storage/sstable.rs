@@ -99,11 +99,29 @@ fn block_entry_reserve_count(count: u32, block_len: usize) -> usize {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BlockEntrySpan {
+pub(crate) struct BlockEntrySpan {
     key_start: usize,
     key_end: usize,
     value_start: usize,
     value_end: usize,
+}
+
+impl BlockEntrySpan {
+    pub(crate) fn key_start(&self) -> usize {
+        self.key_start
+    }
+
+    pub(crate) fn key_end(&self) -> usize {
+        self.key_end
+    }
+
+    pub(crate) fn value_start(&self) -> usize {
+        self.value_start
+    }
+
+    pub(crate) fn value_end(&self) -> usize {
+        self.value_end
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -131,7 +149,7 @@ impl ReverseBlockScanStats {
     }
 }
 
-fn key_user_part(key: &[u8], suffix_len: usize) -> &[u8] {
+pub(crate) fn key_user_part(key: &[u8], suffix_len: usize) -> &[u8] {
     key.len()
         .checked_sub(suffix_len)
         .map(|len| &key[..len])
@@ -1620,7 +1638,7 @@ impl SsTable {
         Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
 
-    fn decoded_block_entry_spans(block_data: &[u8]) -> Result<Vec<BlockEntrySpan>> {
+    pub(crate) fn decoded_block_entry_spans(block_data: &[u8]) -> Result<Vec<BlockEntrySpan>> {
         let mut cursor = 0usize;
         let count = Self::read_block_u32_at(block_data, &mut cursor)
             .ok_or_else(|| Self::decode_meta_error("SSTable block is missing its entry count"))?;
@@ -2837,6 +2855,28 @@ impl SsTable {
     pub async fn read_block(&self, offset: u64) -> Result<BlockCacheValue> {
         self.read_block_with_options(offset, SsTableReadOptions::default())
             .await
+    }
+
+    /// Read one block by its (index) offset for the columnar single-source
+    /// aggregate fast path (472 T1). Delegates to the shared block reader with
+    /// no reusable file handle: each block is read once and (per `read_options`)
+    /// cached, matching the block-cache behavior of the merge iterator path.
+    pub(crate) async fn read_range_block(
+        &self,
+        offset: u64,
+        read_options: SsTableReadOptions,
+    ) -> Result<BlockCacheValue> {
+        Self::read_block_at_with_reusable_file(
+            &self.path,
+            &self.block_cache,
+            self.id,
+            &self.index_offsets,
+            self.file_len,
+            offset,
+            read_options,
+            None,
+        )
+        .await
     }
 
     pub async fn read_block_with_options(

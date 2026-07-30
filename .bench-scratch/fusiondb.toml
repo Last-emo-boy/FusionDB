@@ -1,0 +1,17 @@
+[server]
+http_port = 8091
+pg_port = 8092
+bind = "127.0.0.1"
+max_connections = 128
+
+[storage]
+data_dir = "data"
+memtable_flush_mb = 256
+sql_bulk_scan_no_fill = true
+
+[auth]
+password = "fusiondb"
+http_legacy_unsafe = true
+
+[distributed]
+enabled = false

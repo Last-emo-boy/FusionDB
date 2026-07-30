@@ -401,6 +401,10 @@ struct CachedSelectResult {
 
 tokio::task_local! {
     static SQL_BLOCK_ZONE_MAP_PRUNING_ENABLED: bool;
+    // 472 T1: scoped kill-switch for the columnar single-source aggregate fast
+    // path. Defaults to enabled; tests scope it to `false` to force the
+    // untouched merge path and assert byte-identical results.
+    static COLUMNAR_SINGLE_SOURCE_AGGREGATE_ENABLED: bool;
 }
 
 struct StopAwareScanVisitor<'a> {
@@ -613,6 +617,26 @@ impl Executor {
         SQL_BLOCK_ZONE_MAP_PRUNING_ENABLED
             .try_with(|enabled| *enabled)
             .unwrap_or(true)
+    }
+
+    pub(crate) fn columnar_single_source_aggregate_enabled(&self) -> bool {
+        COLUMNAR_SINGLE_SOURCE_AGGREGATE_ENABLED
+            .try_with(|enabled| *enabled)
+            .unwrap_or(true)
+    }
+
+    /// Run `sql` with the 472 T1 columnar single-source aggregate fast path
+    /// forced on or off. Used by tests to compare the fast path against the
+    /// untouched merge path on the identical table/snapshot.
+    #[cfg(test)]
+    pub(crate) async fn execute_sql_with_columnar_single_source_aggregate(
+        &self,
+        sql: &str,
+        enabled: bool,
+    ) -> Result<Vec<QueryResult>> {
+        COLUMNAR_SINGLE_SOURCE_AGGREGATE_ENABLED
+            .scope(enabled, async move { self.execute_sql(sql).await })
+            .await
     }
 
     pub(crate) async fn execute_sql_with_sql_block_zone_map_pruning(

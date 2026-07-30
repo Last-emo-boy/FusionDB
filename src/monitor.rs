@@ -90,6 +90,7 @@ pub struct Metrics {
     pub sstable_range_probe_count: AtomicU64,
     pub sstable_range_overlap_skip_count: AtomicU64,
     pub sstable_iterator_open_count: AtomicU64,
+    pub columnar_single_source_aggregate_fast_path_count: AtomicU64,
     pub sstable_reverse_iterator_open_count: AtomicU64,
     pub sstable_reverse_block_read_count: AtomicU64,
     pub sstable_reverse_block_entry_decode_count: AtomicU64,
@@ -436,6 +437,8 @@ impl Metrics {
         self.sstable_range_overlap_skip_count
             .store(0, Ordering::Relaxed);
         self.sstable_iterator_open_count.store(0, Ordering::Relaxed);
+        self.columnar_single_source_aggregate_fast_path_count
+            .store(0, Ordering::Relaxed);
         self.sstable_reverse_iterator_open_count
             .store(0, Ordering::Relaxed);
         self.sstable_reverse_block_read_count
@@ -998,6 +1001,12 @@ pub fn inc_sstable_range_overlap_skip() {
 pub fn inc_sstable_iterator_open() {
     GLOBAL_METRICS
         .sstable_iterator_open_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_columnar_single_source_aggregate_fast_path() {
+    GLOBAL_METRICS
+        .columnar_single_source_aggregate_fast_path_count
         .fetch_add(1, Ordering::Relaxed);
 }
 
