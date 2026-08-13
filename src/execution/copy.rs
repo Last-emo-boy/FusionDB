@@ -374,15 +374,17 @@ impl Executor {
         }
     }
 
-    fn copy_table_name(table_name: &ObjectName) -> Result<String> {
-        table_name
-            .0
-            .last()
-            .and_then(ObjectNamePart::as_ident)
-            .map(|ident| ident.value.clone())
-            .ok_or_else(|| {
-                FusionError::Execution(format!("COPY table target {} is not supported", table_name))
-            })
+    pub(super) fn copy_table_name(table_name: &ObjectName) -> Result<String> {
+        // FusionDB does not implement schema-qualified catalog lookup. Accept
+        // exactly one identifier (quoted or unquoted) instead of silently
+        // dropping qualifiers and writing a different table.
+        let [ObjectNamePart::Identifier(identifier)] = table_name.0.as_slice() else {
+            return Err(FusionError::Execution(format!(
+                "COPY table target {} is not supported",
+                table_name
+            )));
+        };
+        Ok(identifier.value.clone())
     }
 
     fn copy_from_options(
@@ -712,5 +714,36 @@ mod tests {
             Executor::copy_field_to_value(" truth ", "NULL"),
             Value::String(" truth ".to_string())
         );
+    }
+
+    #[test]
+    fn copy_table_name_normalizes_quotes_and_rejects_qualifiers() {
+        let statement = crate::parser::parse_sql("COPY \"Sink Table\" FROM STDIN;")
+            .unwrap()
+            .remove(0);
+        let Statement::Copy {
+            source: CopySource::Table { table_name, .. },
+            ..
+        } = statement
+        else {
+            panic!("expected COPY table statement");
+        };
+
+        assert_eq!(
+            Executor::copy_table_name(&table_name).unwrap(),
+            "Sink Table"
+        );
+
+        let qualified = crate::parser::parse_sql("COPY public.sink FROM STDIN;")
+            .unwrap()
+            .remove(0);
+        let Statement::Copy {
+            source: CopySource::Table { table_name, .. },
+            ..
+        } = qualified
+        else {
+            panic!("expected qualified COPY table statement");
+        };
+        assert!(Executor::copy_table_name(&table_name).is_err());
     }
 }

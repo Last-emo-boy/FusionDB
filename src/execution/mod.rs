@@ -34,14 +34,171 @@ use parking_lot::RwLock;
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByKind, Query,
-    SelectItem, SetExpr, Statement, TableFactor,
+    SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::ControlFlow;
 use std::sync::{
     atomic::{AtomicU64, Ordering as AtomicOrdering},
     Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Collects stored relations read by a query while respecting FusionDB's CTE
+/// materialization order. A plain AST-wide relation visitor is not sufficient:
+/// it would either authorize CTE aliases as stored tables or hide a physical
+/// table referenced before a same-named CTE becomes visible.
+#[derive(Default)]
+struct QueryReadCollector {
+    tables: Vec<String>,
+    seen_tables: HashSet<String>,
+    visible_ctes: Vec<String>,
+    visited_queries: HashSet<*const Query>,
+    skipped_query_depth: usize,
+}
+
+impl QueryReadCollector {
+    fn collect(query: &Query) -> Vec<String> {
+        let mut collector = Self::default();
+        collector.collect_query(query);
+        collector.tables
+    }
+
+    fn collect_query(&mut self, query: &Query) {
+        if !self.visited_queries.insert(std::ptr::from_ref(query)) {
+            return;
+        }
+
+        let inherited_scope_len = self.visible_ctes.len();
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                let cte_name = cte.alias.name.value.clone();
+                if with.recursive {
+                    if let Some((anchor, recursive)) =
+                        Self::recursive_union_parts(cte.query.as_ref())
+                    {
+                        // The executor evaluates the anchor before publishing
+                        // the CTE relation, then evaluates the recursive term
+                        // with that relation visible. Keeping the same order is
+                        // security-sensitive: a physical table named like the
+                        // CTE in the anchor still requires SELECT permission.
+                        self.collect_set_expr(anchor);
+                        self.visible_ctes.push(cte_name);
+                        self.collect_set_expr(recursive);
+                        self.collect_query_clauses(cte.query.as_ref());
+                        continue;
+                    }
+                }
+
+                self.collect_query(cte.query.as_ref());
+                self.visible_ctes.push(cte_name);
+            }
+        }
+
+        self.collect_set_expr(query.body.as_ref());
+        self.collect_query_clauses(query);
+
+        self.visible_ctes.truncate(inherited_scope_len);
+    }
+
+    fn recursive_union_parts(query: &Query) -> Option<(&SetExpr, &SetExpr)> {
+        match query.body.as_ref() {
+            SetExpr::SetOperation { left, right, .. } => Some((left, right)),
+            SetExpr::Query(inner) => Self::recursive_union_parts(inner),
+            _ => None,
+        }
+    }
+
+    fn collect_set_expr(&mut self, set_expr: &SetExpr) {
+        self.collect_table_commands(set_expr);
+        self.visit_node(set_expr);
+    }
+
+    fn collect_query_clauses(&mut self, query: &Query) {
+        self.visit_node(&query.order_by);
+        self.visit_node(&query.limit_clause);
+        self.visit_node(&query.fetch);
+        self.visit_node(&query.locks);
+        self.visit_node(&query.for_clause);
+        self.visit_node(&query.settings);
+        self.visit_node(&query.format_clause);
+        self.visit_node(&query.pipe_operators);
+    }
+
+    fn collect_table_commands(&mut self, set_expr: &SetExpr) {
+        match set_expr {
+            SetExpr::Table(table) => {
+                if let Some(table_name) = &table.table_name {
+                    if let Some(schema_name) = &table.schema_name {
+                        self.push_table(format!("{schema_name}.{table_name}"));
+                    } else if !self.visible_ctes.iter().rev().any(|cte| cte == table_name) {
+                        self.push_table(table_name.clone());
+                    }
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.collect_table_commands(left);
+                self.collect_table_commands(right);
+            }
+            SetExpr::Query(query) => self.collect_query(query),
+            _ => {}
+        }
+    }
+
+    fn visit_node<T: Visit>(&mut self, node: &T) {
+        let _ = node.visit(self);
+    }
+
+    fn relation_is_visible_cte(&self, relation: &ObjectName) -> bool {
+        let [ObjectNamePart::Identifier(ident)] = relation.0.as_slice() else {
+            return false;
+        };
+
+        // Query execution currently materializes aliases by Ident::value but
+        // resolves quoted relation names through ObjectName::to_string(). Match
+        // that behavior exactly so authorization never hides a physical quoted
+        // relation that execution would actually read.
+        ident.quote_style.is_none()
+            && self
+                .visible_ctes
+                .iter()
+                .rev()
+                .any(|cte| cte == &ident.value)
+    }
+
+    fn push_table(&mut self, table: String) {
+        if self.seen_tables.insert(table.clone()) {
+            self.tables.push(table);
+        }
+    }
+}
+
+impl Visitor for QueryReadCollector {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        // The surrounding generic visitor will walk this query after the
+        // callback. Collect it once with its own CTE scope, then ignore that
+        // duplicate walk until post_visit_query restores the prior depth.
+        let previous_depth = self.skipped_query_depth;
+        self.skipped_query_depth = 0;
+        self.collect_query(query);
+        self.skipped_query_depth = previous_depth.saturating_add(1);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.skipped_query_depth = self.skipped_query_depth.saturating_sub(1);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        if self.skipped_query_depth == 0 && !self.relation_is_visible_cte(relation) {
+            self.push_table(relation.to_string());
+        }
+        ControlFlow::Continue(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum QueryResult {
@@ -1474,6 +1631,19 @@ impl Executor {
         limit: Option<usize>,
         options: StorageScanOptions,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut overlay_pairs = Vec::with_capacity(limit.unwrap_or(0).min(4096));
+        let overlay_scan = {
+            let mut collect = |key: &[u8], value: &[u8]| {
+                overlay_pairs.push((key.to_vec(), value.to_vec()));
+                true
+            };
+            txn.scan_relation_overlay_for_each(table_name, limit, &mut collect, options.clone())
+                .await?
+        };
+        if overlay_scan.is_some() {
+            return Ok(overlay_pairs);
+        }
+
         // A limited scan must stop the storage scan itself, not read the whole
         // table and slice the result: passing `None` down and truncating
         // afterwards is exactly what an `ORDER BY <pk> LIMIT n` plan pushes a
@@ -1554,6 +1724,13 @@ impl Executor {
         visitor: &mut dyn ScanVisitor,
         options: StorageScanOptions,
     ) -> Result<usize> {
+        if let Some(visited) = txn
+            .scan_relation_overlay_for_each(table_name, limit, visitor, options.clone())
+            .await?
+        {
+            return Ok(visited);
+        }
+
         let prefixes = self.routed_data_prefixes_for_table(table_name);
         let schema = self
             .load_schema_for_data_prefix_filter(table_name, txn)
@@ -4710,8 +4887,24 @@ impl Executor {
         execution_object_name_eq_ascii(&function.name, "fusiondb_data_backfill_status")
     }
 
-    pub(crate) fn statement_is_data_migration_call(stmt: &Statement) -> bool {
-        matches!(stmt, Statement::Call(function) if Self::is_data_migration_call(function))
+    pub(crate) fn statement_is_data_migration_call(mut stmt: &Statement) -> bool {
+        loop {
+            match stmt {
+                Statement::Explain { statement, .. } => stmt = statement,
+                Statement::Call(function) => return Self::is_data_migration_call(function),
+                _ => return false,
+            }
+        }
+    }
+
+    fn statement_is_vacuum(mut stmt: &Statement) -> bool {
+        loop {
+            match stmt {
+                Statement::Explain { statement, .. } => stmt = statement,
+                Statement::Vacuum(_) => return true,
+                _ => return false,
+            }
+        }
     }
 
     fn call_string_arguments(function: &Function) -> Result<Vec<String>> {
@@ -5314,14 +5507,11 @@ impl Executor {
             return Ok(());
         }
 
-        if matches!(stmt, Statement::Vacuum(_)) {
-            return self.require_superuser(username).await;
-        }
-
         // Statement-shaped, not string-prefix-shaped: a leading comment or
-        // an extended-protocol bind must not slip a migration procedure past
-        // the superuser gate.
-        if Self::statement_is_data_migration_call(stmt) {
+        // an extended-protocol bind must not slip an operator-only statement
+        // past the superuser gate. EXPLAIN ANALYZE executes its inner
+        // statement, so peel every EXPLAIN layer before making the decision.
+        if Self::statement_requires_superuser(stmt) {
             return self.require_superuser(username).await;
         }
 
@@ -5333,43 +5523,110 @@ impl Executor {
         Ok(())
     }
 
+    fn statement_requires_superuser(mut stmt: &Statement) -> bool {
+        loop {
+            match stmt {
+                Statement::Explain { statement, .. } => stmt = statement,
+                Statement::Vacuum(_) => return true,
+                Statement::Call(function) => return Self::is_data_migration_call(function),
+                Statement::Copy { target, .. } => {
+                    return matches!(
+                        target,
+                        sqlparser::ast::CopyTarget::File { .. }
+                            | sqlparser::ast::CopyTarget::Program { .. }
+                    );
+                }
+                Statement::Drop { object_type, .. } => {
+                    // FusionDB has no index ownership model yet. Checking a
+                    // privilege on the index name is insufficient because
+                    // DROP INDEX mutates its owning table's constraints and
+                    // metadata, so keep it operator-only until ownership is
+                    // represented explicitly.
+                    return matches!(object_type, ObjectType::Index);
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn statement_permissions(stmt: &Statement) -> Vec<(String, &'static str)> {
         match stmt {
             Statement::Query(query) => {
-                let mut tables = Vec::with_capacity(Self::query_table_capacity(query));
-                Self::collect_query_tables(query, &mut tables);
+                let tables = QueryReadCollector::collect(query);
                 let mut permissions = Vec::with_capacity(tables.len());
-                for table in tables {
-                    permissions.push((table, "SELECT"));
-                }
+                Self::append_select_permissions(&mut permissions, tables);
                 permissions
             }
-            Statement::Insert(insert) => vec![(insert.table.to_string(), "INSERT")],
-            Statement::Delete(delete) => {
-                let table = match &delete.from {
-                    sqlparser::ast::FromTable::WithFromKeyword(tables)
-                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
-                        tables.first().and_then(|table| {
-                            if let TableFactor::Table { name, .. } = &table.relation {
-                                Some(name.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                    }
-                };
-                match table {
-                    Some(name) => vec![(name, "DELETE")],
-                    None => Vec::new(),
+            Statement::Insert(insert) => {
+                let target_table = insert.table.to_string();
+                let mut permissions = vec![(target_table.clone(), "INSERT")];
+                let may_update = Self::insert_may_update_conflicting_row(insert.on.as_ref());
+                if may_update {
+                    permissions.push((target_table.clone(), "UPDATE"));
                 }
+                if may_update || insert.returning.is_some() {
+                    permissions.push((target_table, "SELECT"));
+                }
+                let mut reads = QueryReadCollector::default();
+                if let Some(source) = &insert.source {
+                    reads.collect_query(source);
+                }
+                reads.visit_node(&insert.assignments);
+                reads.visit_node(&insert.partitioned);
+                reads.visit_node(&insert.on);
+                reads.visit_node(&insert.returning);
+                reads.visit_node(&insert.settings);
+                Self::append_select_permissions(&mut permissions, reads.tables);
+                permissions
+            }
+            Statement::Delete(delete) => {
+                let from_tables = match &delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables)
+                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+                };
+
+                let mut permissions = Vec::new();
+                if let Some(table) = from_tables.first() {
+                    if let TableFactor::Table { name, .. } = &table.relation {
+                        let target_table = name.to_string();
+                        permissions.push((target_table.clone(), "DELETE"));
+                        permissions.push((target_table, "SELECT"));
+                    }
+                }
+
+                let mut reads = QueryReadCollector::default();
+                if let Some(target) = from_tables.first() {
+                    reads.visit_node(&target.joins);
+                }
+                for source in from_tables.iter().skip(1) {
+                    reads.visit_node(source);
+                }
+                reads.visit_node(&delete.using);
+                reads.visit_node(&delete.selection);
+                reads.visit_node(&delete.returning);
+                reads.visit_node(&delete.order_by);
+                reads.visit_node(&delete.limit);
+                Self::append_select_permissions(&mut permissions, reads.tables);
+                permissions
             }
             Statement::Update(update) => {
                 let sqlparser::ast::TableWithJoins { relation, .. } = &update.table;
+                let mut permissions = Vec::new();
                 if let TableFactor::Table { name, .. } = relation {
-                    vec![(name.to_string(), "UPDATE")]
-                } else {
-                    Vec::new()
+                    let target_table = name.to_string();
+                    permissions.push((target_table.clone(), "UPDATE"));
+                    permissions.push((target_table, "SELECT"));
                 }
+
+                let mut reads = QueryReadCollector::default();
+                reads.visit_node(&update.table.joins);
+                reads.visit_node(&update.assignments);
+                reads.visit_node(&update.from);
+                reads.visit_node(&update.selection);
+                reads.visit_node(&update.returning);
+                reads.visit_node(&update.limit);
+                Self::append_select_permissions(&mut permissions, reads.tables);
+                permissions
             }
             Statement::CreateTable(create_table) => vec![(create_table.name.to_string(), "ALL")],
             Statement::CreateIndex(create_index) => {
@@ -5384,33 +5641,27 @@ impl Executor {
                 permissions
             }
             Statement::CreateView(create_view) => {
-                let mut source_tables =
-                    Vec::with_capacity(Self::query_table_capacity(&create_view.query));
-                Self::collect_query_tables(&create_view.query, &mut source_tables);
+                let source_tables = QueryReadCollector::collect(&create_view.query);
                 let mut permissions = Vec::with_capacity(source_tables.len() + 1);
                 permissions.push((create_view.name.to_string(), "ALL"));
-                for table in source_tables {
-                    permissions.push((table, "SELECT"));
-                }
+                Self::append_select_permissions(&mut permissions, source_tables);
                 permissions
             }
             Statement::Explain { statement, .. } => Self::statement_permissions(statement),
             Statement::ExplainTable { table_name, .. } => vec![(table_name.to_string(), "SELECT")],
-            Statement::Analyze(analyze) => vec![(analyze.table_name.to_string(), "SELECT")],
+            Statement::Analyze(analyze) => vec![(analyze.table_name.to_string(), "ALL")],
             Statement::Copy { source, to, .. } => match source {
                 sqlparser::ast::CopySource::Table { table_name, .. } => {
                     vec![(
-                        table_name.to_string(),
+                        Self::copy_table_name(table_name)
+                            .unwrap_or_else(|_| table_name.to_string()),
                         if *to { "SELECT" } else { "INSERT" },
                     )]
                 }
                 sqlparser::ast::CopySource::Query(query) => {
-                    let mut tables = Vec::with_capacity(Self::query_table_capacity(query));
-                    Self::collect_query_tables(query, &mut tables);
+                    let tables = QueryReadCollector::collect(query);
                     let mut permissions = Vec::with_capacity(tables.len());
-                    for table in tables {
-                        permissions.push((table, "SELECT"));
-                    }
+                    Self::append_select_permissions(&mut permissions, tables);
                     permissions
                 }
             },
@@ -5431,49 +5682,29 @@ impl Executor {
         }
     }
 
-    fn collect_query_tables(query: &sqlparser::ast::Query, tables: &mut Vec<String>) {
-        if let SetExpr::Select(select) = query.body.as_ref() {
-            for table_with_joins in &select.from {
-                Self::collect_table_factor(&table_with_joins.relation, tables);
-                for join in &table_with_joins.joins {
-                    Self::collect_table_factor(&join.relation, tables);
-                }
+    fn append_select_permissions(
+        permissions: &mut Vec<(String, &'static str)>,
+        tables: Vec<String>,
+    ) {
+        for table in tables {
+            if !permissions
+                .iter()
+                .any(|(existing, operation)| existing == &table && *operation == "SELECT")
+            {
+                permissions.push((table, "SELECT"));
             }
         }
     }
 
-    fn query_table_capacity(query: &sqlparser::ast::Query) -> usize {
-        if let SetExpr::Select(select) = query.body.as_ref() {
-            select
-                .from
-                .iter()
-                .map(|table_with_joins| {
-                    Self::table_factor_table_capacity(&table_with_joins.relation)
-                        + table_with_joins
-                            .joins
-                            .iter()
-                            .map(|join| Self::table_factor_table_capacity(&join.relation))
-                            .sum::<usize>()
-                })
-                .sum()
-        } else {
-            0
-        }
-    }
-
-    fn table_factor_table_capacity(table: &TableFactor) -> usize {
-        match table {
-            TableFactor::Table { .. } => 1,
-            TableFactor::Derived { subquery, .. } => Self::query_table_capacity(subquery),
-            _ => 0,
-        }
-    }
-
-    fn collect_table_factor(table: &TableFactor, tables: &mut Vec<String>) {
-        match table {
-            TableFactor::Table { name, .. } => tables.push(name.to_string()),
-            TableFactor::Derived { subquery, .. } => Self::collect_query_tables(subquery, tables),
-            _ => {}
+    fn insert_may_update_conflicting_row(on_insert: Option<&sqlparser::ast::OnInsert>) -> bool {
+        match on_insert {
+            Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_)) => true,
+            Some(sqlparser::ast::OnInsert::OnConflict(conflict)) => matches!(
+                conflict.action,
+                sqlparser::ast::OnConflictAction::DoUpdate(_)
+            ),
+            Some(_) => true,
+            None => false,
         }
     }
 
@@ -5561,11 +5792,7 @@ impl Executor {
         }
 
         let stmts = self.prepare(sql)?;
-        if stmts.len() > 1
-            && stmts
-                .iter()
-                .any(|stmt| matches!(stmt, Statement::Vacuum(_)))
-        {
+        if stmts.len() > 1 && stmts.iter().any(Self::statement_is_vacuum) {
             return Err(FusionError::Execution(
                 "VACUUM must be executed as a standalone statement".to_string(),
             ));
@@ -6879,7 +7106,10 @@ mod tests {
 
         assert_eq!(
             statement_permissions("DELETE FROM users WHERE id = 1"),
-            vec![("users".to_string(), "DELETE")]
+            vec![
+                ("users".to_string(), "DELETE"),
+                ("users".to_string(), "SELECT"),
+            ]
         );
 
         assert_eq!(
@@ -6888,6 +7118,11 @@ mod tests {
                 ("old_orders".to_string(), "DELETE"),
                 ("old_items".to_string(), "DELETE")
             ]
+        );
+
+        assert_eq!(
+            statement_permissions("ANALYZE TABLE users COMPUTE STATISTICS"),
+            vec![("users".to_string(), "ALL")]
         );
 
         assert_eq!(
@@ -6915,6 +7150,333 @@ mod tests {
                 ("old_items".to_string(), "ALL")
             ]
         );
+    }
+
+    #[test]
+    fn statement_permissions_cover_nested_queries_and_cte_scopes() {
+        assert_eq!(
+            statement_permissions("SELECT id FROM public_rows UNION ALL SELECT id FROM secrets"),
+            vec![
+                ("public_rows".to_string(), "SELECT"),
+                ("secrets".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "SELECT (SELECT id FROM secrets) FROM public_rows \
+                 WHERE EXISTS (SELECT 1 FROM audit_log)"
+            ),
+            vec![
+                ("secrets".to_string(), "SELECT"),
+                ("public_rows".to_string(), "SELECT"),
+                ("audit_log".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "WITH exposed AS (SELECT id FROM secrets) SELECT id FROM exposed"
+            ),
+            vec![("secrets".to_string(), "SELECT")]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "WITH first AS (SELECT id FROM public_rows), \
+                      second AS (SELECT id FROM first) \
+                 SELECT id FROM second"
+            ),
+            vec![("public_rows".to_string(), "SELECT")]
+        );
+
+        // A later non-recursive CTE is not visible to an earlier definition.
+        // If a stored table has that name, execution reads it and RBAC must not
+        // accidentally hide it as a temporary relation.
+        assert_eq!(
+            statement_permissions(
+                "WITH first AS (SELECT id FROM later), \
+                      later AS (SELECT id FROM public_rows) \
+                 SELECT id FROM first"
+            ),
+            vec![
+                ("later".to_string(), "SELECT"),
+                ("public_rows".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "WITH RECURSIVE r(n) AS ( \
+                     SELECT n FROM seed \
+                     UNION ALL \
+                     SELECT n + 1 FROM r WHERE n < 3 \
+                 ) SELECT n FROM r"
+            ),
+            vec![("seed".to_string(), "SELECT")]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "WITH RECURSIVE r(n) AS ( \
+                     SELECT n FROM r \
+                     UNION ALL \
+                     SELECT n + 1 FROM r WHERE n < 3 \
+                 ) SELECT n FROM r"
+            ),
+            // The recursive relation does not exist until after the anchor has
+            // run, so this first `r` is a physical-table read and must remain
+            // authorized. References in the recursive term and outer query are
+            // correctly resolved to the CTE and add no further requirement.
+            vec![("r".to_string(), "SELECT")]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "WITH scoped AS (SELECT id FROM outer_source) \
+                 SELECT nested.id FROM ( \
+                     WITH scoped AS (SELECT id FROM inner_source) \
+                     SELECT id FROM scoped \
+                 ) nested JOIN scoped ON nested.id = scoped.id"
+            ),
+            vec![
+                ("outer_source".to_string(), "SELECT"),
+                ("inner_source".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("INSERT INTO sink SELECT id FROM secrets"),
+            vec![
+                ("sink".to_string(), "INSERT"),
+                ("secrets".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "INSERT INTO sink (id) VALUES (1) \
+                 ON CONFLICT (id) DO UPDATE SET id = excluded.id"
+            ),
+            vec![
+                ("sink".to_string(), "INSERT"),
+                ("sink".to_string(), "UPDATE"),
+                ("sink".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("INSERT INTO sink (id) VALUES (1) ON CONFLICT DO NOTHING"),
+            vec![("sink".to_string(), "INSERT")]
+        );
+
+        assert_eq!(
+            statement_permissions("INSERT INTO sink (id) VALUES (1) RETURNING *"),
+            vec![
+                ("sink".to_string(), "INSERT"),
+                ("sink".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "INSERT INTO sink (id) VALUES (1) ON CONFLICT DO NOTHING RETURNING *"
+            ),
+            vec![
+                ("sink".to_string(), "INSERT"),
+                ("sink".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "INSERT INTO sink (id) VALUES (1) \
+                 ON CONFLICT (id) DO UPDATE SET id = excluded.id RETURNING *"
+            ),
+            vec![
+                ("sink".to_string(), "INSERT"),
+                ("sink".to_string(), "UPDATE"),
+                ("sink".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions(
+                "UPDATE public_rows SET id = (SELECT id FROM secrets) \
+                 WHERE EXISTS (SELECT 1 FROM audit_log)"
+            ),
+            vec![
+                ("public_rows".to_string(), "UPDATE"),
+                ("public_rows".to_string(), "SELECT"),
+                ("secrets".to_string(), "SELECT"),
+                ("audit_log".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("DELETE FROM public_rows WHERE EXISTS (SELECT 1 FROM secrets)"),
+            vec![
+                ("public_rows".to_string(), "DELETE"),
+                ("public_rows".to_string(), "SELECT"),
+                ("secrets".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("UPDATE public_rows SET id = 1 RETURNING *"),
+            vec![
+                ("public_rows".to_string(), "UPDATE"),
+                ("public_rows".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("DELETE FROM public_rows RETURNING *"),
+            vec![
+                ("public_rows".to_string(), "DELETE"),
+                ("public_rows".to_string(), "SELECT"),
+            ]
+        );
+
+        assert_eq!(
+            statement_permissions("SELECT * FROM \"Secret Table\""),
+            vec![("\"Secret Table\"".to_string(), "SELECT")]
+        );
+    }
+
+    #[tokio::test]
+    async fn rbac_authorization_rejects_every_nested_read_source() {
+        let wal_path = format!("test_nested_rbac_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> =
+            Arc::new(crate::storage::memory::MemoryStorage::new(&wal_path).unwrap());
+        let executor = Executor::new(storage);
+
+        executor
+            .execute_sql("CREATE USER reader WITH PASSWORD 'pw'")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("GRANT SELECT ON public_rows TO reader")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("GRANT INSERT ON sink TO reader")
+            .await
+            .unwrap();
+        executor
+            .authorize_sql("reader", "COPY sink FROM STDIN;")
+            .await
+            .expect("client-streamed COPY only requires table INSERT");
+        let error = executor
+            .authorize_sql("reader", "COPY sink FROM '/etc/passwd'")
+            .await
+            .expect_err("server-side COPY files must be operator-only");
+        assert!(
+            error.to_string().to_lowercase().contains("superuser"),
+            "unexpected server-side COPY authorization error: {error}"
+        );
+        let error = executor
+            .authorize_sql("reader", "DROP INDEX idx_sink")
+            .await
+            .expect_err("DROP INDEX must remain operator-only without ownership metadata");
+        assert!(
+            error.to_string().to_lowercase().contains("superuser"),
+            "unexpected DROP INDEX authorization error: {error}"
+        );
+
+        let nested_reads = [
+            "SELECT id FROM public_rows UNION ALL SELECT id FROM secrets",
+            "SELECT (SELECT id FROM secrets) FROM public_rows",
+            "WITH exposed AS (SELECT id FROM secrets) SELECT id FROM exposed",
+            "INSERT INTO sink SELECT id FROM secrets",
+        ];
+        for sql in nested_reads {
+            let error = executor
+                .authorize_sql("reader", sql)
+                .await
+                .expect_err(&format!("nested source must require SELECT: {sql}"));
+            assert!(
+                error.to_string().contains("secrets") && error.to_string().contains("SELECT"),
+                "unexpected authorization error for {sql}: {error}"
+            );
+        }
+
+        executor
+            .execute_sql("GRANT SELECT ON secrets TO reader")
+            .await
+            .unwrap();
+        for sql in nested_reads {
+            executor
+                .authorize_sql("reader", sql)
+                .await
+                .expect(&format!("all required permissions are granted: {sql}"));
+        }
+
+        executor
+            .execute_sql("CREATE USER writer WITH PASSWORD 'pw'")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("GRANT INSERT ON sink TO writer")
+            .await
+            .unwrap();
+        executor
+            .execute_sql("GRANT UPDATE, DELETE ON secrets TO writer")
+            .await
+            .unwrap();
+
+        let upsert = "INSERT INTO sink (id) VALUES (1) \
+                      ON CONFLICT (id) DO UPDATE SET id = excluded.id";
+        let upsert_returning = "INSERT INTO sink (id) VALUES (1) \
+                                ON CONFLICT (id) DO UPDATE SET id = excluded.id RETURNING *";
+        let do_nothing = "INSERT INTO sink (id) VALUES (1) ON CONFLICT DO NOTHING";
+        executor.authorize_sql("writer", do_nothing).await.unwrap();
+        let error = executor.authorize_sql("writer", upsert).await.unwrap_err();
+        assert!(
+            error.to_string().contains("sink") && error.to_string().contains("UPDATE"),
+            "UPSERT must require target UPDATE: {error}"
+        );
+
+        let returning_statements = [
+            "INSERT INTO sink (id) VALUES (1) RETURNING *",
+            "UPDATE secrets SET id = 1 RETURNING *",
+            "DELETE FROM secrets RETURNING *",
+        ];
+        for sql in returning_statements {
+            let error = executor.authorize_sql("writer", sql).await.unwrap_err();
+            assert!(
+                error.to_string().contains("SELECT"),
+                "RETURNING must require target SELECT for {sql}: {error}"
+            );
+        }
+
+        executor
+            .execute_sql("GRANT UPDATE ON sink TO writer")
+            .await
+            .unwrap();
+        let error = executor.authorize_sql("writer", upsert).await.unwrap_err();
+        assert!(
+            error.to_string().contains("sink") && error.to_string().contains("SELECT"),
+            "UPSERT must require target SELECT in the table-level privilege model: {error}"
+        );
+        executor
+            .execute_sql("GRANT SELECT ON sink TO writer")
+            .await
+            .unwrap();
+        executor.authorize_sql("writer", upsert).await.unwrap();
+        executor
+            .authorize_sql("writer", upsert_returning)
+            .await
+            .unwrap();
+        executor
+            .execute_sql("GRANT SELECT ON secrets TO writer")
+            .await
+            .unwrap();
+        for sql in returning_statements {
+            executor.authorize_sql("writer", sql).await.unwrap();
+        }
+
+        let _ = std::fs::remove_file(wal_path);
     }
 
     #[test]
@@ -8594,6 +9156,11 @@ mod tests {
             .await
             .expect_err("migration CALL must be standalone");
         assert!(error.to_string().contains("standalone"));
+        let error = executor
+            .execute_sql("EXPLAIN ANALYZE CALL fusiondb_data_migration_init(); SELECT 1")
+            .await
+            .expect_err("an explained migration CALL must remain standalone");
+        assert!(error.to_string().contains("standalone"));
 
         let shown = executor
             .execute_sql("SHOW DATA MIGRATION PHASE")
@@ -8649,6 +9216,9 @@ mod tests {
             "/* sneak */ CALL fusiondb_data_migration_init()",
             "CALL\tfusiondb_data_migration_advance('write-delete-shadow')",
             "  \n CALL fusiondb_data_migration_init()",
+            "EXPLAIN CALL fusiondb_data_backfill_status()",
+            "EXPLAIN ANALYZE CALL fusiondb_data_migration_init()",
+            "EXPLAIN ANALYZE VACUUM",
         ] {
             let error = executor
                 .authorize_sql("alice", sql)

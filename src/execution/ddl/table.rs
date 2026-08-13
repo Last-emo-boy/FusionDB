@@ -651,6 +651,24 @@ impl Executor {
         table_names: &[sqlparser::ast::TruncateTableTarget],
         txn: &mut dyn Transaction,
     ) -> Result<QueryResult> {
+        let truncated_tables: HashSet<String> = table_names
+            .iter()
+            .map(|target| target.name.to_string())
+            .collect();
+        for table_name in &truncated_tables {
+            if let Some(reference) = self
+                .load_parent_foreign_keys(table_name, txn)
+                .await?
+                .into_iter()
+                .find(|foreign_key| !truncated_tables.contains(&foreign_key.child_table))
+            {
+                return Err(FusionError::Execution(format!(
+                    "Cannot truncate table {} because it is referenced by FOREIGN KEY '{}' on table {}",
+                    table_name, reference.name, reference.child_table
+                )));
+            }
+        }
+
         let mut count = 0;
         for target in table_names {
             let table_name = target.name.to_string();

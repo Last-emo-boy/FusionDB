@@ -502,6 +502,19 @@ pub trait Transaction: Send + Sync {
         Ok(None)
     }
 
+    /// Visit a transaction-local logical relation without consulting a shadowed
+    /// persistent relation. Transactions without relation overlays return
+    /// `None`, allowing the executor to use the normal routed key scan.
+    async fn scan_relation_overlay_for_each(
+        &self,
+        _table_name: &str,
+        _limit: Option<usize>,
+        _visitor: &mut dyn ScanVisitor,
+        _options: StorageScanOptions,
+    ) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
     /// Scan keys in a range [start, end) with optional limit
     async fn scan_range(
         &self,

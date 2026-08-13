@@ -2708,12 +2708,11 @@ mod tests {
         let _ = std::fs::remove_file(wal_path);
     }
 
-    /// CTE materialization writes rows into the legacy `data:` namespace, so
-    /// its batches must carry a phase precondition too — otherwise the guard
-    /// above would reject ordinary `INSERT ... WITH ...` statements on a
-    /// cluster that has reached Backfill.
+    /// CTE materialization is query-local and must never enter a replicated
+    /// mutation batch. A zero-row outer INSERT therefore carries no CTE
+    /// schema/data mutations even after the cluster reaches Backfill.
     #[tokio::test]
-    async fn cte_batches_carry_a_phase_precondition_and_apply_at_backfill() {
+    async fn cte_rows_stay_out_of_raft_batches_at_backfill() {
         let (mut store, storage, wal_path) = test_store("phase_cte_fenced");
         let executor = Executor::new(storage.clone());
         executor
@@ -2753,8 +2752,8 @@ mod tests {
                 .unwrap();
         }
 
-        // A CTE whose outer INSERT selects nothing: the only data-family
-        // mutations in the batch come from materializing the CTE.
+        // The outer INSERT selects nothing, so any schema/data mutation would
+        // necessarily be an accidental persistence of the CTE itself.
         let request = evaluate_sql_to_request(
             &executor,
             "INSERT INTO cte_dst WITH batch AS (SELECT id FROM cte_src) SELECT id FROM batch WHERE id > 999999",
@@ -2765,11 +2764,12 @@ mod tests {
             panic!("expected a mutation batch");
         };
         assert!(
-            batch
-                .preconditions
-                .iter()
-                .any(|p| p.key == migration_phase_key()),
-            "a batch containing CTE data-family writes must be fenced"
+            batch.mutations.is_empty(),
+            "CTE rows must not be replicated"
+        );
+        assert!(
+            batch.side_index_mutations.is_empty(),
+            "CTE rows must not produce replicated side-index mutations"
         );
 
         let response = store

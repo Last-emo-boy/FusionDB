@@ -1645,6 +1645,54 @@ async fn test_truncate_table() {
 }
 
 #[tokio::test]
+async fn test_truncate_preserves_foreign_key_integrity() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE trunc_parent (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE trunc_child (\
+             id INTEGER PRIMARY KEY, \
+             parent_id INTEGER REFERENCES trunc_parent(id)\
+         )",
+    )
+    .await;
+    exec_ok(&executor, "INSERT INTO trunc_parent VALUES (1)").await;
+    exec_ok(&executor, "INSERT INTO trunc_child VALUES (10, 1)").await;
+
+    let error = executor
+        .execute_sql("TRUNCATE TABLE trunc_parent")
+        .await
+        .expect_err("a referenced parent must not be truncated alone");
+    assert!(
+        error.to_string().contains("FOREIGN KEY") && error.to_string().contains("trunc_child"),
+        "unexpected truncate error: {error}"
+    );
+    assert_eq!(
+        query(&executor, "SELECT * FROM trunc_parent").await.1.len(),
+        1
+    );
+    assert_eq!(
+        query(&executor, "SELECT * FROM trunc_child").await.1.len(),
+        1
+    );
+
+    exec_ok(&executor, "TRUNCATE TABLE trunc_child, trunc_parent").await;
+    assert!(query(&executor, "SELECT * FROM trunc_parent")
+        .await
+        .1
+        .is_empty());
+    assert!(query(&executor, "SELECT * FROM trunc_child")
+        .await
+        .1
+        .is_empty());
+    cleanup(&wal);
+}
+
+#[tokio::test]
 async fn test_truncate_table_invalidates_row_cache() {
     let (executor, wal) = setup().await;
     exec_ok(

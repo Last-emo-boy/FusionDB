@@ -3,14 +3,14 @@ mod order;
 
 use crate::catalog::{Column, IndexType, TableSchema};
 use crate::common::{FusionError, Result, Value};
-use crate::storage::Transaction;
+use crate::storage::{ScanVisitor, StorageScanOptions, Transaction};
 use sqlparser::ast::{
     Cte, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause,
     ObjectName, ObjectNamePart, OrderByKind, SelectItem, SetExpr, SetOperator, SetQuantifier,
     TableFactor,
 };
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{AggregateAccumulator, Executor, QueryResult};
 use order::SortOrderKey;
@@ -24,28 +24,582 @@ fn join_group_left_bucket() -> Vec<Vec<Value>> {
     Vec::with_capacity(1)
 }
 
-fn materialized_cte_data_prefix_for_name(cte_name: &str) -> String {
-    let mut prefix = String::with_capacity("data:".len() + cte_name.len() + 1);
-    prefix.push_str("data:");
-    prefix.push_str(cte_name);
-    prefix.push(':');
-    prefix
-}
-
-fn materialized_cte_data_key_for_row_id(cte_name: &str, row_id: &str) -> String {
-    let mut key = String::with_capacity("data:".len() + cte_name.len() + 1 + row_id.len());
-    key.push_str("data:");
-    key.push_str(cte_name);
-    key.push(':');
-    key.push_str(row_id);
-    key
-}
-
 fn query_schema_key_for_table(table_name: &str) -> String {
     let mut key = String::with_capacity("schema:".len() + table_name.len());
     key.push_str("schema:");
     key.push_str(table_name);
     key
+}
+
+struct QueryLocalTransactionMarker;
+
+static QUERY_LOCAL_TRANSACTION_MARKER: QueryLocalTransactionMarker = QueryLocalTransactionMarker;
+
+pub(super) fn transaction_is_query_local(txn: &dyn Transaction) -> bool {
+    txn.as_any().is::<QueryLocalTransactionMarker>()
+}
+
+struct QueryLocalRelation {
+    table_name: String,
+    schema_key: Vec<u8>,
+    data_prefixes: Vec<Vec<u8>>,
+    shadowed_schema: Option<TableSchema>,
+    shard_router: Option<crate::distributed::sharding::ShardRouter>,
+    local_data_keys: Vec<Vec<u8>>,
+}
+
+/// A read-through transaction scope whose CTE relations exist only for the
+/// lifetime of one query. CTE keys shadow the matching persistent relation,
+/// while every unrelated key is delegated to the caller's transaction.
+struct QueryLocalTransaction<'a> {
+    inner: &'a mut dyn Transaction,
+    values: BTreeMap<Vec<u8>, Vec<u8>>,
+    relations: Vec<QueryLocalRelation>,
+}
+
+struct QueryLocalMergeVisitor<'scope, 'transaction, 'output> {
+    transaction: &'scope QueryLocalTransaction<'transaction>,
+    local_rows: Vec<(&'scope [u8], &'scope [u8])>,
+    local_index: usize,
+    output: &'output mut dyn ScanVisitor,
+    limit: Option<usize>,
+    emitted: usize,
+    stopped: bool,
+}
+
+impl QueryLocalMergeVisitor<'_, '_, '_> {
+    fn emit(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if self.stopped || self.limit.is_some_and(|limit| self.emitted >= limit) {
+            self.stopped = true;
+            return false;
+        }
+        self.emitted += 1;
+        if !self.output.visit(key, value) || self.limit.is_some_and(|limit| self.emitted >= limit) {
+            self.stopped = true;
+            return false;
+        }
+        true
+    }
+
+    fn emit_local_before(&mut self, upper_bound: Option<&[u8]>) -> bool {
+        while let Some((key, value)) = self.local_rows.get(self.local_index).copied() {
+            if upper_bound.is_some_and(|upper_bound| key >= upper_bound) {
+                break;
+            }
+            self.local_index += 1;
+            if !self.emit(key, value) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn finish(&mut self) {
+        if !self.stopped {
+            self.emit_local_before(None);
+        }
+    }
+}
+
+impl ScanVisitor for QueryLocalMergeVisitor<'_, '_, '_> {
+    fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if !self.emit_local_before(Some(key)) {
+            return false;
+        }
+
+        if self
+            .local_rows
+            .get(self.local_index)
+            .is_some_and(|(local_key, _)| *local_key == key)
+        {
+            let (local_key, local_value) = self.local_rows[self.local_index];
+            self.local_index += 1;
+            return self.emit(local_key, local_value);
+        }
+
+        if self.transaction.key_value_is_shadowed(key, value) {
+            return true;
+        }
+        self.emit(key, value)
+    }
+}
+
+impl<'a> QueryLocalTransaction<'a> {
+    fn new(inner: &'a mut dyn Transaction) -> Self {
+        Self {
+            inner,
+            values: BTreeMap::new(),
+            relations: Vec::new(),
+        }
+    }
+
+    fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut end = prefix.to_vec();
+        while let Some(last) = end.last_mut() {
+            if *last < u8::MAX {
+                *last += 1;
+                return Some(end);
+            }
+            end.pop();
+        }
+        None
+    }
+
+    fn relation_owns_data_entry(relation: &QueryLocalRelation, key: &[u8], value: &[u8]) -> bool {
+        let Some((prefix_index, suffix)) =
+            relation
+                .data_prefixes
+                .iter()
+                .enumerate()
+                .find_map(|(index, prefix)| {
+                    key.strip_prefix(prefix.as_slice())
+                        .map(|suffix| (index, suffix))
+                })
+        else {
+            return false;
+        };
+        let Ok(suffix) = std::str::from_utf8(suffix) else {
+            return false;
+        };
+        if suffix.is_empty() {
+            return false;
+        }
+
+        if let Some(schema) = &relation.shadowed_schema {
+            if let Some(pk_index) = schema.get_primary_key_index() {
+                if let Ok(Some(pk_value)) =
+                    crate::common::encoding::RowDecoder::decode_column(value, pk_index)
+                {
+                    if let Some(row_id) = Executor::value_to_primary_row_id(&pk_value) {
+                        let expected_prefix_index = relation
+                            .shard_router
+                            .as_ref()
+                            .map(|router| {
+                                router.route_key(&relation.table_name, &row_id).shard_id as usize
+                            })
+                            .unwrap_or(0);
+                        return expected_prefix_index == prefix_index && suffix == row_id;
+                    }
+                }
+            }
+        }
+
+        !suffix.contains(':')
+    }
+
+    fn key_value_is_shadowed(&self, key: &[u8], value: &[u8]) -> bool {
+        self.relations.iter().any(|relation| {
+            relation.schema_key.as_slice() == key
+                || Self::relation_owns_data_entry(relation, key, value)
+        })
+    }
+
+    fn key_is_local_or_schema(&self, key: &[u8]) -> bool {
+        self.values.contains_key(key)
+            || self
+                .relations
+                .iter()
+                .any(|relation| relation.schema_key.as_slice() == key)
+    }
+
+    fn prefix_intersects_shadow(&self, prefix: &[u8]) -> bool {
+        self.relations.iter().any(|relation| {
+            relation.schema_key.starts_with(prefix)
+                || relation
+                    .data_prefixes
+                    .iter()
+                    .any(|shadow| shadow.starts_with(prefix) || prefix.starts_with(shadow))
+        })
+    }
+
+    fn range_intersects_shadow(&self, start: &[u8], end: &[u8]) -> bool {
+        if start >= end {
+            return false;
+        }
+        if self.relations.iter().any(|relation| {
+            relation.schema_key.as_slice() >= start && relation.schema_key.as_slice() < end
+        }) {
+            return true;
+        }
+        self.relations
+            .iter()
+            .flat_map(|relation| &relation.data_prefixes)
+            .any(|prefix| {
+                let Some(prefix_end) = Self::prefix_end(prefix) else {
+                    return prefix.as_slice() < end;
+                };
+                prefix.as_slice() < end && prefix_end.as_slice() > start
+            })
+    }
+
+    fn replace_relation(
+        &mut self,
+        table_name: String,
+        schema_key: Vec<u8>,
+        schema_value: Vec<u8>,
+        data_prefixes: Vec<Vec<u8>>,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+        shadowed_schema: Option<TableSchema>,
+        shard_router: Option<crate::distributed::sharding::ShardRouter>,
+    ) {
+        let mut local_data_keys: Vec<Vec<u8>> = rows.iter().map(|(key, _)| key.clone()).collect();
+        local_data_keys.sort_unstable();
+        local_data_keys.dedup();
+        if let Some(index) = self
+            .relations
+            .iter()
+            .position(|relation| relation.table_name == table_name)
+        {
+            for key in std::mem::take(&mut self.relations[index].local_data_keys) {
+                self.values.remove(&key);
+            }
+            self.relations[index].local_data_keys = local_data_keys;
+        } else {
+            self.relations.push(QueryLocalRelation {
+                table_name,
+                schema_key: schema_key.clone(),
+                data_prefixes,
+                shadowed_schema,
+                shard_router,
+                local_data_keys,
+            });
+        }
+        self.values.insert(schema_key, schema_value);
+        self.values.extend(rows);
+    }
+
+    async fn overlay_prefix_rows(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut rows = Vec::with_capacity(limit.unwrap_or(0).min(4096));
+        let mut collect = |key: &[u8], value: &[u8]| {
+            rows.push((key.to_vec(), value.to_vec()));
+            true
+        };
+        self.visit_overlay_prefix_rows(prefix, limit, &mut collect, None)
+            .await?;
+        Ok(rows)
+    }
+
+    async fn overlay_range_rows(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if start >= end || limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut rows = Vec::with_capacity(limit.unwrap_or(0).min(4096));
+        let mut collect = |key: &[u8], value: &[u8]| {
+            rows.push((key.to_vec(), value.to_vec()));
+            true
+        };
+        self.visit_overlay_range_rows(start, end, limit, &mut collect, None)
+            .await?;
+        Ok(rows)
+    }
+
+    async fn visit_overlay_prefix_rows(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: Option<StorageScanOptions>,
+    ) -> Result<usize> {
+        if limit == Some(0) {
+            return Ok(0);
+        }
+        let local_rows = self
+            .values
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.as_slice(), value.as_slice()))
+            .collect();
+        let mut merge = QueryLocalMergeVisitor {
+            transaction: self,
+            local_rows,
+            local_index: 0,
+            output: visitor,
+            limit,
+            emitted: 0,
+            stopped: false,
+        };
+        if let Some(options) = options {
+            self.inner
+                .scan_prefix_for_each_with_options(prefix, None, &mut merge, options)
+                .await?;
+        } else {
+            self.inner
+                .scan_prefix_for_each(prefix, None, &mut merge)
+                .await?;
+        }
+        merge.finish();
+        Ok(merge.emitted)
+    }
+
+    async fn visit_overlay_range_rows(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: Option<StorageScanOptions>,
+    ) -> Result<usize> {
+        if start >= end || limit == Some(0) {
+            return Ok(0);
+        }
+        let local_rows = self
+            .values
+            .range(start.to_vec()..end.to_vec())
+            .map(|(key, value)| (key.as_slice(), value.as_slice()))
+            .collect();
+        let mut merge = QueryLocalMergeVisitor {
+            transaction: self,
+            local_rows,
+            local_index: 0,
+            output: visitor,
+            limit,
+            emitted: 0,
+            stopped: false,
+        };
+        if let Some(options) = options {
+            self.inner
+                .scan_range_for_each_with_options(start, end, None, &mut merge, options)
+                .await?;
+        } else {
+            self.inner
+                .scan_range_for_each(start, end, None, &mut merge)
+                .await?;
+        }
+        merge.finish();
+        Ok(merge.emitted)
+    }
+}
+
+#[async_trait::async_trait]
+impl Transaction for QueryLocalTransaction<'_> {
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(value) = self.values.get(key) {
+            return Ok(Some(value.clone()));
+        }
+        if self
+            .relations
+            .iter()
+            .any(|relation| relation.schema_key.as_slice() == key)
+        {
+            return Ok(None);
+        }
+        let value = self.inner.get(key).await?;
+        if value
+            .as_deref()
+            .is_some_and(|value| self.key_value_is_shadowed(key, value))
+        {
+            return Ok(None);
+        }
+        Ok(value)
+    }
+
+    async fn fence_data_migration_phase(&mut self, phase: u8, phase_seq: u64) -> Result<()> {
+        self.inner
+            .fence_data_migration_phase(phase, phase_seq)
+            .await
+    }
+
+    fn data_migration_phase_pin(&self) -> Option<(u8, u64)> {
+        self.inner.data_migration_phase_pin()
+    }
+
+    async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.key_is_local_or_schema(key) || self.key_value_is_shadowed(key, value) {
+            return Err(FusionError::Execution(
+                "query-local CTE storage cannot be mutated through SQL writes".to_string(),
+            ));
+        }
+        self.inner.put(key, value).await
+    }
+
+    async fn delete(&mut self, key: &[u8]) -> Result<()> {
+        if self.key_is_local_or_schema(key) {
+            return Err(FusionError::Execution(
+                "query-local CTE storage cannot be mutated through SQL writes".to_string(),
+            ));
+        }
+        self.inner.delete(key).await
+    }
+
+    async fn scan_prefix(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.prefix_intersects_shadow(prefix) {
+            return self.inner.scan_prefix(prefix, limit).await;
+        }
+        self.overlay_prefix_rows(prefix, limit).await
+    }
+
+    async fn scan_prefix_for_each(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        if !self.prefix_intersects_shadow(prefix) {
+            return self
+                .inner
+                .scan_prefix_for_each(prefix, limit, visitor)
+                .await;
+        }
+        self.visit_overlay_prefix_rows(prefix, limit, visitor, None)
+            .await
+    }
+
+    async fn scan_prefix_for_each_with_options(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<usize> {
+        if !self.prefix_intersects_shadow(prefix) {
+            return self
+                .inner
+                .scan_prefix_for_each_with_options(prefix, limit, visitor, options)
+                .await;
+        }
+        self.visit_overlay_prefix_rows(prefix, limit, visitor, Some(options))
+            .await
+    }
+
+    async fn scan_relation_overlay_for_each(
+        &self,
+        table_name: &str,
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<Option<usize>> {
+        let Some(relation) = self
+            .relations
+            .iter()
+            .find(|relation| relation.table_name == table_name)
+        else {
+            return self
+                .inner
+                .scan_relation_overlay_for_each(table_name, limit, visitor, options)
+                .await;
+        };
+        if limit == Some(0) {
+            return Ok(Some(0));
+        }
+
+        let mut visited = 0usize;
+        for prefix in &relation.data_prefixes {
+            for key in &relation.local_data_keys {
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+                let Some(value) = self.values.get(key) else {
+                    continue;
+                };
+                visited += 1;
+                if !visitor.visit(key, value) || limit.is_some_and(|limit| visited >= limit) {
+                    return Ok(Some(visited));
+                }
+            }
+        }
+        Ok(Some(visited))
+    }
+
+    async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.range_intersects_shadow(start, end) {
+            return self.inner.scan_range(start, end, limit).await;
+        }
+        self.overlay_range_rows(start, end, limit).await
+    }
+
+    async fn scan_range_for_each(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<usize> {
+        if !self.range_intersects_shadow(start, end) {
+            return self
+                .inner
+                .scan_range_for_each(start, end, limit, visitor)
+                .await;
+        }
+        self.visit_overlay_range_rows(start, end, limit, visitor, None)
+            .await
+    }
+
+    async fn scan_range_for_each_with_options(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+        visitor: &mut dyn ScanVisitor,
+        options: StorageScanOptions,
+    ) -> Result<usize> {
+        if !self.range_intersects_shadow(start, end) {
+            return self
+                .inner
+                .scan_range_for_each_with_options(start, end, limit, visitor, options)
+                .await;
+        }
+        self.visit_overlay_range_rows(start, end, limit, visitor, Some(options))
+            .await
+    }
+
+    async fn count_prefix(&self, prefix: &[u8]) -> Result<usize> {
+        if !self.prefix_intersects_shadow(prefix) {
+            return self.inner.count_prefix(prefix).await;
+        }
+        Ok(self.overlay_prefix_rows(prefix, None).await?.len())
+    }
+
+    async fn first(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if !self.range_intersects_shadow(start, end) {
+            return self.inner.first(start, end).await;
+        }
+        Ok(self
+            .overlay_range_rows(start, end, Some(1))
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn last(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if !self.range_intersects_shadow(start, end) {
+            return self.inner.last(start, end).await;
+        }
+        Ok(self.overlay_range_rows(start, end, None).await?.pop())
+    }
+
+    async fn commit(self: Box<Self>) -> Result<()> {
+        Err(FusionError::Execution(
+            "query-local CTE transaction scope cannot commit".to_string(),
+        ))
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<()> {
+        Err(FusionError::Execution(
+            "query-local CTE transaction scope cannot roll back its parent".to_string(),
+        ))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        &QUERY_LOCAL_TRANSACTION_MARKER
+    }
 }
 
 #[cfg(test)]
@@ -1167,9 +1721,9 @@ impl Executor {
         "UNKNOWN".to_string()
     }
 
-    async fn put_materialized_cte(
+    async fn replace_materialized_cte(
         &self,
-        txn: &mut dyn Transaction,
+        txn: &mut QueryLocalTransaction<'_>,
         cte_name: &str,
         columns: &[String],
         rows: &[Vec<Value>],
@@ -1188,53 +1742,51 @@ impl Executor {
                 check_expr: None,
             });
         }
-        // CTE rows live in the legacy `data:` namespace, so they are
-        // data-family writes and must observe the Data V2 migration phase
-        // like any other. Without this their Raft batches carry no phase
-        // precondition and the apply-side guard rejects them at >= Backfill.
-        self.observe_data_migration_phase_and_fence(txn).await?;
         let schema = TableSchema::new(cte_name.to_string(), cols);
         let schema_key = query_schema_key_for_table(cte_name);
+        let shadowed_schema = if txn
+            .relations
+            .iter()
+            .any(|relation| relation.table_name == cte_name)
+        {
+            None
+        } else {
+            txn.get(schema_key.as_bytes())
+                .await?
+                .map(|bytes| {
+                    bincode::deserialize(&bytes).map_err(|e| {
+                        FusionError::Execution(format!(
+                            "shadowed relation schema deserialization error: {}",
+                            e
+                        ))
+                    })
+                })
+                .transpose()?
+        };
         let schema_bytes = bincode::serialize(&schema)
             .map_err(|e| FusionError::Execution(format!("CTE schema error: {}", e)))?;
-        txn.put(schema_key.as_bytes(), &schema_bytes).await?;
 
+        let mut encoded_rows = Vec::with_capacity(rows.len());
         for (i, row) in rows.iter().enumerate() {
             let pk_str = crate::common::encoding::encode_i64_comparable(i as i64);
-            let key = materialized_cte_data_key_for_row_id(cte_name, &pk_str);
+            let key = self.routed_data_key_for_row_id(cte_name, &pk_str);
             let val = crate::common::encoding::RowEncoder::encode(row);
-            txn.put(key.as_bytes(), &val).await?;
+            encoded_rows.push((key.into_bytes(), val));
         }
 
+        txn.replace_relation(
+            cte_name.to_string(),
+            schema_key.into_bytes(),
+            schema_bytes,
+            self.routed_data_prefixes_for_table(cte_name)
+                .into_iter()
+                .map(String::into_bytes)
+                .collect(),
+            encoded_rows,
+            shadowed_schema,
+            self.shard_router.clone(),
+        );
         Ok(())
-    }
-
-    async fn clear_materialized_cte(
-        &self,
-        txn: &mut dyn Transaction,
-        cte_name: &str,
-    ) -> Result<()> {
-        self.observe_data_migration_phase_and_fence(txn).await?;
-        let schema_key = query_schema_key_for_table(cte_name);
-        txn.delete(schema_key.as_bytes()).await?;
-        let prefix = materialized_cte_data_prefix_for_name(cte_name);
-        let entries = txn.scan_prefix(prefix.as_bytes(), None).await?;
-        for (key, _) in entries {
-            txn.delete(&key).await?;
-        }
-        Ok(())
-    }
-
-    async fn replace_materialized_cte(
-        &self,
-        txn: &mut dyn Transaction,
-        cte_name: &str,
-        columns: &[String],
-        rows: &[Vec<Value>],
-    ) -> Result<()> {
-        self.clear_materialized_cte(txn, cte_name).await?;
-        self.put_materialized_cte(txn, cte_name, columns, rows)
-            .await
     }
 
     fn recursive_union_parts(
@@ -1270,7 +1822,7 @@ impl Executor {
     async fn materialize_recursive_cte(
         &self,
         cte: &Cte,
-        txn: &mut dyn Transaction,
+        txn: &mut QueryLocalTransaction<'_>,
         params: &[Value],
     ) -> Result<String> {
         let cte_name = cte.alias.name.value.clone();
@@ -2096,35 +2648,41 @@ impl Executor {
         txn: &mut dyn Transaction,
         params: &[Value],
     ) -> Result<QueryResult> {
-        // Materialize CTEs (WITH ... AS) as temporary tables in the transaction
-        let mut cte_names: Vec<String> =
-            Vec::with_capacity(query.with.as_ref().map_or(0, |with| with.cte_tables.len()));
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                let cte_name = cte.alias.name.value.clone();
-                if with.recursive && Self::recursive_union_parts(&cte.query).is_some() {
-                    cte_names.push(self.materialize_recursive_cte(cte, txn, params).await?);
-                    continue;
-                }
+        if query.with.is_some() {
+            let mut scoped_txn = QueryLocalTransaction::new(txn);
+            return Box::pin(self.handle_query_with_cte_scope(query, &mut scoped_txn, params))
+                .await;
+        }
 
-                let result = Box::pin(self.handle_query(&cte.query, txn, params)).await?;
-                if let QueryResult::Select { columns, rows } = result {
-                    let columns = Self::cte_output_columns(cte, &columns)?;
-                    self.put_materialized_cte(txn, &cte_name, &columns, &rows)
-                        .await?;
-                    cte_names.push(cte_name);
-                }
+        self.handle_query_inner(query, txn, params).await
+    }
+
+    async fn handle_query_with_cte_scope(
+        &self,
+        query: &sqlparser::ast::Query,
+        txn: &mut QueryLocalTransaction<'_>,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let with = query
+            .with
+            .as_ref()
+            .expect("CTE scope requires a WITH clause");
+        for cte in &with.cte_tables {
+            let cte_name = cte.alias.name.value.clone();
+            if with.recursive && Self::recursive_union_parts(&cte.query).is_some() {
+                self.materialize_recursive_cte(cte, txn, params).await?;
+                continue;
+            }
+
+            let result = Box::pin(self.handle_query(&cte.query, txn, params)).await?;
+            if let QueryResult::Select { columns, rows } = result {
+                let columns = Self::cte_output_columns(cte, &columns)?;
+                self.replace_materialized_cte(txn, &cte_name, &columns, &rows)
+                    .await?;
             }
         }
 
-        let result = self.handle_query_inner(query, txn, params).await;
-
-        // Cleanup CTE temporary tables
-        for name in &cte_names {
-            let _ = self.clear_materialized_cte(txn, name).await;
-        }
-
-        result
+        self.handle_query_inner(query, txn, params).await
     }
 
     async fn handle_query_inner(
@@ -3770,7 +4328,414 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{memory::MemoryStorage, Storage};
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+    use std::sync::Arc;
+
+    struct PanicOnScanTransaction;
+
+    #[async_trait::async_trait]
+    impl Transaction for PanicOnScanTransaction {
+        async fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn put(&mut self, _key: &[u8], _value: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&mut self, _key: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn scan_prefix(
+            &self,
+            _prefix: &[u8],
+            _limit: Option<usize>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            panic!("query-local data scans must not reach the shadowed persistent relation")
+        }
+
+        async fn scan_prefix_for_each(
+            &self,
+            _prefix: &[u8],
+            _limit: Option<usize>,
+            _visitor: &mut dyn ScanVisitor,
+        ) -> Result<usize> {
+            panic!("query-local visitor scans must not reach the shadowed persistent relation")
+        }
+
+        async fn scan_range(
+            &self,
+            _start: &[u8],
+            _end: &[u8],
+            _limit: Option<usize>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            panic!("query-local range scans must not reach the shadowed persistent relation")
+        }
+
+        async fn count_prefix(&self, _prefix: &[u8]) -> Result<usize> {
+            panic!("query-local counts must not reach the shadowed persistent relation")
+        }
+
+        async fn first(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+            panic!("query-local first must not reach the shadowed persistent relation")
+        }
+
+        async fn last(&self, _start: &[u8], _end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+            panic!("query-local last must not reach the shadowed persistent relation")
+        }
+
+        async fn commit(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn query_local_test_executor() -> (Executor, Arc<dyn Storage>, String) {
+        let wal_path = format!("test_query_local_cte_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+        (Executor::new(storage.clone()), storage, wal_path)
+    }
+
+    async fn query_local_storage_snapshot(storage: &Arc<dyn Storage>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let txn = storage.begin_transaction().await.unwrap();
+        let rows = txn.scan_range(b"", b"\xff", None).await.unwrap();
+        txn.rollback().await.unwrap();
+        rows
+    }
+
+    fn one_select_rows(results: Vec<QueryResult>) -> Vec<Vec<Value>> {
+        assert_eq!(results.len(), 1);
+        match results.into_iter().next().unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_local_limit_never_scans_same_named_persistent_relation() {
+        let mut inner = PanicOnScanTransaction;
+        let mut scoped = QueryLocalTransaction::new(&mut inner);
+        scoped.replace_relation(
+            "t".to_string(),
+            b"schema:t".to_vec(),
+            b"local-schema".to_vec(),
+            vec![b"data:t:".to_vec()],
+            vec![
+                (b"data:t:1".to_vec(), b"first".to_vec()),
+                (b"data:t:2".to_vec(), b"second".to_vec()),
+            ],
+            None,
+            None,
+        );
+
+        let mut visited_rows = Vec::new();
+        let mut collect = |key: &[u8], value: &[u8]| {
+            visited_rows.push((key.to_vec(), value.to_vec()));
+            true
+        };
+        let visited = scoped
+            .scan_relation_overlay_for_each(
+                "t",
+                Some(1),
+                &mut collect,
+                StorageScanOptions::fill_cache(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(visited, Some(1));
+        assert_eq!(
+            visited_rows,
+            vec![(b"data:t:1".to_vec(), b"first".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_local_cte_scope_never_mutates_same_named_persistent_relation_or_wal() {
+        let (executor, storage, wal_path) = query_local_test_executor();
+        executor
+            .execute_sql(
+                "CREATE TABLE preserved (id INTEGER PRIMARY KEY, label TEXT); \
+                 INSERT INTO preserved VALUES (7, 'persistent')",
+            )
+            .await
+            .unwrap();
+
+        let before = query_local_storage_snapshot(&storage).await;
+        let wal_len_before = std::fs::metadata(&wal_path).unwrap().len();
+        let rows = one_select_rows(
+            executor
+                .execute_sql(
+                    "WITH preserved AS (SELECT 9 AS id, 'query-local' AS label) \
+                     SELECT id, label FROM preserved",
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Integer(9),
+                Value::String("query-local".to_string())
+            ]]
+        );
+        assert_eq!(query_local_storage_snapshot(&storage).await, before);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len_before);
+
+        executor
+            .execute_sql(
+                "WITH preserved AS (SELECT 10 AS id, 'discarded' AS label) \
+                 SELECT * FROM relation_that_does_not_exist",
+            )
+            .await
+            .expect_err("query body must fail after CTE materialization");
+        assert_eq!(query_local_storage_snapshot(&storage).await, before);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len_before);
+
+        let persistent_rows = one_select_rows(
+            executor
+                .execute_sql("SELECT id, label FROM preserved")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            persistent_rows,
+            vec![vec![
+                Value::Integer(7),
+                Value::String("persistent".to_string())
+            ]]
+        );
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn query_local_nested_cte_scope_restores_outer_relation() {
+        let (executor, _storage, wal_path) = query_local_test_executor();
+        let rows = one_select_rows(
+            executor
+                .execute_sql(
+                    "WITH scoped AS (SELECT 1 AS value) \
+                     SELECT value FROM scoped \
+                     UNION ALL \
+                     SELECT value FROM (WITH scoped AS (SELECT 2 AS value) \
+                                        SELECT value FROM scoped) nested \
+                     UNION ALL \
+                     SELECT value FROM scoped",
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Integer(1)]
+            ]
+        );
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn query_local_cte_never_uses_same_named_persistent_indexes() {
+        let (executor, _storage, wal_path) = query_local_test_executor();
+        executor
+            .execute_sql(
+                "CREATE TABLE indexed_cte (\
+                     id INTEGER PRIMARY KEY, left_key INTEGER, right_key INTEGER, label TEXT\
+                 ); \
+                 INSERT INTO indexed_cte VALUES (99, 1, 2, 'persistent'); \
+                 CREATE INDEX indexed_cte_pair ON indexed_cte (left_key, right_key)",
+            )
+            .await
+            .unwrap();
+
+        let rows = one_select_rows(
+            executor
+                .execute_sql(
+                    "WITH indexed_cte AS (\
+                         SELECT 1 AS id, 1 AS left_key, 2 AS right_key, 'query-local' AS label\
+                     ) \
+                     SELECT label FROM indexed_cte \
+                     WHERE left_key = 1 AND right_key = 2",
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![vec![Value::String("query-local".to_string())]]);
+
+        let rows = one_select_rows(
+            executor
+                .execute_sql(
+                    "WITH indexed_cte AS (\
+                         SELECT 1 AS id, 7 AS left_key, 8 AS right_key, 'different' AS label\
+                     ) \
+                     SELECT label FROM indexed_cte \
+                     WHERE left_key = 1 AND right_key = 2",
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(rows.is_empty());
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn query_local_cte_prefix_collision_preserves_colon_table_and_broad_scans() {
+        let (executor, storage, wal_path) = query_local_test_executor();
+        executor
+            .execute_sql(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT); \
+                 CREATE TABLE \"t:archive\" (id INTEGER PRIMARY KEY, label TEXT); \
+                 INSERT INTO t VALUES (7, 'base-t'); \
+                 INSERT INTO \"t:archive\" VALUES (8, 'archive')",
+            )
+            .await
+            .unwrap();
+
+        let rows = one_select_rows(
+            executor
+                .execute_sql(
+                    "WITH t AS (SELECT 1 AS id, 'cte' AS label) \
+                     SELECT label FROM t \
+                     UNION ALL SELECT label FROM \"t:archive\"",
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::String("cte".to_string())],
+                vec![Value::String("archive".to_string())]
+            ]
+        );
+
+        let base_t_key = executor.routed_data_key_for_row_id(
+            "t",
+            &Executor::value_to_primary_row_id(&Value::Integer(7)).unwrap(),
+        );
+        let quoted_archive_key = executor.routed_data_key_for_row_id(
+            "\"t:archive\"",
+            &Executor::value_to_primary_row_id(&Value::Integer(8)).unwrap(),
+        );
+        let raw_collision_key = executor.routed_data_key_for_row_id("t:archive", "raw:1");
+        let mut raw_txn = storage.begin_transaction().await.unwrap();
+        raw_txn
+            .put(
+                raw_collision_key.as_bytes(),
+                &crate::common::encoding::RowEncoder::encode(&[
+                    Value::String("raw:1".to_string()),
+                    Value::String("raw archive".to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+        raw_txn.commit().await.unwrap();
+
+        let mut txn = storage.begin_transaction().await.unwrap();
+        let mut scoped = QueryLocalTransaction::new(&mut *txn);
+        executor
+            .replace_materialized_cte(
+                &mut scoped,
+                "t",
+                &["id".to_string(), "label".to_string()],
+                &[vec![Value::Integer(1), Value::String("cte".to_string())]],
+            )
+            .await
+            .unwrap();
+        let exact_cte_prefix_keys: Vec<Vec<u8>> = scoped
+            .scan_prefix(b"data:t:", None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert!(!exact_cte_prefix_keys
+            .iter()
+            .any(|key| key == base_t_key.as_bytes()));
+        assert!(exact_cte_prefix_keys
+            .iter()
+            .any(|key| key == raw_collision_key.as_bytes()));
+
+        let collision_prefix = b"data:t:archive:";
+        let collision_end = QueryLocalTransaction::prefix_end(collision_prefix).unwrap();
+        let contained_collision_keys: Vec<Vec<u8>> = scoped
+            .scan_range(collision_prefix, &collision_end, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert!(contained_collision_keys
+            .iter()
+            .any(|key| key == raw_collision_key.as_bytes()));
+
+        let broad_keys: Vec<Vec<u8>> = scoped
+            .scan_prefix(b"data:", None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert!(!broad_keys.iter().any(|key| key == base_t_key.as_bytes()));
+        assert!(broad_keys
+            .iter()
+            .any(|key| key == quoted_archive_key.as_bytes()));
+        assert!(broad_keys
+            .iter()
+            .any(|key| key == raw_collision_key.as_bytes()));
+        assert!(broad_keys
+            .iter()
+            .any(|key| key.starts_with(b"data:t:") && key != raw_collision_key.as_bytes()));
+        drop(scoped);
+        txn.rollback().await.unwrap();
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[tokio::test]
+    async fn query_local_sharded_executor_reads_cte_rows() {
+        let wal_path = format!("test_query_local_cte_sharded_{}.wal", uuid::Uuid::new_v4());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal_path).unwrap());
+        let mut config = crate::config::Config::default();
+        config.distributed.enabled = true;
+        config.distributed.node_id = 1;
+        config.distributed.sharding = crate::config::ShardingConfig {
+            enabled: true,
+            strategy: crate::config::ShardingStrategy::Hash,
+            shard_count: 4,
+            range_boundaries: Vec::new(),
+        };
+        let router = crate::distributed::sharding::ShardRouter::from_config(&config).unwrap();
+        let executor = Executor::with_config_and_shard_router(
+            storage,
+            &crate::config::StorageConfig::default(),
+            Some(router),
+        );
+
+        let rows = one_select_rows(
+            executor
+                .execute_sql(
+                    "WITH routed AS (SELECT 11 AS value UNION ALL SELECT 22 AS value) \
+                     SELECT value FROM routed ORDER BY value",
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Integer(11)], vec![Value::Integer(22)]]
+        );
+        let _ = std::fs::remove_file(wal_path);
+    }
 
     #[test]
     fn window_partition_bucket_preallocates_first_row_index() {
@@ -3782,22 +4747,6 @@ mod tests {
     fn join_group_left_bucket_preallocates_first_row() {
         let bucket = join_group_left_bucket();
         assert!(bucket.capacity() >= 1);
-    }
-
-    #[test]
-    fn materialized_cte_data_prefix_for_name_preallocates_exact_prefix() {
-        let prefix = materialized_cte_data_prefix_for_name("recent_orders");
-
-        assert_eq!(prefix, "data:recent_orders:");
-        assert!(prefix.capacity() >= prefix.len());
-    }
-
-    #[test]
-    fn materialized_cte_data_key_for_row_id_preallocates_exact_key() {
-        let key = materialized_cte_data_key_for_row_id("recent_orders", "0007");
-
-        assert_eq!(key, "data:recent_orders:0007");
-        assert!(key.capacity() >= key.len());
     }
 
     #[test]

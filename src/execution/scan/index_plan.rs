@@ -440,6 +440,9 @@ impl Executor {
         order_by: Option<&sqlparser::ast::OrderBy>,
         ordered_limit: Option<usize>,
     ) -> Result<Option<IndexScanPlan>> {
+        if super::super::query::transaction_is_query_local(txn) {
+            return Ok(None);
+        }
         let Some(limit) = ordered_limit else {
             return Ok(None);
         };
@@ -823,6 +826,9 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<Option<IndexScanPlan>>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if super::super::query::transaction_is_query_local(txn) {
+                return Ok(None);
+            }
             let delimited_row_ids_are_unambiguous =
                 Self::legacy_delimited_index_row_ids_are_unambiguous(schema);
             if delimited_row_ids_are_unambiguous {
