@@ -1,5 +1,8 @@
+use fusiondb::common::encoding::RowEncoder;
 use fusiondb::common::Value;
 use fusiondb::execution::Executor;
+use fusiondb::storage::{memory::MemoryStorage, Storage};
+use std::sync::Arc;
 
 #[path = "sql/common.rs"]
 mod common;
@@ -132,6 +135,167 @@ async fn test_streaming_order_by_limit_offset_topk() {
             vec![Value::Integer(5)],
         ]
     );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_streaming_order_by_wildcard_late_materialization_preserves_rows() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE st_topk_wide (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT, extra TEXT)",
+    )
+    .await;
+    for (id, score, payload, extra) in [
+        (1, 20, "payload-1", "extra-1"),
+        (2, 10, "payload-2", "extra-2"),
+        (3, 50, "payload-3", "extra-3"),
+        (4, 40, "payload-4", "extra-4"),
+        (5, 30, "payload-5", "extra-5"),
+        (6, 40, "payload-6", "extra-6"),
+        (7, 50, "payload-7", "extra-7"),
+    ] {
+        exec_ok(
+            &executor,
+            &format!("INSERT INTO st_topk_wide VALUES ({id}, {score}, '{payload}', '{extra}')"),
+        )
+        .await;
+    }
+
+    // The two 50s tie on the first key; the second key must retain the
+    // existing stable ordering before OFFSET is applied.
+    let (_, rows) = query(
+        &executor,
+        "SELECT * FROM st_topk_wide ORDER BY score DESC, id ASC LIMIT 3 OFFSET 1",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(7),
+                Value::Integer(50),
+                Value::String("payload-7".to_string()),
+                Value::String("extra-7".to_string()),
+            ],
+            vec![
+                Value::Integer(4),
+                Value::Integer(40),
+                Value::String("payload-4".to_string()),
+                Value::String("extra-4".to_string()),
+            ],
+            vec![
+                Value::Integer(6),
+                Value::Integer(40),
+                Value::String("payload-6".to_string()),
+                Value::String("extra-6".to_string()),
+            ],
+        ]
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT * FROM st_topk_wide ORDER BY score ASC, id ASC LIMIT 4 OFFSET 1",
+    )
+    .await;
+    assert_eq!(
+        rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+        vec![
+            Value::Integer(1),
+            Value::Integer(5),
+            Value::Integer(4),
+            Value::Integer(6),
+        ]
+    );
+    assert!(rows.iter().all(|row| row.len() == 4));
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_streaming_order_by_wildcard_preserves_null_ordering() {
+    let (executor, wal) = setup().await;
+    exec_ok(
+        &executor,
+        "CREATE TABLE st_topk_null (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    for sql in [
+        "INSERT INTO st_topk_null VALUES (1, NULL, 'null-1')",
+        "INSERT INTO st_topk_null VALUES (2, 20, 'value-2')",
+        "INSERT INTO st_topk_null VALUES (3, NULL, 'null-3')",
+        "INSERT INTO st_topk_null VALUES (4, 10, 'value-4')",
+    ] {
+        exec_ok(&executor, sql).await;
+    }
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT * FROM st_topk_null ORDER BY score ASC, id ASC LIMIT 3",
+    )
+    .await;
+    assert_eq!(
+        rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+        vec![Value::Integer(1), Value::Integer(3), Value::Integer(4)]
+    );
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT * FROM st_topk_null ORDER BY score DESC, id ASC LIMIT 4",
+    )
+    .await;
+    assert_eq!(
+        rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+        vec![
+            Value::Integer(2),
+            Value::Integer(4),
+            Value::Integer(1),
+            Value::Integer(3),
+        ]
+    );
+    cleanup(&wal);
+}
+
+#[tokio::test]
+async fn test_streaming_order_by_skips_corrupt_best_candidate() {
+    let wal = format!("test_topk_corrupt_{}.wal", uuid::Uuid::new_v4());
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(&wal).unwrap());
+    let executor = Executor::new(storage.clone());
+    exec_ok(
+        &executor,
+        "CREATE TABLE st_topk_corrupt (id INTEGER PRIMARY KEY, score INTEGER, payload TEXT)",
+    )
+    .await;
+    exec_ok(
+        &executor,
+        "INSERT INTO st_topk_corrupt VALUES (2, 50, 'valid')",
+    )
+    .await;
+
+    // Keep the id and ordering-column spans intact, but truncate the payload
+    // span. The old full-row visitor skips this row; the late path must not
+    // let it evict the valid LIMIT 1 candidate before final materialization.
+    let mut corrupt = RowEncoder::encode(&[
+        Value::Integer(1),
+        Value::Integer(100),
+        Value::String("corrupt".to_string()),
+    ]);
+    let payload_start = u32::from_le_bytes(corrupt[10..14].try_into().unwrap()) as usize;
+    corrupt.truncate(payload_start);
+    let mut txn = storage.begin_transaction().await.unwrap();
+    txn.put(b"data:st_topk_corrupt:8000000000000001", &corrupt)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+
+    let (_, rows) = query(
+        &executor,
+        "SELECT * FROM st_topk_corrupt ORDER BY score DESC LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(2));
+    assert_eq!(rows[0][1], Value::Integer(50));
+    assert_eq!(rows[0][2], Value::String("valid".to_string()));
     cleanup(&wal);
 }
 

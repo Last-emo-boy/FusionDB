@@ -2361,6 +2361,9 @@ impl Executor {
                         if limit.is_none()
                             && OrderTopKScanVisitor::supports_order_by(order_by, &schema, self)
                         {
+                            let order_column_indices =
+                                OrderTopKScanVisitor::order_column_indices(order_by, &schema, self)
+                                    .unwrap_or_default();
                             let mut visitor = OrderTopKScanVisitor {
                                 executor: self,
                                 selection: selection.as_ref(),
@@ -2372,6 +2375,18 @@ impl Executor {
                                 zero_column_projection,
                                 pk_index,
                                 window,
+                                late_materialization: selection.is_none()
+                                    && projection_indices.is_none()
+                                    && !key_only_scan
+                                    && !zero_column_projection
+                                    // Keep the deferred payload footprint bounded for
+                                    // untrustedly large LIMIT + OFFSET windows.
+                                    && window <= 4096
+                                    && !order_column_indices.is_empty(),
+                                order_values_scratch: Vec::with_capacity(
+                                    order_column_indices.len(),
+                                ),
+                                order_column_indices,
                                 sequence: 0,
                                 entries: BinaryHeap::with_capacity(window.saturating_add(1)),
                                 error: None,
@@ -2390,15 +2405,11 @@ impl Executor {
                                 ),
                             )
                             .await?;
-                            let OrderTopKScanVisitor { error, entries, .. } = visitor;
-                            if let Some(err) = error {
+                            if let Some(err) = visitor.error.take() {
                                 return Err(err);
                             }
-                            return Ok((
-                                schema,
-                                OrderTopKScanVisitor::into_sorted_rows(entries),
-                                true,
-                            ));
+                            let topk_rows = visitor.into_sorted_rows();
+                            return Ok((schema, topk_rows, true));
                         }
                     }
 
@@ -2715,10 +2726,19 @@ struct OrderTopKValue {
     asc: bool,
 }
 
+enum OrderTopKPayload {
+    Materialized(Vec<Value>),
+    Encoded {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        row: Vec<Value>,
+    },
+}
+
 struct OrderTopKEntry {
     order_values: Vec<OrderTopKValue>,
     sequence: usize,
-    row: Vec<Value>,
+    payload: OrderTopKPayload,
 }
 
 impl PartialEq for OrderTopKEntry {
@@ -2737,7 +2757,23 @@ impl PartialOrd for OrderTopKEntry {
 
 impl Ord for OrderTopKEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        for (left, right) in self.order_values.iter().zip(other.order_values.iter()) {
+        Self::compare_order_values(
+            &self.order_values,
+            self.sequence,
+            &other.order_values,
+            other.sequence,
+        )
+    }
+}
+
+impl OrderTopKEntry {
+    fn compare_order_values(
+        left_values: &[OrderTopKValue],
+        left_sequence: usize,
+        right_values: &[OrderTopKValue],
+        right_sequence: usize,
+    ) -> Ordering {
+        for (left, right) in left_values.iter().zip(right_values.iter()) {
             let ordering = left.value.compare(&right.value);
             let ordering = if left.asc {
                 ordering
@@ -2749,10 +2785,10 @@ impl Ord for OrderTopKEntry {
             }
         }
 
-        self.order_values
+        left_values
             .len()
-            .cmp(&other.order_values.len())
-            .then_with(|| self.sequence.cmp(&other.sequence))
+            .cmp(&right_values.len())
+            .then_with(|| left_sequence.cmp(&right_sequence))
     }
 }
 
@@ -2767,6 +2803,9 @@ struct OrderTopKScanVisitor<'a> {
     zero_column_projection: bool,
     pk_index: Option<usize>,
     window: usize,
+    late_materialization: bool,
+    order_values_scratch: Vec<OrderTopKValue>,
+    order_column_indices: Vec<usize>,
     sequence: usize,
     entries: BinaryHeap<OrderTopKEntry>,
     error: Option<FusionError>,
@@ -2778,15 +2817,27 @@ impl OrderTopKScanVisitor<'_> {
         schema: &TableSchema,
         executor: &Executor,
     ) -> bool {
+        Self::order_column_indices(order_by, schema, executor).is_some()
+    }
+
+    fn order_column_indices(
+        order_by: &sqlparser::ast::OrderBy,
+        schema: &TableSchema,
+        executor: &Executor,
+    ) -> Option<Vec<usize>> {
         let OrderByKind::Expressions(exprs) = &order_by.kind else {
-            return false;
+            return None;
         };
-        !exprs.is_empty()
-            && exprs.iter().all(|order_expr| {
+        if exprs.is_empty() {
+            return None;
+        }
+        exprs
+            .iter()
+            .map(|order_expr| {
                 Executor::order_limit_column_name(&order_expr.expr)
                     .and_then(|name| executor.resolve_column_index(&name, schema).ok())
-                    .is_some()
             })
+            .collect()
     }
 
     fn order_values_for_row(&self, row: &[Value]) -> Vec<OrderTopKValue> {
@@ -2807,32 +2858,150 @@ impl OrderTopKScanVisitor<'_> {
         values
     }
 
-    fn push_row(&mut self, row: Vec<Value>) {
-        let entry = OrderTopKEntry {
-            order_values: self.order_values_for_row(&row),
-            sequence: self.sequence,
-            row,
+    fn decode_order_values_for_encoded(
+        &self,
+        encoded: &[u8],
+        values: &mut Vec<OrderTopKValue>,
+    ) -> bool {
+        values.clear();
+        let OrderByKind::Expressions(exprs) = &self.order_by.kind else {
+            return false;
         };
-        self.sequence = self.sequence.saturating_add(1);
 
+        values.reserve(self.order_column_indices.len());
+        let mut fallback_row = None;
+        for (order_expr, &column_index) in exprs.iter().zip(&self.order_column_indices) {
+            let value =
+                match crate::common::encoding::RowDecoder::decode_column(encoded, column_index) {
+                    Ok(Some(value)) => value,
+                    Ok(None) | Err(_) => {
+                        // `decode_column` returns `None` for a non-row-encoded
+                        // or short value. Fall back to the old full decode so
+                        // legacy rows and missing columns retain the previous
+                        // ORDER BY NULL behavior.
+                        if fallback_row.is_none() {
+                            fallback_row =
+                                Some(crate::common::encoding::RowDecoder::decode(encoded).ok());
+                        }
+                        let Some(row) = fallback_row.as_ref().and_then(Option::as_ref) else {
+                            values.clear();
+                            return false;
+                        };
+                        row.get(column_index).cloned().unwrap_or(Value::Null)
+                    }
+                };
+            values.push(OrderTopKValue {
+                value,
+                asc: order_expr.options.asc.unwrap_or(true),
+            });
+        }
+        true
+    }
+
+    fn candidate_is_better(&self, order_values: &[OrderTopKValue], sequence: usize) -> bool {
+        if self.entries.len() < self.window {
+            return true;
+        }
+
+        self.entries.peek().is_some_and(|worst| {
+            OrderTopKEntry::compare_order_values(
+                order_values,
+                sequence,
+                &worst.order_values,
+                worst.sequence,
+            ) == Ordering::Less
+        })
+    }
+
+    fn insert_admitted_entry(&mut self, entry: OrderTopKEntry) -> Option<OrderTopKEntry> {
         if self.entries.len() < self.window {
             self.entries.push(entry);
+            None
+        } else if let Some(mut worst) = self.entries.peek_mut() {
+            Some(std::mem::replace(&mut *worst, entry))
+        } else {
+            None
+        }
+    }
+
+    fn push_row(&mut self, row: Vec<Value>) {
+        let order_values = self.order_values_for_row(&row);
+        let sequence = self.sequence;
+        self.sequence = self.sequence.saturating_add(1);
+        if !self.candidate_is_better(&order_values, sequence) {
+            return;
+        }
+        drop(self.insert_admitted_entry(OrderTopKEntry {
+            order_values,
+            sequence,
+            payload: OrderTopKPayload::Materialized(row),
+        }));
+    }
+
+    fn push_encoded(&mut self, order_values: Vec<OrderTopKValue>, key: &[u8], value: &[u8]) {
+        let sequence = self.sequence;
+        if !self.candidate_is_better(&order_values, sequence) {
+            // A successfully decoded, non-admitted row still advances the
+            // stable tie sequence just like the legacy push_row path.
+            self.sequence = self.sequence.saturating_add(1);
+            self.order_values_scratch = order_values;
             return;
         }
 
-        if let Some(mut worst) = self.entries.peek_mut() {
-            if entry.cmp(&*worst) == Ordering::Less {
-                *worst = entry;
+        // Validate the complete candidate before it can evict a valid row.
+        // Otherwise a malformed non-ordering column would occupy the heap and
+        // disappear only during final materialization, changing LIMIT results.
+        let Some(row) = self.decode_candidate_row(key, value) else {
+            self.order_values_scratch = order_values;
+            return;
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        let evicted = self.insert_admitted_entry(OrderTopKEntry {
+            order_values,
+            sequence,
+            payload: OrderTopKPayload::Encoded {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                row,
+            },
+        });
+        if let Some(evicted) = evicted {
+            self.order_values_scratch = evicted.order_values;
+        }
+    }
+
+    fn decode_candidate_row(&self, key: &[u8], value: &[u8]) -> Option<Vec<Value>> {
+        match std::str::from_utf8(key) {
+            Ok(key_str) => self.executor.row_cache_lookup(key_str, value).or_else(|| {
+                Executor::decode_row_for_projection(value, self.projection_indices).ok()
+            }),
+            Err(_) => Executor::decode_row_for_projection(value, self.projection_indices).ok(),
+        }
+    }
+
+    fn materialize_entry(&self, entry: OrderTopKEntry) -> Option<Vec<Value>> {
+        match entry.payload {
+            OrderTopKPayload::Materialized(row) => Some(row),
+            OrderTopKPayload::Encoded { key, value, row } => {
+                if self.projection_indices.is_none() {
+                    if let Ok(key_str) = std::str::from_utf8(&key) {
+                        self.executor
+                            .row_cache_store(key_str.to_string(), &value, &row);
+                    }
+                }
+                Some(row)
             }
         }
     }
 
-    fn into_sorted_rows(entries: BinaryHeap<OrderTopKEntry>) -> Vec<Vec<Value>> {
-        let mut entries = entries.into_vec();
+    fn into_sorted_rows(mut self) -> Vec<Vec<Value>> {
+        let mut entries = std::mem::take(&mut self.entries).into_vec();
         entries.sort_by(|left, right| left.cmp(right));
         let mut rows = Vec::with_capacity(entries.len());
         for entry in entries {
-            rows.push(entry.row);
+            if let Some(row) = self.materialize_entry(entry) {
+                rows.push(row);
+            }
         }
         rows
     }
@@ -2840,6 +3009,16 @@ impl OrderTopKScanVisitor<'_> {
 
 impl ScanVisitor for OrderTopKScanVisitor<'_> {
     fn visit(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if self.late_materialization {
+            let mut order_values = std::mem::take(&mut self.order_values_scratch);
+            if self.decode_order_values_for_encoded(value, &mut order_values) {
+                self.push_encoded(order_values, key, value);
+            } else {
+                self.order_values_scratch = order_values;
+            }
+            return true;
+        }
+
         let row = if self.key_only_scan {
             let pk_str = match self
                 .executor
