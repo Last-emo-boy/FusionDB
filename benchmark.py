@@ -57,7 +57,7 @@ Options (env vars):
     BENCH_SCALE    - small / medium / large  (default: medium)
     BENCH_PROTO    - http / pg  (default: http; pg = PostgreSQL wire protocol on :8092)
     BENCH_PARTS    - optional comma list/range of parts or keys, e.g. 1,4,10 or base,join_ndv
-    BENCH_MATRIX   - optional preset slice: full / join_ndv / selectivity / topk / index_topk / index_topk_restart / index_topk_rseek_ab / index_topk_prefix_prune / sql_block_index_prefix_prune / sql_block_zone_map_prune / index_topk_frontier / sstable_reverse_frontier / fusion_reverse_frontier / index_distinct / groupby / analyze / planner / or_in_scan / between_scan / like_prefix_scan / sql_no_fill_cache / sstable_range_bound / sstable_prefix_bloom / sstable_block_prefix / sstable_block_index_prefix / sstable_user_key_bloom / sstable_no_fill_cache / sstable_startup_index
+    BENCH_MATRIX   - optional preset slice: full / join_ndv / selectivity / topk / columnar_single_source / index_topk / index_topk_restart / index_topk_rseek_ab / index_topk_prefix_prune / sql_block_index_prefix_prune / sql_block_zone_map_prune / index_topk_frontier / sstable_reverse_frontier / fusion_reverse_frontier / index_distinct / groupby / analyze / planner / or_in_scan / between_scan / like_prefix_scan / sql_no_fill_cache / sstable_range_bound / sstable_prefix_bloom / sstable_block_prefix / sstable_block_index_prefix / sstable_user_key_bloom / sstable_no_fill_cache / sstable_startup_index
     BENCH_CLAIM_MODE - set to 1 to turn supported benchmark observations into pass/fail gates
     BENCH_OS_CACHE_CONTROL - none / drop_caches for benchmark-owned restart matrices (default: none)
     BENCH_INDEX_TOPK_RESTART_TRIALS - process restart trials for index_topk_restart (default: 1)
@@ -485,6 +485,7 @@ METRIC_COUNTER_KEYS = (
     "sstable_range_probe_count",
     "sstable_range_overlap_skip_count",
     "sstable_iterator_open_count",
+    "columnar_single_source_aggregate_fast_path_count",
     "sstable_reverse_iterator_open_count",
     "sstable_reverse_block_read_count",
     "sstable_reverse_block_entry_decode_count",
@@ -2144,6 +2145,9 @@ def annotate_block_cache_metrics(result: "BenchResult") -> None:
     index_loose_run_skips = result.metrics_delta.get("index_loose_run_skip_count", 0)
     point_overlap_skips = result.metrics_delta.get("sstable_point_overlap_skip_count", 0)
     query_sort_fallbacks = result.metrics_delta.get("query_sort_fallback_count", 0)
+    columnar_single_source_fast_paths = result.metrics_delta.get(
+        "columnar_single_source_aggregate_fast_path_count", 0
+    )
     result.metadata.update({
         "block_read_requests": block_read_requests,
         "block_read_requests_per_query": round(block_read_requests / query_count, 3),
@@ -2203,6 +2207,10 @@ def annotate_block_cache_metrics(result: "BenchResult") -> None:
         "sstable_range_overlap_skip_ratio": round(overlap_skips / range_probes, 6) if range_probes else None,
         "sstable_iterator_opens": iterator_opens,
         "sstable_iterator_opens_per_query": round(iterator_opens / query_count, 3),
+        "columnar_single_source_fast_paths": columnar_single_source_fast_paths,
+        "columnar_single_source_fast_paths_per_query": round(
+            columnar_single_source_fast_paths / query_count, 3
+        ),
         "sstable_reverse_iterator_opens": reverse_iterator_opens,
         "sstable_reverse_iterator_opens_per_query": round(
             reverse_iterator_opens / query_count, 3
@@ -4437,6 +4445,7 @@ def setup(selected_part_keys: Optional[Set[str]] = None) -> Dict[str, float]:
     index_topk_frontier_only = selected_part_keys == {"index_topk_frontier"}
     index_distinct_only = selected_part_keys == {"index_distinct"}
     sql_no_fill_only = selected_part_keys == {"sql_no_fill_cache"}
+    column_scan_only = selected_part_keys == {"column_scan"}
     scan_micro_only = (
         bool(selected_part_keys)
         and selected_part_keys.issubset({"or_in_scan", "between_scan", "like_prefix_scan"})
@@ -4747,6 +4756,12 @@ def setup(selected_part_keys: Optional[Set[str]] = None) -> Dict[str, float]:
 
     if "sql_no_fill_cache" in selected_part_keys:
         total_rows = setup_sql_no_fill_cache_table(T, total_rows)
+
+    if column_scan_only:
+        print("  [setup] Checkpointing column-scan data for a clean single-SSTable window ...")
+        T["columnar_single_source_checkpoint_ok"] = int(
+            checkpoint_storage("columnar_single_source")
+        )
 
     return print_load_summary(T, total_rows)
 
@@ -5138,10 +5153,61 @@ def part8_risk_audit() -> List[BenchResult]:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Part 9 — Column-Scan Fast Paths
 # ═══════════════════════════════════════════════════════════════════════════════
+def apply_columnar_single_source_claim_gate(result: BenchResult) -> None:
+    query_count = result.metrics_delta.get("query_count", 0)
+    fast_paths = result.metrics_delta.get(
+        "columnar_single_source_aggregate_fast_path_count", 0
+    )
+    cold_misses = result.metrics_delta.get("block_cache_miss_count", 0)
+    file_opens = result.metrics_delta.get("sstable_block_file_open_count", 0)
+    failures = []
+
+    if query_count <= 0:
+        failures.append("expected at least one measured query")
+    if fast_paths != query_count:
+        failures.append(
+            f"expected one columnar single-source fast path per query, got "
+            f"fast_paths={fast_paths}, queries={query_count}"
+        )
+    if cold_misses <= 1:
+        failures.append(
+            f"expected a cold multi-block scan with more than one miss, got {cold_misses}"
+        )
+    if file_opens <= 0:
+        failures.append("expected at least one SSTable block file open")
+    elif cold_misses > 1 and file_opens >= cold_misses:
+        failures.append(
+            f"expected query-local file reuse to keep opens below cold misses, got "
+            f"opens={file_opens}, misses={cold_misses}"
+        )
+    if not result.result_checksums or len(set(result.result_checksums)) != 1:
+        failures.append("expected a stable non-empty result checksum sequence")
+
+    result.metadata.update({
+        "claim_gate": "columnar_single_source_file_reuse",
+        "claim_scope": (
+            "cold multi-block query must fire the clean single-SSTable aggregate path on "
+            "every measured execution, return stable checksums, and open fewer files than "
+            "cold blocks"
+        ),
+        "claim_status": "failed" if failures else "passed",
+        "claim_failures": failures,
+    })
+    if BENCH_CLAIM_MODE and failures:
+        result.error = "columnar single-source claim failed: " + "; ".join(failures)
+
+
 def part9_column_scan_fast_paths() -> List[BenchResult]:
     R, cat = [], "ColumnScan"
+    focused_claim = BENCH_MATRIX == "columnar_single_source"
 
-    R.append(bench("Bare COUNT nullable", "SELECT COUNT(category) FROM bench", cat=cat))
+    cold_result = bench(
+        "Bare COUNT nullable",
+        "SELECT COUNT(category) FROM bench",
+        warmup=0 if focused_claim else None,
+        cat=cat,
+    )
+    R.append(cold_result)
     R.append(bench("Bare COUNT with WHERE", "SELECT COUNT(category) FROM bench WHERE val >= 500", cat=cat))
     R.append(bench("COUNT DISTINCT WHERE", "SELECT COUNT(DISTINCT user_id) FROM events WHERE event_type = 'click'", cat=cat))
     R.append(bench("DISTINCT with WHERE", "SELECT DISTINCT category FROM bench WHERE val >= 500", cat=cat))
@@ -5152,6 +5218,13 @@ def part9_column_scan_fast_paths() -> List[BenchResult]:
     R.append(bench("GROUP BY COUNT WHERE", "SELECT event_type, COUNT(*) FROM events WHERE ts > 1700000000 + 86400*23 GROUP BY event_type", cat=cat))
     R.append(bench("GROUP BY SUM WHERE", "SELECT status, SUM(total), COUNT(*) FROM orders WHERE status != 'cancelled' GROUP BY status", cat=cat))
 
+    for result in R:
+        result.metadata["matrix"] = (
+            "columnar_single_source" if focused_claim else "column_scan"
+        )
+        annotate_block_cache_metrics(result)
+    if focused_claim:
+        apply_columnar_single_source_claim_gate(cold_result)
     return R
 
 
@@ -10085,6 +10158,7 @@ MATRIX_PARTS = {
     "join_ndv": ("join_ndv",),
     "selectivity": ("base",),
     "topk": ("base", "inventory"),
+    "columnar_single_source": ("column_scan",),
     "index_topk": ("index_topk",),
     "index_topk_prefix_prune": ("index_topk_prefix_prune",),
     "sql_block_index_prefix_prune": ("sql_block_index_prefix_prune",),

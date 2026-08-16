@@ -704,6 +704,9 @@ async fn handle_prometheus() -> String {
          # HELP fusiondb_sstable_iterator_open_count SSTable iterators opened for reads\n\
          # TYPE fusiondb_sstable_iterator_open_count counter\n\
          fusiondb_sstable_iterator_open_count {}\n\
+         # HELP fusiondb_columnar_single_source_aggregate_fast_path_count Columnar single-source aggregate fast-path executions\n\
+         # TYPE fusiondb_columnar_single_source_aggregate_fast_path_count counter\n\
+         fusiondb_columnar_single_source_aggregate_fast_path_count {}\n\
          # HELP fusiondb_sstable_reverse_iterator_open_count SSTable reverse iterators opened for reads\n\
          # TYPE fusiondb_sstable_reverse_iterator_open_count counter\n\
          fusiondb_sstable_reverse_iterator_open_count {}\n\
@@ -1027,6 +1030,8 @@ async fn handle_prometheus() -> String {
         m.sstable_range_probe_count.load(Relaxed),
         m.sstable_range_overlap_skip_count.load(Relaxed),
         m.sstable_iterator_open_count.load(Relaxed),
+        m.columnar_single_source_aggregate_fast_path_count
+            .load(Relaxed),
         m.sstable_reverse_iterator_open_count.load(Relaxed),
         m.sstable_reverse_block_read_count.load(Relaxed),
         m.sstable_reverse_block_entry_decode_count.load(Relaxed),
@@ -5528,6 +5533,7 @@ pub struct MetricsSnapshot {
     sstable_range_probe_count: u64,
     sstable_range_overlap_skip_count: u64,
     sstable_iterator_open_count: u64,
+    columnar_single_source_aggregate_fast_path_count: u64,
     sstable_reverse_iterator_open_count: u64,
     sstable_reverse_block_read_count: u64,
     sstable_reverse_block_entry_decode_count: u64,
@@ -5970,6 +5976,9 @@ impl MetricsSnapshot {
                 .sstable_range_overlap_skip_count
                 .load(Relaxed),
             sstable_iterator_open_count: metrics.sstable_iterator_open_count.load(Relaxed),
+            columnar_single_source_aggregate_fast_path_count: metrics
+                .columnar_single_source_aggregate_fast_path_count
+                .load(Relaxed),
             sstable_reverse_iterator_open_count: metrics
                 .sstable_reverse_iterator_open_count
                 .load(Relaxed),
@@ -9776,6 +9785,9 @@ mod tests {
         assert!(data.get("sstable_range_probe_count").is_some());
         assert!(data.get("sstable_range_overlap_skip_count").is_some());
         assert!(data.get("sstable_iterator_open_count").is_some());
+        assert!(data
+            .get("columnar_single_source_aggregate_fast_path_count")
+            .is_some());
         assert!(data.get("sstable_reverse_iterator_open_count").is_some());
         assert!(data.get("sstable_reverse_block_read_count").is_some());
         assert!(data
@@ -9986,6 +9998,7 @@ mod tests {
         assert!(prometheus.contains("fusiondb_sstable_range_probe_count"));
         assert!(prometheus.contains("fusiondb_sstable_range_overlap_skip_count"));
         assert!(prometheus.contains("fusiondb_sstable_iterator_open_count"));
+        assert!(prometheus.contains("fusiondb_columnar_single_source_aggregate_fast_path_count"));
         assert!(prometheus.contains("fusiondb_sstable_reverse_iterator_open_count"));
         assert!(prometheus.contains("fusiondb_sstable_reverse_block_read_count"));
         assert!(prometheus.contains("fusiondb_sstable_reverse_block_entry_decode_count"));

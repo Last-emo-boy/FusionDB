@@ -3754,6 +3754,10 @@ impl FusionTransaction {
 
         let read_options = SsTableReadOptions::fill_cache();
         let mut last_user_key: Option<Vec<u8>> = None;
+        // This path walks one immutable SSTable sequentially. Keep the file
+        // handle local to this query so concurrent scans do not share a seek
+        // cursor, while consecutive block misses avoid reopening the file.
+        let mut reusable_file = None;
 
         // Walk in-range blocks in offset (= key) order.
         for property in block_properties.iter() {
@@ -3771,7 +3775,11 @@ impl FusionTransaction {
             }
 
             let block = sstable
-                .read_range_block(property.offset, read_options)
+                .read_range_block_with_reusable_file(
+                    property.offset,
+                    read_options,
+                    &mut reusable_file,
+                )
                 .await?;
             let spans = SsTable::decoded_block_entry_spans(&block)?;
 

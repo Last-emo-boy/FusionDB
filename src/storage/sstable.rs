@@ -2773,28 +2773,6 @@ impl SsTable {
         Ok(decoded)
     }
 
-    async fn read_block_at(
-        path: &PathBuf,
-        block_cache: &Arc<BlockCache>,
-        sst_id: u64,
-        index_offsets: &[u64],
-        file_len: u64,
-        offset: u64,
-        read_options: SsTableReadOptions,
-    ) -> Result<BlockCacheValue> {
-        Self::read_block_at_with_reusable_file(
-            path,
-            block_cache,
-            sst_id,
-            index_offsets,
-            file_len,
-            offset,
-            read_options,
-            None,
-        )
-        .await
-    }
-
     async fn read_block_bytes(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>> {
         file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; len];
@@ -2857,10 +2835,13 @@ impl SsTable {
             .await
     }
 
-    /// Read one block by its (index) offset for the columnar single-source
-    /// aggregate fast path (472 T1). Delegates to the shared block reader with
-    /// no reusable file handle: each block is read once and (per `read_options`)
-    /// cached, matching the block-cache behavior of the merge iterator path.
+    /// Read one block by its index offset for the columnar single-source
+    /// aggregate fast path.
+    ///
+    /// This compatibility wrapper keeps the historical one-shot behavior for
+    /// callers that do not own a query-local file slot. Call
+    /// [`Self::read_range_block_with_reusable_file`] when walking multiple
+    /// blocks so cold misses can share one handle.
     pub(crate) async fn read_range_block(
         &self,
         offset: u64,
@@ -2879,12 +2860,20 @@ impl SsTable {
         .await
     }
 
-    pub async fn read_block_with_options(
+    /// Read one block for a range walk while reusing the caller's query-local
+    /// file handle across consecutive cache misses.
+    ///
+    /// The handle is owned by the caller rather than the `SsTable` itself so
+    /// concurrent iterators never share a mutable seek cursor. This mirrors
+    /// the ordinary forward/reverse iterator lifetime and keeps obsolete SSTable
+    /// files pinned only for the duration of the active range walk.
+    pub(crate) async fn read_range_block_with_reusable_file(
         &self,
         offset: u64,
         read_options: SsTableReadOptions,
+        reusable_file: &mut Option<File>,
     ) -> Result<BlockCacheValue> {
-        Self::read_block_at(
+        Self::read_block_at_with_reusable_file(
             &self.path,
             &self.block_cache,
             self.id,
@@ -2892,8 +2881,17 @@ impl SsTable {
             self.file_len,
             offset,
             read_options,
+            Some(reusable_file),
         )
         .await
+    }
+
+    pub async fn read_block_with_options(
+        &self,
+        offset: u64,
+        read_options: SsTableReadOptions,
+    ) -> Result<BlockCacheValue> {
+        self.read_range_block(offset, read_options).await
     }
 
     pub async fn new_iterator(&self, start_key: Option<&[u8]>) -> Result<SsTableIterator> {
@@ -4823,6 +4821,64 @@ mod tests {
             .await
             .unwrap();
         assert!(table.block_cache.get(&(3, offset)).is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn range_block_reader_reuses_query_local_file_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "fusiondb_sstable_range_reusable_file_{}.sst",
+            uuid::Uuid::new_v4()
+        ));
+        let mut builder = SsTableBuilder::new(path.clone());
+        let keys = [b"k000".as_slice(), b"k100".as_slice(), b"k200".as_slice()];
+        for key in keys {
+            let mut block = Vec::new();
+            append_block_entry(&mut block, key, key);
+            builder.add_key(key);
+            builder.flush_block(key.to_vec(), 1, &block).await.unwrap();
+        }
+        builder.finish().await.unwrap();
+
+        let table = SsTable::open(path.clone(), 23, Arc::new(Cache::new(16)))
+            .await
+            .unwrap();
+        let offsets = keys
+            .iter()
+            .map(|key| table.index_offset_for(key).unwrap())
+            .collect::<Vec<_>>();
+        let mut reusable_file = None;
+        let mut blocks = Vec::new();
+        for offset in &offsets {
+            blocks.push(
+                table
+                    .read_range_block_with_reusable_file(
+                        *offset,
+                        SsTableReadOptions::no_fill_cache(),
+                        &mut reusable_file,
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        assert!(
+            reusable_file.is_some(),
+            "a cache miss should initialize the query-local file slot"
+        );
+        for (block, key) in blocks.iter().zip(keys) {
+            let spans = SsTable::decoded_block_entry_spans(block).unwrap();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(&block[spans[0].key_start()..spans[0].key_end()], key);
+            assert_eq!(&block[spans[0].value_start()..spans[0].value_end()], key);
+        }
+        for offset in offsets {
+            assert!(
+                table.block_cache.get(&(23, offset)).is_none(),
+                "the reusable reader must preserve no-fill semantics"
+            );
+        }
 
         let _ = std::fs::remove_file(&path);
     }
