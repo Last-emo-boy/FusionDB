@@ -2266,6 +2266,18 @@ impl SsTable {
         property: &SsTableBlockProperties,
         table_prefix: &[u8],
     ) -> Option<Option<(Vec<u8>, Vec<u8>)>> {
+        Self::block_property_table_prefix_interval_ref(property, table_prefix).map(|interval| {
+            interval.map(|(first_user_key, last_user_key)| {
+                (first_user_key.to_vec(), last_user_key.to_vec())
+            })
+        })
+    }
+
+    /// 零分配地借用 block metadata 中某个 table prefix 的精确 user-key 闭区间。
+    pub fn block_property_table_prefix_interval_ref<'a>(
+        property: &'a SsTableBlockProperties,
+        table_prefix: &[u8],
+    ) -> Option<Option<(&'a [u8], &'a [u8])>> {
         if !property.table_prefix_ranges_complete {
             return None;
         }
@@ -2277,8 +2289,8 @@ impl SsTable {
                 return None;
             }
             return Some(Some((
-                range.first_user_key.clone(),
-                range.last_user_key.clone(),
+                range.first_user_key.as_slice(),
+                range.last_user_key.as_slice(),
             )));
         }
         Some(None)

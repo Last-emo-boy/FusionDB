@@ -4612,25 +4612,70 @@ impl FusionTransaction {
         Ok(Some(visited))
     }
 
-    /// Derive up to K-1 split keys dividing `[start, end)` into roughly even integer-primary-key
-    /// sub-ranges (keys shaped `<table prefix> ++ <16 ASCII hex>`, the `encode_i64_comparable`
-    /// encoding). Returns `None` — so the caller stays serial — when the range is empty, not that
-    /// encoding, or estimated to hold fewer than `PARALLEL_SCAN_MIN_ROWS` rows.
-    /// Cheap, in-memory upper bound on how many entries `[start, end)` can
-    /// hold, counting at most `cap`. Memtable entries come from a bounded
-    /// skip-map range walk; SSTable entries from the preloaded per-block
-    /// properties (blocks whose key span overlaps the range).
+    /// 解析同一前缀下的 16 字节定长十六进制整数主键。
+    fn integer_pk_value_for_prefix(key: &[u8], prefix: &[u8]) -> Option<u64> {
+        let suffix = key.strip_prefix(prefix)?;
+        if suffix.len() != 16 || !suffix.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        u64::from_str_radix(std::str::from_utf8(suffix).ok()?, 16).ok()
+    }
+
+    /// 返回有界整数主键范围的精确逻辑宽度。SQL 存储范围是半开区间，
+    /// `[prefix ++ a, prefix ++ b)` 最多只能容纳 `b - a` 个不同整数键，
+    /// 与 MVCC 版本数无关。含 sentinel（`>`、`<=`）、混合前缀或非整数键
+    /// 时放弃该优化。
+    fn integer_pk_bounded_range_width(start: &[u8], end: &[u8]) -> Option<u64> {
+        if start.len() != end.len() || start.len() < 16 {
+            return None;
+        }
+        let prefix_len = start.len() - 16;
+        if start[..prefix_len] != end[..prefix_len] {
+            return None;
+        }
+        let prefix = &start[..prefix_len];
+        let start_u = Self::integer_pk_value_for_prefix(start, prefix)?;
+        let end_u = Self::integer_pk_value_for_prefix(end, prefix)?;
+        Some(end_u.saturating_sub(start_u))
+    }
+
+    /// 判断较昂贵的可见 `first()` + `last()` 探测是否仍可能得到并行整数主键范围。
     ///
-    /// This is a performance heuristic only: the parallel-split boundaries
-    /// are still computed from real keys, so an estimate that is off in
-    /// either direction changes whether the probe runs, never the results.
-    /// It deliberately over-counts (MVCC versions, partial block overlap,
-    /// unloaded properties count as `cap`) so a table worth parallelizing
-    /// never loses its probe.
-    fn range_entry_upper_bound_capped(&self, start: &[u8], end: &[u8], cap: u64) -> u64 {
+    /// entry 计数刻意保持保守：它包含 MVCC 版本和整个部分重叠 block。对精确
+    /// table prefix 范围，当前 V6 block metadata 还记录该前缀真实的首尾 user key。
+    /// 如果所有可信 SSTable key 的跨度都小于 `cap`，即使旧版本把 entry 数推高到
+    /// `cap` 以上，可见子集也不可能通过后续跨度门。
+    ///
+    /// metadata 缺失或为旧版本、write buffer/memtable 重叠、非整数键时均 fail-open
+    /// 到原有探测。该方法只改变计划选择，扫描结果不依赖这个估算。
+    fn range_warrants_integer_pk_split_probe(&self, start: &[u8], end: &[u8], cap: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+        if Self::integer_pk_bounded_range_width(start, end).is_some_and(|width| width <= cap) {
+            return false;
+        }
+
         let start_ik = FusionStorage::encode_key(start, u64::MAX);
         let end_ik = FusionStorage::encode_key(end, u64::MAX);
         let mut total = 0u64;
+        let mem_tables = self.snapshot_memtables();
+
+        let prefix_end = FusionStorage::prefix_end(start);
+        let full_prefix = prefix_end
+            .as_deref()
+            .filter(|prefix_end| *prefix_end == end)
+            .map(|_| start);
+        let mut prefix_span_trusted = full_prefix.is_some();
+        if prefix_span_trusted
+            && (Self::write_buffer_overlaps_user_key_interval(&self.write_buffer, start, end)
+                || Self::memtables_overlap_user_key_interval(&mem_tables, start, end))
+        {
+            prefix_span_trusted = false;
+        }
+        let mut saw_prefix_key = false;
+        let mut prefix_min = u64::MAX;
+        let mut prefix_max = 0u64;
 
         // SSTable block metadata first: for a table already worth
         // parallelizing, a handful of block entry counts reaches `cap`
@@ -4642,9 +4687,39 @@ impl FusionTransaction {
             if properties.is_empty() {
                 // Properties not preloaded yet: assume the worst so the
                 // probe still runs — same behavior as before this gate.
-                return cap;
+                return true;
             }
-            for property in properties.iter() {
+            if properties.len() != sst.index_offsets.len() {
+                return true;
+            }
+            for (block_idx, property) in properties.iter().enumerate() {
+                // Validate alignment in the same pass as the capped count. A
+                // mismatch makes both entry counts and prefix spans
+                // untrustworthy, so retain the original visible-key probe.
+                if property.offset != sst.index_offsets[block_idx] {
+                    return true;
+                }
+                if prefix_span_trusted {
+                    let prefix = full_prefix.expect("trusted prefix span has a prefix");
+                    match SsTable::block_property_table_prefix_interval_ref(property, prefix) {
+                        Some(Some((first_user_key, last_user_key))) => {
+                            match (
+                                Self::integer_pk_value_for_prefix(first_user_key, prefix),
+                                Self::integer_pk_value_for_prefix(last_user_key, prefix),
+                            ) {
+                                (Some(first_u), Some(last_u)) => {
+                                    saw_prefix_key = true;
+                                    prefix_min = prefix_min.min(first_u);
+                                    prefix_max = prefix_max.max(last_u);
+                                }
+                                _ => prefix_span_trusted = false,
+                            }
+                        }
+                        Some(None) => {}
+                        None => prefix_span_trusted = false,
+                    }
+                }
+
                 let (block_first, _) = FusionStorage::decode_key(&property.first_key);
                 let (block_last, _) = FusionStorage::decode_key(&property.last_key);
                 if block_last < start || block_first >= end {
@@ -4652,34 +4727,34 @@ impl FusionTransaction {
                 }
                 total = total.saturating_add(u64::from(property.entry_count));
                 if total >= cap {
-                    return total;
+                    if !prefix_span_trusted || (saw_prefix_key && prefix_max - prefix_min >= cap) {
+                        return true;
+                    }
                 }
             }
         }
 
-        let mem_tables = {
-            let mut tables = vec![self.storage.active_memtable.read().unwrap().clone()];
-            tables.extend(
-                self.storage
-                    .immutable_memtables
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .cloned(),
-            );
-            tables
-        };
         for mem in &mem_tables {
             for _ in mem.map.range(start_ik.clone()..end_ik.clone()) {
                 total += 1;
                 if total >= cap {
-                    return total;
+                    return true;
                 }
             }
         }
-        total
+
+        if total < cap {
+            return false;
+        }
+        if prefix_span_trusted && saw_prefix_key {
+            return prefix_max - prefix_min >= cap;
+        }
+        true
     }
 
+    /// 将 `[start, end)` 派生成最多 K-1 个近似均匀的整数主键切分点。键必须是
+    /// `<table prefix> ++ <16 ASCII hex>`（`encode_i64_comparable` 编码）。范围为空、
+    /// 编码不匹配，或估计行数低于 `PARALLEL_SCAN_MIN_ROWS` 时返回 `None` 并保持串行。
     async fn integer_pk_range_splits(
         &self,
         start: &[u8],
@@ -4700,9 +4775,7 @@ impl FusionTransaction {
         // every overlapping SSTable, which on a small table costs more than
         // the query itself — and its result would be discarded against
         // PARALLEL_SCAN_MIN_ROWS anyway.
-        if self.range_entry_upper_bound_capped(start, end, PARALLEL_SCAN_MIN_ROWS)
-            < PARALLEL_SCAN_MIN_ROWS
-        {
+        if !self.range_warrants_integer_pk_split_probe(start, end, PARALLEL_SCAN_MIN_ROWS) {
             return Ok(None);
         }
         let (Some((min_key, _)), Some((max_key, _))) =
@@ -9088,6 +9161,179 @@ mod tests {
         cleanup_storage_dir(&data_dir);
     }
 
+    #[test]
+    fn integer_pk_bounded_range_width_accepts_only_exact_half_open_bounds() {
+        use crate::common::encoding::encode_i64_comparable;
+
+        let key =
+            |prefix: &str, id: i64| format!("{prefix}{}", encode_i64_comparable(id)).into_bytes();
+        let prefix = "data:bounded:";
+
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(&key(prefix, 42), &key(prefix, 43)),
+            Some(1)
+        );
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(&key(prefix, 0), &key(prefix, 8192)),
+            Some(8192)
+        );
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(&key(prefix, 0), &key(prefix, 8193)),
+            Some(8193)
+        );
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(&key(prefix, 7), &key(prefix, 7)),
+            Some(0)
+        );
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(&key(prefix, 8), &key(prefix, 7)),
+            Some(0)
+        );
+
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(
+                &key("data:bounded:", 1),
+                &key("data:other__:", 2)
+            ),
+            None
+        );
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(
+                b"data:bounded:000000000000000g",
+                b"data:bounded:000000000000000f"
+            ),
+            None
+        );
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(
+                b"data:bounded:0000000000000000\0",
+                b"data:bounded:0000000000000001\0"
+            ),
+            None
+        );
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(b"short", b"short"),
+            None
+        );
+
+        assert_eq!(
+            FusionTransaction::integer_pk_bounded_range_width(
+                b"data:bounded:0000000000000000",
+                b"data:bounded:ffffffffffffffff"
+            ),
+            Some(u64::MAX)
+        );
+    }
+
+    #[tokio::test]
+    async fn integer_pk_split_probe_uses_prefix_metadata_for_mvcc_inflated_ranges() {
+        use crate::common::encoding::encode_i64_comparable;
+
+        let data_dir = unique_storage_dir("integer_pk_prefix_span_gate");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = StorageConfig::default();
+        config.data_dir = data_dir.to_string_lossy().to_string();
+        let wal_path = config.wal_path();
+        let storage = FusionStorage::with_config(&wal_path.to_string_lossy(), &config)
+            .await
+            .unwrap();
+
+        let small_prefix = b"data:span_small:";
+        let wide_prefix = b"data:span_wide:";
+        let schema_bytes = |name: &str| {
+            bincode::serialize(&crate::catalog::TableSchema::new(
+                name.to_string(),
+                vec![crate::catalog::Column {
+                    name: "id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    is_primary: true,
+                    is_indexed: true,
+                    index_type: crate::catalog::IndexType::BTree,
+                    default_value: None,
+                    is_nullable: false,
+                    is_unique: true,
+                    check_expr: None,
+                }],
+            ))
+            .unwrap()
+        };
+        {
+            // 让 flush 期间的 schema snapshot 生成真实 V6 zone-map metadata。
+            let active = storage.active_memtable.read().unwrap();
+            for table_name in ["span_small", "span_wide"] {
+                let schema_key = format!("schema:{table_name}");
+                let schema = schema_bytes(table_name);
+                active.insert(
+                    FusionStorage::encode_key(schema_key.as_bytes(), 0),
+                    FusionStorage::encode_value(true, &schema),
+                );
+            }
+        }
+        for ts in 1..=3 {
+            let mem = MemTable::new(ts);
+            for id in 0..4 {
+                let key = format!(
+                    "{}{}",
+                    std::str::from_utf8(small_prefix).unwrap(),
+                    encode_i64_comparable(id)
+                );
+                mem.insert(
+                    FusionStorage::encode_key(key.as_bytes(), ts),
+                    FusionStorage::encode_value(
+                        true,
+                        &crate::common::encoding::RowEncoder::encode(&[
+                            crate::common::Value::Integer(id),
+                        ]),
+                    ),
+                );
+            }
+            for id in 0..10 {
+                let key = format!(
+                    "{}{}",
+                    std::str::from_utf8(wide_prefix).unwrap(),
+                    encode_i64_comparable(id)
+                );
+                mem.insert(
+                    FusionStorage::encode_key(key.as_bytes(), ts),
+                    FusionStorage::encode_value(
+                        true,
+                        &crate::common::encoding::RowEncoder::encode(&[
+                            crate::common::Value::Integer(id),
+                        ]),
+                    ),
+                );
+            }
+            storage.immutable_memtables.write().unwrap().push(mem);
+            storage.flush_all_immutable_memtables().await.unwrap();
+        }
+        storage.current_ts.store(3, Ordering::SeqCst);
+
+        // 该测试验证已持久化的 V6 prefix span，因此先显式加载延迟 metadata。
+        for sstable in storage.sstables.read().unwrap().clone() {
+            sstable.preload_block_properties().await;
+        }
+
+        let txn = storage.begin_transaction().await.unwrap();
+        let fusion_txn = txn
+            .as_any()
+            .downcast_ref::<FusionTransaction>()
+            .expect("FusionStorage returns FusionTransaction");
+        let small_end = FusionStorage::prefix_end(small_prefix).unwrap();
+        let wide_end = FusionStorage::prefix_end(wide_prefix).unwrap();
+
+        assert!(
+            !fusion_txn.range_warrants_integer_pk_split_probe(small_prefix, &small_end, 8),
+            "12 internal versions over a four-key span cannot pass the later split-span gate"
+        );
+        assert!(
+            fusion_txn.range_warrants_integer_pk_split_probe(wide_prefix, &wide_end, 8),
+            "a ten-key span with enough entries must retain the real first/last probe"
+        );
+
+        drop(txn);
+        cleanup_storage_dir(&data_dir);
+    }
+
     #[tokio::test]
     async fn scan_prefix_parallel_matches_serial_across_split_boundaries() {
         use crate::common::encoding::encode_i64_comparable;
@@ -9209,7 +9455,7 @@ mod tests {
         // Ids spanning the full i64 range so `max_u - min_u` approaches u64::MAX. The interpolation
         // must use u128 internally; multiplying `span * shard` in u64 would panic (debug) or wrap
         // into out-of-order boundaries (release) -> duplicated/missing rows.
-        let ids: [i64; 8] = [
+        let mut ids = vec![
             i64::MIN,
             i64::MIN + 1,
             -3_000_000_000,
@@ -9219,9 +9465,12 @@ mod tests {
             6_637_030_065_269_067_181,
             i64::MAX,
         ];
+        // Cross the production split threshold so this test exercises the
+        // u128 interpolation path instead of serial fallback.
+        ids.extend(2_i64..=8_186_i64);
         let mem = MemTable::new(1);
-        for id in ids {
-            let key = format!("data:wspan:{}", encode_i64_comparable(id));
+        for id in &ids {
+            let key = format!("data:wspan:{}", encode_i64_comparable(*id));
             mem.insert(
                 FusionStorage::encode_key(key.as_bytes(), 1),
                 FusionStorage::encode_value(true, b"v"),
@@ -9238,6 +9487,10 @@ mod tests {
             "wide-span parallel scan must equal serial (no overflow-induced gaps/dupes)"
         );
         assert_eq!(serial.len(), ids.len(), "all rows returned exactly once");
+        assert!(
+            serial.len() >= 8_192,
+            "parallel split gate must be exercised"
+        );
 
         cleanup_storage_dir(&data_dir);
     }
