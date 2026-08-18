@@ -3696,6 +3696,7 @@ impl FusionTransaction {
     pub(crate) async fn scan_single_source_clean_blocks<F>(
         &self,
         prefix: &[u8],
+        zone_map_plan: Option<&SqlBlockZoneMapPruningPlan>,
         sink: &mut F,
     ) -> Result<Option<()>>
     where
@@ -3772,6 +3773,31 @@ impl FusionTransaction {
             // are out of range) — skip without reading.
             if block_last.as_slice() < start || block_first.as_slice() >= end {
                 continue;
+            }
+
+            // Zone-map pruning: on the clean-block path the single-SSTable /
+            // no-memtable-write-buffer guarantees mean every block is a sole
+            // visible source, so a SkipBlock decision is safe (no MVCC merge
+            // participant is dropped). FailOpen falls through to the read,
+            // preserving correctness when metadata is incomplete or the
+            // predicate column lacks a zone map.
+            if let Some(plan) = zone_map_plan {
+                match plan.evaluate_block_zone_maps(
+                    prefix,
+                    property.sql_zone_maps_complete,
+                    &property.sql_zone_maps,
+                ) {
+                    SqlBlockZoneMapPruningDecision::SkipBlock => {
+                        crate::monitor::inc_sstable_block_zone_map_filter_skip();
+                        continue;
+                    }
+                    SqlBlockZoneMapPruningDecision::ReadBlock => {
+                        crate::monitor::inc_sstable_block_zone_map_filter_positive();
+                    }
+                    SqlBlockZoneMapPruningDecision::FailOpen(reason) => {
+                        Self::record_sql_zone_map_fail_open(reason);
+                    }
+                }
             }
 
             let block = sstable
@@ -5547,7 +5573,7 @@ mod tests {
             }
             Ok(())
         };
-        txn.scan_single_source_clean_blocks(prefix, &mut sink)
+        txn.scan_single_source_clean_blocks(prefix, None, &mut sink)
             .await
             .unwrap()
             .map(|()| seen)

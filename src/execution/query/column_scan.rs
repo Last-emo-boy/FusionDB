@@ -4,7 +4,11 @@ use crate::common::{FusionError, Result, Value};
 use crate::execution::analyze::TableStats;
 use crate::storage::fusion::{FusionTransaction, TS_SIZE};
 use crate::storage::sstable::{key_user_part, BlockEntrySpan};
-use crate::storage::{ScanVisitor, Transaction};
+use crate::storage::{
+    sql_block_zone_map_schema_fingerprint, sql_block_zone_map_scalar, sql_block_zone_map_type_tag,
+    SqlBlockZoneMapComparisonOp, SqlBlockZoneMapPredicateKind, SqlBlockZoneMapPredicateTerm,
+    SqlBlockZoneMapPruningPlan, ScanVisitor, Transaction,
+};
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
     ObjectName, ObjectNamePart, OrderByKind, SelectItem,
@@ -73,6 +77,56 @@ struct ColumnPredicateTerm {
 pub(super) struct ColumnPredicateScanPlan {
     terms: Vec<ColumnPredicateTerm>,
     column_indices: Vec<usize>,
+}
+
+impl ColumnPredicateScanPlan {
+    /// Build a storage-level zone-map pruning plan for the clean-block fast
+    /// path. Only integer-class columns have zone-map scalars; any term whose
+    /// column lacks a type tag is dropped (the per-row predicate still filters
+    /// it). Returns `None` when no term can prune a block — the caller then
+    /// skips zone-map evaluation entirely.
+    fn zone_map_pruning_plan(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+    ) -> Option<SqlBlockZoneMapPruningPlan> {
+        let mut terms = Vec::with_capacity(self.terms.len());
+        for term in &self.terms {
+            let &column_index = self.column_indices.get(term.value_slot)?;
+            let column = schema.columns.get(column_index)?;
+            let type_tag = sql_block_zone_map_type_tag(&column.data_type)?;
+            // `sql_block_zone_map_scalar` returns `None` for unsupported values
+            // (e.g. NULL against an integer column) — skip those terms; the
+            // row-level predicate still handles them.
+            let scalar = sql_block_zone_map_scalar(&term.value, type_tag)??;
+            let op = match term.op {
+                BinaryOperator::Eq => SqlBlockZoneMapComparisonOp::Eq,
+                BinaryOperator::Lt => SqlBlockZoneMapComparisonOp::Lt,
+                BinaryOperator::LtEq => SqlBlockZoneMapComparisonOp::LtEq,
+                BinaryOperator::Gt => SqlBlockZoneMapComparisonOp::Gt,
+                BinaryOperator::GtEq => SqlBlockZoneMapComparisonOp::GtEq,
+                // NotEq cannot prune a min/max block (any block may contain the
+                // non-matching value), and zone maps have no NotEq kind.
+                BinaryOperator::NotEq => continue,
+                _ => return None,
+            };
+            terms.push(SqlBlockZoneMapPredicateTerm {
+                column_index: u32::try_from(column_index).ok()?,
+                column_name: column.name.clone(),
+                type_tag,
+                value_encoding_version: crate::storage::SQL_BLOCK_ZONE_MAP_VALUE_ENCODING_VERSION,
+                kind: SqlBlockZoneMapPredicateKind::Compare { op, scalar },
+            });
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        Some(SqlBlockZoneMapPruningPlan {
+            table_name: table_name.to_string(),
+            schema_fingerprint: sql_block_zone_map_schema_fingerprint(schema),
+            terms,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1545,6 +1599,7 @@ impl Executor {
         let decode_plan = ColumnAggregateDecodePlan::new(plans, predicate);
         let mut decoded_values = Vec::with_capacity(decode_plan.scratch_capacity());
         let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
+        let zone_map_plan = predicate.and_then(|p| schema.as_ref().and_then(|s| p.zone_map_pruning_plan(table_name, s)));
         let folded = {
             let schema_ref = schema.as_ref();
             let prefixes_ref = &prefixes;
@@ -1585,7 +1640,7 @@ impl Executor {
                 Ok(())
             };
             fusion
-                .scan_single_source_clean_blocks(prefixes[0].as_bytes(), &mut sink)
+                .scan_single_source_clean_blocks(prefixes[0].as_bytes(), zone_map_plan.as_ref(), &mut sink)
                 .await?
         };
 
@@ -1633,6 +1688,7 @@ impl Executor {
         };
 
         let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
+        let zone_map_plan = predicate.and_then(|p| schema.as_ref().and_then(|s| p.zone_map_pruning_plan(table_name, s)));
         let folded = {
             let schema_ref = schema.as_ref();
             let prefixes_ref = &prefixes;
@@ -1672,7 +1728,7 @@ impl Executor {
                 Ok(())
             };
             fusion
-                .scan_single_source_clean_blocks(prefixes[0].as_bytes(), &mut sink)
+                .scan_single_source_clean_blocks(prefixes[0].as_bytes(), zone_map_plan.as_ref(), &mut sink)
                 .await?
         };
 
@@ -3255,7 +3311,79 @@ mod tests {
         }
     }
 
-    /// Single-column GROUP BY aggregates must also fire the columnar
+    /// Zone-map pruning on the clean-block fast path: when the predicate
+    /// column has integer zone maps, blocks whose [min,max] cannot satisfy
+    /// the predicate are skipped without being read. This verifies (1) the
+    /// result still matches the merge fallback and (2) the skip counter
+    /// advances, proving blocks were pruned at the zone-map level.
+    #[tokio::test]
+    async fn columnar_fast_path_zone_map_skips_non_matching_blocks() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (executor, fusion, data_dir) =
+            fusion_executor("zone_map_prune").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE zm (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL)",
+        )
+        .await;
+
+        // Insert rows where `vi` is a monotonic function of `id` so blocks
+        // have non-overlapping [min,max] intervals: block N covers
+        // roughly [N*band, (N+1)*band). A range predicate high above the
+        // earliest blocks lets zone maps skip them.
+        let row_count = 2000u32;
+        let band = 100i64;
+        let mut insert = String::from("INSERT INTO zm VALUES ");
+        for id in 1..=row_count {
+            if id > 1 {
+                insert.push(',');
+            }
+            // vi grows with id so consecutive blocks have distinct ranges.
+            let vi = (id as i64) * band;
+            insert.push_str(&format!("({id}, {vi})"));
+        }
+        exec_ok_sql(&executor, &insert).await;
+        fusion.create_snapshot_now().await.unwrap();
+
+        // Predicate selecting only the top band: zone maps for the lower
+        // blocks (whose max < 195000) must be skipped.
+        let sql = "SELECT SUM(vi) FROM zm WHERE vi >= 195000";
+
+        executor.invalidate_query_result_cache();
+        let fast = agg_row_fast(&executor, sql).await;
+        let fallback = agg_row_fallback(&executor, sql).await;
+        assert!(
+            values_bit_equal(&fast, &fallback),
+            "zone-map prune: fast {fast:?} != fallback {fallback:?}"
+        );
+
+        let skip_after =
+            crate::monitor::GLOBAL_METRICS
+                .sstable_block_zone_map_filter_skip_count
+                .load(Relaxed);
+        // Reset and run a predicate that selects a disjoint high band to
+        // measure the skip delta from this query alone.
+        crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_skip_count
+            .store(0, Relaxed);
+        executor.invalidate_query_result_cache();
+        let _ = executor.execute_sql(sql).await.unwrap();
+        let skip_delta =
+            crate::monitor::GLOBAL_METRICS
+                .sstable_block_zone_map_filter_skip_count
+                .load(Relaxed);
+        assert!(
+            skip_delta > 0,
+            "zone-map pruning must skip at least one block on a clean single \
+             SSTable with a high-band predicate (skip_after={skip_after}, \
+             skip_delta={skip_delta})"
+        );
+
+        cleanup_dir(&data_dir);
+    }
+
+
     /// single-source fast path on a clean single SSTable, and produce
     /// bit-identical rows to the merge fallback.
     #[tokio::test]
