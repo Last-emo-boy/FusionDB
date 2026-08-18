@@ -1600,6 +1600,85 @@ impl Executor {
         }
     }
 
+    /// 472 T2: columnar single-source fast path for single-column GROUP BY.
+    /// Same contract as `try_columnar_single_source_aggregate` but folds into
+    /// a `HashMap<Value, Vec<GroupColumnAggregateState>>` instead of flat
+    /// accumulators. Returns `Ok(Some(true))` if the fast path fired (groups
+    /// are populated), `Ok(Some(false))` if it declined (groups untouched), or
+    /// `Ok(None)` if the fast path is disabled entirely.
+    async fn try_group_by_single_column_columnar_fast_path(
+        &self,
+        table_name: &str,
+        group_column_index: usize,
+        aggregate_plans: &[GroupColumnAggregateScanPlan],
+        predicate: Option<&ColumnPredicateScanPlan>,
+        txn: &mut dyn Transaction,
+        groups: &mut HashMap<Value, Vec<GroupColumnAggregateState>>,
+    ) -> Result<Option<bool>> {
+        if !self.columnar_single_source_aggregate_enabled() {
+            return Ok(None);
+        }
+
+        let prefixes = self.routed_data_prefixes_for_table(table_name);
+        if prefixes.len() != 1 {
+            return Ok(Some(false));
+        }
+
+        let schema = self
+            .load_schema_for_data_prefix_filter(table_name, txn)
+            .await?;
+
+        let Some(fusion) = txn.as_any().downcast_ref::<FusionTransaction>() else {
+            return Ok(Some(false));
+        };
+
+        let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
+        let folded = {
+            let schema_ref = schema.as_ref();
+            let prefixes_ref = &prefixes;
+            let groups_ref = groups;
+            let mut sink = |block: &[u8], spans: &[BlockEntrySpan]| -> Result<()> {
+                for span in spans {
+                    let key = &block[span.key_start()..span.key_end()];
+                    let user_key = key_user_part(key, TS_SIZE);
+                    let payload = &block[span.value_start() + 1..span.value_end()];
+                    if self.routed_data_entry_belongs_to_table(
+                        table_name,
+                        schema_ref,
+                        prefixes_ref,
+                        user_key,
+                        payload,
+                    ) {
+                        Executor::decode_predicate_values(
+                            payload,
+                            predicate,
+                            &mut predicate_values,
+                        )?;
+                        if let Some(predicate) = predicate {
+                            if !predicate.matches_values(&predicate_values) {
+                                continue;
+                            }
+                        }
+                        apply_single_group_aggregate_matched_row(
+                            group_column_index,
+                            aggregate_plans,
+                            predicate,
+                            groups_ref,
+                            &predicate_values,
+                            payload,
+                        )?;
+                    }
+                }
+                Ok(())
+            };
+            fusion
+                .scan_single_source_clean_blocks(prefixes[0].as_bytes(), &mut sink)
+                .await?
+        };
+
+        Ok(Some(folded.is_some()))
+    }
+
     async fn simple_column_aggregate_index_scan(
         &self,
         table_name: &str,
@@ -2716,6 +2795,38 @@ impl Executor {
         let mut groups: HashMap<Value, Vec<GroupColumnAggregateState>> =
             HashMap::with_capacity(4096);
 
+        // 472 T2: columnar single-source fast path for single-column GROUP BY
+        // aggregates. Same clean-window contract as the bare-aggregate path:
+        // storage proves the merge would yield the identical ascending-user-key
+        // sequence of visible-sole-version PUTs, and the sink applies the
+        // identical membership + predicate + group-fold. Returns `None` on any
+        // decline so the untouched merge path below runs verbatim.
+        if let Some(folded) = self
+            .try_group_by_single_column_columnar_fast_path(
+                table_name,
+                group_column_index,
+                aggregate_plans,
+                predicate,
+                txn,
+                &mut groups,
+            )
+            .await?
+        {
+            if folded {
+                crate::monitor::inc_columnar_single_source_aggregate_fast_path();
+                #[cfg(test)]
+                note_columnar_fast_path_fire_for_test();
+                let mut rows = Vec::with_capacity(groups.len());
+                for (group_value, states) in groups {
+                    let mut row = Vec::with_capacity(1 + states.len());
+                    row.push(group_value);
+                    row.extend(states.iter().map(GroupColumnAggregateState::finalize));
+                    rows.push(row);
+                }
+                return Ok(rows);
+            }
+        }
+
         let scan_error = {
             let mut visitor = SingleGroupAggregateScanVisitor {
                 group_column_index,
@@ -3141,6 +3252,97 @@ mod tests {
             }
 
             cleanup_dir(&data_dir);
+        }
+    }
+
+    /// Single-column GROUP BY aggregates must also fire the columnar
+    /// single-source fast path on a clean single SSTable, and produce
+    /// bit-identical rows to the merge fallback.
+    #[tokio::test]
+    async fn group_by_single_column_columnar_fast_path_matches_merge() {
+        let (executor, fusion, data_dir) =
+            fusion_executor("group_by_fast_path").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE g (id INTEGER PRIMARY KEY, cat TEXT NOT NULL, \
+             vi INTEGER NOT NULL, vf FLOAT NOT NULL, vn INTEGER)",
+        )
+        .await;
+
+        let mut rng = SplitMix64(0xFEED_FACE_C0DE_1234);
+        let row_count = 300u32;
+        let mut insert = String::from("INSERT INTO g VALUES ");
+        for id in 1..=row_count {
+            if id > 1 {
+                insert.push(',');
+            }
+            let cat = format!("cat{}", rng.below(8));
+            let vi = rng.below(1_000_000) as i64;
+            let vf = (rng.next_u64() as f64 / u64::MAX as f64) * 1000.0;
+            let vn = if rng.below(3) == 0 {
+                "NULL".to_string()
+            } else {
+                (rng.below(500) as i64).to_string()
+            };
+            insert.push_str(&format!("({id}, '{cat}', {vi}, {vf:.6}, {vn})"));
+        }
+        exec_ok_sql(&executor, &insert).await;
+        fusion.create_snapshot_now().await.unwrap();
+
+        // COUNT(*) routes to the dedicated `group_by_count_column_scan` path
+        // (which has its own index-key fast path) and is not exercised by the
+        // columnar single-source GROUP BY path. The remaining queries cover
+        // SUM/AVG/MIN/MAX/COUNT(col) with and without predicates.
+        let queries = [
+            "SELECT cat, SUM(vi) FROM g GROUP BY cat",
+            "SELECT cat, AVG(vf) FROM g GROUP BY cat",
+            "SELECT cat, MIN(vi), MAX(vi) FROM g GROUP BY cat",
+            "SELECT cat, COUNT(vn), SUM(vn) FROM g GROUP BY cat",
+            "SELECT cat, SUM(vi) FROM g WHERE vi >= 500000 GROUP BY cat",
+            "SELECT cat, COUNT(vn) FROM g WHERE vf > 500.0 GROUP BY cat",
+        ];
+
+        for sql in queries {
+            executor.invalidate_query_result_cache();
+            let before = fast_path_fire_count();
+            let fast = executor.execute_sql(sql).await.unwrap();
+            let fired = fast_path_fire_count() > before;
+            let fallback = executor
+                .execute_sql_with_columnar_single_source_aggregate(sql, false)
+                .await
+                .unwrap();
+            // Sort both result sets for order-independent comparison.
+            let mut fast_rows = group_result_rows(fast);
+            let mut fallback_rows = group_result_rows(fallback);
+            fast_rows.sort_by(|a, b| a.cmp(b));
+            fallback_rows.sort_by(|a, b| a.cmp(b));
+            assert_eq!(
+                fast_rows, fallback_rows,
+                "{sql}: fast {fast_rows:?} != fallback {fallback_rows:?}"
+            );
+            assert!(
+                fired,
+                "{sql}: fast path must fire on a clean single SSTable"
+            );
+        }
+
+        cleanup_dir(&data_dir);
+    }
+
+    fn group_result_rows(results: Vec<QueryResult>) -> Vec<Vec<String>> {
+        match results.into_iter().next().unwrap() {
+            QueryResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| match v {
+                            Value::Float(f) => format!("{}", f.to_bits()),
+                            other => format!("{other}"),
+                        })
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected Select, got {other:?}"),
         }
     }
 
