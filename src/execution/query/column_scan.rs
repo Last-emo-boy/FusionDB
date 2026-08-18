@@ -7,7 +7,7 @@ use crate::storage::sstable::{key_user_part, BlockEntrySpan};
 use crate::storage::{
     sql_block_zone_map_schema_fingerprint, sql_block_zone_map_scalar, sql_block_zone_map_type_tag,
     SqlBlockZoneMapComparisonOp, SqlBlockZoneMapPredicateKind, SqlBlockZoneMapPredicateTerm,
-    SqlBlockZoneMapPruningPlan, ScanVisitor, Transaction,
+    SqlBlockZoneMapPruningPlan, ScanVisitor, StorageScanOptions, Transaction,
 };
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
@@ -15,6 +15,7 @@ use sqlparser::ast::{
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::Executor;
 
@@ -1513,6 +1514,22 @@ impl Executor {
 
         let mut states = column_aggregate_states(plans);
 
+        // Build a storage-level zone-map pruning plan so the merge scan skips
+        // blocks whose [min,max] cannot satisfy the predicate — block-level
+        // late materialization on the fallback (multi-SSTable / memtable
+        // overlap) path, complementing the clean-block fast path above.
+        let scan_options =
+            if let (Some(predicate), Some(schema)) = (predicate, schema) {
+                match predicate.zone_map_pruning_plan(table_name, schema) {
+                    Some(plan) => {
+                        StorageScanOptions::fill_cache().with_sql_block_zone_map_pruning_plan(Arc::new(plan))
+                    }
+                    None => StorageScanOptions::fill_cache(),
+                }
+            } else {
+                StorageScanOptions::fill_cache()
+            };
+
         let scan_error = {
             let decode_plan = ColumnAggregateDecodePlan::new(plans, predicate);
             let decoded_capacity = decode_plan.scratch_capacity();
@@ -1524,8 +1541,10 @@ impl Executor {
                 decoded_values: Vec::with_capacity(decoded_capacity),
                 error: None,
             };
-            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
-                .await?;
+            self.scan_routed_data_prefixes_for_each_with_options(
+                table_name, txn, None, &mut visitor, scan_options,
+            )
+            .await?;
             visitor.error
         };
 
@@ -2442,6 +2461,12 @@ impl Executor {
 
         let mut counts: HashMap<Value, i64> = HashMap::with_capacity(4096);
 
+        let scan_options = match predicate.and_then(|p| p.zone_map_pruning_plan(table_name, schema)) {
+            Some(plan) => StorageScanOptions::fill_cache()
+                .with_sql_block_zone_map_pruning_plan(Arc::new(plan)),
+            None => StorageScanOptions::fill_cache(),
+        };
+
         let scan_error = {
             let mut visitor = GroupCountScanVisitor {
                 group_column_index: column_index,
@@ -2451,8 +2476,10 @@ impl Executor {
                 batch: Some(ColumnScanBatch::new(predicate)),
                 error: None,
             };
-            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
-                .await?;
+            self.scan_routed_data_prefixes_for_each_with_options(
+                table_name, txn, None, &mut visitor, scan_options,
+            )
+            .await?;
             if visitor.error.is_none() {
                 if let Err(err) = visitor.flush_batch() {
                     visitor.error = Some(err);
@@ -2796,6 +2823,12 @@ impl Executor {
         let mut groups: HashMap<Vec<Value>, Vec<GroupColumnAggregateState>> =
             HashMap::with_capacity(4096);
 
+        let scan_options = match predicate.and_then(|p| p.zone_map_pruning_plan(table_name, schema)) {
+            Some(plan) => StorageScanOptions::fill_cache()
+                .with_sql_block_zone_map_pruning_plan(Arc::new(plan)),
+            None => StorageScanOptions::fill_cache(),
+        };
+
         let scan_error = {
             let mut visitor = GroupAggregateScanVisitor {
                 group_column_indices,
@@ -2807,8 +2840,10 @@ impl Executor {
                     .then(|| ColumnScanBatch::new(predicate)),
                 error: None,
             };
-            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
-                .await?;
+            self.scan_routed_data_prefixes_for_each_with_options(
+                table_name, txn, None, &mut visitor, scan_options,
+            )
+            .await?;
             if visitor.error.is_none() {
                 if let Err(err) = visitor.flush_batch() {
                     visitor.error = Some(err);
@@ -2875,6 +2910,12 @@ impl Executor {
             }
         }
 
+        let scan_options = match predicate.and_then(|p| p.zone_map_pruning_plan(table_name, schema)) {
+            Some(plan) => StorageScanOptions::fill_cache()
+                .with_sql_block_zone_map_pruning_plan(Arc::new(plan)),
+            None => StorageScanOptions::fill_cache(),
+        };
+
         let scan_error = {
             let mut visitor = SingleGroupAggregateScanVisitor {
                 group_column_index,
@@ -2886,8 +2927,10 @@ impl Executor {
                     .then(|| ColumnScanBatch::new(predicate)),
                 error: None,
             };
-            self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
-                .await?;
+            self.scan_routed_data_prefixes_for_each_with_options(
+                table_name, txn, None, &mut visitor, scan_options,
+            )
+            .await?;
             if visitor.error.is_none() {
                 if let Err(err) = visitor.flush_batch() {
                     visitor.error = Some(err);
