@@ -390,6 +390,33 @@ impl RowDecoder {
         bincode::deserialize(span).map(Some)
     }
 
+    /// Fast integer-only decode: returns the raw `i64` for an integer column
+    /// (bincode tag 2), or `None` if the column is absent, null, or any
+    /// non-integer type. This avoids constructing a `Value` enum, enabling
+    /// integer predicate evaluation directly on the encoded bytes — true
+    /// late materialization for the most common predicate case.
+    pub fn decode_integer_column(data: &[u8], idx: usize) -> Option<i64> {
+        if data.len() < 2 {
+            let row: Vec<Value> = bincode::deserialize(data).ok()?;
+            match row.get(idx)? {
+                Value::Integer(v) => Some(*v),
+                _ => None,
+            }
+        } else {
+            let (start, end) = Self::column_bounds(data, idx)?;
+            let span = &data[start..end];
+            // Tag 2 (Integer) = 4-byte LE tag + 8-byte LE i64 payload = 12 bytes.
+            if span.len() != 12 {
+                return None;
+            }
+            let (tag, body) = span.split_first_chunk::<4>()?;
+            if u32::from_le_bytes(*tag) != 2 {
+                return None;
+            }
+            Some(i64::from_le_bytes(body.try_into().ok()?))
+        }
+    }
+
     // Partially decode row, returning full Vec<Value> but with Nulls for skipped columns
     pub fn decode_partial(data: &[u8], indices: &[usize]) -> bincode::Result<Vec<Value>> {
         if data.len() < 2 {

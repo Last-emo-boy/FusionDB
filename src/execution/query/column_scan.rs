@@ -253,6 +253,41 @@ impl ColumnPredicateScanPlan {
 
         true
     }
+
+    /// Fast integer-only predicate evaluation: if every term compares an
+    /// integer column against an integer literal, decode the column directly
+    /// as `i64` and compare without constructing `Value` enums. Returns
+    /// `None` when any term's column or value is not integer (caller falls
+    /// back to `decode_values` + `matches_values`). NULL values in the row
+    /// cause the term to not match (SQL semantics: NULL comparisons are
+    /// unknown/false for filtering).
+    fn matches_row_integer_fast(&self, data: &[u8]) -> Option<bool> {
+        let mut result = true;
+        for term in &self.terms {
+            let &column_index = self.column_indices.get(term.value_slot)?;
+            // Only Integer-on-Integer comparisons can use this path.
+            let Value::Integer(expected) = &term.value else {
+                return None;
+            };
+            let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
+                data, column_index,
+            )?;
+            let matched = match term.op {
+                BinaryOperator::Eq => row_value == *expected,
+                BinaryOperator::NotEq => row_value != *expected,
+                BinaryOperator::Gt => row_value > *expected,
+                BinaryOperator::Lt => row_value < *expected,
+                BinaryOperator::GtEq => row_value >= *expected,
+                BinaryOperator::LtEq => row_value <= *expected,
+                _ => return None,
+            };
+            if !matched {
+                result = false;
+                break;
+            }
+        }
+        Some(result)
+    }
 }
 
 struct ColumnScanBatch {
@@ -293,6 +328,13 @@ impl ColumnScanBatch {
         // here; the aggregate/group columns decode inside `apply_matched_row`.
         if let Some(predicate) = predicate {
             for row in self.rows.iter() {
+                // Integer fast path: if every term is integer-on-integer, skip
+                // the full Value decode for non-matching rows entirely. Only
+                // matching rows pay for the full decode (the aggregate may
+                // reuse the predicate column value).
+                if let Some(false) = predicate.matches_row_integer_fast(row) {
+                    continue;
+                }
                 predicate.decode_values(row, &mut self.predicate_scratch)?;
                 if predicate.matches_values(&self.predicate_scratch) {
                     apply_matched_row(row, &self.predicate_scratch)?;
@@ -1627,6 +1669,15 @@ impl Executor {
                         user_key,
                         payload,
                     ) {
+                        // Integer fast path: skip full Value decode for
+                        // non-matching integer-predicate rows entirely.
+                        if let Some(predicate) = predicate {
+                            if let Some(false) =
+                                predicate.matches_row_integer_fast(payload)
+                            {
+                                continue;
+                            }
+                        }
                         // Decode predicate column(s) and skip non-matching rows
                         // before folding — late materialization at the block level.
                         Executor::decode_predicate_values(
@@ -1716,6 +1767,15 @@ impl Executor {
                         user_key,
                         payload,
                     ) {
+                        // Integer fast path: skip full Value decode for
+                        // non-matching integer-predicate rows entirely.
+                        if let Some(predicate) = predicate {
+                            if let Some(false) =
+                                predicate.matches_row_integer_fast(payload)
+                            {
+                                continue;
+                            }
+                        }
                         Executor::decode_predicate_values(
                             payload,
                             predicate,
