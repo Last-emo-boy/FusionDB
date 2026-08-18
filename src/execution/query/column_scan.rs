@@ -359,16 +359,25 @@ impl ColumnScanBatch {
         // here; the aggregate/group columns decode inside `apply_matched_row`.
         if let Some(predicate) = predicate {
             for row in self.rows.iter() {
-                // Integer fast path: if every term is integer-on-integer, skip
-                // the full Value decode for non-matching rows entirely. Only
-                // matching rows pay for the full decode (the aggregate may
-                // reuse the predicate column value).
-                if let Some(false) = predicate.matches_row_scalar_fast(row) {
-                    continue;
-                }
-                predicate.decode_values(row, &mut self.predicate_scratch)?;
-                if predicate.matches_values(&self.predicate_scratch) {
-                    apply_matched_row(row, &self.predicate_scratch)?;
+                // Scalar fast path: when every term is an int/float literal
+                // comparison, `matches_row_scalar_fast` gives a definitive
+                // answer without building `Value` enums. On a confirmed match
+                // we still decode the predicate columns (the aggregate may
+                // reuse them), but skip the redundant `matches_values`
+                // re-check. `None` (NULL or non-scalar term) falls back to the
+                // full decode + match path.
+                match predicate.matches_row_scalar_fast(row) {
+                    Some(true) => {
+                        predicate.decode_values(row, &mut self.predicate_scratch)?;
+                        apply_matched_row(row, &self.predicate_scratch)?;
+                    }
+                    Some(false) => continue,
+                    None => {
+                        predicate.decode_values(row, &mut self.predicate_scratch)?;
+                        if predicate.matches_values(&self.predicate_scratch) {
+                            apply_matched_row(row, &self.predicate_scratch)?;
+                        }
+                    }
                 }
             }
         } else {
@@ -1700,34 +1709,45 @@ impl Executor {
                         user_key,
                         payload,
                     ) {
-                        // Integer fast path: skip full Value decode for
-                        // non-matching integer-predicate rows entirely.
-                        if let Some(predicate) = predicate {
-                            if let Some(false) =
-                                predicate.matches_row_scalar_fast(payload)
-                            {
-                                continue;
+                        // Scalar fast path: skip full Value decode for
+                        // non-matching scalar-predicate rows entirely; on a
+                        // confirmed match skip the redundant re-check.
+                        match predicate.and_then(|p| p.matches_row_scalar_fast(payload)) {
+                            Some(false) => continue,
+                            Some(true) => {
+                                Executor::decode_predicate_values(
+                                    payload,
+                                    predicate,
+                                    &mut predicate_values,
+                                )?;
+                                apply_column_aggregate_matched_row(
+                                    &decode_plan,
+                                    states_ref,
+                                    &predicate_values,
+                                    &mut decoded_values,
+                                    payload,
+                                )?;
+                            }
+                            None => {
+                                Executor::decode_predicate_values(
+                                    payload,
+                                    predicate,
+                                    &mut predicate_values,
+                                )?;
+                                if let Some(predicate) = predicate {
+                                    if !predicate.matches_values(&predicate_values) {
+                                        continue;
+                                    }
+                                }
+                                apply_column_aggregate_matched_row(
+                                    &decode_plan,
+                                    states_ref,
+                                    &predicate_values,
+                                    &mut decoded_values,
+                                    payload,
+                                )?;
                             }
                         }
-                        // Decode predicate column(s) and skip non-matching rows
-                        // before folding — late materialization at the block level.
-                        Executor::decode_predicate_values(
-                            payload,
-                            predicate,
-                            &mut predicate_values,
-                        )?;
-                        if let Some(predicate) = predicate {
-                            if !predicate.matches_values(&predicate_values) {
-                                continue;
-                            }
-                        }
-                        apply_column_aggregate_matched_row(
-                            &decode_plan,
-                            states_ref,
-                            &predicate_values,
-                            &mut decoded_values,
-                            payload,
-                        )?;
                     }
                 }
                 Ok(())
@@ -1798,33 +1818,47 @@ impl Executor {
                         user_key,
                         payload,
                     ) {
-                        // Integer fast path: skip full Value decode for
-                        // non-matching integer-predicate rows entirely.
-                        if let Some(predicate) = predicate {
-                            if let Some(false) =
-                                predicate.matches_row_scalar_fast(payload)
-                            {
-                                continue;
+                        // Scalar fast path: skip full Value decode for
+                        // non-matching scalar-predicate rows entirely; on a
+                        // confirmed match skip the redundant re-check.
+                        match predicate.and_then(|p| p.matches_row_scalar_fast(payload)) {
+                            Some(false) => continue,
+                            Some(true) => {
+                                Executor::decode_predicate_values(
+                                    payload,
+                                    predicate,
+                                    &mut predicate_values,
+                                )?;
+                                apply_single_group_aggregate_matched_row(
+                                    group_column_index,
+                                    aggregate_plans,
+                                    predicate,
+                                    groups_ref,
+                                    &predicate_values,
+                                    payload,
+                                )?;
+                            }
+                            None => {
+                                Executor::decode_predicate_values(
+                                    payload,
+                                    predicate,
+                                    &mut predicate_values,
+                                )?;
+                                if let Some(predicate) = predicate {
+                                    if !predicate.matches_values(&predicate_values) {
+                                        continue;
+                                    }
+                                }
+                                apply_single_group_aggregate_matched_row(
+                                    group_column_index,
+                                    aggregate_plans,
+                                    predicate,
+                                    groups_ref,
+                                    &predicate_values,
+                                    payload,
+                                )?;
                             }
                         }
-                        Executor::decode_predicate_values(
-                            payload,
-                            predicate,
-                            &mut predicate_values,
-                        )?;
-                        if let Some(predicate) = predicate {
-                            if !predicate.matches_values(&predicate_values) {
-                                continue;
-                            }
-                        }
-                        apply_single_group_aggregate_matched_row(
-                            group_column_index,
-                            aggregate_plans,
-                            predicate,
-                            groups_ref,
-                            &predicate_values,
-                            payload,
-                        )?;
                     }
                 }
                 Ok(())
