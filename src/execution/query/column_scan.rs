@@ -1452,17 +1452,17 @@ impl Executor {
             }
         }
 
-        // 472 T1: block-level columnar fast path for bare (predicate-free)
-        // single-source aggregates. A pure pre-check that either folds the whole
-        // range and returns, or returns `None` so the untouched merge path below
-        // runs verbatim (zero risk).
-        if predicate.is_none() {
-            if let Some(values) = self
-                .try_columnar_single_source_aggregate(table_name, plans, txn)
-                .await?
-            {
-                return Ok(values);
-            }
+        // 472 T1: block-level columnar fast path for single-source aggregates.
+        // A pure pre-check that either folds the whole range and returns, or
+        // returns `None` so the untouched merge path below runs verbatim (zero
+        // risk). Supports bare (predicate-free) and simple value-predicate
+        // aggregates: the sink decodes the predicate column(s) and skips
+        // non-matching rows before folding.
+        if let Some(values) = self
+            .try_columnar_single_source_aggregate(table_name, plans, predicate, txn)
+            .await?
+        {
+            return Ok(values);
         }
 
         let mut states = column_aggregate_states(plans);
@@ -1517,6 +1517,7 @@ impl Executor {
         &self,
         table_name: &str,
         plans: &[ColumnAggregateScanPlan],
+        predicate: Option<&ColumnPredicateScanPlan>,
         txn: &mut dyn Transaction,
     ) -> Result<Option<Vec<Value>>> {
         if !self.columnar_single_source_aggregate_enabled() {
@@ -1541,8 +1542,9 @@ impl Executor {
         };
 
         let mut states = column_aggregate_states(plans);
-        let decode_plan = ColumnAggregateDecodePlan::new(plans, None);
+        let decode_plan = ColumnAggregateDecodePlan::new(plans, predicate);
         let mut decoded_values = Vec::with_capacity(decode_plan.scratch_capacity());
+        let mut predicate_values = ColumnPredicateScanPlan::scratch_values(predicate);
         let folded = {
             let schema_ref = schema.as_ref();
             let prefixes_ref = &prefixes;
@@ -1559,10 +1561,22 @@ impl Executor {
                         user_key,
                         payload,
                     ) {
+                        // Decode predicate column(s) and skip non-matching rows
+                        // before folding — late materialization at the block level.
+                        Executor::decode_predicate_values(
+                            payload,
+                            predicate,
+                            &mut predicate_values,
+                        )?;
+                        if let Some(predicate) = predicate {
+                            if !predicate.matches_values(&predicate_values) {
+                                continue;
+                            }
+                        }
                         apply_column_aggregate_matched_row(
                             &decode_plan,
                             states_ref,
-                            &[],
+                            &predicate_values,
                             &mut decoded_values,
                             payload,
                         )?;
@@ -3041,6 +3055,88 @@ mod tests {
                         fired,
                         "iteration {iteration} {aggregate}: fast path must fire on a clean single SSTable"
                     );
+                }
+            }
+
+            cleanup_dir(&data_dir);
+        }
+    }
+
+    /// Predicate-bearing aggregates must also fire the columnar single-source
+    /// fast path on a clean single SSTable, and produce bit-identical results to
+    /// the merge fallback (including float accumulation order).
+    #[tokio::test]
+    async fn columnar_fast_path_predicate_matches_merge_across_aggregates() {
+        let mut rng = SplitMix64(0x0BAD_CAFE_DEAD_BEEF);
+        for iteration in 0..6u32 {
+            let (executor, fusion, data_dir) =
+                fusion_executor(&format!("pred_diff_{iteration}")).await;
+            let table = format!("pd_{iteration}");
+            exec_ok_sql(
+                &executor,
+                &format!(
+                    "CREATE TABLE {table} (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL, \
+                     vf FLOAT NOT NULL, vs TEXT, vn INTEGER, vd DECIMAL(20, 4))"
+                ),
+            )
+            .await;
+
+            let row_count = 40 + rng.below(220) as u32;
+            let mut insert = format!("INSERT INTO {table} VALUES ");
+            for id in 1..=row_count {
+                if id > 1 {
+                    insert.push(',');
+                }
+                let vi = rng.below(2_000_000) as i64 - 1_000_000;
+                let vf = (rng.next_u64() as f64 / u64::MAX as f64) * 4000.0 - 2000.0;
+                let vd_cents = rng.below(50_000_000) as i64 - 25_000_000;
+                let vs = format!("s{:08}", rng.below(100_000_000));
+                let vn = if rng.below(4) == 0 {
+                    "NULL".to_string()
+                } else {
+                    (rng.below(1_000_000) as i64).to_string()
+                };
+                let vs_lit = if rng.below(10) == 0 {
+                    "NULL".to_string()
+                } else {
+                    format!("'{vs}'")
+                };
+                let vd = format!(
+                    "CAST('{}.{:04}' AS DECIMAL(20,4))",
+                    vd_cents / 10_000,
+                    (vd_cents % 10_000).abs()
+                );
+                insert.push_str(&format!("({id}, {vi}, {vf:.6}, {vs_lit}, {vn}, {vd})"));
+            }
+            exec_ok_sql(&executor, &insert).await;
+            fusion.create_snapshot_now().await.unwrap();
+
+            // Predicates that exercise comparison operators on different column types.
+            // Only BinaryOp comparisons are supported by ColumnPredicateScanPlan;
+            // IS NULL / IS NOT NULL take a different execution path.
+            let predicates = [
+                "WHERE vi >= 0",
+                "WHERE vi < 500000",
+                "WHERE vf > 0.0",
+                "WHERE vn >= 0",
+            ];
+            for predicate in predicates {
+                for aggregate in DIFFERENTIAL_AGGREGATES {
+                    let sql = format!("SELECT {aggregate} FROM {table} {predicate}");
+                    let before = fast_path_fire_count();
+                    let fast = agg_row_fast(&executor, &sql).await;
+                    let fired = fast_path_fire_count() > before;
+                    let fallback = agg_row_fallback(&executor, &sql).await;
+                    assert!(
+                        values_bit_equal(&fast, &fallback),
+                        "iteration {iteration} {aggregate} {predicate}: fast {fast:?} != fallback {fallback:?}"
+                    );
+                    if *aggregate != "COUNT(*)" {
+                        assert!(
+                            fired,
+                            "iteration {iteration} {aggregate} {predicate}: fast path must fire on a clean single SSTable"
+                        );
+                    }
                 }
             }
 
