@@ -24,11 +24,17 @@ const GROUP_BY_COUNT_INDEX_STATS_MIN_ENTRIES: usize = 65_536;
 #[cfg(test)]
 thread_local! {
     static COLUMNAR_FAST_PATH_FIRE_LOCAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static COLUMN_AGGREGATE_COLUMN_DECODE_LOCAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn note_columnar_fast_path_fire_for_test() {
     COLUMNAR_FAST_PATH_FIRE_LOCAL.with(|cell| cell.set(cell.get() + 1));
+}
+
+#[cfg(test)]
+fn note_column_aggregate_column_decode_for_test() {
+    COLUMN_AGGREGATE_COLUMN_DECODE_LOCAL.with(|cell| cell.set(cell.get() + 1));
 }
 
 #[derive(Clone, Copy)]
@@ -279,6 +285,113 @@ fn join_string_aggregate_values(values: &[String]) -> String {
     joined
 }
 
+#[derive(Clone, Copy)]
+enum ColumnAggregateValueSource {
+    Predicate(usize),
+    Decoded(usize),
+}
+
+struct ColumnAggregateDecodePlan {
+    sources: Vec<Option<ColumnAggregateValueSource>>,
+    decoded_columns: Vec<usize>,
+    decoded_last_consumers: Vec<usize>,
+    has_decoded_reuse: bool,
+}
+
+impl ColumnAggregateDecodePlan {
+    fn new(plans: &[ColumnAggregateScanPlan], predicate: Option<&ColumnPredicateScanPlan>) -> Self {
+        let mut sources = Vec::with_capacity(plans.len());
+        let mut decoded_columns = Vec::new();
+
+        for plan in plans {
+            let Some(column_index) = plan.column_index else {
+                sources.push(None);
+                continue;
+            };
+
+            if let Some(predicate_slot) = predicate.and_then(|predicate| {
+                predicate
+                    .column_indices
+                    .iter()
+                    .position(|&index| index == column_index)
+            }) {
+                sources.push(Some(ColumnAggregateValueSource::Predicate(predicate_slot)));
+                continue;
+            }
+
+            let decoded_slot = if let Some(slot) = decoded_columns
+                .iter()
+                .position(|&index| index == column_index)
+            {
+                slot
+            } else {
+                let slot = decoded_columns.len();
+                decoded_columns.push(column_index);
+                slot
+            };
+            sources.push(Some(ColumnAggregateValueSource::Decoded(decoded_slot)));
+        }
+
+        let mut decoded_last_consumers = vec![0; decoded_columns.len()];
+        for (plan_index, source) in sources.iter().enumerate() {
+            if let Some(ColumnAggregateValueSource::Decoded(slot)) = source {
+                decoded_last_consumers[*slot] = plan_index;
+            }
+        }
+        let decoded_source_count = sources
+            .iter()
+            .filter(|source| matches!(source, Some(ColumnAggregateValueSource::Decoded(_))))
+            .count();
+        let has_decoded_reuse = decoded_source_count > decoded_last_consumers.len();
+
+        Self {
+            sources,
+            decoded_columns,
+            decoded_last_consumers,
+            has_decoded_reuse,
+        }
+    }
+
+    fn decode(&self, data: &[u8], decoded_values: &mut Vec<Value>) -> Result<()> {
+        decoded_values.clear();
+        decoded_values.reserve(self.decoded_columns.len());
+
+        for &column_index in &self.decoded_columns {
+            decoded_values.push(self.decode_one(data, column_index)?);
+        }
+
+        Ok(())
+    }
+
+    fn decode_one(&self, data: &[u8], column_index: usize) -> Result<Value> {
+        let value = crate::common::encoding::RowDecoder::decode_column(data, column_index)
+            .map_err(|e| FusionError::Execution(format!("Data deserialization error: {}", e)))?
+            .unwrap_or(Value::Null);
+        #[cfg(test)]
+        note_column_aggregate_column_decode_for_test();
+        Ok(value)
+    }
+
+    fn scratch_capacity(&self) -> usize {
+        if self.has_decoded_reuse && self.decoded_columns.len() > 1 {
+            self.decoded_columns.len()
+        } else {
+            0
+        }
+    }
+
+    fn value<'a>(
+        source: ColumnAggregateValueSource,
+        predicate_values: &'a [Value],
+        decoded_values: &'a [Value],
+    ) -> &'a Value {
+        match source {
+            ColumnAggregateValueSource::Predicate(slot) => &predicate_values[slot],
+            ColumnAggregateValueSource::Decoded(slot) => &decoded_values[slot],
+        }
+    }
+}
+
 impl ColumnAggregateState {
     fn new(kind: ColumnAggregateKind) -> Self {
         Self {
@@ -295,35 +408,76 @@ impl ColumnAggregateState {
         }
     }
 
-    fn update(&mut self, value: Value) {
+    fn update_count_star(&mut self) {
+        debug_assert!(matches!(self.kind, ColumnAggregateKind::CountStar));
+        self.count += 1;
+    }
+
+    fn update_ref(&mut self, value: &Value) {
         match self.kind {
-            ColumnAggregateKind::CountStar => {
-                self.count += 1;
-            }
+            ColumnAggregateKind::CountStar => self.update_count_star(),
             ColumnAggregateKind::CountColumn => {
-                if value != Value::Null {
+                if !matches!(value, Value::Null) {
                     self.count += 1;
                 }
             }
             ColumnAggregateKind::Sum | ColumnAggregateKind::Avg => match value {
                 Value::Integer(value) => {
-                    self.sum += value as f64;
+                    self.sum += *value as f64;
                     self.count += 1;
                 }
                 Value::Float(value) => {
-                    self.sum += value;
+                    self.sum += *value;
                     self.count += 1;
                     self.is_int = false;
                 }
                 Value::Decimal(value) => {
-                    if let Ok(value) = value.parse::<f64>() {
-                        self.sum += value;
+                    if let Ok(parsed) = value.parse::<f64>() {
+                        self.sum += parsed;
                         self.count += 1;
                         self.is_int = false;
                     }
                 }
                 _ => {}
             },
+            ColumnAggregateKind::Min => {
+                if matches!(value, Value::Null) {
+                    return;
+                }
+                if self
+                    .min
+                    .as_ref()
+                    .is_none_or(|current| value.compare(current) == Ordering::Less)
+                {
+                    self.min = Some(value.clone());
+                }
+            }
+            ColumnAggregateKind::Max => {
+                if matches!(value, Value::Null) {
+                    return;
+                }
+                if self
+                    .max
+                    .as_ref()
+                    .is_none_or(|current| value.compare(current) == Ordering::Greater)
+                {
+                    self.max = Some(value.clone());
+                }
+            }
+            ColumnAggregateKind::StringAgg => match value {
+                Value::String(value) => self.strings.push(value.clone()),
+                Value::Integer(value) => self.strings.push(value.to_string()),
+                Value::Float(value) => self.strings.push(value.to_string()),
+                Value::Decimal(value) => self.strings.push(value.clone()),
+                Value::Boolean(value) => self.strings.push(value.to_string()),
+                Value::Null => {}
+                _ => {}
+            },
+        }
+    }
+
+    fn update_owned(&mut self, value: Value) {
+        match self.kind {
             ColumnAggregateKind::Min => {
                 if value == Value::Null {
                     return;
@@ -357,6 +511,7 @@ impl ColumnAggregateState {
                 Value::Null => {}
                 _ => {}
             },
+            _ => self.update_ref(&value),
         }
     }
 
@@ -408,23 +563,83 @@ fn finalize_column_aggregate_states(states: &[ColumnAggregateState]) -> Vec<Valu
 }
 
 fn apply_column_aggregate_matched_row(
-    plans: &[ColumnAggregateScanPlan],
-    predicate: Option<&ColumnPredicateScanPlan>,
+    decode_plan: &ColumnAggregateDecodePlan,
     states: &mut [ColumnAggregateState],
     predicate_values: &[Value],
+    decoded_values: &mut Vec<Value>,
     data: &[u8],
 ) -> Result<()> {
-    for (state, plan) in states.iter_mut().zip(plans.iter()) {
-        if let Some(column_index) = plan.column_index {
-            let value = Executor::decode_column_or_reuse_predicate(
-                data,
-                column_index,
-                predicate,
-                predicate_values,
-            )?;
-            state.update(value);
+    // If no decoded column is shared by multiple plans, preserve the original
+    // owned per-plan fold. This keeps singleton and multi-column aggregates
+    // free of scratch-container bookkeeping; only actual reuse pays for the
+    // row-local decode cache below.
+    if !decode_plan.has_decoded_reuse {
+        for (state, source) in states.iter_mut().zip(decode_plan.sources.iter()) {
+            match source {
+                Some(ColumnAggregateValueSource::Decoded(slot)) => {
+                    let value = decode_plan.decode_one(data, decode_plan.decoded_columns[*slot])?;
+                    state.update_owned(value);
+                }
+                Some(ColumnAggregateValueSource::Predicate(slot)) => {
+                    state.update_ref(&predicate_values[*slot]);
+                }
+                None => state.update_count_star(),
+            }
+        }
+        return Ok(());
+    }
+
+    // A single decoded column is common for COUNT/SUM/AVG/MIN/MAX. Keep the
+    // value in a local so this path avoids a per-row Vec clear/push and lets
+    // the final consumer take ownership (notably for STRING_AGG and MIN/MAX).
+    if decode_plan.decoded_columns.len() == 1 {
+        let mut decoded_value = decode_plan.decode_one(data, decode_plan.decoded_columns[0])?;
+        for (plan_index, (state, source)) in states
+            .iter_mut()
+            .zip(decode_plan.sources.iter())
+            .enumerate()
+        {
+            match source {
+                Some(ColumnAggregateValueSource::Decoded(slot)) => {
+                    debug_assert_eq!(*slot, 0);
+                    if decode_plan.decoded_last_consumers[*slot] == plan_index {
+                        state.update_owned(std::mem::replace(&mut decoded_value, Value::Null));
+                    } else {
+                        state.update_ref(&decoded_value);
+                    }
+                }
+                Some(ColumnAggregateValueSource::Predicate(slot)) => {
+                    state.update_ref(&predicate_values[*slot]);
+                }
+                None => state.update_count_star(),
+            }
+        }
+        return Ok(());
+    }
+
+    decode_plan.decode(data, decoded_values)?;
+
+    for (plan_index, (state, source)) in states
+        .iter_mut()
+        .zip(decode_plan.sources.iter())
+        .enumerate()
+    {
+        if let Some(source) = source {
+            match source {
+                ColumnAggregateValueSource::Decoded(slot)
+                    if decode_plan.decoded_last_consumers[*slot] == plan_index =>
+                {
+                    let value = std::mem::replace(&mut decoded_values[*slot], Value::Null);
+                    state.update_owned(value);
+                }
+                _ => {
+                    let value =
+                        ColumnAggregateDecodePlan::value(*source, predicate_values, decoded_values);
+                    state.update_ref(value);
+                }
+            }
         } else {
-            state.update(Value::Integer(1));
+            state.update_count_star();
         }
     }
 
@@ -432,10 +647,11 @@ fn apply_column_aggregate_matched_row(
 }
 
 struct ColumnAggregateScanVisitor<'a> {
-    plans: &'a [ColumnAggregateScanPlan],
-    predicate: Option<&'a ColumnPredicateScanPlan>,
+    decode_plan: ColumnAggregateDecodePlan,
     states: &'a mut [ColumnAggregateState],
+    predicate: Option<&'a ColumnPredicateScanPlan>,
     predicate_values: Vec<Value>,
+    decoded_values: Vec<Value>,
     error: Option<FusionError>,
 }
 
@@ -449,10 +665,10 @@ impl ColumnAggregateScanVisitor<'_> {
         }
 
         apply_column_aggregate_matched_row(
-            self.plans,
-            self.predicate,
+            &self.decode_plan,
             self.states,
             &self.predicate_values,
+            &mut self.decoded_values,
             data,
         )
     }
@@ -1252,11 +1468,14 @@ impl Executor {
         let mut states = column_aggregate_states(plans);
 
         let scan_error = {
+            let decode_plan = ColumnAggregateDecodePlan::new(plans, predicate);
+            let decoded_capacity = decode_plan.scratch_capacity();
             let mut visitor = ColumnAggregateScanVisitor {
-                plans,
+                decode_plan,
                 predicate,
                 states: &mut states,
                 predicate_values: ColumnPredicateScanPlan::scratch_values(predicate),
+                decoded_values: Vec::with_capacity(decoded_capacity),
                 error: None,
             };
             self.scan_routed_data_prefixes_for_each(table_name, txn, None, &mut visitor)
@@ -1322,6 +1541,8 @@ impl Executor {
         };
 
         let mut states = column_aggregate_states(plans);
+        let decode_plan = ColumnAggregateDecodePlan::new(plans, None);
+        let mut decoded_values = Vec::with_capacity(decode_plan.scratch_capacity());
         let folded = {
             let schema_ref = schema.as_ref();
             let prefixes_ref = &prefixes;
@@ -1338,7 +1559,13 @@ impl Executor {
                         user_key,
                         payload,
                     ) {
-                        apply_column_aggregate_matched_row(plans, None, states_ref, &[], payload)?;
+                        apply_column_aggregate_matched_row(
+                            &decode_plan,
+                            states_ref,
+                            &[],
+                            &mut decoded_values,
+                            payload,
+                        )?;
                     }
                 }
                 Ok(())
@@ -1404,11 +1631,14 @@ impl Executor {
         }
 
         let mut states = column_aggregate_states(plans);
+        let decode_plan = ColumnAggregateDecodePlan::new(plans, Some(predicate));
+        let decoded_capacity = decode_plan.scratch_capacity();
         let mut visitor = ColumnAggregateScanVisitor {
-            plans,
+            decode_plan,
             predicate: Some(predicate),
             states: &mut states,
             predicate_values: ColumnPredicateScanPlan::scratch_values(Some(predicate)),
+            decoded_values: Vec::with_capacity(decoded_capacity),
             error: None,
         };
 
@@ -2674,6 +2904,10 @@ mod tests {
         super::COLUMNAR_FAST_PATH_FIRE_LOCAL.with(|cell| cell.get())
     }
 
+    fn aggregate_column_decode_count() -> u64 {
+        super::COLUMN_AGGREGATE_COLUMN_DECODE_LOCAL.with(|cell| cell.get())
+    }
+
     async fn exec_ok_sql(executor: &Executor, sql: &str) {
         executor.execute_sql(sql).await.unwrap();
     }
@@ -2812,6 +3046,98 @@ mod tests {
 
             cleanup_dir(&data_dir);
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_column_aggregates_decode_once_per_row_and_match_fallback() {
+        let (executor, fusion, data_dir) = fusion_executor("decode_once").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)",
+        )
+        .await;
+        exec_ok_sql(
+            &executor,
+            "INSERT INTO d VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)",
+        )
+        .await;
+        fusion.create_snapshot_now().await.unwrap();
+
+        let sql = "SELECT SUM(v), AVG(v), MIN(v), MAX(v), COUNT(v), COUNT(*) FROM d";
+        let fast_path_before = fast_path_fire_count();
+        let decode_before = aggregate_column_decode_count();
+        let fast = agg_row_fast(&executor, sql).await;
+
+        assert!(
+            fast_path_fire_count() > fast_path_before,
+            "the clean single-SSTable path must fire"
+        );
+        assert_eq!(
+            aggregate_column_decode_count() - decode_before,
+            4,
+            "five aggregates over v must decode that column once for each of four rows"
+        );
+        assert_eq!(
+            fast,
+            vec![
+                Value::Integer(40),
+                Value::Float(20.0),
+                Value::Integer(10),
+                Value::Integer(30),
+                Value::Integer(2),
+                Value::Integer(4),
+            ]
+        );
+
+        let fallback_decode_before = aggregate_column_decode_count();
+        let fallback = agg_row_fallback(&executor, sql).await;
+        assert!(values_bit_equal(&fast, &fallback));
+        assert_eq!(
+            aggregate_column_decode_count() - fallback_decode_before,
+            4,
+            "the merge fallback must share the same decode-once fold"
+        );
+
+        cleanup_dir(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn multi_column_aggregate_reuse_matches_fallback_bitwise() {
+        let (executor, fusion, data_dir) = fusion_executor("decode_once_multi").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE dm (id INTEGER PRIMARY KEY, vi INTEGER, vf FLOAT)",
+        )
+        .await;
+        exec_ok_sql(
+            &executor,
+            "INSERT INTO dm VALUES (1, 10, 1.5), (2, NULL, -2.0), (3, 30, 3.25)",
+        )
+        .await;
+        fusion.create_snapshot_now().await.unwrap();
+
+        let sql = "SELECT SUM(vi), AVG(vi), MIN(vf), MAX(vf), COUNT(*) FROM dm";
+        let decode_before = aggregate_column_decode_count();
+        let fast = agg_row_fast(&executor, sql).await;
+        assert_eq!(
+            aggregate_column_decode_count() - decode_before,
+            6,
+            "two unique columns must be decoded once per row in the shared generic path"
+        );
+        assert_eq!(
+            fast,
+            vec![
+                Value::Integer(40),
+                Value::Float(20.0),
+                Value::Float(-2.0),
+                Value::Float(3.25),
+                Value::Integer(3),
+            ]
+        );
+
+        let fallback = agg_row_fallback(&executor, sql).await;
+        assert!(values_bit_equal(&fast, &fallback));
+        cleanup_dir(&data_dir);
     }
 
     #[tokio::test]
