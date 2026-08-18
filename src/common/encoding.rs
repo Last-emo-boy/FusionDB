@@ -281,21 +281,14 @@ impl RowDecoder {
         }
 
         let off_pos = 2 + idx * 4;
-        let start = u32::from_le_bytes([
-            data[off_pos],
-            data[off_pos + 1],
-            data[off_pos + 2],
-            data[off_pos + 3],
-        ]) as usize;
+        // Single contiguous 4-byte read per offset (the header is little-endian
+        // u32 offsets laid out consecutively). Bounds are already verified by
+        // `header_size` above so these slices are in range.
+        let start = u32::from_le_bytes(data[off_pos..off_pos + 4].try_into().ok()?) as usize;
 
         let end = if idx + 1 < count {
             let next_off_pos = off_pos + 4;
-            u32::from_le_bytes([
-                data[next_off_pos],
-                data[next_off_pos + 1],
-                data[next_off_pos + 2],
-                data[next_off_pos + 3],
-            ]) as usize
+            u32::from_le_bytes(data[next_off_pos..next_off_pos + 4].try_into().ok()?) as usize
         } else {
             data.len()
         };
@@ -322,21 +315,13 @@ impl RowDecoder {
         let mut row = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
             let off_pos = 2 + i * 4;
-            let start = u32::from_le_bytes([
-                data[off_pos],
-                data[off_pos + 1],
-                data[off_pos + 2],
-                data[off_pos + 3],
-            ]) as usize;
+            let start = u32::from_le_bytes(data[off_pos..off_pos + 4].try_into().unwrap()) as usize;
 
             let end = if i + 1 < count as usize {
                 let next_off_pos = off_pos + 4;
-                u32::from_le_bytes([
-                    data[next_off_pos],
-                    data[next_off_pos + 1],
-                    data[next_off_pos + 2],
-                    data[next_off_pos + 3],
-                ]) as usize
+                u32::from_le_bytes(
+                    data[next_off_pos..next_off_pos + 4].try_into().unwrap(),
+                ) as usize
             } else {
                 data.len()
             };
@@ -426,21 +411,13 @@ impl RowDecoder {
             }
 
             let off_pos = 2 + idx * 4;
-            let start = u32::from_le_bytes([
-                data[off_pos],
-                data[off_pos + 1],
-                data[off_pos + 2],
-                data[off_pos + 3],
-            ]) as usize;
+            let start = u32::from_le_bytes(data[off_pos..off_pos + 4].try_into().unwrap()) as usize;
 
             let end = if idx + 1 < count {
                 let next_off_pos = off_pos + 4;
-                u32::from_le_bytes([
-                    data[next_off_pos],
-                    data[next_off_pos + 1],
-                    data[next_off_pos + 2],
-                    data[next_off_pos + 3],
-                ]) as usize
+                u32::from_le_bytes(
+                    data[next_off_pos..next_off_pos + 4].try_into().unwrap(),
+                ) as usize
             } else {
                 data.len()
             };
