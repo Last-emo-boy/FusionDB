@@ -396,24 +396,39 @@ impl RowDecoder {
     /// integer predicate evaluation directly on the encoded bytes — true
     /// late materialization for the most common predicate case.
     pub fn decode_integer_column(data: &[u8], idx: usize) -> Option<i64> {
+        Self::decode_scalar_raw(data, idx, 2).map(i64::from_le_bytes)
+    }
+
+    /// Fast float-only decode: returns the raw `f64` for a float column
+    /// (bincode tag 3), or `None` otherwise. Same late-materialization
+    /// benefit as `decode_integer_column` for float-predicate rows.
+    pub fn decode_float_column(data: &[u8], idx: usize) -> Option<f64> {
+        Self::decode_scalar_raw(data, idx, 3).map(f64::from_le_bytes)
+    }
+
+    /// Shared fast-scalar decode: tag + 8-byte LE payload. Returns the 8
+    /// payload bytes for the given bincode tag, or `None` if the column is
+    /// absent, null, wrong-sized, or a different type.
+    fn decode_scalar_raw(data: &[u8], idx: usize, expected_tag: u32) -> Option<[u8; 8]> {
         if data.len() < 2 {
             let row: Vec<Value> = bincode::deserialize(data).ok()?;
             match row.get(idx)? {
-                Value::Integer(v) => Some(*v),
+                Value::Integer(v) if expected_tag == 2 => Some(v.to_le_bytes()),
+                Value::Float(v) if expected_tag == 3 => Some(v.to_le_bytes()),
                 _ => None,
             }
         } else {
             let (start, end) = Self::column_bounds(data, idx)?;
             let span = &data[start..end];
-            // Tag 2 (Integer) = 4-byte LE tag + 8-byte LE i64 payload = 12 bytes.
+            // Tag + 8-byte payload = 12 bytes.
             if span.len() != 12 {
                 return None;
             }
             let (tag, body) = span.split_first_chunk::<4>()?;
-            if u32::from_le_bytes(*tag) != 2 {
+            if u32::from_le_bytes(*tag) != expected_tag {
                 return None;
             }
-            Some(i64::from_le_bytes(body.try_into().ok()?))
+            body.try_into().ok()
         }
     }
 

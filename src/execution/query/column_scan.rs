@@ -254,31 +254,30 @@ impl ColumnPredicateScanPlan {
         true
     }
 
-    /// Fast integer-only predicate evaluation: if every term compares an
-    /// integer column against an integer literal, decode the column directly
-    /// as `i64` and compare without constructing `Value` enums. Returns
-    /// `None` when any term's column or value is not integer (caller falls
-    /// back to `decode_values` + `matches_values`). NULL values in the row
-    /// cause the term to not match (SQL semantics: NULL comparisons are
-    /// unknown/false for filtering).
-    fn matches_row_integer_fast(&self, data: &[u8]) -> Option<bool> {
+    /// Fast scalar predicate evaluation: if every term compares an integer or
+    /// float column against a same-type literal, decode the column directly
+    /// as `i64`/`f64` and compare without constructing `Value` enums. Returns
+    /// `None` when any term's column or value is not a supported scalar
+    /// (caller falls back to `decode_values` + `matches_values`). NULL values
+    /// in the row cause the term to not match (SQL semantics: NULL
+    /// comparisons are unknown/false for filtering).
+    fn matches_row_scalar_fast(&self, data: &[u8]) -> Option<bool> {
         let mut result = true;
         for term in &self.terms {
             let &column_index = self.column_indices.get(term.value_slot)?;
-            // Only Integer-on-Integer comparisons can use this path.
-            let Value::Integer(expected) = &term.value else {
-                return None;
-            };
-            let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
-                data, column_index,
-            )?;
-            let matched = match term.op {
-                BinaryOperator::Eq => row_value == *expected,
-                BinaryOperator::NotEq => row_value != *expected,
-                BinaryOperator::Gt => row_value > *expected,
-                BinaryOperator::Lt => row_value < *expected,
-                BinaryOperator::GtEq => row_value >= *expected,
-                BinaryOperator::LtEq => row_value <= *expected,
+            let matched = match &term.value {
+                Value::Integer(expected) => {
+                    let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
+                        data, column_index,
+                    )?;
+                    Self::scalar_i64_matches(row_value, &term.op, *expected)?
+                }
+                Value::Float(expected) => {
+                    let row_value = crate::common::encoding::RowDecoder::decode_float_column(
+                        data, column_index,
+                    )?;
+                    Self::scalar_f64_matches(row_value, &term.op, *expected)?
+                }
                 _ => return None,
             };
             if !matched {
@@ -287,6 +286,38 @@ impl ColumnPredicateScanPlan {
             }
         }
         Some(result)
+    }
+
+    fn scalar_i64_matches(
+        row: i64,
+        op: &BinaryOperator,
+        expected: i64,
+    ) -> Option<bool> {
+        Some(match op {
+            BinaryOperator::Eq => row == expected,
+            BinaryOperator::NotEq => row != expected,
+            BinaryOperator::Gt => row > expected,
+            BinaryOperator::Lt => row < expected,
+            BinaryOperator::GtEq => row >= expected,
+            BinaryOperator::LtEq => row <= expected,
+            _ => return None,
+        })
+    }
+
+    fn scalar_f64_matches(
+        row: f64,
+        op: &BinaryOperator,
+        expected: f64,
+    ) -> Option<bool> {
+        Some(match op {
+            BinaryOperator::Eq => row == expected,
+            BinaryOperator::NotEq => row != expected,
+            BinaryOperator::Gt => row > expected,
+            BinaryOperator::Lt => row < expected,
+            BinaryOperator::GtEq => row >= expected,
+            BinaryOperator::LtEq => row <= expected,
+            _ => return None,
+        })
     }
 }
 
@@ -332,7 +363,7 @@ impl ColumnScanBatch {
                 // the full Value decode for non-matching rows entirely. Only
                 // matching rows pay for the full decode (the aggregate may
                 // reuse the predicate column value).
-                if let Some(false) = predicate.matches_row_integer_fast(row) {
+                if let Some(false) = predicate.matches_row_scalar_fast(row) {
                     continue;
                 }
                 predicate.decode_values(row, &mut self.predicate_scratch)?;
@@ -1673,7 +1704,7 @@ impl Executor {
                         // non-matching integer-predicate rows entirely.
                         if let Some(predicate) = predicate {
                             if let Some(false) =
-                                predicate.matches_row_integer_fast(payload)
+                                predicate.matches_row_scalar_fast(payload)
                             {
                                 continue;
                             }
@@ -1771,7 +1802,7 @@ impl Executor {
                         // non-matching integer-predicate rows entirely.
                         if let Some(predicate) = predicate {
                             if let Some(false) =
-                                predicate.matches_row_integer_fast(payload)
+                                predicate.matches_row_scalar_fast(payload)
                             {
                                 continue;
                             }
