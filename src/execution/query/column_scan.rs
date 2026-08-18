@@ -256,8 +256,6 @@ impl ColumnPredicateScanPlan {
 
 struct ColumnScanBatch {
     rows: Vec<Vec<u8>>,
-    selected: Vec<usize>,
-    predicate_values: Vec<Vec<Value>>,
     predicate_scratch: Vec<Value>,
 }
 
@@ -265,8 +263,6 @@ impl ColumnScanBatch {
     fn new(predicate: Option<&ColumnPredicateScanPlan>) -> Self {
         Self {
             rows: Vec::with_capacity(COLUMN_SCAN_BATCH_SIZE),
-            selected: Vec::with_capacity(COLUMN_SCAN_BATCH_SIZE),
-            predicate_values: Vec::with_capacity(predicate.map_or(0, |_| COLUMN_SCAN_BATCH_SIZE)),
             predicate_scratch: ColumnPredicateScanPlan::scratch_values(predicate),
         }
     }
@@ -288,27 +284,23 @@ impl ColumnScanBatch {
             return Ok(());
         }
 
-        self.selected.clear();
-        self.predicate_values.clear();
+        // Single pass: decode the predicate columns, check the predicate, and
+        // fold the row in the same iteration. The decoded predicate values
+        // live in `predicate_scratch` for the duration of the synchronous
+        // `apply_matched_row` call, so no per-row clone or selection buffer is
+        // needed. Late materialization: only predicate columns are decoded
+        // here; the aggregate/group columns decode inside `apply_matched_row`.
         if let Some(predicate) = predicate {
-            for (row_index, row) in self.rows.iter().enumerate() {
+            for row in self.rows.iter() {
                 predicate.decode_values(row, &mut self.predicate_scratch)?;
                 if predicate.matches_values(&self.predicate_scratch) {
-                    self.selected.push(row_index);
-                    self.predicate_values.push(self.predicate_scratch.clone());
+                    apply_matched_row(row, &self.predicate_scratch)?;
                 }
             }
         } else {
-            self.selected.extend(0..self.rows.len());
-        }
-
-        for (selection_slot, &row_index) in self.selected.iter().enumerate() {
-            let predicate_values = if predicate.is_some() {
-                self.predicate_values[selection_slot].as_slice()
-            } else {
-                &[]
-            };
-            apply_matched_row(&self.rows[row_index], predicate_values)?;
+            for row in self.rows.iter() {
+                apply_matched_row(row, &[])?;
+            }
         }
 
         self.rows.clear();
