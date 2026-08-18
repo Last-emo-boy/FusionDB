@@ -264,7 +264,10 @@ impl ColumnPredicateScanPlan {
     fn matches_row_scalar_fast(&self, data: &[u8]) -> Option<bool> {
         let mut result = true;
         for term in &self.terms {
-            let &column_index = self.column_indices.get(term.value_slot)?;
+            // `value_slot` is validated against `column_indices` at
+            // construction time, so direct indexing is safe and avoids the
+            // per-row bounds check of `.get()`.
+            let column_index = self.column_indices[term.value_slot];
             let matched = match &term.value {
                 Value::Integer(expected) => {
                     let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
