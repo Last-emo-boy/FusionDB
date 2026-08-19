@@ -800,6 +800,20 @@ impl ColumnAggregateState {
         }
     }
 
+    /// Type-agnostic fast fold for `COUNT(col)`: when the caller has already
+    /// confirmed the column is non-NULL (via `column_is_non_null`), count it
+    /// without decoding the value at all. Returns `true` only for `CountColumn`
+    /// — every other kind needs the value and falls back.
+    fn update_count_non_null(&mut self) -> bool {
+        match self.kind {
+            ColumnAggregateKind::CountColumn => {
+                self.count += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn finalize(&self) -> Value {
         match self.kind {
             ColumnAggregateKind::CountStar => Value::Integer(self.count),
@@ -879,6 +893,17 @@ fn apply_column_aggregate_matched_row(
                     }
                     if let Some(f) = crate::common::encoding::RowDecoder::decode_float_column(data, column_index) {
                         if state.update_scalar_f64(f) {
+                            #[cfg(test)]
+                            note_column_aggregate_column_decode_for_test();
+                            continue;
+                        }
+                    }
+                    // COUNT(col) over a non-scalar (e.g. TEXT) column: peek
+                    // the tag to skip NULLs without decoding the value, so
+                    // `COUNT(category)` on a nullable string column never pays
+                    // for a full `Value` decode.
+                    if let Some(true) = crate::common::encoding::RowDecoder::column_is_non_null(data, column_index) {
+                        if state.update_count_non_null() {
                             #[cfg(test)]
                             note_column_aggregate_column_decode_for_test();
                             continue;
@@ -3708,6 +3733,7 @@ mod tests {
     const DIFFERENTIAL_AGGREGATES: &[&str] = &[
         "COUNT(*)",
         "COUNT(vn)",
+        "COUNT(vs)",
         "SUM(vi)",
         "SUM(vf)",
         "SUM(vd)",

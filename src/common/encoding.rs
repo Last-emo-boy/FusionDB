@@ -218,6 +218,52 @@ mod tests {
         let blob = bincode::serialize(&Value::Blob(vec![1, 2])).unwrap();
         assert_eq!(RowDecoder::decode_scalar_span(&blob), None);
     }
+
+    #[test]
+    fn test_column_is_non_null_distinguishes_null_from_value() {
+        // Column 0 = NULL, column 1 = Integer, column 2 = String, column 3 = Float.
+        let row = vec![
+            Value::Null,
+            Value::Integer(7),
+            Value::String("hi".to_string()),
+            Value::Float(1.5),
+        ];
+        let encoded = RowEncoder::encode(&row);
+        assert_eq!(RowDecoder::column_is_non_null(&encoded, 0), Some(false));
+        assert_eq!(RowDecoder::column_is_non_null(&encoded, 1), Some(true));
+        assert_eq!(RowDecoder::column_is_non_null(&encoded, 2), Some(true));
+        assert_eq!(RowDecoder::column_is_non_null(&encoded, 3), Some(true));
+        // Out-of-range column is absent → None (caller falls back).
+        assert_eq!(RowDecoder::column_is_non_null(&encoded, 4), None);
+    }
+
+    #[test]
+    fn test_column_is_non_null_handles_all_scalar_values() {
+        for value in [
+            Value::Null,
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Integer(0),
+            Value::Integer(-1),
+            Value::Integer(i64::MAX),
+            Value::Float(0.0),
+            Value::Float(f64::NAN),
+            Value::Decimal("1.5".to_string()),
+            Value::String(String::new()),
+            Value::String("x".to_string()),
+            Value::Date(0),
+            Value::Timestamp(0),
+            Value::Interval(0),
+        ] {
+            let encoded = RowEncoder::encode(std::slice::from_ref(&value));
+            let expected = !matches!(value, Value::Null);
+            assert_eq!(
+                RowDecoder::column_is_non_null(&encoded, 0),
+                Some(expected),
+                "mismatch for {value:?}"
+            );
+        }
+    }
 }
 
 /// Decodes a comparable hex string back to i64.
@@ -430,6 +476,30 @@ impl RowDecoder {
             }
             body.try_into().ok()
         }
+    }
+
+    /// Type-agnostic NULL check for `COUNT(col)`: peek only the column's
+    /// bincode tag without decoding the value. Returns `Some(true)` for a
+    /// confirmed non-NULL value, `Some(false)` for a confirmed NULL, and
+    /// `None` when the row layout is legacy/indeterminate (caller falls back
+    /// to full decode). NULL is bincode variant 0 with an empty body, i.e.
+    /// a 4-byte span `[0,0,0,0]`; any non-zero tag is a real value.
+    pub fn column_is_non_null(data: &[u8], idx: usize) -> Option<bool> {
+        if data.len() < 2 {
+            return None;
+        }
+        let (start, end) = Self::column_bounds(data, idx)?;
+        let span = &data[start..end];
+        if span.len() == 4 && u32::from_le_bytes([span[0], span[1], span[2], span[3]]) == 0 {
+            return Some(false);
+        }
+        // Any non-empty span with a non-zero tag is a value; a zero-length
+        // span or 4-byte non-zero tag is still "present" (non-NULL) — only the
+        // exact `[0,0,0,0]` pattern means NULL.
+        if span.is_empty() {
+            return None;
+        }
+        Some(true)
     }
 
     // Partially decode row, returning full Vec<Value> but with Nulls for skipped columns
