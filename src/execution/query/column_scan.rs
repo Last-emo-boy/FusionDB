@@ -69,10 +69,17 @@ pub(super) struct ColumnAggregateScanPlan {
     pub(super) output_name: String,
 }
 
-struct ColumnPredicateTerm {
-    value_slot: usize,
-    op: BinaryOperator,
-    value: Value,
+enum ColumnPredicateTerm {
+    Compare {
+        value_slot: usize,
+        op: BinaryOperator,
+        value: Value,
+    },
+    InList {
+        value_slot: usize,
+        values: Vec<Value>,
+        negated: bool,
+    },
 }
 
 pub(super) struct ColumnPredicateScanPlan {
@@ -93,31 +100,80 @@ impl ColumnPredicateScanPlan {
     ) -> Option<SqlBlockZoneMapPruningPlan> {
         let mut terms = Vec::with_capacity(self.terms.len());
         for term in &self.terms {
-            let &column_index = self.column_indices.get(term.value_slot)?;
-            let column = schema.columns.get(column_index)?;
-            let type_tag = sql_block_zone_map_type_tag(&column.data_type)?;
-            // `sql_block_zone_map_scalar` returns `None` for unsupported values
-            // (e.g. NULL against an integer column) — skip those terms; the
-            // row-level predicate still handles them.
-            let scalar = sql_block_zone_map_scalar(&term.value, type_tag)??;
-            let op = match term.op {
-                BinaryOperator::Eq => SqlBlockZoneMapComparisonOp::Eq,
-                BinaryOperator::Lt => SqlBlockZoneMapComparisonOp::Lt,
-                BinaryOperator::LtEq => SqlBlockZoneMapComparisonOp::LtEq,
-                BinaryOperator::Gt => SqlBlockZoneMapComparisonOp::Gt,
-                BinaryOperator::GtEq => SqlBlockZoneMapComparisonOp::GtEq,
-                // NotEq cannot prune a min/max block (any block may contain the
-                // non-matching value), and zone maps have no NotEq kind.
-                BinaryOperator::NotEq => continue,
-                _ => return None,
-            };
-            terms.push(SqlBlockZoneMapPredicateTerm {
-                column_index: u32::try_from(column_index).ok()?,
-                column_name: column.name.clone(),
-                type_tag,
-                value_encoding_version: crate::storage::SQL_BLOCK_ZONE_MAP_VALUE_ENCODING_VERSION,
-                kind: SqlBlockZoneMapPredicateKind::Compare { op, scalar },
-            });
+            match term {
+                ColumnPredicateTerm::Compare {
+                    value_slot,
+                    op,
+                    value,
+                } => {
+                    let &column_index = self.column_indices.get(*value_slot)?;
+                    let column = schema.columns.get(column_index)?;
+                    let type_tag = sql_block_zone_map_type_tag(&column.data_type)?;
+                    // `sql_block_zone_map_scalar` returns `None` for unsupported
+                    // values (e.g. NULL against an integer column) — skip those
+                    // terms; the row-level predicate still handles them.
+                    let scalar = sql_block_zone_map_scalar(value, type_tag)??;
+                    let op = match op {
+                        BinaryOperator::Eq => SqlBlockZoneMapComparisonOp::Eq,
+                        BinaryOperator::Lt => SqlBlockZoneMapComparisonOp::Lt,
+                        BinaryOperator::LtEq => SqlBlockZoneMapComparisonOp::LtEq,
+                        BinaryOperator::Gt => SqlBlockZoneMapComparisonOp::Gt,
+                        BinaryOperator::GtEq => SqlBlockZoneMapComparisonOp::GtEq,
+                        // NotEq cannot prune a min/max block (any block may
+                        // contain the non-matching value), and zone maps have
+                        // no NotEq kind.
+                        BinaryOperator::NotEq => continue,
+                        _ => return None,
+                    };
+                    terms.push(SqlBlockZoneMapPredicateTerm {
+                        column_index: u32::try_from(column_index).ok()?,
+                        column_name: column.name.clone(),
+                        type_tag,
+                        value_encoding_version: crate::storage::SQL_BLOCK_ZONE_MAP_VALUE_ENCODING_VERSION,
+                        kind: SqlBlockZoneMapPredicateKind::Compare { op, scalar },
+                    });
+                }
+                ColumnPredicateTerm::InList {
+                    value_slot,
+                    values,
+                    negated,
+                } => {
+                    // NOT IN cannot prune a min/max block; skip the term — the
+                    // row-level predicate still filters it.
+                    if *negated {
+                        continue;
+                    }
+                    let &column_index = self.column_indices.get(*value_slot)?;
+                    let column = schema.columns.get(column_index)?;
+                    let type_tag = sql_block_zone_map_type_tag(&column.data_type)?;
+                    // An unsupported value (e.g. NULL against an integer column)
+                    // drops the whole term, mirroring the scan layer's
+                    // `?`-propagation in `sql_block_zone_map_in_list_term`.
+                    let mut scalars = Vec::with_capacity(values.len());
+                    for value in values {
+                        // `sql_block_zone_map_scalar` returns `Option<Option<i64>>`:
+                        // outer `None` = unsupported type, inner `None` = NULL
+                        // value. NULLs in an IN list never match (SQL NULL
+                        // semantics) — skip them; an unsupported type drops the
+                        // whole term via the outer `?`.
+                        if let Some(scalar) = sql_block_zone_map_scalar(value, type_tag)? {
+                            scalars.push(scalar);
+                        }
+                    }
+                    scalars.sort_unstable();
+                    scalars.dedup();
+                    if scalars.is_empty() {
+                        continue;
+                    }
+                    terms.push(SqlBlockZoneMapPredicateTerm {
+                        column_index: u32::try_from(column_index).ok()?,
+                        column_name: column.name.clone(),
+                        type_tag,
+                        value_encoding_version: crate::storage::SQL_BLOCK_ZONE_MAP_VALUE_ENCODING_VERSION,
+                        kind: SqlBlockZoneMapPredicateKind::InList { scalars },
+                    });
+                }
+            }
         }
         if terms.is_empty() {
             return None;
@@ -198,18 +254,37 @@ fn group_column_aggregate_function_kind(name: &ObjectName) -> Option<GroupColumn
 
 impl ColumnPredicateTerm {
     fn matches(&self, value: &Value) -> bool {
-        if matches!(value, Value::Null) || matches!(self.value, Value::Null) {
-            return false;
+        match self {
+            ColumnPredicateTerm::Compare { op, value: expected, .. } => {
+                if matches!(value, Value::Null) || matches!(expected, Value::Null) {
+                    return false;
+                }
+                match op {
+                    BinaryOperator::Eq => value == expected,
+                    BinaryOperator::NotEq => value != expected,
+                    BinaryOperator::Gt => value.compare(expected) == Ordering::Greater,
+                    BinaryOperator::Lt => value.compare(expected) == Ordering::Less,
+                    BinaryOperator::GtEq => value.compare(expected) != Ordering::Less,
+                    BinaryOperator::LtEq => value.compare(expected) != Ordering::Greater,
+                    _ => false,
+                }
+            }
+            ColumnPredicateTerm::InList { values, negated, .. } => {
+                if matches!(value, Value::Null) {
+                    return false;
+                }
+                let found = values.iter().any(|v| v == value);
+                if *negated { !found } else { found }
+            }
         }
+    }
 
-        match self.op {
-            BinaryOperator::Eq => value == &self.value,
-            BinaryOperator::NotEq => value != &self.value,
-            BinaryOperator::Gt => value.compare(&self.value) == Ordering::Greater,
-            BinaryOperator::Lt => value.compare(&self.value) == Ordering::Less,
-            BinaryOperator::GtEq => value.compare(&self.value) != Ordering::Less,
-            BinaryOperator::LtEq => value.compare(&self.value) != Ordering::Greater,
-            _ => false,
+    /// Column index slot into `column_indices` for this term's referenced
+    /// column. Both variants carry a `value_slot`.
+    fn value_slot(&self) -> usize {
+        match self {
+            ColumnPredicateTerm::Compare { value_slot, .. }
+            | ColumnPredicateTerm::InList { value_slot, .. } => *value_slot,
         }
     }
 }
@@ -243,7 +318,7 @@ impl ColumnPredicateScanPlan {
 
     fn matches_values(&self, values: &[Value]) -> bool {
         for term in &self.terms {
-            let Some(value) = values.get(term.value_slot) else {
+            let Some(value) = values.get(term.value_slot()) else {
                 return false;
             };
             if !term.matches(value) {
@@ -266,21 +341,69 @@ impl ColumnPredicateScanPlan {
             // `value_slot` is validated against `column_indices` at
             // construction time, so direct indexing is safe and avoids the
             // per-row bounds check of `.get()`.
-            let column_index = self.column_indices[term.value_slot];
-            let matched = match &term.value {
-                Value::Integer(expected) => {
-                    let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
-                        data, column_index,
-                    )?;
-                    Self::scalar_i64_matches(row_value, &term.op, *expected)?
+            let column_index = self.column_indices[term.value_slot()];
+            let matched = match term {
+                ColumnPredicateTerm::Compare { op, value, .. } => match value {
+                    Value::Integer(expected) => {
+                        let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
+                            data, column_index,
+                        )?;
+                        Self::scalar_i64_matches(row_value, op, *expected)?
+                    }
+                    Value::Float(expected) => {
+                        let row_value = crate::common::encoding::RowDecoder::decode_float_column(
+                            data, column_index,
+                        )?;
+                        Self::scalar_f64_matches(row_value, op, *expected)?
+                    }
+                    _ => return None,
+                },
+                ColumnPredicateTerm::InList { values, negated, .. } => {
+                    // `negated` (NOT IN) is not supported on the scalar fast
+                    // path — fall back so the Value-based `matches` handles it.
+                    if *negated {
+                        return None;
+                    }
+                    // Integer list: decode the column as i64 and binary-search
+                    // the pre-sorted i64 list.
+                    if values.iter().all(|v| matches!(v, Value::Integer(_))) {
+                        let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
+                            data, column_index,
+                        )?;
+                        let scalars: Vec<i64> = values
+                            .iter()
+                            .map(|v| match v {
+                                Value::Integer(i) => *i,
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        match scalars.binary_search(&row_value) {
+                            Ok(_) => true,
+                            Err(_) => false,
+                        }
+                    } else if values.iter().all(|v| matches!(v, Value::Float(_))) {
+                        let row_value = crate::common::encoding::RowDecoder::decode_float_column(
+                            data, column_index,
+                        )?;
+                        let bits = row_value.to_bits();
+                        // Pre-sorted at construction by to_bits; binary-search.
+                        let mut scalars: Vec<u64> = values
+                            .iter()
+                            .map(|v| match v {
+                                Value::Float(f) => f.to_bits(),
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        scalars.sort_unstable();
+                        scalars.dedup();
+                        match scalars.binary_search(&bits) {
+                            Ok(_) => true,
+                            Err(_) => false,
+                        }
+                    } else {
+                        return None;
+                    }
                 }
-                Value::Float(expected) => {
-                    let row_value = crate::common::encoding::RowDecoder::decode_float_column(
-                        data, column_index,
-                    )?;
-                    Self::scalar_f64_matches(row_value, &term.op, *expected)?
-                }
-                _ => return None,
             };
             if !matched {
                 return Some(false);
@@ -2021,10 +2144,17 @@ impl Executor {
     ) -> Result<Option<Vec<Value>>> {
         let mut index_probe: Option<(usize, String, Value)> = None;
         for term in &predicate.terms {
-            if term.op != BinaryOperator::Eq {
+            // Only a single Eq compare yields a point probe value; InList has
+            // no single value to probe an index with.
+            let ColumnPredicateTerm::Compare {
+                value_slot,
+                op: BinaryOperator::Eq,
+                value,
+            } = term
+            else {
                 continue;
-            }
-            let Some(&column_index) = predicate.column_indices.get(term.value_slot) else {
+            };
+            let Some(&column_index) = predicate.column_indices.get(*value_slot) else {
                 continue;
             };
             let Some(column) = schema.columns.get(column_index) else {
@@ -2032,14 +2162,14 @@ impl Executor {
             };
             if column.is_primary {
                 let value =
-                    Self::coerce_value_to_column_type(term.value.clone(), &column.data_type)
+                    Self::coerce_value_to_column_type(value.clone(), &column.data_type)
                         .unwrap_or(Value::Null);
                 index_probe = Some((column_index, column.name.clone(), value));
                 break;
             }
             if column.is_indexed && column.index_type == IndexType::BTree {
                 let value =
-                    Self::coerce_value_to_column_type(term.value.clone(), &column.data_type)
+                    Self::coerce_value_to_column_type(value.clone(), &column.data_type)
                         .unwrap_or(Value::Null);
                 index_probe = Some((column_index, column.name.clone(), value));
                 break;
@@ -2121,6 +2251,50 @@ impl Executor {
         let mut column_indices = Vec::with_capacity(predicates.len());
 
         for predicate in predicates {
+            // `WHERE col IN (1, 2, 3)` — mirror the scan layer's
+            // `sql_block_zone_map_in_list_term`: reject NOT IN (no single
+            // probe point and zone maps can't prune NOT IN) and empty lists.
+            if let Expr::InList { expr, list, negated } = predicate {
+                if negated || list.is_empty() {
+                    return None;
+                }
+                let Some(column_index) = Self::order_limit_column_name(&expr)
+                    .and_then(|name| self.resolve_column_index(&name, schema).ok())
+                else {
+                    return None;
+                };
+                let data_type = &schema.columns[column_index].data_type;
+                let mut values = Vec::with_capacity(list.len());
+                for item in &list {
+                    if !Self::simple_column_predicate_value_expr(item) {
+                        return None;
+                    }
+                    let value = self.evaluate_value(item, &[], schema, params).ok()?;
+                    let value = Self::coerce_value_to_column_type(value, data_type).ok()?;
+                    values.push(value);
+                }
+                // Pre-sort + dedup so the scalar fast path can binary_search
+                // the list and zone-map InList terms reuse the same ordering.
+                values.sort_unstable_by(|a, b| a.compare(b));
+                values.dedup();
+                if values.is_empty() {
+                    return None;
+                }
+                let value_slot = match column_indices.iter().position(|&idx| idx == column_index) {
+                    Some(slot) => slot,
+                    None => {
+                        column_indices.push(column_index);
+                        column_indices.len() - 1
+                    }
+                };
+                terms.push(ColumnPredicateTerm::InList {
+                    value_slot,
+                    values,
+                    negated: false,
+                });
+                continue;
+            }
+
             let Expr::BinaryOp { left, op, right } = predicate else {
                 return None;
             };
@@ -2157,7 +2331,7 @@ impl Executor {
                         column_indices.len() - 1
                     }
                 };
-                terms.push(ColumnPredicateTerm {
+                terms.push(ColumnPredicateTerm::Compare {
                     value_slot,
                     op,
                     value,
@@ -2193,7 +2367,7 @@ impl Executor {
                         column_indices.len() - 1
                     }
                 };
-                terms.push(ColumnPredicateTerm {
+                terms.push(ColumnPredicateTerm::Compare {
                     value_slot,
                     op,
                     value,
@@ -3425,6 +3599,57 @@ mod tests {
             })
     }
 
+    // Build a comma-separated IN-list literal of i64 values: a few real values
+    // sampled from `existing` (so partial/full matches occur) plus a couple of
+    // out-of-range misses (`miss_lo`/`miss_hi`). Dedup keeps the SQL valid.
+    fn build_in_list_i64(
+        rng: &mut SplitMix64,
+        existing: &[i64],
+        miss_lo: i64,
+        miss_hi: i64,
+    ) -> String {
+        let mut picked: Vec<i64> = Vec::new();
+        if !existing.is_empty() {
+            let samples = 2 + rng.below(3) as usize;
+            for _ in 0..samples {
+                let idx = rng.below(existing.len() as u64) as usize;
+                picked.push(existing[idx]);
+            }
+        }
+        picked.push(miss_lo + rng.below((miss_hi - miss_lo) as u64).max(1) as i64);
+        picked.push(miss_lo + rng.below((miss_hi - miss_lo) as u64).max(1) as i64);
+        picked.sort_unstable();
+        picked.dedup();
+        picked
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    // Build an IN-list literal of f64 values sampled from `existing` plus a
+    // couple of never-inserted misses. Uses enough precision to round-trip.
+    fn build_in_list_f64(rng: &mut SplitMix64, existing: &[f64]) -> String {
+        let mut picked: Vec<f64> = Vec::new();
+        if !existing.is_empty() {
+            let samples = 2 + rng.below(3) as usize;
+            for _ in 0..samples {
+                let idx = rng.below(existing.len() as u64) as usize;
+                picked.push(existing[idx]);
+            }
+        }
+        // Misses well outside the [-2000, 2000] insert range.
+        picked.push(5000.0 + rng.below(1000) as f64);
+        picked.push(-5000.0 - rng.below(1000) as f64);
+        picked.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        picked.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        picked
+            .iter()
+            .map(|v| format!("{v:.6}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     // Deterministic splitmix64 so the randomized differential harness is
     // reproducible across runs.
     struct SplitMix64(u64);
@@ -3588,6 +3813,106 @@ mod tests {
                 "WHERE vn >= 0",
             ];
             for predicate in predicates {
+                for aggregate in DIFFERENTIAL_AGGREGATES {
+                    let sql = format!("SELECT {aggregate} FROM {table} {predicate}");
+                    let before = fast_path_fire_count();
+                    let fast = agg_row_fast(&executor, &sql).await;
+                    let fired = fast_path_fire_count() > before;
+                    let fallback = agg_row_fallback(&executor, &sql).await;
+                    assert!(
+                        values_bit_equal(&fast, &fallback),
+                        "iteration {iteration} {aggregate} {predicate}: fast {fast:?} != fallback {fallback:?}"
+                    );
+                    if *aggregate != "COUNT(*)" {
+                        assert!(
+                            fired,
+                            "iteration {iteration} {aggregate} {predicate}: fast path must fire on a clean single SSTable"
+                        );
+                    }
+                }
+            }
+
+            cleanup_dir(&data_dir);
+        }
+    }
+
+    /// `WHERE col IN (...)` must fire the columnar single-source fast path on
+    /// a clean single SSTable and produce bit-identical results to the merge
+    /// fallback across all aggregate kinds. Covers integer and float IN lists
+    /// (the two scalar fast-path columns), including empty-result, full-match,
+    /// and partial-match lists.
+    #[tokio::test]
+    async fn columnar_fast_path_in_list_matches_merge() {
+        let mut rng = SplitMix64(0x1A15_15F1_2345_6789u64);
+        for iteration in 0..6u32 {
+            let (executor, fusion, data_dir) =
+                fusion_executor(&format!("inlist_diff_{iteration}")).await;
+            let table = format!("il_{iteration}");
+            exec_ok_sql(
+                &executor,
+                &format!(
+                    "CREATE TABLE {table} (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL, \
+                     vf FLOAT NOT NULL, vs TEXT, vn INTEGER, vd DECIMAL(20, 4))"
+                ),
+            )
+            .await;
+
+            // Track distinct vi/vf values so IN lists can sample real values
+            // (partial match) plus out-of-range values (miss) and guarantee
+            // empty-result cases too.
+            let mut vi_values: Vec<i64> = Vec::new();
+            let mut vf_values: Vec<f64> = Vec::new();
+            let row_count = 40 + rng.below(220) as u32;
+            let mut insert = format!("INSERT INTO {table} VALUES ");
+            for id in 1..=row_count {
+                if id > 1 {
+                    insert.push(',');
+                }
+                let vi = rng.below(2_000_000) as i64 - 1_000_000;
+                let vf = (rng.next_u64() as f64 / u64::MAX as f64) * 4000.0 - 2000.0;
+                vi_values.push(vi);
+                vf_values.push(vf);
+                let vd_cents = rng.below(50_000_000) as i64 - 25_000_000;
+                let vs = format!("s{:08}", rng.below(100_000_000));
+                let vn = if rng.below(4) == 0 {
+                    "NULL".to_string()
+                } else {
+                    (rng.below(1_000_000) as i64).to_string()
+                };
+                let vs_lit = if rng.below(10) == 0 {
+                    "NULL".to_string()
+                } else {
+                    format!("'{vs}'")
+                };
+                let vd = format!(
+                    "CAST('{}.{:04}' AS DECIMAL(20,4))",
+                    vd_cents / 10_000,
+                    (vd_cents % 10_000).abs()
+                );
+                insert.push_str(&format!("({id}, {vi}, {vf:.6}, {vs_lit}, {vn}, {vd})"));
+            }
+            exec_ok_sql(&executor, &insert).await;
+            fusion.create_snapshot_now().await.unwrap();
+
+            // Build IN lists: sample a few real values (partial/full match) and
+            // a couple of never-inserted values (misses). Dedup so the SQL is
+            // valid even with collisions.
+            vi_values.sort_unstable();
+            vi_values.dedup();
+            vf_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            vf_values.dedup_by(|a, b| a.to_bits() == b.to_bits());
+
+            let vi_in = build_in_list_i64(&mut rng, &vi_values, 2_000_001, 3_000_000);
+            let vf_in = build_in_list_f64(&mut rng, &vf_values);
+
+            let predicates = [
+                format!("WHERE vi IN ({vi_in})"),
+                format!("WHERE vf IN ({vf_in})"),
+                // Disjoint list: no row can match (empty result), but the fast
+                // path must still fire and agree with the fallback.
+                "WHERE vi IN (3000000, 3000001, 3000002)".to_string(),
+            ];
+            for predicate in &predicates {
                 for aggregate in DIFFERENTIAL_AGGREGATES {
                     let sql = format!("SELECT {aggregate} FROM {table} {predicate}");
                     let before = fast_path_fire_count();
