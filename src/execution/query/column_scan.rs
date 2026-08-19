@@ -262,7 +262,6 @@ impl ColumnPredicateScanPlan {
     /// in the row cause the term to not match (SQL semantics: NULL
     /// comparisons are unknown/false for filtering).
     fn matches_row_scalar_fast(&self, data: &[u8]) -> Option<bool> {
-        let mut result = true;
         for term in &self.terms {
             // `value_slot` is validated against `column_indices` at
             // construction time, so direct indexing is safe and avoids the
@@ -284,11 +283,10 @@ impl ColumnPredicateScanPlan {
                 _ => return None,
             };
             if !matched {
-                result = false;
-                break;
+                return Some(false);
             }
         }
-        Some(result)
+        Some(true)
     }
 
     fn scalar_i64_matches(
