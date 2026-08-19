@@ -3961,6 +3961,9 @@ mod tests {
                 // scalar fast path defers to Value matching (Mixed). The first
                 // row is forced to vf=0.0, guaranteeing a non-empty match.
                 "WHERE vf IN (0.0, 1.5, -2.25)".to_string(),
+                // Combined IN + range predicate: exercises multiple terms in
+                // one ColumnPredicateScanPlan (scalar fast path per term).
+                format!("WHERE vi IN ({vi_in}) AND vf > 0.0"),
             ];
             for predicate in &predicates {
                 for aggregate in DIFFERENTIAL_AGGREGATES {
@@ -4053,6 +4056,68 @@ mod tests {
             "zone-map pruning must skip at least one block on a clean single \
              SSTable with a high-band predicate (skip_after={skip_after}, \
              skip_delta={skip_delta})"
+        );
+
+        cleanup_dir(&data_dir);
+    }
+
+    /// Zone-map pruning with an IN-list predicate: blocks whose [min,max] is
+    /// disjoint from every IN-list scalar must be skipped without being read,
+    /// proving the InList zone-map term prunes at the storage level (not just
+    /// the row-level predicate). Mirrors `columnar_fast_path_zone_map_skips_non_matching_blocks`.
+    #[tokio::test]
+    async fn columnar_fast_path_in_list_zone_map_skips_non_matching_blocks() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (executor, fusion, data_dir) =
+            fusion_executor("inlist_zone_map_prune").await;
+        exec_ok_sql(
+            &executor,
+            "CREATE TABLE zil (id INTEGER PRIMARY KEY, vi INTEGER NOT NULL)",
+        )
+        .await;
+
+        // `vi` grows monotonically with `id` so blocks have non-overlapping
+        // [min,max] intervals: block N covers roughly [N*band, (N+1)*band).
+        let row_count = 2000u32;
+        let band = 100i64;
+        let mut insert = String::from("INSERT INTO zil VALUES ");
+        for id in 1..=row_count {
+            if id > 1 {
+                insert.push(',');
+            }
+            let vi = (id as i64) * band;
+            insert.push_str(&format!("({id}, {vi})"));
+        }
+        exec_ok_sql(&executor, &insert).await;
+        fusion.create_snapshot_now().await.unwrap();
+
+        // IN list selecting only the top band: zone maps for the lower blocks
+        // (whose max < 195000) must be skipped, since none of the scalars fall
+        // in their [min,max].
+        let sql = "SELECT SUM(vi) FROM zil WHERE vi IN (195000, 195100, 199900)";
+
+        executor.invalidate_query_result_cache();
+        let fast = agg_row_fast(&executor, sql).await;
+        let fallback = agg_row_fallback(&executor, sql).await;
+        assert!(
+            values_bit_equal(&fast, &fallback),
+            "in-list zone-map prune: fast {fast:?} != fallback {fallback:?}"
+        );
+
+        crate::monitor::GLOBAL_METRICS
+            .sstable_block_zone_map_filter_skip_count
+            .store(0, Relaxed);
+        executor.invalidate_query_result_cache();
+        let _ = executor.execute_sql(sql).await.unwrap();
+        let skip_delta =
+            crate::monitor::GLOBAL_METRICS
+                .sstable_block_zone_map_filter_skip_count
+                .load(Relaxed);
+        assert!(
+            skip_delta > 0,
+            "in-list zone-map pruning must skip at least one block when the \
+             IN scalars fall in only the top band (skip_delta={skip_delta})"
         );
 
         cleanup_dir(&data_dir);
