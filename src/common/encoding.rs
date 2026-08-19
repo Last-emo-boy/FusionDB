@@ -264,6 +264,34 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_decode_string_column_matches_bincode_and_rejects_non_strings() {
+        // Column 0 = String, 1 = Integer, 2 = Null, 3 = Decimal, 4 = empty String.
+        let row = vec![
+            Value::String("héllo".to_string()),
+            Value::Integer(42),
+            Value::Null,
+            Value::Decimal("9.99".to_string()),
+            Value::String(String::new()),
+        ];
+        let encoded = RowEncoder::encode(&row);
+        assert_eq!(
+            RowDecoder::decode_string_column(&encoded, 0),
+            Some("héllo".to_string())
+        );
+        assert_eq!(
+            RowDecoder::decode_string_column(&encoded, 4),
+            Some(String::new())
+        );
+        // Integer, Null, and Decimal (tag 4, not 5) all return None — callers
+        // fall back to the Value path.
+        assert_eq!(RowDecoder::decode_string_column(&encoded, 1), None);
+        assert_eq!(RowDecoder::decode_string_column(&encoded, 2), None);
+        assert_eq!(RowDecoder::decode_string_column(&encoded, 3), None);
+        // Out-of-range column is absent.
+        assert_eq!(RowDecoder::decode_string_column(&encoded, 5), None);
+    }
 }
 
 /// Decodes a comparable hex string back to i64.
@@ -450,6 +478,37 @@ impl RowDecoder {
     /// benefit as `decode_integer_column` for float-predicate rows.
     pub fn decode_float_column(data: &[u8], idx: usize) -> Option<f64> {
         Self::decode_scalar_raw(data, idx, 3).map(f64::from_le_bytes)
+    }
+
+    /// Fast string-only decode: returns the owned `String` for a string column
+    /// (bincode tag 5), or `None` if the column is absent, null, or any other
+    /// type. Lets `STRING_AGG`/`GROUP_CONCAT` accumulate directly without
+    /// constructing a `Value` enum, mirroring the scalar fast fold for
+    /// Sum/Avg/CountColumn on integer/float columns.
+    pub fn decode_string_column(data: &[u8], idx: usize) -> Option<String> {
+        if data.len() < 2 {
+            let row: Vec<Value> = bincode::deserialize(data).ok()?;
+            return match row.get(idx)? {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            };
+        }
+        let (start, end) = Self::column_bounds(data, idx)?;
+        let span = &data[start..end];
+        // Tag (4) + u64 length (8) = 12-byte header before the UTF-8 bytes.
+        if span.len() < 12 {
+            return None;
+        }
+        let (tag, rest) = span.split_first_chunk::<4>()?;
+        if u32::from_le_bytes(*tag) != 5 {
+            return None;
+        }
+        let (len, text) = rest.split_first_chunk::<8>()?;
+        let len = u64::from_le_bytes(*len) as usize;
+        if text.len() != len {
+            return None;
+        }
+        Some(std::str::from_utf8(text).ok()?.to_string())
     }
 
     /// Shared fast-scalar decode: tag + 8-byte LE payload. Returns the 8

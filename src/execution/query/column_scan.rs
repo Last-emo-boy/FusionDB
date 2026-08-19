@@ -814,6 +814,20 @@ impl ColumnAggregateState {
         }
     }
 
+    /// Fast string fold for `STRING_AGG`/`GROUP_CONCAT`: push an owned `String`
+    /// decoded directly from the column bytes, skipping the `Value` enum
+    /// round-trip. Returns `true` only for `StringAgg`; other kinds need the
+    /// full `Value` and fall back.
+    fn update_string(&mut self, value: String) -> bool {
+        match self.kind {
+            ColumnAggregateKind::StringAgg => {
+                self.strings.push(value);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn finalize(&self) -> Value {
         match self.kind {
             ColumnAggregateKind::CountStar => Value::Integer(self.count),
@@ -904,6 +918,15 @@ fn apply_column_aggregate_matched_row(
                     // for a full `Value` decode.
                     if let Some(true) = crate::common::encoding::RowDecoder::column_is_non_null(data, column_index) {
                         if state.update_count_non_null() {
+                            #[cfg(test)]
+                            note_column_aggregate_column_decode_for_test();
+                            continue;
+                        }
+                    }
+                    // STRING_AGG/GROUP_CONCAT over a string column: decode the
+                    // owned String directly, skipping the `Value` round-trip.
+                    if let Some(s) = crate::common::encoding::RowDecoder::decode_string_column(data, column_index) {
+                        if state.update_string(s) {
                             #[cfg(test)]
                             note_column_aggregate_column_decode_for_test();
                             continue;
