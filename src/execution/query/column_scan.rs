@@ -1455,10 +1455,32 @@ struct CountDistinctScanVisitor<'a> {
 
 impl CountDistinctScanVisitor<'_> {
     fn visit_row(&mut self, data: &[u8]) -> Result<()> {
-        Executor::decode_predicate_values(data, self.predicate, &mut self.predicate_values)?;
+        // Scalar predicate fast path: skip non-matching rows without decoding
+        // any predicate column into a `Value`. `Some(false)` short-circuits
+        // before `decode_predicate_values`; `None` (NULL/non-scalar term)
+        // falls back to the full decode + `matches_values` path.
         if let Some(predicate) = self.predicate {
-            if !predicate.matches_values(&self.predicate_values) {
-                return Ok(());
+            match predicate.matches_row_scalar_fast(data) {
+                Some(false) => return Ok(()),
+                Some(true) => {
+                    Executor::decode_predicate_values(
+                        data,
+                        self.predicate,
+                        &mut self.predicate_values,
+                    )?;
+                    // Confirmed match on the scalar path; skip the redundant
+                    // `matches_values` re-check.
+                }
+                None => {
+                    Executor::decode_predicate_values(
+                        data,
+                        self.predicate,
+                        &mut self.predicate_values,
+                    )?;
+                    if !predicate.matches_values(&self.predicate_values) {
+                        return Ok(());
+                    }
+                }
             }
         }
 
@@ -1498,10 +1520,28 @@ struct DistinctColumnScanVisitor<'a> {
 
 impl DistinctColumnScanVisitor<'_> {
     fn visit_row(&mut self, data: &[u8]) -> Result<()> {
-        Executor::decode_predicate_values(data, self.predicate, &mut self.predicate_values)?;
+        // Scalar predicate fast path: same short-circuit as the count-distinct
+        // visitor — skip non-matching rows before any `Value` decode.
         if let Some(predicate) = self.predicate {
-            if !predicate.matches_values(&self.predicate_values) {
-                return Ok(());
+            match predicate.matches_row_scalar_fast(data) {
+                Some(false) => return Ok(()),
+                Some(true) => {
+                    Executor::decode_predicate_values(
+                        data,
+                        self.predicate,
+                        &mut self.predicate_values,
+                    )?;
+                }
+                None => {
+                    Executor::decode_predicate_values(
+                        data,
+                        self.predicate,
+                        &mut self.predicate_values,
+                    )?;
+                    if !predicate.matches_values(&self.predicate_values) {
+                        return Ok(());
+                    }
+                }
             }
         }
 
