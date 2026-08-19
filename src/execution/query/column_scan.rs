@@ -79,7 +79,23 @@ enum ColumnPredicateTerm {
         value_slot: usize,
         values: Vec<Value>,
         negated: bool,
+        /// Pre-extracted, sorted, deduped scalar view of `values`. Built once
+        /// at construction so the per-row scalar fast path can binary-search
+        /// without re-allocating per row. `Mixed` (or `Floats` when NaN/neg-zero
+        /// ordering matters) defers to the `Value`-based `matches`.
+        scalars: InListScalars,
     },
+}
+
+/// Scalar projection of an IN-list's values for the row-level fast path.
+/// `Integers`/`Floats` are sorted by the same key the decoder produces (i64 /
+/// f64::to_bits), so a single `binary_search` per row replaces a per-row
+/// `Vec` allocation + sort.
+enum InListScalars {
+    /// Values are not all the same scalar kind — fall back to `Value` matching.
+    Mixed,
+    Integers(Vec<i64>),
+    Floats(Vec<u64>),
 }
 
 pub(super) struct ColumnPredicateScanPlan {
@@ -137,6 +153,7 @@ impl ColumnPredicateScanPlan {
                     value_slot,
                     values,
                     negated,
+                    ..
                 } => {
                     // NOT IN cannot prune a min/max block; skip the term — the
                     // row-level predicate still filters it.
@@ -358,50 +375,28 @@ impl ColumnPredicateScanPlan {
                     }
                     _ => return None,
                 },
-                ColumnPredicateTerm::InList { values, negated, .. } => {
+                ColumnPredicateTerm::InList { scalars, negated, .. } => {
                     // `negated` (NOT IN) is not supported on the scalar fast
                     // path — fall back so the Value-based `matches` handles it.
                     if *negated {
                         return None;
                     }
-                    // Integer list: decode the column as i64 and binary-search
-                    // the pre-sorted i64 list.
-                    if values.iter().all(|v| matches!(v, Value::Integer(_))) {
-                        let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
-                            data, column_index,
-                        )?;
-                        let scalars: Vec<i64> = values
-                            .iter()
-                            .map(|v| match v {
-                                Value::Integer(i) => *i,
-                                _ => unreachable!(),
-                            })
-                            .collect();
-                        match scalars.binary_search(&row_value) {
-                            Ok(_) => true,
-                            Err(_) => false,
+                    match scalars {
+                        InListScalars::Integers(ints) => {
+                            let row_value = crate::common::encoding::RowDecoder::decode_integer_column(
+                                data, column_index,
+                            )?;
+                            ints.binary_search(&row_value).is_ok()
                         }
-                    } else if values.iter().all(|v| matches!(v, Value::Float(_))) {
-                        let row_value = crate::common::encoding::RowDecoder::decode_float_column(
-                            data, column_index,
-                        )?;
-                        let bits = row_value.to_bits();
-                        // Pre-sorted at construction by to_bits; binary-search.
-                        let mut scalars: Vec<u64> = values
-                            .iter()
-                            .map(|v| match v {
-                                Value::Float(f) => f.to_bits(),
-                                _ => unreachable!(),
-                            })
-                            .collect();
-                        scalars.sort_unstable();
-                        scalars.dedup();
-                        match scalars.binary_search(&bits) {
-                            Ok(_) => true,
-                            Err(_) => false,
+                        InListScalars::Floats(bits_list) => {
+                            let row_value = crate::common::encoding::RowDecoder::decode_float_column(
+                                data, column_index,
+                            )?;
+                            bits_list.binary_search(&row_value.to_bits()).is_ok()
                         }
-                    } else {
-                        return None;
+                        // Non-uniform list (or NaN/-0.0 edge case): defer to
+                        // Value-based matching.
+                        InListScalars::Mixed => return None,
                     }
                 }
             };
@@ -2280,6 +2275,49 @@ impl Executor {
                 if values.is_empty() {
                     return None;
                 }
+                // Project to a sorted scalar view once, so the per-row fast
+                // path binary-searches without re-allocating. Floats sort by
+                // to_bits (matching the decoder's f64::to_bits output); this
+                // differs from `Value::compare` only for NaN/-0.0, in which
+                // case we fall back to `Mixed` (Value-based matching).
+                let scalars = if values.iter().all(|v| matches!(v, Value::Integer(_))) {
+                    let mut ints: Vec<i64> = values
+                        .iter()
+                        .map(|v| match v {
+                            Value::Integer(i) => *i,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    ints.sort_unstable();
+                    ints.dedup();
+                    InListScalars::Integers(ints)
+                } else if values.iter().all(|v| matches!(v, Value::Float(_))) {
+                    // NaN compares unordered (never matches via `==`), and
+                    // +0.0/-0.0 compare equal under `Value::compare` but have
+                    // distinct `to_bits`. Since the row value is only known at
+                    // runtime, any zero (±) or NaN in the list would make the
+                    // to_bits binary_search disagree with `Value::compare` —
+                    // defer to Value matching to stay correct.
+                    if values
+                        .iter()
+                        .any(|v| matches!(v, Value::Float(f) if f.is_nan() || *f == 0.0))
+                    {
+                        InListScalars::Mixed
+                    } else {
+                        let mut bits: Vec<u64> = values
+                            .iter()
+                            .map(|v| match v {
+                                Value::Float(f) => f.to_bits(),
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        bits.sort_unstable();
+                        bits.dedup();
+                        InListScalars::Floats(bits)
+                    }
+                } else {
+                    InListScalars::Mixed
+                };
                 let value_slot = match column_indices.iter().position(|&idx| idx == column_index) {
                     Some(slot) => slot,
                     None => {
@@ -2291,6 +2329,7 @@ impl Executor {
                     value_slot,
                     values,
                     negated: false,
+                    scalars,
                 });
                 continue;
             }
@@ -3869,7 +3908,14 @@ mod tests {
                     insert.push(',');
                 }
                 let vi = rng.below(2_000_000) as i64 - 1_000_000;
-                let vf = (rng.next_u64() as f64 / u64::MAX as f64) * 4000.0 - 2000.0;
+                // Force the first row's float to exactly 0.0 so the zero-bearing
+                // IN list below has a guaranteed match (exercises the Mixed
+                // fallback where to_bits binary_search would be unsafe).
+                let vf = if id == 1 {
+                    0.0
+                } else {
+                    (rng.next_u64() as f64 / u64::MAX as f64) * 4000.0 - 2000.0
+                };
                 vi_values.push(vi);
                 vf_values.push(vf);
                 let vd_cents = rng.below(50_000_000) as i64 - 25_000_000;
@@ -3911,6 +3957,10 @@ mod tests {
                 // Disjoint list: no row can match (empty result), but the fast
                 // path must still fire and agree with the fallback.
                 "WHERE vi IN (3000000, 3000001, 3000002)".to_string(),
+                // Zero-bearing float list: 0.0/-0.0 make to_bits unsafe, so the
+                // scalar fast path defers to Value matching (Mixed). The first
+                // row is forced to vf=0.0, guaranteeing a non-empty match.
+                "WHERE vf IN (0.0, 1.5, -2.25)".to_string(),
             ];
             for predicate in &predicates {
                 for aggregate in DIFFERENTIAL_AGGREGATES {
