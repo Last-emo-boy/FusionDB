@@ -943,6 +943,28 @@ fn apply_group_aggregate_matched_row(
 
     for (state, plan) in states.iter_mut().zip(aggregate_plans.iter()) {
         if let Some(column_index) = plan.column_index {
+            // Scalar fast fold: when the aggregate column is not a reused
+            // predicate column, try integer/float decode and accumulate
+            // without building a `Value`. Falls back to the Value path when
+            // the column is non-scalar, NULL, reused from the predicate, or
+            // the aggregate needs the full Value (Min/Max/CountDistinct/
+            // StringAgg).
+            if predicate.and_then(|p| p.value_for_column(column_index, predicate_values)).is_none() {
+                if let Some(i) = crate::common::encoding::RowDecoder::decode_integer_column(
+                    data, column_index,
+                ) {
+                    if state.update_scalar_i64(i) {
+                        continue;
+                    }
+                }
+                if let Some(f) = crate::common::encoding::RowDecoder::decode_float_column(
+                    data, column_index,
+                ) {
+                    if state.update_scalar_f64(f) {
+                        continue;
+                    }
+                }
+            }
             let value = Executor::decode_column_or_reuse_predicate(
                 data,
                 column_index,
@@ -979,6 +1001,27 @@ fn apply_single_group_aggregate_matched_row(
 
     for (state, plan) in states.iter_mut().zip(aggregate_plans.iter()) {
         if let Some(column_index) = plan.column_index {
+            // Scalar fast fold: when the aggregate column is not a reused
+            // predicate column, try integer/float decode and accumulate
+            // without building a `Value`. Falls back to the Value path when
+            // the column is non-scalar, NULL, reused from the predicate, or
+            // the aggregate needs the full Value.
+            if predicate.and_then(|p| p.value_for_column(column_index, predicate_values)).is_none() {
+                if let Some(i) = crate::common::encoding::RowDecoder::decode_integer_column(
+                    data, column_index,
+                ) {
+                    if state.update_scalar_i64(i) {
+                        continue;
+                    }
+                }
+                if let Some(f) = crate::common::encoding::RowDecoder::decode_float_column(
+                    data, column_index,
+                ) {
+                    if state.update_scalar_f64(f) {
+                        continue;
+                    }
+                }
+            }
             let value = Executor::decode_column_or_reuse_predicate(
                 data,
                 column_index,
@@ -1431,6 +1474,43 @@ impl GroupColumnAggregateState {
                 Value::Null => {}
                 _ => {}
             },
+        }
+    }
+
+    /// Scalar integer fast fold for Sum/Avg/CountColumn: accumulate an `i64`
+    /// without constructing a `Value`. Returns `true` if accepted; `false`
+    /// signals Value-based fallback.
+    fn update_scalar_i64(&mut self, value: i64) -> bool {
+        match self.kind {
+            GroupColumnAggregateKind::Sum | GroupColumnAggregateKind::Avg => {
+                self.sum += value as f64;
+                self.count += 1;
+                true
+            }
+            GroupColumnAggregateKind::CountColumn => {
+                self.count += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Scalar float fast fold for Sum/Avg/CountColumn: accumulate an `f64`
+    /// without constructing a `Value`. Returns `true` if accepted; `false`
+    /// signals Value-based fallback.
+    fn update_scalar_f64(&mut self, value: f64) -> bool {
+        match self.kind {
+            GroupColumnAggregateKind::Sum | GroupColumnAggregateKind::Avg => {
+                self.sum += value;
+                self.count += 1;
+                self.is_int = false;
+                true
+            }
+            GroupColumnAggregateKind::CountColumn => {
+                self.count += 1;
+                true
+            }
+            _ => false,
         }
     }
 
