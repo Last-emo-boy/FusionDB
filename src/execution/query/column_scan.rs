@@ -647,6 +647,43 @@ impl ColumnAggregateState {
         }
     }
 
+    /// Scalar integer fast fold: directly accumulate an `i64` into Sum/Avg
+    /// without constructing a `Value` enum. Returns `true` if the state kind
+    /// accepts an integer scalar (Sum/Avg/CountColumn); `false` signals the
+    /// caller to fall back to `Value`-based fold.
+    fn update_scalar_i64(&mut self, value: i64) -> bool {
+        match self.kind {
+            ColumnAggregateKind::Sum | ColumnAggregateKind::Avg => {
+                self.sum += value as f64;
+                self.count += 1;
+                true
+            }
+            ColumnAggregateKind::CountColumn => {
+                self.count += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Scalar float fast fold: directly accumulate an `f64` into Sum/Avg.
+    /// Returns `true` if accepted; `false` signals Value-based fallback.
+    fn update_scalar_f64(&mut self, value: f64) -> bool {
+        match self.kind {
+            ColumnAggregateKind::Sum | ColumnAggregateKind::Avg => {
+                self.sum += value;
+                self.count += 1;
+                self.is_int = false;
+                true
+            }
+            ColumnAggregateKind::CountColumn => {
+                self.count += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn finalize(&self) -> Value {
         match self.kind {
             ColumnAggregateKind::CountStar => Value::Integer(self.count),
@@ -709,7 +746,29 @@ fn apply_column_aggregate_matched_row(
         for (state, source) in states.iter_mut().zip(decode_plan.sources.iter()) {
             match source {
                 Some(ColumnAggregateValueSource::Decoded(slot)) => {
-                    let value = decode_plan.decode_one(data, decode_plan.decoded_columns[*slot])?;
+                    let column_index = decode_plan.decoded_columns[*slot];
+                    // Scalar fast fold: try integer/float decode directly and
+                    // accumulate without building a `Value`. Falls back to
+                    // the owned-Value path when the column is non-scalar, the
+                    // value is NULL, or the aggregate kind needs the full
+                    // Value (Min/Max/StringAgg). The test decode counter is
+                    // incremented in both paths so the "decode once per row
+                    // per column" invariant is preserved.
+                    if let Some(i) = crate::common::encoding::RowDecoder::decode_integer_column(data, column_index) {
+                        if state.update_scalar_i64(i) {
+                            #[cfg(test)]
+                            note_column_aggregate_column_decode_for_test();
+                            continue;
+                        }
+                    }
+                    if let Some(f) = crate::common::encoding::RowDecoder::decode_float_column(data, column_index) {
+                        if state.update_scalar_f64(f) {
+                            #[cfg(test)]
+                            note_column_aggregate_column_decode_for_test();
+                            continue;
+                        }
+                    }
+                    let value = decode_plan.decode_one(data, column_index)?;
                     state.update_owned(value);
                 }
                 Some(ColumnAggregateValueSource::Predicate(slot)) => {
